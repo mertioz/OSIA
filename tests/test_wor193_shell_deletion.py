@@ -9,10 +9,8 @@ from osia import action_policy
 from osia import agent as agent_module
 from osia import deletion_plan as deletion_module
 from osia import system_resources as system_module
-from osia.action_policy import PermissionPolicy
 from osia.deletion_plan import DeletionPlanError, parse_shell_deletion
 from osia.mcp_client import registry as mcp_registry
-from osia.permission_store import PermissionStore, UnavailableSecureStorageBackend
 from osia.system_resources import SystemResourceRegistry, WindowsRuntimeAdapter
 
 
@@ -49,13 +47,23 @@ def test_exact_literal_shell_forms_are_enumerable(command, family, count, recurs
         "find . -print0 | xargs -0 rm",
         "for x in a b; do rm $x; done",
         "Remove-Item -Path C:\\Temp\\one",
-        "Remove-Partition -DiskNumber 0 -PartitionNumber 1",
-        "mkfs.ext4 /dev/sda1",
     ],
 )
 def test_dynamic_complex_or_raw_deletion_shell_is_rejected(command):
     with pytest.raises(DeletionPlanError):
         parse_shell_deletion(command, platform_family="windows")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "Remove-Partition -DiskNumber 0 -PartitionNumber 1",
+        "mkfs.ext4 /dev/sda1",
+        "Write-Output 'format C:'",
+    ],
+)
+def test_storage_syntax_is_not_a_deletion_plan_classifier(command):
+    assert parse_shell_deletion(command, platform_family="windows") is None
 
 
 def _safe_registry(tmp_path: Path) -> SystemResourceRegistry:
@@ -74,9 +82,6 @@ def _safe_registry(tmp_path: Path) -> SystemResourceRegistry:
 
 @pytest.fixture(autouse=True)
 def _policy(monkeypatch, tmp_path):
-    action_policy.set_default_permission_policy(PermissionPolicy(PermissionStore(
-        tmp_path / "session.dat", backend=UnavailableSecureStorageBackend(),
-    )))
     monkeypatch.setattr(
         deletion_module,
         "get_default_system_resource_registry",
@@ -91,7 +96,6 @@ def _policy(monkeypatch, tmp_path):
     mcp_registry.set_confirmation_provider(None)
     yield
     mcp_registry.set_confirmation_provider(None)
-    action_policy.set_default_permission_policy(None)
 
 
 def test_literal_shell_deletion_runs_plan_instead_of_raw_shell(tmp_path, monkeypatch):

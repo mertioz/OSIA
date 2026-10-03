@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import math
 import re
 import secrets
 import threading
@@ -36,40 +35,21 @@ ERROR_CONVERSATION_NOT_FOUND = "conversation_not_found"
 ERROR_CONVERSATION_AMBIGUOUS = "conversation_ambiguous"
 ERROR_MODEL_NOT_FOUND = "model_not_found"
 ERROR_MODEL_AMBIGUOUS = "model_ambiguous"
-ERROR_AUTHORIZATION_REQUIRED = "authorization_required"
-ERROR_AUTHORIZATION_STALE = "authorization_stale"
-ERROR_AUTHORIZATION_UNAVAILABLE = "authorization_unavailable"
-ERROR_PC_REVIEW_REQUIRED = "pc_local_review_required"
+ERROR_BLOCKED = "execution_blocked"
+ERROR_DISABLED = "task_disabled"
+ERROR_STALE = "task_definition_changed"
 
 SCHEDULED_TASK_SCHEMA_VERSION = 2
-AUTHORIZATION_PROTOCOL_VERSION = 1
-AUTHORIZATION_REQUIRED = "authorization_required"
-AUTHORIZED = "authorized"
-AUTHORIZATION_EXPIRED = "authorization_expired"
-AUTHORIZATION_REVOKED = "authorization_revoked"
-AUTHORIZATION_EDITED = "authorization_invalidated_by_edit"
 BLOCKED_OUTCOME_UNKNOWN = "blocked_outcome_unknown"
 DISABLED = "disabled"
 RUNNING = "running"
 
-_AUTHORIZATION_STATES = {
-    AUTHORIZATION_REQUIRED,
-    AUTHORIZED,
-    AUTHORIZATION_EXPIRED,
-    AUTHORIZATION_REVOKED,
-    AUTHORIZATION_EDITED,
-    BLOCKED_OUTCOME_UNKNOWN,
-    DISABLED,
-    RUNNING,
-}
-_MOBILE_SAFE_CATEGORIES = {"safe_local_setting"}
 _PUBLIC_CAPABILITY_CATEGORIES = {
     "read_only", "dynamic_scope_requires_review", "safe_local_setting",
     "local_path", "directory_tree", "local_paths", "connector_operation",
     "local_command", "tool_operation", "sensitive_scope",
 }
 _MAX_EXECUTION_RECORDS = 64
-_DEFAULT_GRANT_TTL_SECONDS = 30 * 24 * 60 * 60
 
 _TASK_ID_RE = re.compile(r"^cron_[A-Za-z0-9_-]{8,}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -78,9 +58,12 @@ _SUPPORTED_SOURCES = {"chat", "settings", "mobile_settings"}
 _CHANGE_CALLBACK: Callable[[], None] | None = None
 _CHANGE_CALLBACKS: list[Callable[[], None]] = []
 _JOBS_LOCK = threading.RLock()
-_AUTHORIZATION_LOCK = threading.RLock()
-_PENDING_AUTHORIZATIONS: dict[str, dict[str, Any]] = {}
-_RESPONDED_AUTHORIZATIONS: list[str] = []
+
+# Obsolete WOR-195 authorization fields stripped from every loaded job.
+_OBSOLETE_AUTHORIZATION_FIELDS = (
+    "grant_refs", "authorization_status", "authorization_expires_at",
+    "authorization_bounds", "authorization_request", "migration_state",
+)
 
 _UNSAFE_MARKUP_RE = re.compile(
     r"<\s*/?\s*(?:tool_call|tool_result|tool_code|think|thinking|system|developer)\b",
@@ -333,7 +316,11 @@ def task_definition_hash(job: dict[str, Any]) -> str:
 
 
 def is_bound_scheduled_context(context: Any) -> bool:
-    """Identify WOR-195 contexts without changing legacy policy test fixtures."""
+    """Identify a fully bound scheduled execution context (integrity only).
+
+    The bound ``plan_revision`` is the exact definition/revision pair; it binds
+    one call to the task revision it was launched from.  No authorization.
+    """
 
     return bool(
         _TASK_ID_RE.match(str(getattr(context, "scheduled_task_id", "") or ""))
@@ -345,22 +332,12 @@ def is_bound_scheduled_context(context: Any) -> bool:
     )
 
 
-def _authorization_binding(job: dict[str, Any], authorization_revision: int | None = None) -> str:
-    revision = (
+def _execution_binding(job: dict[str, Any], revision: int | None = None) -> str:
+    current = (
         int(job.get("authorization_revision", 0))
-        if authorization_revision is None else int(authorization_revision)
+        if revision is None else int(revision)
     )
-    return f"{str(job.get('definition_hash') or '')}:{revision}"
-
-
-def _permission_snapshot() -> tuple[Any | None, Any | None]:
-    try:
-        from osia.action_policy import get_default_permission_policy
-
-        policy = get_default_permission_policy()
-        return policy, policy.store.load_state()
-    except Exception:
-        return None, None
+    return f"{str(job.get('definition_hash') or '')}:{current}"
 
 
 def _safe_capability_summary(job: dict[str, Any]) -> list[str]:
@@ -385,57 +362,47 @@ def _safe_capability_summary(job: dict[str, Any]) -> list[str]:
 
 def _constraint_metadata_for_calls(
     calls: list[dict[str, Any]],
-    *,
-    context=None,
-    policy=None,
-) -> tuple[list[dict[str, str]], list[Any]]:
-    """Build exact policy requests while retaining only value-free task metadata."""
+) -> list[dict[str, str]]:
+    """Build value-free exact call metadata (binding + tool classification).
 
-    from osia.action_policy import build_permission_request
+    The metadata is execution identity, not authority: it feeds the task hash
+    that binds one occurrence to the exact call it was created from.
+    """
+
+    from osia.tool_contracts import SideEffectClass, get_tool_spec, normalized_call_hash
 
     metadata: list[dict[str, str]] = []
-    requests = []
     for call in calls:
         if not isinstance(call, dict):
             raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_REQUIRED,
+                ERROR_VALIDATION,
                 "capability proposal is incomplete",
             )
         tool = str(call.get("tool") or "").strip()
         arguments = call.get("arguments", {})
         if not tool or not isinstance(arguments, dict):
             raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_REQUIRED,
+                ERROR_VALIDATION,
                 "capability proposal is incomplete",
             )
-        request = build_permission_request(
-            tool,
-            arguments,
-            confirmation_domain="action",
-            origin_id="osia",
-            execution_context=context,
-            force_sensitive=True,
-            policy=policy,
-        )
-        if not request.private_scope.grantable:
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_REQUIRED,
-                "dynamic or unknown targets require later authorization",
-            )
-        binding = request.normalized_call_hash
+        spec = get_tool_spec(tool)
+        read_only = spec is not None and spec.side_effect is SideEffectClass.READ_ONLY
+        category = "read_only" if read_only else "sensitive_scope"
+        binding = normalized_call_hash(tool, arguments)
         metadata.append({
             "capability_id": canonical_hash({
-                "tool": request.tool_identity,
+                "tool": tool,
                 "call_binding": binding,
             })[:32],
-            "tool_category": request.tool_category,
-            "effect_class": request.effect_class,
-            "safe_category": request.safe_category,
+            "tool_category": category,
+            "effect_class": (
+                spec.side_effect.value if spec is not None else "unknown_high_risk"
+            ),
+            "safe_category": category,
             "call_binding": binding,
         })
-        requests.append(request)
     metadata.sort(key=lambda item: canonical_serialize(item))
-    return metadata, requests
+    return metadata
 
 
 def _derived_constraint_metadata(instruction: str) -> list[dict[str, str]]:
@@ -443,8 +410,7 @@ def _derived_constraint_metadata(instruction: str) -> list[dict[str, str]]:
     if not calls:
         return []
     try:
-        metadata, _requests = _constraint_metadata_for_calls(calls)
-        return metadata
+        return _constraint_metadata_for_calls(calls)
     except Exception:
         return []
 
@@ -746,7 +712,7 @@ def _model_registry_snapshot() -> tuple[list[dict[str, Any]], Callable[[str], st
             {"id": "gpt-5.5", "label": "GPT-5.5", "provider": "openai"},
             {"id": "gpt-5.4", "label": "GPT-5.4", "provider": "openai"},
             {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini", "provider": "openai"},
-            {"id": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "provider": "deepseek"},
+            {"id": "deepseek-flash", "label": "DeepSeek V4.1 Flash", "provider": "deepseek"},
             {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash", "provider": "google"},
         ]
 
@@ -801,6 +767,8 @@ def _resolve_model_metadata(
     if not (raw_id or raw_provider or raw_query):
         return None
 
+    from osia.deepseek import migrate_model_id
+    raw_id = migrate_model_id(raw_provider, raw_id)
     models, provider_for_model = _model_registry_snapshot()
     candidates = [
         m for m in models
@@ -1050,131 +1018,67 @@ def _normalize_existing_job(
         clean["target_binding"] = expected_target_binding
         changed = True
 
-    policy, permission_state = _permission_snapshot()
-    current_epoch = int(getattr(permission_state, "policy_epoch", 0) or 0)
-    full_access = str(getattr(permission_state, "permission_mode", "")) in {
-        "PermissionMode.FULL_ACCESS", "full_access",
-    }
     schema_is_current = original_schema == SCHEDULED_TASK_SCHEMA_VERSION
     legacy_schema = original_schema is None
     unknown_schema = not legacy_schema and not schema_is_current
+    task_revision = clean.get("task_revision")
+    authorization_revision = clean.get("authorization_revision")
+    stored_hash = str(clean.get("definition_hash") or "")
+    expected_hash = task_definition_hash(clean)
+    execution_identity_valid = (
+        schema_is_current
+        and type(task_revision) is int and task_revision >= 1
+        and type(authorization_revision) is int and authorization_revision >= 0
+        and bool(re.fullmatch(r"[0-9a-f]{64}", stored_hash))
+    )
     if unknown_schema:
-        unknown_was_authorized = bool(
-            clean.get("grant_refs")
-            or clean.get("enabled")
-            or clean.get("authorization_status") not in {
-                None, AUTHORIZATION_REQUIRED,
-            }
-        )
-        revoked_epoch = _revoke_grant_refs(clean.get("grant_refs"))
-        if unknown_was_authorized and policy is not None:
-            try:
-                revoked_epoch = int(policy.store.invalidate_active_permits())
-            except Exception:
-                pass
-        if clean.get("authorization_status") != AUTHORIZATION_REQUIRED:
-            clean["authorization_status"] = AUTHORIZATION_REQUIRED
-            changed = True
-        if clean.get("enabled") is not False:
-            clean["enabled"] = False
-            changed = True
+        # Unknown execution identity fails closed: the task stays stored and
+        # disabled until a local edit rewrites it to the current schema.
         clean["schema_state"] = "unknown_schema"
-        clean["grant_refs"] = []
-        clean["policy_epoch"] = revoked_epoch
-        clean.setdefault("task_revision", 1)
-        clean.setdefault("authorization_revision", 0)
-        clean["definition_hash"] = task_definition_hash(clean)
-        clean["capability_summary"] = _safe_capability_summary(clean)
+        clean["task_revision"] = 1
+        clean["authorization_revision"] = 0
+        clean["definition_hash"] = expected_hash
+        clean["enabled"] = False
+        changed = True
+    elif legacy_schema:
+        clean["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
+        clean["task_revision"] = 1
+        clean["authorization_revision"] = 0
+        clean["definition_hash"] = expected_hash
+        clean["enabled"] = bool(desired_enabled)
+        changed = True
+    elif not execution_identity_valid or stored_hash != expected_hash:
+        try:
+            next_task_revision = max(1, int(task_revision)) + 1
+        except (TypeError, ValueError, OverflowError):
+            next_task_revision = 1
+        try:
+            next_authorization_revision = max(0, int(authorization_revision)) + 1
+        except (TypeError, ValueError, OverflowError):
+            next_authorization_revision = 1
+        clean.update({
+            "schema_version": SCHEDULED_TASK_SCHEMA_VERSION,
+            "task_revision": next_task_revision,
+            "authorization_revision": next_authorization_revision,
+            "definition_hash": expected_hash,
+            "enabled": bool(desired_enabled),
+        })
+        changed = True
     else:
-        auth_status = clean.get("authorization_status")
-        task_revision = clean.get("task_revision")
-        authorization_revision = clean.get("authorization_revision")
-        grant_refs = clean.get("grant_refs")
-        stored_hash = str(clean.get("definition_hash") or "")
-        expected_hash = task_definition_hash(clean)
-        authorization_fields_valid = (
-            schema_is_current
-            and type(task_revision) is int and task_revision >= 1
-            and type(authorization_revision) is int and authorization_revision >= 0
-            and type(clean.get("policy_epoch")) is int
-            and auth_status in _AUTHORIZATION_STATES
-            and isinstance(grant_refs, list)
-            and all(isinstance(ref, str) and bool(ref) for ref in grant_refs)
-            and bool(re.fullmatch(r"[0-9a-f]{64}", stored_hash))
+        clean["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
+        blocked_by_ambiguity = bool(
+            isinstance(clean.get("ambiguity_barriers"), list)
+            and clean.get("ambiguity_barriers")
         )
-        if legacy_schema:
-            clean["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
-            clean["task_revision"] = 1
-            clean["authorization_revision"] = 0
-            clean["policy_epoch"] = current_epoch
-            clean["grant_refs"] = []
-            clean["definition_hash"] = expected_hash
-            clean["authorization_status"] = (
-                AUTHORIZED if desired_enabled and (expected_mode == "read_only" or full_access)
-                else DISABLED if not desired_enabled
-                else AUTHORIZATION_REQUIRED
-            )
-            clean["enabled"] = bool(
-                desired_enabled and clean["authorization_status"] == AUTHORIZED
-            )
-            clean["migration_state"] = (
-                "read_only_proven" if expected_mode == "read_only"
-                else "full_access" if full_access
-                else "authorization_required"
-            )
+        expected_enabled = bool(desired_enabled and not blocked_by_ambiguity)
+        if clean.get("enabled") is not expected_enabled:
+            clean["enabled"] = expected_enabled
             changed = True
-        elif not authorization_fields_valid or stored_hash != expected_hash:
-            revoked_epoch = _revoke_grant_refs(
-                grant_refs if isinstance(grant_refs, list) else []
-            )
-            if policy is not None:
-                try:
-                    revoked_epoch = int(policy.store.invalidate_active_permits())
-                except Exception:
-                    pass
-            try:
-                next_task_revision = max(1, int(task_revision)) + 1
-            except (TypeError, ValueError, OverflowError):
-                next_task_revision = 1
-            try:
-                next_authorization_revision = max(0, int(authorization_revision)) + 1
-            except (TypeError, ValueError, OverflowError):
-                next_authorization_revision = 1
-            clean.update({
-                "schema_version": SCHEDULED_TASK_SCHEMA_VERSION,
-                "task_revision": next_task_revision,
-                "authorization_revision": next_authorization_revision,
-                "definition_hash": expected_hash,
-                "policy_epoch": revoked_epoch,
-                "authorization_status": AUTHORIZATION_EDITED,
-                "grant_refs": [],
-                "enabled": False,
-                "authorization_expires_at": None,
-                "authorization_bounds": None,
-            })
-            clean.pop("authorization_request", None)
-            clean["migration_state"] = "authorization_fields_failed_closed"
+    for name in _OBSOLETE_AUTHORIZATION_FIELDS:
+        if name in clean:
+            clean.pop(name, None)
             changed = True
-        else:
-            clean["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
-            if clean.get("policy_epoch") != current_epoch:
-                clean["policy_epoch"] = current_epoch
-                changed = True
-            if not desired_enabled:
-                if clean.get("authorization_status") != DISABLED:
-                    clean["authorization_status"] = DISABLED
-                    changed = True
-                if clean.get("enabled") is not False:
-                    clean["enabled"] = False
-                    changed = True
-            elif clean.get("authorization_status") not in {AUTHORIZED, RUNNING}:
-                if clean.get("enabled") is not False:
-                    clean["enabled"] = False
-                    changed = True
-            elif clean.get("enabled") is not True:
-                clean["enabled"] = True
-                changed = True
-        clean["capability_summary"] = _safe_capability_summary(clean)
+    clean["capability_summary"] = _safe_capability_summary(clean)
 
     next_run_dt = _parse_dt(clean.get("next_run_at"))
     schedule_marker = str(clean.get("next_run_schedule") or "")
@@ -1224,61 +1128,22 @@ def _job_summary(job: dict[str, Any]) -> str:
     return f"{title} ({schedule}, {status})"
 
 
-def _revoke_grant_refs(grant_refs: Any) -> int:
-    """Idempotently revoke opaque refs and return the resulting policy epoch."""
-
-    policy, state = _permission_snapshot()
-    epoch = int(getattr(state, "policy_epoch", 0) or 0)
-    if policy is None:
-        return epoch
-    for grant_ref in tuple(str(ref or "") for ref in (grant_refs or ())):
-        if not grant_ref:
-            continue
-        try:
-            result = policy.store.revoke_grant(grant_ref)
-            epoch = int(result.policy_epoch)
-        except Exception:
-            # Clearing ordinary refs is still fail-closed; the protected store
-            # remains the authority and a surviving mismatched grant cannot bind
-            # to the incremented task/authorization revision.
-            pass
-    try:
-        epoch = int(policy.store.load_state().policy_epoch)
-    except Exception:
-        pass
-    return epoch
-
-
-def _invalidate_authorization(
+def _bump_execution_revision(
     job: dict[str, Any],
     *,
-    status: str,
     increment_task_revision: bool,
 ) -> dict[str, Any]:
+    """Advance the durable task/execution revisions after a real task edit."""
+
     clean = dict(job)
-    refs = list(clean.get("grant_refs") or [])
-    epoch = _revoke_grant_refs(refs)
-    policy, _state = _permission_snapshot()
-    if policy is not None:
-        try:
-            epoch = int(policy.store.invalidate_active_permits())
-        except Exception:
-            pass
     if increment_task_revision:
         clean["task_revision"] = max(1, int(clean.get("task_revision", 1))) + 1
     clean["authorization_revision"] = (
         max(0, int(clean.get("authorization_revision", 0))) + 1
     )
-    clean.update({
-        "grant_refs": [],
-        "policy_epoch": epoch,
-        "authorization_status": status,
-        "enabled": False,
-        "authorization_expires_at": None,
-        "authorization_bounds": None,
-        "updated_at": _iso(),
-    })
-    clean.pop("authorization_request", None)
+    for name in _OBSOLETE_AUTHORIZATION_FIELDS:
+        clean.pop(name, None)
+    clean["updated_at"] = _iso()
     return clean
 
 
@@ -1333,15 +1198,7 @@ def create_scheduled_task(
             "read_only" if _deterministically_read_only(task_text) else "agent"
         )
         capability_constraints = _derived_constraint_metadata(task_text)
-        _policy, permission_state = _permission_snapshot()
-        policy_epoch = int(getattr(permission_state, "policy_epoch", 0) or 0)
-        full_access = str(getattr(permission_state, "permission_mode", "")) in {
-            "PermissionMode.FULL_ACCESS", "full_access",
-        }
         desired_enabled = bool(enabled)
-        may_enable = desired_enabled and (
-            execution_mode == "read_only" or full_access
-        )
         job = {
             "schema_version": SCHEDULED_TASK_SCHEMA_VERSION,
             "id": _new_task_id(),
@@ -1349,7 +1206,7 @@ def create_scheduled_task(
             "task": task_text,
             "schedule": canonical,
             "desired_enabled": desired_enabled,
-            "enabled": may_enable,
+            "enabled": desired_enabled,
             "conversation_id": clean_conversation_id,
             "source": clean_source,
             "timezone": timezone_name,
@@ -1364,14 +1221,6 @@ def create_scheduled_task(
             ),
             "task_revision": 1,
             "authorization_revision": 0,
-            "policy_epoch": policy_epoch,
-            "authorization_status": (
-                AUTHORIZED if may_enable else DISABLED if not desired_enabled
-                else AUTHORIZATION_REQUIRED
-            ),
-            "grant_refs": [],
-            "authorization_expires_at": None,
-            "authorization_bounds": None,
             "created_at": created_at,
             "updated_at": created_at,
             "last_run_at": None,
@@ -1516,16 +1365,9 @@ def update_scheduled_task(
             job["source"] = source
         next_hash = task_definition_hash(job)
         if next_hash != previous_hash:
-            job = _invalidate_authorization(
-                job,
-                status=(
-                    AUTHORIZATION_EDITED
-                    if bool(job.get("desired_enabled", False)) else DISABLED
-                ),
-                increment_task_revision=True,
-            )
+            job = _bump_execution_revision(job, increment_task_revision=True)
             job["definition_hash"] = next_hash
-            _forget_pending_for_task(clean_id)
+            job["enabled"] = bool(job.get("desired_enabled", False))
         else:
             job["definition_hash"] = previous_hash
             job["updated_at"] = _iso()
@@ -1566,7 +1408,6 @@ def delete_scheduled_task(
             if idx < 0:
                 raise ScheduledTaskError(ERROR_NOT_FOUND, "scheduled task not found")
             removed = jobs.pop(idx)
-            _revoke_grant_refs(removed.get("grant_refs"))
             _save_jobs(jobs)
         _notify_changed()
         return _result_ok(
@@ -1670,33 +1511,26 @@ def replace_scheduled_tasks_from_settings(
                 if next_hash != previous_hash or (
                     previous.get("schema_version") != SCHEDULED_TASK_SCHEMA_VERSION
                 ):
-                    candidate = _invalidate_authorization(
-                        candidate,
-                        status=(
-                            AUTHORIZATION_EDITED
-                            if bool(candidate.get("desired_enabled", False)) else DISABLED
-                        ),
-                        increment_task_revision=True,
+                    candidate = _bump_execution_revision(
+                        candidate, increment_task_revision=True,
                     )
                     candidate["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
                     candidate["definition_hash"] = next_hash
+                    candidate["enabled"] = bool(
+                        candidate.get("desired_enabled", False)
+                    )
                     candidate["next_run_at"] = next_run_at_for_schedule(
                         str(candidate.get("schedule") or "")
                     )
                     candidate["next_run_schedule"] = str(
                         candidate.get("schedule") or ""
                     )
-                    _forget_pending_for_task(incoming_id)
                 else:
                     candidate["definition_hash"] = previous_hash
                     candidate["updated_at"] = _iso()
                 candidate["capability_summary"] = _safe_capability_summary(candidate)
                 normalized.append(candidate)
 
-            for removed in existing:
-                removed_id = str(removed.get("id") or "")
-                if removed_id and removed_id not in retained_ids:
-                    _revoke_grant_refs(removed.get("grant_refs"))
             _save_jobs(normalized)
         _notify_changed()
         return _result_ok(jobs=normalized, count=len(normalized))
@@ -1727,67 +1561,19 @@ def _save_current_job(job: dict[str, Any]) -> None:
     _notify_changed()
 
 
-def _commit_authorization_fields(
-    candidate: dict[str, Any], pending: dict[str, Any],
-) -> dict[str, Any]:
-    """Atomically reject an approval raced by an edit, then merge auth only."""
+def _job_execution_state(job: dict[str, Any]) -> str:
+    """Return the durable execution block state for one stored job."""
 
-    task_id = str(pending.get("task_id") or "")
-    with _JOBS_LOCK:
-        jobs = _load_normalized_jobs()
-        idx = _find_index(jobs, task_id)
-        if idx < 0:
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "task changed")
-        current = dict(jobs[idx])
-        if (
-            int(current.get("task_revision", 0)) != pending["task_revision"]
-            or str(current.get("definition_hash") or "")
-            != pending["definition_hash"]
-            or int(current.get("authorization_revision", 0))
-            != pending["authorization_revision"] - 1
-        ):
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "task changed")
-        for name in (
-            "authorization_revision", "authorization_status", "enabled",
-            "grant_refs", "policy_epoch", "authorization_expires_at",
-            "authorization_bounds", "updated_at",
-        ):
-            if name in candidate:
-                current[name] = copy.deepcopy(candidate[name])
-        jobs[idx] = current
-        _save_jobs(jobs)
-    _notify_changed()
-    return current
+    if isinstance(job.get("ambiguity_barriers"), list) and job.get("ambiguity_barriers"):
+        return BLOCKED_OUTCOME_UNKNOWN
+    if not job.get("desired_enabled") or not job.get("enabled"):
+        return DISABLED
+    return ""
 
 
-def _public_authorization_task(job: dict[str, Any]) -> dict[str, Any]:
-    raw_expiration = job.get("authorization_expires_at")
-    expiration = (
-        float(raw_expiration)
-        if isinstance(raw_expiration, (int, float))
-        and not isinstance(raw_expiration, bool)
-        and math.isfinite(float(raw_expiration))
-        and float(raw_expiration) > 0
-        else None
-    )
-    raw_bounds = job.get("authorization_bounds")
-    bounds = None
-    if isinstance(raw_bounds, dict) and raw_bounds.get("mode") in {
-        "full_access", "read_only", "bounded", "recurring",
-    }:
-        maximum = raw_bounds.get("max_executions")
-        bounds = {
-            "mode": str(raw_bounds["mode"]),
-            "max_executions": (
-                maximum if type(maximum) is int and maximum > 0 else None
-            ),
-            "storage": (
-                str(raw_bounds.get("storage"))
-                if raw_bounds.get("storage") in {"protected", "session_only"}
-                else None
-            ),
-        }
-    raw_status = str(job.get("authorization_status") or "")
+def _public_task(job: dict[str, Any]) -> dict[str, Any]:
+    """Value-free task metadata shared with settings/mobile displays."""
+
     return {
         "task_id": (
             str(job.get("id") or "")
@@ -1805,687 +1591,79 @@ def _public_authorization_task(job: dict[str, Any]) -> dict[str, Any]:
             job["authorization_revision"]
             if type(job.get("authorization_revision")) is int else 0
         ),
-        "policy_epoch": (
-            job["policy_epoch"] if type(job.get("policy_epoch")) is int else 0
-        ),
-        "authorization_status": (
-            raw_status if raw_status in _AUTHORIZATION_STATES
-            else AUTHORIZATION_REQUIRED
-        ),
+        "execution_state": _job_execution_state(job),
         "capability_summary": list(_safe_capability_summary(job)),
-        "authorization_expires_at": expiration,
-        "authorization_bounds": bounds,
         "enabled": bool(job.get("enabled", False)),
     }
 
 
-def _forget_pending_for_task(task_id: str) -> None:
-    with _AUTHORIZATION_LOCK:
-        stale = [
-            request_id for request_id, item in _PENDING_AUTHORIZATIONS.items()
-            if item.get("task_id") == task_id
-        ]
-        for request_id in stale:
-            _PENDING_AUTHORIZATIONS.pop(request_id, None)
-
-
-def _remember_responded(request_id: str) -> None:
-    if request_id in _RESPONDED_AUTHORIZATIONS:
-        return
-    _RESPONDED_AUTHORIZATIONS.append(request_id)
-    del _RESPONDED_AUTHORIZATIONS[:-256]
-
-
-def begin_scheduled_task_authorization(
-    task_id: str,
-    *,
-    calls: list[dict[str, Any]] | None = None,
-    origin_ref: str = "desktop",
-    mobile: bool = False,
-    ttl_seconds: float = _DEFAULT_GRANT_TTL_SECONDS,
-    max_executions: int | None = None,
-    request_ttl_seconds: float = 300.0,
-) -> dict[str, Any]:
-    """Create one revision/hash/epoch-bound sanitized authorization request."""
-
-    try:
-        job = _current_job(task_id)
-        if job.get("schema_version") != SCHEDULED_TASK_SCHEMA_VERSION:
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_REQUIRED,
-                "unknown scheduled-task schema requires a local edit",
-            )
-        if job.get("authorization_status") == BLOCKED_OUTCOME_UNKNOWN:
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_REQUIRED,
-                "ambiguous outcome requires explicit local reconciliation",
-            )
-        policy, state = _permission_snapshot()
-        if policy is None or state is None:
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_UNAVAILABLE,
-                "permission authority is unavailable",
-            )
-        full_access = str(getattr(state, "permission_mode", "")) in {
-            "PermissionMode.FULL_ACCESS", "full_access",
-        }
-        if full_access or (
-            str(job.get("execution_mode") or "") == "read_only" and not calls
-        ):
-            job.update({
-                "authorization_status": AUTHORIZED,
-                "enabled": bool(job.get("desired_enabled", False)),
-                "policy_epoch": int(state.policy_epoch),
-                "grant_refs": [],
-                "authorization_expires_at": None,
-                "authorization_bounds": {
-                    "mode": "full_access" if full_access else "read_only",
-                },
-                "updated_at": _iso(),
-            })
-            _save_current_job(job)
-            return _result_ok(
-                already_authorized=True,
-                task=_public_authorization_task(job),
-            )
-
-        exact_calls = list(calls) if calls is not None else _derived_exact_calls(
-            str(job.get("task") or "")
-        )
-        if not exact_calls:
-            raise ScheduledTaskError(
-                ERROR_PC_REVIEW_REQUIRED if mobile else ERROR_AUTHORIZATION_REQUIRED,
-                "unknown or dynamic targets require later PC-local authorization",
-            )
-
-        if job.get("grant_refs"):
-            job = _invalidate_authorization(
-                job,
-                status=AUTHORIZATION_REQUIRED,
-                increment_task_revision=False,
-            )
-            _save_current_job(job)
-            state = policy.store.load_state()
-
-        provisional_context = None
-        metadata, _unused = _constraint_metadata_for_calls(
-            exact_calls, context=provisional_context, policy=policy,
-        )
-        if metadata != job.get("capability_constraints"):
-            job["capability_constraints"] = metadata
-            job["target_binding"] = canonical_hash(sorted(
-                item["call_binding"] for item in metadata
-            ))
-            job = _invalidate_authorization(
-                job,
-                status=AUTHORIZATION_REQUIRED,
-                increment_task_revision=True,
-            )
-            job["definition_hash"] = task_definition_hash(job)
-            job["capability_summary"] = _safe_capability_summary(job)
-            _save_current_job(job)
-
-        state = policy.store.load_state()
-        next_authorization_revision = int(job.get("authorization_revision", 0)) + 1
-        from osia.action_policy import ExecutionType, make_execution_context
-
-        context = make_execution_context(
-            execution_type=ExecutionType.SCHEDULED,
-            interactive=False,
-            scheduled_task_id=str(job["id"]),
-            task_revision=str(job["task_revision"]),
-            plan_revision=_authorization_binding(job),
-            policy_epoch=int(state.policy_epoch),
-            run_id="",
-            store=policy.store,
-        )
-        metadata, requests = _constraint_metadata_for_calls(
-            exact_calls, context=context, policy=policy,
-        )
-        promoted_binding = _authorization_binding(
-            job, next_authorization_revision,
-        )
-        requests = [
-            replace(
-                request,
-                execution_context=replace(
-                    request.execution_context,
-                    plan_revision=promoted_binding,
-                ),
-            )
-            for request in requests
-        ]
-        if mobile and any(
-            request.safe_category not in _MOBILE_SAFE_CATEGORIES
-            for request in requests
-        ):
-            raise ScheduledTaskError(
-                ERROR_PC_REVIEW_REQUIRED,
-                "private scope details require PC-local review",
-            )
-        ttl = max(60.0, min(float(ttl_seconds), 366 * 24 * 60 * 60))
-        now_ts = time.time()
-        grant_expires_at = now_ts + ttl
-        request_expires_at = now_ts + max(
-            30.0, min(float(request_ttl_seconds), 900.0)
-        )
-        if max_executions is not None:
-            if type(max_executions) is not int or max_executions < 1:
-                raise ScheduledTaskError(
-                    ERROR_VALIDATION,
-                    "max_executions must be a positive integer",
-                )
-        request_id = "sched_auth_" + secrets.token_urlsafe(18).rstrip("=")
-        pending = {
-            "request_id": request_id,
-            "task_id": str(job["id"]),
-            "task_revision": int(job["task_revision"]),
-            "definition_hash": str(job["definition_hash"]),
-            "authorization_revision": next_authorization_revision,
-            "policy_epoch": int(state.policy_epoch),
-            "expiration": grant_expires_at,
-            "request_expires_at": request_expires_at,
-            "origin_ref": str(origin_ref or ""),
-            "requests": requests,
-            "metadata": metadata,
-            "max_executions": max_executions,
-        }
-        _forget_pending_for_task(str(job["id"]))
-        with _AUTHORIZATION_LOCK:
-            _PENDING_AUTHORIZATIONS[request_id] = pending
-        return _result_ok(
-            request={
-                "type": "scheduled_task_authorization_request",
-                "protocol_version": AUTHORIZATION_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "task_id": pending["task_id"],
-                "task_revision": pending["task_revision"],
-                "definition_hash": pending["definition_hash"],
-                "authorization_revision": pending["authorization_revision"],
-                "policy_epoch": pending["policy_epoch"],
-                "expiration": pending["expiration"],
-                "request_expires_at": pending["request_expires_at"],
-                "origin_ref": pending["origin_ref"],
-                "capabilities": [
-                    {
-                        "id": item["capability_id"],
-                        "tool_category": item["tool_category"],
-                        "effect_class": item["effect_class"],
-                        "safe_category": item["safe_category"],
-                    }
-                    for item in metadata
-                ],
-                "max_executions": max_executions,
-            },
-        )
-    except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message, **exc.details)
-    except Exception:
-        return _result_error(
-            ERROR_AUTHORIZATION_UNAVAILABLE,
-            "scheduled-task authorization is unavailable",
-        )
-
-
-def respond_scheduled_task_authorization(
-    response: dict[str, Any],
-    *,
-    authenticated_origin: str,
-) -> dict[str, Any]:
-    """Validate an exact, single-response authorization envelope."""
-
-    request_id = str(response.get("request_id") or "")
-    with _AUTHORIZATION_LOCK:
-        if request_id in _RESPONDED_AUTHORIZATIONS:
-            return _result_error(ERROR_AUTHORIZATION_STALE, "duplicate response")
-        pending = _PENDING_AUTHORIZATIONS.get(request_id)
-        if pending is not None and pending.get("responding"):
-            return _result_error(ERROR_AUTHORIZATION_STALE, "duplicate response")
-        if pending is not None:
-            pending["responding"] = True
-    if pending is None:
-        return _result_error(ERROR_AUTHORIZATION_STALE, "authorization request is stale")
-    created_grant_refs: list[str] = []
-    try:
-        if response.get("protocol_version") != AUTHORIZATION_PROTOCOL_VERSION:
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "wrong protocol version")
-        exact_fields = (
-            "task_id", "task_revision", "definition_hash",
-            "authorization_revision", "policy_epoch", "expiration", "origin_ref",
-        )
-        if any(response.get(name) != pending.get(name) for name in exact_fields):
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_STALE,
-                "authorization response binding mismatch",
-            )
-        if pending.get("origin_ref") != str(authenticated_origin or ""):
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "wrong authenticated origin")
-        if time.time() >= float(pending["request_expires_at"]):
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "authorization request expired")
-        job = _current_job(str(pending["task_id"]))
-        if (
-            int(job.get("task_revision", 0)) != pending["task_revision"]
-            or str(job.get("definition_hash") or "") != pending["definition_hash"]
-            or int(job.get("authorization_revision", 0))
-            != pending["authorization_revision"] - 1
-        ):
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "task changed")
-        policy, state = _permission_snapshot()
-        if policy is None or state is None or int(state.policy_epoch) != pending["policy_epoch"]:
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "policy epoch changed")
-        action = str(response.get("action") or "").strip().lower()
-        if action not in {"approve", "deny"}:
-            raise ScheduledTaskError(ERROR_VALIDATION, "action must be approve or deny")
-        if action == "deny":
-            job.update({
-                "authorization_revision": pending["authorization_revision"],
-                "authorization_status": AUTHORIZATION_REQUIRED,
-                "enabled": False,
-                "policy_epoch": int(state.policy_epoch),
-                "updated_at": _iso(),
-            })
-            job = _commit_authorization_fields(job, pending)
-        else:
-            from osia.action_policy import UsePolicy, create_grant
-
-            full_access = str(getattr(state, "permission_mode", "")) in {
-                "PermissionMode.FULL_ACCESS", "full_access",
-            }
-            try:
-                if not full_access:
-                    use_policy = (
-                        UsePolicy.BOUNDED
-                        if pending["max_executions"] is not None
-                        else UsePolicy.RECURRING
-                    )
-                    for permission_request in pending["requests"]:
-                        grant = create_grant(
-                            permission_request,
-                            use_policy=use_policy,
-                            max_uses=pending["max_executions"],
-                            expires_at=float(pending["expiration"]),
-                            persistent=bool(policy.store.secure_available),
-                        )
-                        policy.store.add_grant(grant)
-                        created_grant_refs.append(grant.grant_id)
-            except Exception as exc:
-                _revoke_grant_refs(created_grant_refs)
-                created_grant_refs.clear()
-                raise ScheduledTaskError(
-                    ERROR_AUTHORIZATION_UNAVAILABLE,
-                    "protected grant creation failed",
-                ) from exc
-            state = policy.store.load_state()
-            job.update({
-                "authorization_revision": pending["authorization_revision"],
-                "authorization_status": AUTHORIZED,
-                "enabled": bool(job.get("desired_enabled", False)),
-                "grant_refs": created_grant_refs,
-                "policy_epoch": int(state.policy_epoch),
-                "authorization_expires_at": (
-                    None if full_access else float(pending["expiration"])
-                ),
-                "authorization_bounds": {
-                    "mode": "full_access" if full_access else (
-                        "bounded" if pending["max_executions"] is not None
-                        else "recurring"
-                    ),
-                    "max_executions": pending["max_executions"],
-                    "storage": (
-                        "protected" if policy.store.secure_available else "session_only"
-                    ),
-                },
-                "updated_at": _iso(),
-            })
-            job = _commit_authorization_fields(job, pending)
-        with _AUTHORIZATION_LOCK:
-            _PENDING_AUTHORIZATIONS.pop(request_id, None)
-            _remember_responded(request_id)
-        return _result_ok(task=_public_authorization_task(job))
-    except ScheduledTaskError as exc:
-        if created_grant_refs:
-            _revoke_grant_refs(created_grant_refs)
-        with _AUTHORIZATION_LOCK:
-            current = _PENDING_AUTHORIZATIONS.get(request_id)
-            if current is pending:
-                current.pop("responding", None)
-        return _result_error(exc.code, exc.message, **exc.details)
-    except Exception:
-        if created_grant_refs:
-            _revoke_grant_refs(created_grant_refs)
-        with _AUTHORIZATION_LOCK:
-            current = _PENDING_AUTHORIZATIONS.get(request_id)
-            if current is pending:
-                current.pop("responding", None)
-        return _result_error(
-            ERROR_AUTHORIZATION_UNAVAILABLE,
-            "scheduled-task authorization is unavailable",
-        )
-
-
-def authorize_scheduled_task(
-    task_id: str,
-    *,
-    calls: list[dict[str, Any]] | None = None,
-    origin_ref: str = "desktop",
-    mobile: bool = False,
-    ttl_seconds: float = _DEFAULT_GRANT_TTL_SECONDS,
-    max_executions: int | None = None,
-) -> dict[str, Any]:
-    """PC/local convenience facade: begin then approve the exact request."""
-
-    begun = begin_scheduled_task_authorization(
-        task_id,
-        calls=calls,
-        origin_ref=origin_ref,
-        mobile=mobile,
-        ttl_seconds=ttl_seconds,
-        max_executions=max_executions,
-    )
-    if not begun.get("ok") or begun.get("already_authorized"):
-        return begun
-    request = dict(begun["request"])
-    request["action"] = "approve"
-    return respond_scheduled_task_authorization(
-        request,
-        authenticated_origin=origin_ref,
-    )
-
-
-def revoke_scheduled_task_grant(task_id: str, grant_ref: str) -> dict[str, Any]:
-    """Revoke one exact grant and suspend the task without touching other refs."""
-
-    try:
-        job = _current_job(task_id)
-        refs = list(job.get("grant_refs") or [])
-        target = str(grant_ref or "")
-        if target not in refs:
-            return _result_ok(changed=False, task=_public_authorization_task(job))
-        policy, _state = _permission_snapshot()
-        if policy is not None:
-            policy.store.revoke_grant(target)
-        refs.remove(target)
-        _policy, state = _permission_snapshot()
-        job.update({
-            "grant_refs": refs,
-            "authorization_revision": int(job.get("authorization_revision", 0)) + 1,
-            "authorization_status": AUTHORIZATION_REVOKED,
-            "enabled": False,
-            "policy_epoch": int(getattr(state, "policy_epoch", 0) or 0),
-            "updated_at": _iso(),
-        })
-        _forget_pending_for_task(str(job["id"]))
-        _save_current_job(job)
-        return _result_ok(changed=True, task=_public_authorization_task(job))
-    except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message)
-
-
-def revoke_scheduled_task_authorization(task_id: str) -> dict[str, Any]:
-    """Idempotently revoke every grant for one task and block its next run."""
-
-    try:
-        job = _current_job(task_id)
-        refs = list(job.get("grant_refs") or [])
-        already = (
-            not refs
-            and job.get("authorization_status") == AUTHORIZATION_REVOKED
-            and not job.get("enabled")
-        )
-        if already:
-            return _result_ok(changed=False, task=_public_authorization_task(job))
-        job = _invalidate_authorization(
-            job,
-            status=AUTHORIZATION_REVOKED,
-            increment_task_revision=False,
-        )
-        _forget_pending_for_task(str(job["id"]))
-        _save_current_job(job)
-        return _result_ok(changed=True, task=_public_authorization_task(job))
-    except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message)
-
-
-def refresh_after_permission_epoch(
-    policy_epoch: int,
-    *,
-    revoked_task_id: str | None = None,
-    revoke_all: bool = False,
-    full_access_disabled: bool = False,
-) -> None:
-    """Refresh persisted task state after an external protected-store revoke."""
-
-    if type(policy_epoch) is not int or policy_epoch < 0:
-        raise ValueError("invalid_policy_epoch")
-    target = str(revoked_task_id or "")
-    changed = False
-    with _JOBS_LOCK:
-        jobs = _load_jobs()
-        for job in jobs:
-            task_id = str(job.get("id") or "")
-            if not task_id:
-                continue
-            refs = [str(item) for item in (job.get("grant_refs") or []) if str(item)]
-            status = str(job.get("authorization_status") or "")
-            revoke_job = bool(
-                (target and task_id == target)
-                or (
-                    revoke_all
-                    and (refs or status in {AUTHORIZED, RUNNING})
-                )
-                or (
-                    full_access_disabled
-                    and not refs
-                    and status in {AUTHORIZED, RUNNING}
-                )
-            )
-            _forget_pending_for_task(task_id)
-            if revoke_job:
-                job["grant_refs"] = []
-                job["policy_epoch"] = policy_epoch
-                job["authorization_revision"] = (
-                    max(0, int(job.get("authorization_revision", 0))) + 1
-                )
-                if status != BLOCKED_OUTCOME_UNKNOWN:
-                    job["authorization_status"] = AUTHORIZATION_REVOKED
-                job["enabled"] = False
-                job["authorization_expires_at"] = None
-                job["authorization_bounds"] = None
-                job["updated_at"] = _iso()
-                job.pop("authorization_request", None)
-                changed = True
-                continue
-            if job.get("policy_epoch") != policy_epoch:
-                job["policy_epoch"] = policy_epoch
-                changed = True
-            if isinstance(job.get("authorization_request"), dict):
-                job.pop("authorization_request", None)
-                if status not in {BLOCKED_OUTCOME_UNKNOWN, DISABLED}:
-                    job["authorization_status"] = AUTHORIZATION_REQUIRED
-                    job["enabled"] = False
-                changed = True
-        if changed:
-            _save_jobs(jobs)
-    if changed:
-        _notify_changed()
-
-
-def _validate_control_envelope(
-    envelope: dict[str, Any], *, authenticated_origin: str,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    try:
-        if envelope.get("protocol_version") != AUTHORIZATION_PROTOCOL_VERSION:
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "wrong protocol version")
-        if envelope.get("origin_ref") != str(authenticated_origin or ""):
-            raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "wrong authenticated origin")
-        job = _current_job(str(envelope.get("task_id") or ""))
-        expected = {
-            "task_revision": int(job.get("task_revision", 0)),
-            "definition_hash": str(job.get("definition_hash") or ""),
-            "authorization_revision": int(job.get("authorization_revision", 0)),
-            "policy_epoch": int(job.get("policy_epoch", 0)),
-            "expiration": job.get("authorization_expires_at"),
-        }
-        if any(envelope.get(name) != value for name, value in expected.items()):
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_STALE,
-                "scheduled-task control binding mismatch",
-            )
-        return job, None
-    except ScheduledTaskError as exc:
-        return None, _result_error(exc.code, exc.message)
-
-
-def revoke_scheduled_task_authorization_bound(
-    envelope: dict[str, Any], *, authenticated_origin: str,
-) -> dict[str, Any]:
-    with _JOBS_LOCK:
-        job, error = _validate_control_envelope(
-            envelope, authenticated_origin=authenticated_origin,
-        )
-        if error is not None:
-            return error
-        return revoke_scheduled_task_authorization(str(job["id"]))
-
-
-def disable_scheduled_task_bound(
-    envelope: dict[str, Any], *, authenticated_origin: str,
-) -> dict[str, Any]:
-    with _JOBS_LOCK:
-        job, error = _validate_control_envelope(
-            envelope, authenticated_origin=authenticated_origin,
-        )
-        if error is not None:
-            return error
-        return disable_scheduled_task(str(job["id"]))
-
-
 def disable_scheduled_task(task_id: str) -> dict[str, Any]:
-    """Disable a task as an execution-relevant edit and revoke its authority."""
+    """Disable a task as an execution-relevant edit (scheduler stop semantics)."""
 
     try:
         job = _current_job(task_id)
-        if not job.get("desired_enabled") and job.get("authorization_status") == DISABLED:
-            return _result_ok(changed=False, task=_public_authorization_task(job))
+        if not job.get("desired_enabled") and not job.get("enabled"):
+            return _result_ok(changed=False, task=_public_task(job))
         job["desired_enabled"] = False
-        job = _invalidate_authorization(
-            job,
-            status=DISABLED,
-            increment_task_revision=True,
-        )
+        job = _bump_execution_revision(job, increment_task_revision=True)
+        job["enabled"] = False
         job["definition_hash"] = task_definition_hash(job)
-        _forget_pending_for_task(str(job["id"]))
         _save_current_job(job)
-        return _result_ok(changed=True, task=_public_authorization_task(job))
+        return _result_ok(changed=True, task=_public_task(job))
     except ScheduledTaskError as exc:
         return _result_error(exc.code, exc.message)
 
 
 def preflight_scheduled_task(task_id: str) -> dict[str, Any]:
-    """Reload and validate current authority before a scheduler launch."""
+    """Reload and validate the exact executable task before a scheduler launch."""
 
     try:
         job = _current_job(task_id)
         if job.get("schema_version") != SCHEDULED_TASK_SCHEMA_VERSION:
             return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
+                ERROR_STALE,
                 "unknown scheduled-task schema",
-                authorization_status=AUTHORIZATION_REQUIRED,
+                execution_state=DISABLED,
             )
         expected_hash = task_definition_hash(job)
         if expected_hash != str(job.get("definition_hash") or ""):
-            job = _invalidate_authorization(
-                job,
-                status=AUTHORIZATION_EDITED,
-                increment_task_revision=True,
-            )
+            job = _bump_execution_revision(job, increment_task_revision=True)
             job["definition_hash"] = expected_hash
+            job["enabled"] = bool(job.get("desired_enabled", False))
             _save_current_job(job)
             return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
+                ERROR_STALE,
                 "task definition changed",
-                authorization_status=AUTHORIZATION_EDITED,
+                execution_state=ERROR_STALE,
+            )
+        if (
+            isinstance(job.get("ambiguity_barriers"), list)
+            and job.get("ambiguity_barriers")
+        ):
+            return _result_error(
+                ERROR_BLOCKED,
+                "ambiguous outcome blocks replay",
+                execution_state=BLOCKED_OUTCOME_UNKNOWN,
             )
         if not job.get("enabled") or not job.get("desired_enabled"):
             return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
+                ERROR_DISABLED,
                 "scheduled task is disabled",
-                authorization_status=str(job.get("authorization_status") or DISABLED),
+                execution_state=DISABLED,
             )
-        if job.get("authorization_status") == BLOCKED_OUTCOME_UNKNOWN:
-            return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
-                "ambiguous outcome blocks replay",
-                authorization_status=BLOCKED_OUTCOME_UNKNOWN,
-            )
-        policy, state = _permission_snapshot()
-        if policy is None or state is None:
-            raise ScheduledTaskError(
-                ERROR_AUTHORIZATION_UNAVAILABLE,
-                "permission authority is unavailable",
-            )
-        full_access = str(getattr(state, "permission_mode", "")) in {
-            "PermissionMode.FULL_ACCESS", "full_access",
-        }
-        if full_access or str(job.get("execution_mode") or "") == "read_only":
-            job["policy_epoch"] = int(state.policy_epoch)
-            return _result_ok(job=job, authorization_source=(
-                "full_access" if full_access else "structural_read_only"
-            ))
-        refs = list(job.get("grant_refs") or [])
-        if not refs:
-            job.update({
-                "authorization_status": AUTHORIZATION_REQUIRED,
-                "enabled": False,
-                "updated_at": _iso(),
-            })
-            _save_current_job(job)
-            return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
-                "scheduled task has no recurring grant",
-                authorization_status=AUTHORIZATION_REQUIRED,
-            )
-        status = policy.store.scheduled_grant_refs_status(
-            refs,
-            task_id=str(job["id"]),
-            task_revision=int(job["task_revision"]),
-            authorization_binding=_authorization_binding(job),
-            now=time.time(),
-        )
-        if status != "valid":
-            next_status = (
-                AUTHORIZATION_EXPIRED if status == "expired_grant"
-                else AUTHORIZATION_REVOKED if status in {
-                    "missing_grant", "revoked_grant", "corrupt_grant",
-                }
-                else AUTHORIZATION_REQUIRED
-            )
-            job.update({
-                "authorization_status": next_status,
-                "enabled": False,
-                "policy_epoch": int(state.policy_epoch),
-                "updated_at": _iso(),
-            })
-            _save_current_job(job)
-            return _result_error(
-                ERROR_AUTHORIZATION_REQUIRED,
-                status,
-                authorization_status=next_status,
-            )
-        job["policy_epoch"] = int(state.policy_epoch)
-        return _result_ok(job=job, authorization_source="grant")
+        return _result_ok(job=job, execution_state="ready")
     except ScheduledTaskError as exc:
         return _result_error(exc.code, exc.message, **exc.details)
     except Exception:
         return _result_error(
-            ERROR_AUTHORIZATION_UNAVAILABLE,
-            "scheduled-task authorization preflight failed",
-            authorization_status=AUTHORIZATION_REQUIRED,
+            ERROR_BLOCKED,
+            "scheduled-task preflight failed",
+            execution_state=ERROR_BLOCKED,
         )
 
 
 def execution_context_for_scheduled_occurrence(execution: dict[str, Any]):
-    """Create the non-interactive policy context for one validated occurrence."""
+    """Create the non-interactive execution context for one validated occurrence."""
 
     task_id = str(execution.get("task_id") or "")
     job = _current_job(task_id)
@@ -2497,16 +1675,13 @@ def execution_context_for_scheduled_occurrence(execution: dict[str, Any]):
         == int(job.get("authorization_revision", 0))
     )
     if not exact:
-        raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "scheduled context is stale")
+        raise ScheduledTaskError(ERROR_STALE, "scheduled context is stale")
     preflight = preflight_scheduled_task(task_id)
     if not preflight.get("ok"):
         raise ScheduledTaskError(
-            ERROR_AUTHORIZATION_REQUIRED,
-            str(preflight.get("message") or "scheduled authorization blocked"),
+            ERROR_BLOCKED,
+            str(preflight.get("message") or "scheduled execution blocked"),
         )
-    policy, state = _permission_snapshot()
-    if policy is None or state is None:
-        raise ScheduledTaskError(ERROR_AUTHORIZATION_UNAVAILABLE, "permission unavailable")
     from osia.action_policy import ExecutionType, make_execution_context
 
     occurrence_id = str(execution.get("occurrence_id") or "")
@@ -2522,11 +1697,9 @@ def execution_context_for_scheduled_occurrence(execution: dict[str, Any]):
         run_id="",
         scheduled_task_id=task_id,
         task_revision=str(job["task_revision"]),
-        plan_revision=_authorization_binding(job),
-        policy_epoch=int(state.policy_epoch),
+        plan_revision=_execution_binding(job),
         execution_id=occurrence_id,
         operation_id=base_operation,
-        store=policy.store,
     )
 
 
@@ -2552,14 +1725,14 @@ def bind_request_execution_context(context, tool_name: str, call_hash: str):
     job = _current_job(context.scheduled_task_id)
     if (
         context.task_revision != str(job.get("task_revision") or "")
-        or context.plan_revision != _authorization_binding(job)
+        or context.plan_revision != _execution_binding(job)
         or task_definition_hash(job) != str(job.get("definition_hash") or "")
     ):
-        raise ScheduledTaskError(ERROR_AUTHORIZATION_STALE, "scheduled task binding changed")
+        raise ScheduledTaskError(ERROR_STALE, "scheduled task binding changed")
     equivalent = _equivalent_operation_id(job, tool_name, call_hash)
     if equivalent in list(job.get("ambiguity_barriers") or []):
         raise ScheduledTaskError(
-            ERROR_AUTHORIZATION_REQUIRED,
+            ERROR_BLOCKED,
             "equivalent operation has an unresolved outcome",
         )
     operation_id = "schedop:" + canonical_hash({
@@ -2568,74 +1741,20 @@ def bind_request_execution_context(context, tool_name: str, call_hash: str):
     })[:48]
     return replace(context, operation_id=operation_id)
 
-
-def validate_scheduled_permission_request(request) -> str | None:
-    """Re-read task/grant state immediately before policy evaluation."""
-
-    context = request.execution_context
-    job = _current_job(context.scheduled_task_id)
-    preflight = preflight_scheduled_task(str(job["id"]))
-    if not preflight.get("ok"):
-        return str(preflight.get("authorization_status") or AUTHORIZATION_REQUIRED)
-    if (
-        context.task_revision != str(job.get("task_revision") or "")
-        or context.plan_revision != _authorization_binding(job)
-    ):
-        return AUTHORIZATION_EDITED
-    equivalent = _equivalent_operation_id(
-        job, request.tool_identity, request.normalized_call_hash,
-    )
-    if equivalent in list(job.get("ambiguity_barriers") or []):
-        return BLOCKED_OUTCOME_UNKNOWN
-    return None
-
-
-def mark_scheduled_authorization_failure(task_id: str, reason: str) -> None:
-    try:
-        code = str(reason or "")
-        status = (
-            AUTHORIZATION_EXPIRED if "expired" in code
-            else AUTHORIZATION_EDITED if "revision" in code or "changed" in code
-            else BLOCKED_OUTCOME_UNKNOWN if "outcome" in code or "ambiguous" in code
-            else AUTHORIZATION_REVOKED if "revoked" in code
-            else AUTHORIZATION_REQUIRED
-        )
-        with _JOBS_LOCK:
-            jobs = _load_normalized_jobs()
-            idx = _find_index(jobs, str(task_id or ""))
-            if idx < 0:
-                return
-            job = dict(jobs[idx])
-            job.update({
-                "authorization_status": status,
-                "enabled": False,
-                "updated_at": _iso(),
-            })
-            jobs[idx] = job
-            _save_jobs(jobs)
-        _notify_changed()
-    except Exception:
-        pass
-
-
 def scheduled_execution_block_state(execution: dict[str, Any] | None) -> str:
+    """Return a durable block state for one launched occurrence, else ``""``."""
+
     if not isinstance(execution, dict) or not execution.get("task_id"):
         return ""
     try:
-        status = str(_current_job(str(execution["task_id"])).get(
-            "authorization_status"
-        ) or "")
+        job = _current_job(str(execution["task_id"]))
     except Exception:
-        return AUTHORIZATION_REQUIRED
-    return status if status in {
-        AUTHORIZATION_REQUIRED, AUTHORIZATION_EXPIRED,
-        AUTHORIZATION_REVOKED, AUTHORIZATION_EDITED,
-        BLOCKED_OUTCOME_UNKNOWN, DISABLED,
-    } else ""
+        return ERROR_BLOCKED
+    return _job_execution_state(job)
 
 
 def mark_scheduled_task_running(execution: dict[str, Any]) -> bool:
-    """Atomically enter RUNNING only for the still-current authorized task."""
+    """Atomically enter RUNNING only for the still-current enabled task."""
 
     task_id = str(execution.get("task_id") or "")
     with _JOBS_LOCK:
@@ -2654,11 +1773,10 @@ def mark_scheduled_task_running(execution: dict[str, Any]) -> bool:
         )
         if (
             not exact
-            or job.get("authorization_status") != AUTHORIZED
-            or not job.get("enabled")
+            or _job_execution_state(job) != ""
         ):
             return False
-        job["authorization_status"] = RUNNING
+        job["execution_state"] = RUNNING
         job["updated_at"] = _iso()
         jobs[idx] = job
         _save_jobs(jobs)
@@ -2667,7 +1785,7 @@ def mark_scheduled_task_running(execution: dict[str, Any]) -> bool:
 
 
 def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
-    """Restore AUTHORIZED without overwriting a concurrent revoke or edit."""
+    """Clear RUNNING without overwriting a concurrent edit/disable."""
 
     task_id = str(execution.get("task_id") or "")
     with _JOBS_LOCK:
@@ -2684,9 +1802,9 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
             and int(execution.get("authorization_revision", -1))
             == int(job.get("authorization_revision", 0))
         )
-        if not exact or job.get("authorization_status") != RUNNING:
+        if not exact or job.get("execution_state") != RUNNING:
             return
-        job["authorization_status"] = AUTHORIZED
+        job["execution_state"] = ""
         job["updated_at"] = _iso()
         jobs[idx] = job
         _save_jobs(jobs)
@@ -2734,15 +1852,8 @@ def record_scheduled_tool_execution(
         if idx < 0:
             return
         job = dict(jobs[idx])
-        if (
-            safe_outcome == "failed_before_dispatch"
-            and job.get("authorization_status") in {
-                AUTHORIZATION_REQUIRED, AUTHORIZATION_EXPIRED,
-                AUTHORIZATION_REVOKED, AUTHORIZATION_EDITED,
-                BLOCKED_OUTCOME_UNKNOWN,
-            }
-        ):
-            safe_outcome = "blocked_authorization"
+        if safe_outcome == "failed_before_dispatch" and _job_execution_state(job):
+            safe_outcome = "blocked_execution"
         records = list(job.get("execution_records") or [])
         records.append({
             "occurrence_id": str(execution.get("occurrence_id") or ""),
@@ -2762,7 +1873,6 @@ def record_scheduled_tool_execution(
             if equivalent not in barriers:
                 barriers.append(equivalent)
             job["ambiguity_barriers"] = barriers[-_MAX_EXECUTION_RECORDS:]
-            job["authorization_status"] = BLOCKED_OUTCOME_UNKNOWN
             job["enabled"] = False
         job["updated_at"] = _iso()
         jobs[idx] = job
@@ -2779,9 +1889,13 @@ def record_scheduled_occurrence(
 
     allowed = {
         "success_verified", "cancelled_proven", "failed_before_dispatch",
-        "partial_effect_verified", "outcome_unknown", "blocked_authorization",
+        "partial_effect_verified", "outcome_unknown", "blocked_execution",
+        # Legacy scheduler label for a blocked occurrence.
+        "blocked_authorization",
     }
     safe_outcome = outcome if outcome in allowed else "outcome_unknown"
+    if safe_outcome == "blocked_authorization":
+        safe_outcome = "blocked_execution"
     try:
         task_id = str(execution.get("task_id") or "")
         with _JOBS_LOCK:
@@ -2813,7 +1927,6 @@ def record_scheduled_occurrence(
                         ),
                     })[:48])
                     job["ambiguity_barriers"] = barriers
-                job["authorization_status"] = BLOCKED_OUTCOME_UNKNOWN
                 job["enabled"] = False
             job["updated_at"] = _iso()
             jobs[idx] = job
@@ -2828,7 +1941,7 @@ def reconcile_scheduled_outcome(
     equivalent_operation_id: str,
     outcome: str,
 ) -> dict[str, Any]:
-    """Explicit local reconciliation; execution remains disabled for reauth."""
+    """Explicit local reconciliation; the task stays disabled until re-enabled."""
 
     if outcome not in {"success_verified", "cancelled_proven", "partial_effect_verified"}:
         return _result_error(ERROR_VALIDATION, "invalid reconciliation outcome")
@@ -2837,30 +1950,26 @@ def reconcile_scheduled_outcome(
         barriers = list(job.get("ambiguity_barriers") or [])
         target = str(equivalent_operation_id or "")
         if target not in barriers:
-            return _result_ok(changed=False, task=_public_authorization_task(job))
+            return _result_ok(changed=False, task=_public_task(job))
         barriers.remove(target)
-        job = _invalidate_authorization(
-            job,
-            status=AUTHORIZATION_REQUIRED,
-            increment_task_revision=False,
-        )
+        job = _bump_execution_revision(job, increment_task_revision=False)
         job["ambiguity_barriers"] = barriers
         job["reconciliation_outcome"] = outcome
         _save_current_job(job)
-        return _result_ok(changed=True, task=_public_authorization_task(job))
+        return _result_ok(changed=True, task=_public_task(job))
     except ScheduledTaskError as exc:
         return _result_error(exc.code, exc.message)
 
 
 def sanitized_mobile_jobs(jobs: Any = None) -> list[dict[str, Any]]:
-    """Return task-management metadata without instructions, scopes or grants."""
+    """Return task-management metadata without instructions or scopes."""
 
     source = _load_normalized_jobs() if jobs is None else [
         dict(item) for item in jobs if isinstance(item, dict)
     ]
     sanitized = []
     for job in source:
-        public = _public_authorization_task(job)
+        public = _public_task(job)
         schedule = str(job.get("schedule") or "")
         try:
             from osia.cron import parse_schedule

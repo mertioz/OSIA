@@ -441,38 +441,6 @@ def test_navigation_page_replacement_and_popup_close_invalidate_references(
     ) == "stale_reference"
 
 
-def test_verified_changed_state_counts_progress_once():
-    field_ref = "fld_AAAAAAAAAAAAAAAAAAAAAAAA"
-    changed = json.dumps({
-        "ok": True,
-        "field_ref": field_ref,
-        "verified": True,
-        "changed": True,
-        "state_token": "a" * 32,
-    })
-    unchanged = json.dumps({
-        "ok": True,
-        "field_ref": field_ref,
-        "verified": True,
-        "changed": False,
-        "state_token": "a" * 32,
-    })
-    guard = agent_module._AntiLoopGuard(lang="en")
-    first = agent_module._semantic_form_progress_fingerprint(
-        "fill_form_field", changed,
-    )
-    assert first is not None
-    assert guard._record_useful_progress(first) is True
-    assert guard._record_useful_progress(first) is False
-    assert agent_module._semantic_form_progress_fingerprint(
-        "fill_form_field", unchanged,
-    ) is None
-    assert agent_module._semantic_form_progress_fingerprint(
-        "fill_form_field", 'ERROR: {"ok":false}',
-    ) is None
-    assert guard.useful_progress_count == 1
-
-
 def test_reference_ttl_and_ambiguous_reresolution_are_fail_closed():
     now = [10.0]
     session = SemanticFormSession(clock=lambda: now[0])
@@ -528,31 +496,16 @@ def test_reference_ttl_and_ambiguous_reresolution_are_fail_closed():
     assert error == "ambiguous_reference"
 
 
-def test_final_form_actions_are_confirmed_and_never_blindly_retried(monkeypatch):
-    confirmations = []
-    monkeypatch.setattr(
-        action_policy,
-        "_confirm_irreversible",
-        lambda decision, tool, kwargs: confirmations.append((decision.reason, tool))
-        or None,
-    )
+def test_final_form_actions_proceed_without_confirmation_and_never_blindly_retried(
+    monkeypatch,
+):
     request = "Submit the prepared job application form."
     assert action_policy.guard_tool_call(
         request, "find_and_click", {"text": "Submit application"},
     ) is None
-    assert confirmations == [("external_form_commitment", "find_and_click")]
     assert action_policy.is_final_external_tool_call(
         request, "press_key", {"key": "Enter"},
     ) is True
-
-    monkeypatch.setattr(
-        action_policy,
-        "_confirm_irreversible",
-        lambda *_args: "ERROR: action/osia/find_and_click: user declined",
-    )
-    assert action_policy.guard_tool_call(
-        request, "find_and_click", {"text": "Submit application"},
-    ).startswith("ERROR:")
 
     calls = []
     monkeypatch.setitem(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import asyncio
 import io
 import json
 import math
@@ -15,7 +14,6 @@ import av
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
-from starlette.requests import Request
 
 from osia import (
     attachments,
@@ -25,7 +23,6 @@ from osia import (
     media_reader,
 )
 from osia.document_identity import DocumentIdentityError, identify_document
-from osia.autonomous.orchestrator import Orchestrator
 
 
 def _image_bytes(fmt: str, *, size=(96, 48), frames=1, exif=None) -> bytes:
@@ -338,40 +335,6 @@ def test_transcription_auto_language_uses_local_detection(monkeypatch):
     assert speech["speech_language"] == "fr"
 
 
-def test_autonomous_synthesis_judge_observes_candidate_without_weakening_effects():
-    class JudgeAgent:
-        def __init__(self):
-            self.prompts = []
-
-        def reset(self):
-            return None
-
-        def run(self, prompt, **_kwargs):
-            self.prompts.append(prompt)
-            return "DONE\nLa sortie candidate satisfait le critère."
-
-    agent = JudgeAgent()
-    task = {"id": "2.0"}
-    orch = Orchestrator(agent)
-    orch._state = {
-        "language": "fr",
-        "operation_records": [{
-            "task_id": "task:2.0",
-            "tool_identity": "query_document",
-            "status": "success_verified",
-        }],
-    }
-    orch._active_task = task
-    outcome = orch._llm_judge_outcome(
-        "Une réponse finale unique en français contient la synthèse.",
-        "Image : orientation normale. Audio : bonjour. Vidéo : trois scènes.",
-    )
-
-    assert outcome.ok is True
-    prompt = agent.prompts[0]
-    assert "inspect the candidate directly" in prompt
-    assert '"query_document"' in prompt
-    assert "Any claimed external state or side effect still requires" in prompt
 
 
 def test_media_artifact_queries_are_bounded_opaque_and_deterministic(tmp_path):
@@ -464,46 +427,6 @@ def test_chat_source_privacy_and_completed_extraction_reuse(
     assert len(calls) == 1
 
 
-def test_autonomous_bound_source_resume_reuses_completed_artifact(
-    tmp_path, private_stores, monkeypatch,
-):
-    _artifacts, sources = private_stores
-    path = tmp_path / "resume.png"
-    path.write_bytes(_image_bytes("PNG"))
-    source = sources.create(
-        path,
-        owner_id="session-owner",
-        source_kind="autonomous_mobile_attachment",
-        display_name="resume.png",
-        permission_epoch=7,
-    )
-    sources.bind_for_run(
-        [source["source_ref"]],
-        owner_id="session-owner",
-        run_owner_id="run-owner",
-        run_id="run-id",
-        permission_epoch=7,
-    )
-    calls = []
-    original = media_reader.extract_media
-
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(media_reader, "extract_media", counted)
-    with document_artifacts.artifact_access_scope("run-owner"):
-        first = json.loads(document_reader.read_document(source_ref=source["source_ref"]))
-    assert sources.linked_artifacts(
-        [source["source_ref"]],
-        run_owner_id="run-owner",
-        run_id="run-id",
-        policy_epoch=first.get("policy_epoch", document_reader._document_policy_epoch()),
-    ) == [first["artifact_id"]]
-    with document_artifacts.artifact_access_scope("run-owner", [first["artifact_id"]]):
-        resumed = json.loads(document_reader.read_document(source_ref=source["source_ref"]))
-    assert resumed["artifact_id"] == first["artifact_id"]
-    assert len(calls) == 1
 
 
 def test_microphone_strict_bounded_base64_and_exact_wav():
@@ -534,10 +457,7 @@ def test_screenshot_uses_local_artifact_path_without_vision_export(
         return None
 
     monkeypatch.setattr(agent, "_capture_screen", capture)
-    monkeypatch.setattr(
-        agent, "_describe_screenshot",
-        lambda _path: pytest.fail("screenshot must not be exported to vision"),
-    )
+    assert not hasattr(agent, "_describe_screenshot")
     with document_artifacts.artifact_access_scope("screen"):
         result = json.loads(agent.tool_take_screenshot())
     assert result["document_family"] == "image"
@@ -639,105 +559,3 @@ def test_read_document_outer_timeout_contains_media_worker_envelope():
         media_reader.VIDEO_TIMEOUT_SECONDS + 6
     )
     assert agent._tool_timeout_seconds("query_document", {}) == 40
-
-
-def test_pc_authorization_reapplies_persisted_model_before_execution(monkeypatch):
-    from osia import mobile_model_catalogue
-    from osia.server import server
-
-    events = []
-    st = {
-        "run_id": "run:restarted",
-        "provider": "chatgpt_account",
-        "model": "gpt-5.6-sol",
-        "authorization_request": {"origin_ref": "mobile:bound"},
-    }
-
-    class FakeOrchestrator:
-        def start(self, value):
-            events.append(("start", value["run_id"]))
-
-    agent = object()
-    monkeypatch.setitem(server._autonomous, "st", st)
-    monkeypatch.setattr(
-        server,
-        "_ensure_autonomous_engine",
-        lambda: (events.append(("engine",)) or (agent, FakeOrchestrator())),
-    )
-    monkeypatch.setattr(
-        mobile_model_catalogue,
-        "resolve_current_autonomous_selection",
-        lambda **kwargs: (
-            events.append(("resolve", kwargs["provider_id"], kwargs["model_id"]))
-            or {
-                "provider_id": kwargs["provider_id"],
-                "model_id": kwargs["model_id"],
-                "fallback_occurred": False,
-            }
-        ),
-    )
-    monkeypatch.setattr(
-        mobile_model_catalogue,
-        "apply_autonomous_agent_model",
-        lambda value, provider, model: events.append(
-            ("apply", value is agent, provider, model)
-        ),
-    )
-    monkeypatch.setattr(
-        server._aauthorization,
-        "response_for_current_request",
-        lambda value, *, action, origin_ref: (
-            events.append(("response", action, origin_ref))
-            or {"action": action, "origin_ref": origin_ref}
-        ),
-    )
-    monkeypatch.setattr(
-        server._aauthorization,
-        "authorize_and_start",
-        lambda value, response, *, origin_ref: events.append(
-            ("authorize", response["action"], origin_ref)
-        ),
-    )
-    monkeypatch.setattr(
-        server._astate,
-        "save_task_state",
-        lambda value: events.append(("save", value["run_id"])),
-    )
-    monkeypatch.setattr(server, "_autonomous_frame", lambda payload, value: payload)
-    monkeypatch.setattr(server, "_broadcast_autonomous", lambda frame: None)
-    monkeypatch.setattr(server, "_autonomous_pc_snapshot", lambda value: value)
-
-    sent = False
-
-    async def receive():
-        nonlocal sent
-        if sent:
-            return {"type": "http.disconnect"}
-        sent = True
-        return {
-            "type": "http.request",
-            "body": b'{"action":"authorize"}',
-            "more_body": False,
-        }
-
-    request = Request({
-        "type": "http",
-        "method": "POST",
-        "path": "/internal/autonomous_authorization_action",
-        "headers": [(b"content-type", b"application/json")],
-        "client": ("127.0.0.1", 1234),
-        "server": ("127.0.0.1", 8765),
-        "scheme": "http",
-    }, receive)
-    result = asyncio.run(server.internal_autonomous_authorization_action(request))
-
-    assert result["ok"] is True
-    assert events == [
-        ("engine",),
-        ("resolve", "chatgpt_account", "gpt-5.6-sol"),
-        ("apply", True, "chatgpt_account", "gpt-5.6-sol"),
-        ("response", "approve", "desktop"),
-        ("authorize", "approve", "desktop"),
-        ("save", "run:restarted"),
-        ("start", "run:restarted"),
-    ]

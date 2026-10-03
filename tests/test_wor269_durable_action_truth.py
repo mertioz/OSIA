@@ -219,7 +219,7 @@ def test_04_exact_non_application_reopens_frontier():
     assert decision.replay_allowed is True
 
 
-def test_05_verified_effect_closes_replay():
+def test_05_verified_effect_is_a_fact_not_a_new_request_veto():
     match = ObservationResult(
         ObservationClassification.MATCH,
         "exact_state",
@@ -238,7 +238,8 @@ def test_05_verified_effect_closes_replay():
         dispatch_started=True,
     )
     assert decision.state is ActionState.EFFECT_VERIFIED
-    assert retry.allowed is False
+    assert decision.replay_allowed is True
+    assert retry.allowed is True
 
 
 def test_06_reconciliation_pending_is_not_an_effect_terminal():
@@ -257,10 +258,10 @@ def test_06_reconciliation_pending_is_not_an_effect_terminal():
     assert decision.safe_avenues_exhausted is False
 
 
-# B. ANTI-REPLAY
+# B. FACTUAL HISTORY — NEW REQUESTS ARE NOT VETOED
 
 
-def test_07_unresolved_mutation_cannot_be_replayed():
+def test_07_unresolved_mutation_history_does_not_veto_a_fresh_request():
     unresolved = _record(_started(_truth()))
     decision = gate_action(
         ActionIntent(
@@ -269,8 +270,8 @@ def test_07_unresolved_mutation_cannot_be_replayed():
         ),
         [unresolved],
     )
-    assert decision.allowed is False
-    assert decision.reason_code == "blocked_due_to_possible_duplicate_effect"
+    assert decision.allowed is True
+    assert decision.reason_code == "new_request_allowed"
 
 
 def test_08_read_only_observer_remains_allowed():
@@ -296,7 +297,7 @@ def test_09_explicitly_independent_safe_branch_remains_allowed():
     assert decision.allowed is True
 
 
-def test_10_dependent_mutation_remains_blocked():
+def test_10_dependency_history_does_not_veto_model_tool_choice():
     unresolved = _record(_started(_truth()))
     decision = gate_action(
         ActionIntent(
@@ -307,7 +308,8 @@ def test_10_dependent_mutation_remains_blocked():
         ),
         [unresolved],
     )
-    assert decision.allowed is False
+    assert decision.allowed is True
+    assert decision.reason_code == "new_request_allowed"
 
 
 # C. READ_ONLY
@@ -332,7 +334,7 @@ def test_11_lost_read_result_can_safely_retry():
         dispatch_started=True,
     )
     assert decision.allowed is True
-    assert decision.reason_code == "read_only_reexecution_safe"
+    assert decision.reason_code == "new_request_allowed"
     assert coordinator.unresolved_actions(turn_id="turn_12345678")
 
 
@@ -482,7 +484,7 @@ def test_20_dispatched_invoke_is_verified_by_vision_match():
     assert decision.state is ActionState.EFFECT_VERIFIED
 
 
-def test_21_desktop_observer_failure_never_authorizes_replay():
+def test_21_observer_failure_is_factual_and_does_not_veto_a_new_request():
     truth = _started(_truth())
     coordinator, _store = _coordinator(
         truth,
@@ -500,7 +502,8 @@ def test_21_desktop_observer_failure_never_authorizes_replay():
         dispatch_started=True,
     )
     assert decision.observer_status is ObserverStatus.FAILED
-    assert retry.allowed is False
+    assert decision.replay_allowed is True
+    assert retry.allowed is True
 
 
 def test_22_exact_desktop_nonmatch_reopens_frontier():
@@ -698,7 +701,7 @@ def test_29_legacy_unknown_loads_without_false_success_upgrade():
         effect_truth=legacy_unverified_mutation["effect_truth"],
         dispatch_started=False,
     )
-    assert legacy_retry.allowed is False
+    assert legacy_retry.allowed is True
     legacy_coordinator, _legacy_store = _coordinator(
         legacy_unverified_mutation,
         ScriptedObserver(ObservationResult(
@@ -711,7 +714,7 @@ def test_29_legacy_unknown_loads_without_false_success_upgrade():
         legacy_unverified_mutation["action_id"]
     )
     assert legacy_decision.effect_truth is EffectTruth.POSSIBLE
-    assert legacy_decision.replay_allowed is False
+    assert legacy_decision.replay_allowed is True
     legacy_exact_coordinator, _legacy_exact_store = _coordinator(
         legacy_unverified_mutation,
         ScriptedObserver(ObservationResult(
@@ -750,7 +753,7 @@ def test_30_reconciliation_pending_is_nonterminal_for_turn(tmp_path):
     assert decision.terminal_state == ""
 
 
-def test_31_blocked_verified_only_after_reconciliation_frontier_exhausted(tmp_path):
+def test_31_unknown_remains_nonterminal_after_reconciliation_frontier_exhausted(tmp_path):
     controller = TurnTerminalityController(
         turn_id="turn_exhausted_12345678",
         objective="perform the requested action",
@@ -771,18 +774,18 @@ def test_31_blocked_verified_only_after_reconciliation_frontier_exhausted(tmp_pa
     ) is True
     controller.set_strategy_frontier(())
     decision = controller.evaluate()
-    assert decision.action == "terminal"
-    assert decision.terminal_state == "blocked_verified"
-    assert controller.reserve_final(
-        decision.terminal_state,
+    assert decision.action in {"continue", "wait"}
+    assert decision.terminal_state == ""
+    assert not controller.reserve_final(
+        "blocked_verified",
         reason_code=decision.reason_code,
-    ) is True
+    )
 
 
 # Additional policy/settle coverage required by PASS A.
 
 
-def test_32_idempotent_write_reuses_only_the_same_canonical_identity():
+def test_32_idempotency_identity_does_not_gate_a_new_model_request():
     truth = _started(_truth(
         CanonicalEffectClass.IDEMPOTENT_WRITE,
         idempotency_identity="operation_key_12345678",
@@ -805,7 +808,7 @@ def test_32_idempotent_write_reuses_only_the_same_canonical_identity():
         [unresolved],
     )
     assert allowed.allowed is True
-    assert wrong_key.allowed is False
+    assert wrong_key.allowed is True
     assert canonical_effect_class(
         "reversible_local",
         "conditionally_idempotent",

@@ -18,10 +18,11 @@ from tools.wor249_prompt_audit import (
     build_deterministic_snapshots,
     measure_snapshots,
 )
+from tools.wor266_prompt_audit import build_prompt_quality_report
 
 
 def _without_language_contract(prompt: str) -> str:
-    return prompt.rsplit("\n\n[AUTHORITATIVE TURN LANGUAGE]\n", 1)[0]
+    return prompt.rsplit("\n\n[TURN RESPONSE LANGUAGE]\n", 1)[0]
 
 
 def _stable_prompt(lang: str, *, persona: str = "", skills: str = "", mcp: str = "") -> str:
@@ -40,27 +41,24 @@ def test_one_canonical_english_core_and_separate_target_language():
     assert agent.SYSTEM_PROMPT_EN is agent.SYSTEM_PROMPT_CORE
     assert not hasattr(agent, "SYSTEM_PROMPT_FR")
     assert _without_language_contract(english) == _without_language_contract(french)
-    assert english.count("[AUTHORITATIVE TURN LANGUAGE]") == 1
-    assert french.count("[AUTHORITATIVE TURN LANGUAGE]") == 1
-    assert english.rstrip().endswith("Produce exactly one trustworthy final answer.")
-    assert "in English" in english.rsplit("[AUTHORITATIVE TURN LANGUAGE]", 1)[1]
-    assert "in French" in french.rsplit("[AUTHORITATIVE TURN LANGUAGE]", 1)[1]
+    assert english.count("[TURN RESPONSE LANGUAGE]") == 1
+    assert french.count("[TURN RESPONSE LANGUAGE]") == 1
+    assert "Produce one truthful final response." in (
+        _without_language_contract(english)
+    )
+    assert "English (en)" in english.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
+    assert "French (fr)" in french.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
 
 
-def test_all_deterministic_effective_prompt_snapshots_are_smaller():
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))["snapshots"]
+def test_all_deterministic_effective_prompt_snapshots_are_minimal_and_stable():
     snapshots = build_deterministic_snapshots()
     assert snapshots == build_deterministic_snapshots()
     current = measure_snapshots(snapshots)
+    report = build_prompt_quality_report()
 
-    assert set(current) == set(baseline)
-    for name, after in current.items():
-        before = baseline[name]
-        assert after["chars"] < before["chars"], name
-        assert after["utf8_bytes"] < before["utf8_bytes"], name
-        assert after["approx_tokens"] < before["approx_tokens"], name
-        if after["o200k_tokens"] is not None:
-            assert after["o200k_tokens"] < before["o200k_tokens"], name
+    assert set(current) == set(snapshots)
+    assert all(report["acceptance"].values())
+    assert report["banned_recipe_hits"] == []
 
 
 def test_static_and_connected_capabilities_are_injected_once_when_available():
@@ -72,15 +70,15 @@ def test_static_and_connected_capabilities_are_injected_once_when_available():
     prompt = _stable_prompt("en", mcp=mcp)
     signature_lines = prompt.splitlines()
 
-    assert prompt.count("## Available OSIA tools (authoritative signatures)") == 1
+    assert prompt.count("## Available OSIA capabilities") == 1
     assert prompt.count("## Connected MCP tools (available now)") == 1
     assert prompt.count("- mcp__fixture__read:") == 1
     assert "## MCP connectors" not in prompt
     assert "You can also connect" not in prompt
     for spec in effective_static_tool_specs():
-        pattern = re.compile(rf"^- {re.escape(spec.name)}:")
+        pattern = re.compile(rf"^- {re.escape(spec.name)}\(")
         assert sum(bool(pattern.match(line)) for line in signature_lines) == 1, spec.name
-    kill_line = next(line for line in signature_lines if line.startswith("- kill_process:"))
+    kill_line = next(line for line in signature_lines if line.startswith("- kill_process("))
     assert "name_or_pid:int|string" in kill_line or "name_or_pid:string|int" in kill_line
 
 
@@ -94,24 +92,27 @@ def test_personality_and_skills_are_once_and_cannot_override_system_contracts():
 
     assert prompt.count("WOR249_PERSONA") == 1
     assert prompt.count("WOR249_SKILL") == 1
-    assert prompt.index("WOR249_PERSONA") < prompt.index("## Action-risk policy")
-    assert prompt.index("WOR249_SKILL") < prompt.index("## Action-risk policy")
-    assert prompt.rfind("[AUTHORITATIVE TURN LANGUAGE]") > prompt.index("WOR249_SKILL")
-    assert "in French" in prompt.rsplit("[AUTHORITATIVE TURN LANGUAGE]", 1)[1]
+    # WOR-301: system contracts precede the lower-priority customization, so a
+    # hostile persona or skill can never override them.
+    assert prompt.index("## Essential protections") < prompt.index(
+        "WOR249_PERSONA"
+    )
+    assert prompt.index("## Essential protections") < prompt.index(
+        "WOR249_SKILL"
+    )
+    assert prompt.rfind("[TURN RESPONSE LANGUAGE]") > prompt.index("WOR249_SKILL")
+    assert "French (fr)" in prompt.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
 
 
-def test_planning_truthfulness_permissions_and_reconciliation_contracts_remain_explicit():
+def test_planning_truthfulness_and_reconciliation_contracts_remain_explicit():
     prompt = _stable_prompt("en")
     required = (
-        "Steam Library request is not satisfied by the public Steam Store",
-        "bounded, relevant, semantically equivalent strategies",
-        "OUTCOME_UNKNOWN",
-        "Never retry, replay, switch provider",
-        "WAITING_TOOL_RESULT",
-        "Produce exactly one trustworthy final answer",
-        "Class A — benign local/reversible actions",
-        "Class D — sensitive actions",
-        "Claim an action was launched, opened, created, changed, sent, or completed only",
+        "Never claim an action or postcondition without supporting evidence",
+        "Respect cancellation, target identity, and stale-state rejection",
+        "do not intentionally duplicate it",
+        "Protect secrets and private data",
+        "Do not bypass operating-system",
+        "Produce one truthful final response",
     )
     for contract in required:
         assert contract in prompt
@@ -120,32 +121,55 @@ def test_planning_truthfulness_permissions_and_reconciliation_contracts_remain_e
         "Open Steam and go to my Library.",
         ("open_uri", "navigate_browser", "desktop_click"),
     ).model_instruction()
-    for layer in (
-        "0 exact direct provider/API/MCP/OSIA capability",
-        "1 deep link or deterministic route",
-        "2 DOM/Playwright",
-        "3 native accessibility",
-        "4 keyboard with observable focus",
-        "5 local/zoomed vision",
-        "6 global coordinates",
-    ):
-        assert layer in strategy_instruction
+    assert "unverified_outcomes" in strategy_instruction
+    assert "applicable_capabilities" not in strategy_instruction
+    assert "The engine enforces target freshness" in strategy_instruction
+    assert "permissions" not in strategy_instruction
+    assert "in this order" not in strategy_instruction
+    assert "earliest applicable" not in strategy_instruction
 
 
-def test_chat_autonomous_and_autonomous_web_surfaces_stay_separate():
+def test_unchanged_visual_state_allows_only_a_safe_intended_probe():
+    prompt = _stable_prompt("en")
+
+    assert (
+        "An unchanged screenshot is inconclusive: it proves neither failure "
+        "nor success."
+    ) in prompt
+    assert (
+        "do not intentionally duplicate it solely because the screenshot "
+        "looks unchanged"
+    ) in prompt
+    assert (
+        "If the task's next intended step is safe and reversible and can "
+        "reveal whether the action took effect, do it once and observe."
+    ) in prompt
+    assert (
+        "Retry only with positive evidence of no effect or when no safe "
+        "intended probe is available"
+    ) in prompt
+    assert (
+        "keep existing verification and reconciliation for consequential "
+        "or uncertain effects"
+    ) in prompt
+    assert "Never claim an action or postcondition without supporting evidence." in prompt
+    assert (
+        "Respect cancellation, target identity, and stale-state rejection."
+    ) in prompt
+    assert "reconcile an uncertain effect before retrying." in prompt
+
+
+def test_chat_and_scheduled_surfaces_stay_separate():
+    # WOR-303: Unified Chat is the only execution surface; Scheduled stays a
+    # distinct temporal trigger and never gains the Chat execution block.
     snapshots = build_deterministic_snapshots()
     chat = snapshots["chat_api_en"]
-    autonomous = snapshots["autonomous_api_en"]
-    autonomous_web = snapshots["autonomous_web_api_fr"]
+    scheduled = snapshots["scheduled_api_en"]
 
-    assert "## Chat / Autonomous routing" in chat
-    assert "## Current execution mode: Autonomous" not in chat
-    assert "## Current execution mode: Autonomous" in autonomous
-    assert "## Chat / Autonomous routing" not in autonomous
-    assert "Autonomous Web step" in autonomous_web
-    assert "## Chat / Autonomous routing" not in autonomous_web
-    assert "WOR249_PERSONALITY" not in autonomous_web
-    assert "WOR249_SKILL" not in autonomous_web
+    assert "## Unified Chat execution" in chat
+    assert "## Unified Chat execution" not in scheduled
+    assert "WOR249_PERSONALITY" not in scheduled
+    assert "WOR249_SKILL" not in scheduled
 
 
 def test_wire_context_preserves_memory_evidence_and_language_contract():
@@ -155,7 +179,7 @@ def test_wire_context_preserves_memory_evidence_and_language_contract():
     assert "untrusted recalled context" in wire
     assert "WOR249_PERSONALITY" in wire
     assert "WOR249_SKILL" in wire
-    assert "in French" in wire
+    assert "French (fr)" in wire
 
 
 def test_language_switch_sequence_and_ambiguous_follow_up_are_deterministic():
@@ -182,11 +206,11 @@ def test_account_provider_override_is_minimal_isolated_and_language_last():
     developer = snapshots["chatgpt_account_developer"]
     shared_api_prompt = snapshots["chat_api_en"]
 
-    assert "CHATGPT ACCOUNT PROVIDER CONTAINMENT" in base
+    assert "[ChatGPT account capability context:" in base
     assert "[PROJECT ROOT:" not in base
     assert "[DESKTOP PATH:" not in base
     assert base.rfind("CHATGPT ACCOUNT PROVIDER CONTAINMENT") < base.rfind(
-        "[AUTHORITATIVE TURN LANGUAGE]"
+        "[TURN RESPONSE LANGUAGE]"
     )
     assert len(developer) < 200
     assert "Codex-native tools" not in shared_api_prompt

@@ -17,6 +17,7 @@ from osia.goal_contract import (
     ObservablePostcondition,
     StateCondition,
     goal_contract_errors,
+    goal_contract_from_dict,
     goal_contract_from_semantic_mission,
     validate_goal_contract,
 )
@@ -169,8 +170,18 @@ def test_steam_library_and_store_have_distinct_false_success_surfaces():
     assert library.fingerprint != store.fingerprint
     assert library.nodes[0].required_surface == "library"
     assert store.nodes[0].required_surface == "store"
-    assert library.nodes[0].forbidden_false_success_states[0].value == "library"
-    assert store.nodes[0].forbidden_false_success_states[0].value == "store"
+    library_surfaces = {
+        item.value
+        for item in library.nodes[0].forbidden_false_success_states
+        if item.attribute == "surface"
+    }
+    store_surfaces = {
+        item.value
+        for item in store.nodes[0].forbidden_false_success_states
+        if item.attribute == "surface"
+    }
+    assert library_surfaces == {"library"}
+    assert store_surfaces == {"store"}
     assert all(
         item.operator == ConditionOperator.NOT_EQUALS.value
         for item in (
@@ -178,3 +189,35 @@ def test_steam_library_and_store_have_distinct_false_success_surfaces():
             *store.nodes[0].forbidden_false_success_states,
         )
     )
+
+
+def test_conditional_branch_metadata_round_trips_without_both_required():
+    mission = derive_semantic_mission(
+        "Dans AppX, clique sur Play si disponible, sinon clique sur Install"
+    )
+    contract = goal_contract_from_semantic_mission(mission)
+    restored = goal_contract_from_dict(contract.to_dict())
+    conditional = restored.nodes[-1]
+
+    assert conditional.conditional_mode == "exactly_one_observed_branch"
+    assert conditional.requires_observation_before_execution is True
+    assert [
+        branch["target"] for branch in conditional.conditional_branches
+    ] == ["play", "install"]
+    assert len(conditional.observable_postconditions) == 1
+
+
+def test_legacy_contract_without_conditional_fields_migrates_fingerprint():
+    contract = goal_contract_from_semantic_mission(
+        derive_semantic_mission("Open Steam at my Library")
+    ).to_dict()
+    for node in contract["nodes"]:
+        node.pop("conditional_mode", None)
+        node.pop("conditional_branches", None)
+        node.pop("requires_observation_before_execution", None)
+    contract["fingerprint"] = "legacy-fingerprint"
+
+    restored = goal_contract_from_dict(contract)
+
+    assert restored.nodes[0].conditional_mode == ""
+    assert restored.fingerprint != "legacy-fingerprint"

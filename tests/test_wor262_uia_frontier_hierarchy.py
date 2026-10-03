@@ -139,7 +139,14 @@ def _static_frontier(strategy) -> set[str]:
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
+        return {spec.name for spec in effective_static_tool_specs()}
+
+
+def _complete_visible_surface() -> set[str]:
+    """WOR-300: every runtime capability of the active surface stays visible."""
+
+    with effective_tool_surface_scope("chat"):
         return {spec.name for spec in effective_static_tool_specs()}
 
 
@@ -155,17 +162,26 @@ def test_01_exact_verifiable_uia_is_visible_and_coordinate_fallback_is_absent():
     assert primitive["surface_ref"] == CONTROL_REF
     assert primitive["verifier"] == "exact_surface_text"
     assert primitive["observable_effect_surface_refs"] == [DISPLAY_REF]
+    assert frontier == _complete_visible_surface()
     assert "activate_desktop_surface" in frontier
-    assert {
-        "desktop_click",
-        "query_document",
-        "run_command",
-        "take_screenshot",
-        "request_visual_observation",
-    }.isdisjoint(frontier)
+    # Execution integrity: the exact-UIA frontier still refuses the lower
+    # coordinate/vision tiers before dispatch...
+    assert es.tool_applicability(strategy, "desktop_click", {}) == (
+        False, "fresh_authoritative_visual_target_required",
+    )
+    assert es.tool_applicability(strategy, "take_screenshot", {}) == (
+        False, "structured_uia_evidence_sufficient",
+    )
+    assert es.tool_applicability(strategy, "request_visual_observation", {}) == (
+        False, "structured_uia_evidence_sufficient",
+    )
+    # ...while WOR-300/WOR-301 keep every runtime capability request-visible:
+    # cross-domain capabilities are never relevance refused.
+    for tool in ("query_document", "run_command"):
+        assert es.tool_applicability(strategy, tool, {}) == (True, ""), tool
 
 
-def test_02_excluded_lower_tier_is_rejected_without_consuming_mutation_frontier():
+def test_02_excluded_lower_tier_is_never_refused():
     strategy = _strategy()
     _observe(strategy)
     attempts_before = len(strategy.attempts)
@@ -176,9 +192,10 @@ def test_02_excluded_lower_tier_is_rejected_without_consuming_mutation_frontier(
         strategy=strategy,
     )
 
-    assert decision is not None and decision.allowed is False
-    assert decision.reason_code == "stronger_exact_uia_frontier_available"
-    assert len(strategy.attempts) == attempts_before
+    # WOR-301: frontier ranking never refuses an available call; the engine
+    # still records the attempt for effect correlation.
+    assert decision is None or decision.allowed is True
+    assert len(strategy.attempts) >= attempts_before
     assert strategy.frozen_reason == ""
 
 
@@ -197,10 +214,13 @@ def test_03_uia_exhaustion_before_effect_exposes_keyboard_before_lower_tiers():
 
     frontier = _static_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert {"desktop_type", "desktop_press"}.issubset(frontier)
-    assert "desktop_click" not in frontier
-    assert "take_screenshot" not in frontier
-    assert "activate_desktop_surface" not in frontier
+    assert es.tool_applicability(strategy, "desktop_click", {})[0] is False
+    assert es.tool_applicability(strategy, "take_screenshot", {})[0] is False
+    assert es.tool_applicability(
+        strategy, "activate_desktop_surface", {},
+    ) == (False, "uia_frontier_exhausted_keyboard_ready")
 
 
 def test_04_explicit_coordinate_goal_keeps_desktop_click_valid():
@@ -214,7 +234,10 @@ def test_04_explicit_coordinate_goal_keeps_desktop_click_valid():
         "desktop_click",
         {"description": "screen coordinates (500, 400)"},
     ) == (True, "")
-    assert "desktop_click" in _static_frontier(strategy)
+    # WOR-289/WOR-300: V3 desktop_click is dormant and thus genuinely
+    # unavailable on every surface, even when the semantic strategy accepts
+    # the explicit coordinate intent.
+    assert "desktop_click" not in _static_frontier(strategy)
 
 
 def test_05_inaccessible_uia_progresses_to_focused_keyboard_first():
@@ -227,9 +250,10 @@ def test_05_inaccessible_uia_progresses_to_focused_keyboard_first():
 
     frontier = _static_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert {"desktop_type", "desktop_press"}.issubset(frontier)
-    assert "desktop_click" not in frontier
-    assert "take_screenshot" not in frontier
+    assert es.tool_applicability(strategy, "desktop_click", {})[0] is False
+    assert es.tool_applicability(strategy, "take_screenshot", {})[0] is False
 
 
 def test_06_background_safe_uia_does_not_require_window_activation():
@@ -357,7 +381,7 @@ def test_10_real_autonomous_provider_frontier_matches_canonical_hierarchy():
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
         provider_frontier = {
             item.identity
             for item in federated_capabilities("chatgpt_account")
@@ -365,10 +389,17 @@ def test_10_real_autonomous_provider_frontier_matches_canonical_hierarchy():
         }
 
     assert "activate_desktop_surface" in provider_frontier
-    assert {
-        "desktop_click",
-        "query_document",
-        "run_command",
-        "take_screenshot",
-        "request_visual_observation",
-    }.isdisjoint(provider_frontier)
+    assert provider_frontier == _complete_visible_surface()
+    # WOR-300: request relevance never removes a runtime capability from the
+    # provider frontier; only execution-integrity gates refuse a call.
+    assert es.tool_applicability(strategy, "desktop_click", {}) == (
+        False, "fresh_authoritative_visual_target_required",
+    )
+    assert es.tool_applicability(strategy, "take_screenshot", {}) == (
+        False, "structured_uia_evidence_sufficient",
+    )
+    assert es.tool_applicability(strategy, "request_visual_observation", {}) == (
+        False, "structured_uia_evidence_sufficient",
+    )
+    for tool in ("query_document", "run_command"):
+        assert es.tool_applicability(strategy, tool, {}) == (True, ""), tool

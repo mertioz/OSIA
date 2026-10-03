@@ -32,7 +32,6 @@ def _registry(*, wrp=False, rows=(), volume_root="D:\\"):
         system_directory="D:\\OS\\Windows\\System32",
         system_windows_directory="D:\\OS\\Windows",
         wrp_probe=lambda _path: wrp,
-        wrp_key_probe=lambda _root, _subkey: False,
         storage_rows=rows,
         volume_root=volume_root,
     )
@@ -48,7 +47,7 @@ def test_windows_directory_is_runtime_derived_and_wrp_protected():
     assert "target" not in evidence.public_metadata()
 
 
-def test_windows_wrp_unavailable_is_typed_and_fail_closed():
+def test_windows_wrp_unavailable_is_typed_but_not_catastrophic_evidence():
     registry = SystemResourceRegistry(
         platform_family="windows",
         windows=_WindowsFixture(
@@ -61,7 +60,7 @@ def test_windows_wrp_unavailable_is_typed_and_fail_closed():
     )
     evidence = registry.classify_path("D:\\OS\\Windows\\unknown.dll")
     assert evidence.classification is Classification.INDETERMINATE_PROTECTED_TARGET
-    assert evidence.blocks_destruction is True
+    assert evidence.blocks_destruction is False
 
 
 @pytest.mark.parametrize(
@@ -104,7 +103,9 @@ def test_boot_configuration_and_runtime_boot_partition_are_protected():
         volume_root="E:\\",
     )
     assert registry.classify_path("E:\\").classification is Classification.PROTECTED_SYSTEM_VOLUME
-    assert _registry().classify_path("D:\\Boot\\BCD").blocks_destruction
+    boot_file = _registry().classify_path("D:\\Boot\\BCD")
+    assert boot_file.classification is Classification.PROTECTED_SYSTEM_RESOURCE
+    assert not boot_file.blocks_destruction
 
 
 def test_ordinary_user_data_remains_outside_the_windows_registry():
@@ -112,7 +113,7 @@ def test_ordinary_user_data_remains_outside_the_windows_registry():
     assert evidence.classification is Classification.NOT_SYSTEM_RESOURCE
 
 
-def test_registry_and_redirect_semantics_block_only_system_targets():
+def test_registry_and_redirect_syntax_is_not_a_destruction_classifier():
     registry = _registry()
     protected_registry = classify_non_deletion_system_mutation(
         "run_command",
@@ -134,42 +135,10 @@ def test_registry_and_redirect_semantics_block_only_system_targets():
         {"command": r'echo data > "D:\Users\fixture\ordinary.txt"'},
         registry=registry,
     )
-    assert protected_registry.blocks_destruction
-    assert ordinary_registry.classification is Classification.NOT_SYSTEM_RESOURCE
-    assert protected_redirect.blocks_destruction
-    assert ordinary_redirect.classification is Classification.NOT_SYSTEM_RESOURCE
-
-
-def test_windows_registry_protection_uses_sfc_key_evidence():
-    adapter = _WindowsFixture(
-        windows_directory="D:\\OS\\Windows",
-        system_directory="D:\\OS\\Windows\\System32",
-        system_windows_directory="D:\\OS\\Windows",
-        wrp_probe=lambda _path: False,
-        wrp_key_probe=lambda root, subkey: (
-            root == "HKEY_LOCAL_MACHINE" and subkey == r"SOFTWARE\PROTECTEDFIXTURE"
-        ),
-        storage_rows=(),
-    )
-    registry = SystemResourceRegistry(platform_family="windows", windows=adapter)
-    evidence = registry.classify_registry_key(r"HKLM\SOFTWARE\ProtectedFixture")
-    assert evidence.classification is Classification.PROTECTED_SYSTEM_RESOURCE
-    assert evidence.reason_code == "windows_registry_protection"
-
-
-def test_windows_registry_protection_unavailable_is_typed_and_fail_closed():
-    adapter = _WindowsFixture(
-        windows_directory="D:\\OS\\Windows",
-        system_directory="D:\\OS\\Windows\\System32",
-        system_windows_directory="D:\\OS\\Windows",
-        wrp_probe=lambda _path: False,
-        wrp_key_probe=lambda _root, _subkey: None,
-        storage_rows=(),
-    )
-    registry = SystemResourceRegistry(platform_family="windows", windows=adapter)
-    evidence = registry.classify_registry_key(r"HKCU\Software\Fixture")
-    assert evidence.classification is Classification.INDETERMINATE_PROTECTED_TARGET
-    assert evidence.reason_code == "wrp_registry_status_unavailable"
+    assert protected_registry is None
+    assert ordinary_registry is None
+    assert protected_redirect is None
+    assert ordinary_redirect is None
 
 
 def test_parent_link_escape_resolves_into_protected_tree(tmp_path):
@@ -191,7 +160,9 @@ def test_parent_link_escape_resolves_into_protected_tree(tmp_path):
         volume_root=Path(tmp_path).anchor,
     )
     registry = SystemResourceRegistry(platform_family="windows", windows=adapter)
-    assert registry.classify_path(link / "resource.bin").blocks_destruction
+    through_link = registry.classify_path(link / "resource.bin")
+    assert through_link.classification is Classification.PROTECTED_SYSTEM_RESOURCE
+    assert not through_link.blocks_destruction
     # The link itself is a leaf and deleting it does not traverse its target.
     assert not registry.classify_path(link, follow_leaf=False).blocks_destruction
 

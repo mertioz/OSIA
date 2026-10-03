@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
@@ -17,6 +19,7 @@ from osia.execution_strategy import (
     SemanticActionNode,
     SemanticMission,
     explicit_negative_constraints,
+    is_desktop_visual_read_node,
 )
 from osia.tool_contracts import SideEffectClass
 
@@ -30,6 +33,16 @@ class ConditionOperator(str, Enum):
     NOT_EQUALS = "not_equals"
     CONTAINS = "contains"
     OBSERVABLE = "observable"
+
+
+class EvidenceRequirement(str, Enum):
+    """Evidence modality explicitly required by the user's semantic goal."""
+
+    NONE = "none"
+    STRUCTURED = "structured"
+    VISUAL = "visual"
+    MIXED = "mixed"
+    ANY_RELIABLE = "any_reliable"
 
 
 @dataclass(frozen=True)
@@ -134,6 +147,11 @@ class GoalNodeContract:
     read_only: bool
     mutation: bool
     source_semantic_node_fingerprint: str
+    evidence_requirement: str = EvidenceRequirement.ANY_RELIABLE.value
+    target_hint: dict[str, Any] | None = None
+    conditional_mode: str = ""
+    conditional_branches: tuple[dict[str, Any], ...] = ()
+    requires_observation_before_execution: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,6 +174,15 @@ class GoalNodeContract:
             "mutation": self.mutation,
             "source_semantic_node_fingerprint": (
                 self.source_semantic_node_fingerprint
+            ),
+            "evidence_requirement": self.evidence_requirement,
+            "target_hint": dict(self.target_hint or {}),
+            "conditional_mode": self.conditional_mode,
+            "conditional_branches": [
+                dict(item) for item in self.conditional_branches
+            ],
+            "requires_observation_before_execution": (
+                self.requires_observation_before_execution
             ),
         }
 
@@ -218,11 +245,63 @@ def _clean(value: object, *, fallback: str = NOT_SPECIFIED) -> str:
     return text or fallback
 
 
+def _normalized_semantic_text(value: object) -> str:
+    text = " ".join(str(value or "").casefold().split())
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(character)
+    )
+
+
+def evidence_requirement_for_node(node: SemanticActionNode) -> EvidenceRequirement:
+    """Classify requested evidence without making Vision globally primary."""
+
+    text = _normalized_semantic_text(
+        " ".join((node.source_clause, node.target_object))
+    )
+    appearance = bool(re.search(
+        r"\b(?:background|theme|colour|color|shade|appearance|looks?\s+like|"
+        r"visually|visual|image|photo|fond|theme|couleur|teinte|apparence|"
+        r"a\s+quoi\s+ressemble|what(?:\s+do)?\s+you\s+see|"
+        r"tu\s+vois|vous\s+voyez|que\s+vois)\b",
+        text,
+    ))
+    visual_target_cue = bool(
+        node.requested_action
+        and re.search(
+            r"\b(?:visible|visually|visuel|visuellement|red|green|blue|"
+            r"yellow|orange|purple|pink|black|white|grey|gray|rouge|vert|"
+            r"bleu|jaune|violet|rose|noir|blanc|gris)\b",
+            text,
+        )
+    )
+    visual = bool(
+        is_desktop_visual_read_node(node) or appearance or visual_target_cue
+    )
+    if visual and node.requested_action:
+        return EvidenceRequirement.MIXED
+    if visual:
+        return EvidenceRequirement.VISUAL
+    structured = bool(re.search(
+        r"\b(?:cpu|gpu|npu|memory|ram|usage|utilisation|api|connected|"
+        r"connecte|status|statut|version|pid|process|running|en\s+cours)\b",
+        text,
+    ))
+    if structured:
+        return EvidenceRequirement.STRUCTURED
+    return EvidenceRequirement.ANY_RELIABLE
+
+
 def _node_side_effect(node: SemanticActionNode) -> str:
     """Conservatively project action semantics onto the existing OSIA enum."""
 
     action = _clean(node.requested_action, fallback="").casefold()
-    if action == "search" or not node.requires_execution:
+    if (
+        action == "search"
+        or not node.requires_execution
+        or is_desktop_visual_read_node(node)
+    ):
         return SideEffectClass.READ_ONLY.value
     if action in {"open", "navigate", "activate", "type"}:
         return SideEffectClass.REVERSIBLE_LOCAL.value
@@ -383,6 +462,16 @@ def goal_contract_from_semantic_mission(
             source_semantic_node_fingerprint=_clean(
                 source.fingerprint, fallback=""
             ),
+            evidence_requirement=evidence_requirement_for_node(source).value,
+            target_hint=dict(source.target_hint or {}),
+            conditional_mode=str(source.conditional_mode or ""),
+            conditional_branches=tuple(
+                dict(item) for item in source.conditional_branches
+                if isinstance(item, dict)
+            ),
+            requires_observation_before_execution=(
+                source.requires_observation_before_execution is True
+            ),
         ))
 
     root_objective = _clean(mission.objective, fallback="")
@@ -429,6 +518,7 @@ def goal_contract_errors(contract: GoalContract) -> tuple[str, ...]:
     node_ids: set[str] = set()
     valid_effects = {item.value for item in SideEffectClass}
     valid_operators = {item.value for item in ConditionOperator}
+    valid_evidence_requirements = {item.value for item in EvidenceRequirement}
     for node in contract.nodes:
         if not node.node_id:
             errors.append("missing_node_identity")
@@ -437,12 +527,63 @@ def goal_contract_errors(contract: GoalContract) -> tuple[str, ...]:
         node_ids.add(node.node_id)
         if node.side_effect_class not in valid_effects:
             errors.append("invalid_side_effect_class")
+        if node.evidence_requirement not in valid_evidence_requirements:
+            errors.append("invalid_evidence_requirement")
+        hint = node.target_hint or {}
+        if not isinstance(hint, dict):
+            errors.append("invalid_target_hint")
+        elif hint:
+            try:
+                confidence = float(hint.get("confidence"))
+            except (TypeError, ValueError, OverflowError):
+                confidence = -1.0
+            if not 0.0 <= confidence <= 1.0:
+                errors.append("invalid_target_hint_confidence")
+            if not str(hint.get("source") or ""):
+                errors.append("missing_target_hint_source")
+            hinted = _clean(
+                hint.get("normalized_value"), fallback="",
+            )
+            if (
+                hinted
+                and node.application != NOT_SPECIFIED
+                and _normalized_semantic_text(hinted)
+                != _normalized_semantic_text(node.application)
+            ):
+                errors.append("target_hint_application_mismatch")
         if node.read_only == node.mutation:
             errors.append("invalid_read_only_mutation_state")
         if node.read_only != (
             node.side_effect_class == SideEffectClass.READ_ONLY.value
         ):
             errors.append("side_effect_read_only_mismatch")
+        if node.conditional_mode:
+            if node.conditional_mode != "exactly_one_observed_branch":
+                errors.append("invalid_conditional_mode")
+            branches = [
+                item for item in node.conditional_branches
+                if isinstance(item, dict)
+            ]
+            if len(branches) < 2:
+                errors.append("conditional_branches_missing")
+            branch_ids = {
+                str(item.get("branch_id") or "") for item in branches
+            }
+            if "" in branch_ids or len(branch_ids) != len(branches):
+                errors.append("conditional_branch_identity_invalid")
+            if any(
+                not str(item.get("target") or "")
+                or str(item.get("requested_action") or "") not in {
+                    "activate", "observe",
+                }
+                or not str(item.get("condition") or "")
+                for item in branches
+            ):
+                errors.append("conditional_branch_invalid")
+            if not node.requires_observation_before_execution:
+                errors.append("conditional_observation_requirement_missing")
+        elif node.conditional_branches:
+            errors.append("conditional_mode_missing")
 
         desired = {item.semantic_key() for item in node.desired_state}
         forbidden = {
@@ -519,12 +660,65 @@ def goal_contract_from_dict(value: dict) -> GoalContract:
         )
 
     nodes = []
+    migrated_evidence_requirement = False
+    migrated_target_hint = False
+    migrated_conditional_metadata = False
     for item in value.get("nodes") or []:
         if not isinstance(item, dict):
             continue
         side_effect_class = _clean(
             item.get("side_effect_class"), fallback=""
         )
+        raw_requirement = _clean(
+            item.get("evidence_requirement"), fallback=""
+        )
+        if not raw_requirement:
+            migrated_evidence_requirement = True
+            legacy_probe = SemanticActionNode(
+                target_object=_clean(item.get("target"), fallback=""),
+                required_application=_clean(
+                    item.get("application"), fallback=""
+                ),
+                required_surface=_clean(
+                    item.get("required_surface"), fallback=""
+                ),
+                required_account=_clean(
+                    item.get("required_account_profile"), fallback=""
+                ),
+                requested_action="",
+                observable_success_postcondition="",
+                fingerprint="",
+                requires_execution=True,
+                source_clause=_clean(item.get("objective"), fallback=""),
+            )
+            raw_requirement = evidence_requirement_for_node(legacy_probe).value
+        raw_target_hint = item.get("target_hint")
+        if not isinstance(raw_target_hint, dict):
+            migrated_target_hint = True
+            legacy_application = _clean(
+                item.get("application"), fallback="",
+            )
+            raw_target_hint = (
+                {
+                    "raw_text": legacy_application,
+                    "normalized_value": legacy_application,
+                    "source": "legacy_goal_contract",
+                    "confidence": 0.5,
+                    "ambiguity": True,
+                    "exactness": False,
+                    "span": [0, 0],
+                    "candidates": [legacy_application],
+                }
+                if legacy_application else {}
+            )
+        if any(
+            key not in item
+            for key in (
+                "conditional_mode", "conditional_branches",
+                "requires_observation_before_execution",
+            )
+        ):
+            migrated_conditional_metadata = True
         nodes.append(GoalNodeContract(
             node_id=_clean(item.get("node_id"), fallback=""),
             objective=_clean(item.get("objective"), fallback=""),
@@ -548,6 +742,20 @@ def goal_contract_from_dict(value: dict) -> GoalContract:
             source_semantic_node_fingerprint=_clean(
                 item.get("source_semantic_node_fingerprint"), fallback=""
             ),
+            evidence_requirement=raw_requirement,
+            target_hint=dict(raw_target_hint),
+            conditional_mode=_clean(
+                item.get("conditional_mode"), fallback="",
+            ),
+            conditional_branches=tuple(
+                dict(branch) for branch in (
+                    item.get("conditional_branches") or []
+                )
+                if isinstance(branch, dict)
+            ),
+            requires_observation_before_execution=(
+                item.get("requires_observation_before_execution") is True
+            ),
         ))
     binding_raw = value.get("execution_binding")
     contract = GoalContract(
@@ -563,6 +771,20 @@ def goal_contract_from_dict(value: dict) -> GoalContract:
         ),
         fingerprint=_clean(value.get("fingerprint"), fallback=""),
     )
+    if (
+        migrated_evidence_requirement
+        or migrated_target_hint
+        or migrated_conditional_metadata
+    ):
+        contract = GoalContract(
+            schema_version=contract.schema_version,
+            root_objective=contract.root_objective,
+            legacy_fingerprint=contract.legacy_fingerprint,
+            nodes=contract.nodes,
+            global_constraints=contract.global_constraints,
+            execution_binding=contract.execution_binding,
+            fingerprint=_contract_fingerprint(contract.semantic_dict()),
+        )
     return validate_goal_contract(contract)
 
 
@@ -575,6 +797,7 @@ def validate_goal_contract(contract: GoalContract) -> GoalContract:
 
 __all__ = [
     "ConditionOperator",
+    "EvidenceRequirement",
     "GOAL_CONTRACT_SCHEMA_VERSION",
     "GoalConstraint",
     "GoalContract",
@@ -585,6 +808,7 @@ __all__ = [
     "ObservablePostcondition",
     "StateCondition",
     "goal_contract_errors",
+    "evidence_requirement_for_node",
     "goal_contract_from_dict",
     "goal_contract_from_semantic_mission",
     "validate_goal_contract",

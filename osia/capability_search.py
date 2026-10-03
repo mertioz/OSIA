@@ -95,14 +95,6 @@ class DeterministicRoute:
 
 
 @dataclass(frozen=True)
-class PersonalBrowserAuthority:
-    capability_id: str
-    tab_id: str
-    session_id: str
-    authorized: bool | None
-
-
-@dataclass(frozen=True)
 class ShadowPlanningContext:
     """Immutable, ephemeral planning facts supplied by a caller or fixture."""
 
@@ -122,7 +114,6 @@ class ShadowPlanningContext:
     completed_goal_node_ids: tuple[str, ...] = ()
     typed_observations: tuple[TypedObservation, ...] = ()
     deterministic_routes: tuple[DeterministicRoute, ...] = ()
-    personal_browser_authorities: tuple[PersonalBrowserAuthority, ...] = ()
 
     def active_goal_node(self) -> GoalNodeContract:
         for node in self.goal_contract.nodes:
@@ -194,7 +185,7 @@ class CapabilitySearchLimits:
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _UNKNOWN_VALUES = frozenset({"", UNKNOWN_METADATA, NOT_SPECIFIED})
 _GENERIC_SURFACES = frozenset({
-    "browser", "desktop", "chat", "autonomous", "scheduled", "native",
+    "browser", "desktop", "chat", "scheduled", "native",
 })
 _MUTATING_EFFECTS = frozenset({
     SideEffectClass.REVERSIBLE_LOCAL.value,
@@ -354,35 +345,6 @@ def _vision_state(context: ShadowPlanningContext) -> str:
     return "unknown"
 
 
-def _personal_browser_state(
-    descriptor: AdaptiveCapabilityDescriptor,
-    context: ShadowPlanningContext,
-) -> str:
-    authority = next((
-        item for item in context.personal_browser_authorities
-        if item.capability_id == descriptor.capability_id
-    ), None)
-    if authority is None:
-        authority = next((
-            item for item in context.personal_browser_authorities
-            if item.capability_id == "*"
-        ), None)
-    if authority is None or authority.authorized is None:
-        return "unknown"
-    if authority.authorized is False:
-        return "mismatch"
-    constraints = _constraint_map(descriptor)
-    expected_tab = _constraint_values(constraints, "tab_id", "exact_tab_id")
-    expected_session = _constraint_values(
-        constraints, "session_id", "exact_session_id"
-    )
-    if expected_tab and _normal(authority.tab_id) not in expected_tab:
-        return "mismatch"
-    if expected_session and _normal(authority.session_id) not in expected_session:
-        return "mismatch"
-    return "exact"
-
-
 def _stale_reference(
     descriptor: AdaptiveCapabilityDescriptor,
     context: ShadowPlanningContext,
@@ -391,24 +353,6 @@ def _stale_reference(
         item for item in context.stale_references
         if item.capability_id in {descriptor.capability_id, "*"}
     ), None)
-
-
-def _replay_is_blocked(
-    descriptor: AdaptiveCapabilityDescriptor,
-    context: ShadowPlanningContext,
-) -> bool:
-    equivalence = _normal(descriptor.anti_replay_equivalence_class)
-    for effect in context.previous_attempt_effects:
-        if _normal(effect.outcome) != "outcome_unknown":
-            continue
-        same_capability = effect.capability_id == descriptor.capability_id
-        same_equivalence = (
-            _known(equivalence)
-            and _normal(effect.equivalence_class) == equivalence
-        )
-        if same_capability or same_equivalence:
-            return True
-    return False
 
 
 def _verifier_score(value: str) -> int:
@@ -542,15 +486,6 @@ def _evaluate_candidate(
         else:
             score.append(SoftScoreComponent("modality_match", 8))
 
-    if descriptor.family == CapabilityFamily.PERSONAL_BROWSER.value:
-        personal_state = _personal_browser_state(descriptor, context)
-        if personal_state == "mismatch":
-            hard.append("personal_browser_authority_mismatch")
-        elif personal_state == "unknown":
-            unresolved.append("personal_browser_authority_unknown")
-        else:
-            score.append(SoftScoreComponent("personal_browser_authority", 16))
-
     stale = _stale_reference(descriptor, context)
     if stale is not None and StepRole.ACT.value in roles:
         if stale.safe_reresolution_capability_id:
@@ -558,12 +493,6 @@ def _evaluate_candidate(
             explanations.append("stale_ref_requires_reresolution")
         else:
             hard.append("stale_ref_cannot_actuate")
-
-    if descriptor.side_effect_class in _MUTATING_EFFECTS and _replay_is_blocked(
-        descriptor, context
-    ):
-        hard.append("outcome_unknown_replay_blocked")
-        explanations.append("outcome_unknown_replay_blocked")
 
     node_effect = _normal(node.side_effect_class)
     descriptor_effect = _normal(descriptor.side_effect_class)
@@ -836,7 +765,6 @@ __all__ = [
     "CapabilitySearchResult",
     "DeterministicRoute",
     "PermissionState",
-    "PersonalBrowserAuthority",
     "SearchCandidate",
     "ShadowPlanningContext",
     "SoftScoreComponent",

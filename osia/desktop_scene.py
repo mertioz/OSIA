@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import contextvars
+import ctypes
 import hashlib
 import io
 import json
+import math
 import re
 import sys
 import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from osia.desktop_surface import (
     DESKTOP_SURFACE_REGISTRY,
@@ -25,13 +29,35 @@ from osia.desktop_vision_policy import (
     AccessibilityQuality,
     DesktopEvidence,
     classify_accessibility_quality,
-    decide_visual_observation,
+)
+from osia.evidence_arbitration import (
+    EvidenceCoverage,
+    EvidenceSource,
+    observer_evidence_semantics,
 )
 from osia.image_inputs import image_input_decision
 from osia.visual_observation import (
     CaptureKind,
     ObservationReason,
     VisualObservationStore,
+)
+from osia.vision_runtime import (
+    CaptureFailure,
+    ImageInputTransport,
+    NormalizedBBox,
+    VisionCaptureError,
+    VisionDomain,
+    VisionFailure,
+    VisionRuntime,
+    VisionStage,
+    VisionTargetError,
+    VisionTrace,
+    VisionTransportError,
+    VisualStatus,
+    VisualTarget,
+    WindowsCaptureDriver,
+    crop_capture,
+    visual_frame_pixels_unchanged,
 )
 
 
@@ -68,6 +94,402 @@ _MODEL_ROUTE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 _LAST_SCENE: contextvars.ContextVar["DesktopScene | None"] = contextvars.ContextVar(
     "osia_last_desktop_scene", default=None,
 )
+_VISUAL_FRAMES: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "osia_visual_frames", default=None,
+)
+_ACTUATION_FRAME_LEASE_SECONDS = 30.0
+_ACTUATION_FRAME_MAX_LIFETIME_SECONDS = 60.0
+_ACTUATION_FRAME_LOCK = threading.RLock()
+_ACTUATION_FRAMES: dict[str, dict] = {}
+
+
+def _prune_visual_actuation_frames(*, now: float | None = None) -> None:
+    moment = time.time() if now is None else float(now)
+    stale = [
+        frame_id for frame_id, entry in _ACTUATION_FRAMES.items()
+        if float(entry.get("retain_until") or 0.0) < moment
+    ]
+    for frame_id in stale:
+        _ACTUATION_FRAMES.pop(frame_id, None)
+
+
+def register_visual_actuation_frame(frame) -> dict:
+    """Register ephemeral pixels for a later acknowledged mutation proposal."""
+
+    route = _MODEL_ROUTE.get() or {}
+    retain_until = float(frame.captured_at) + (
+        _ACTUATION_FRAME_MAX_LIFETIME_SECONDS
+    )
+    entry = {
+        "frame": frame,
+        "provider": str(frame.provider or ""),
+        "model": str(frame.model or ""),
+        "owner_id": str(route.get("owner_id") or ""),
+        "turn_id": str(route.get("turn_id") or ""),
+        "surface_ref": str(frame.surface_ref or ""),
+        "window_generation": str(frame.window_generation or ""),
+        "application": str(frame.application_id or ""),
+        "acknowledged_at": 0.0,
+        "lease_expires_at": 0.0,
+        "retain_until": retain_until,
+    }
+    with _ACTUATION_FRAME_LOCK:
+        _prune_visual_actuation_frames()
+        _ACTUATION_FRAMES[str(frame.frame_id)] = entry
+        while len(_ACTUATION_FRAMES) > 16:
+            _ACTUATION_FRAMES.pop(next(iter(_ACTUATION_FRAMES)))
+    return {
+        "frame_id": str(frame.frame_id),
+        "lease_state": "awaiting_provider_acknowledgement",
+        "lease_expires_at": 0.0,
+    }
+
+
+def acknowledge_visual_actuation_frame(
+    frame_id: str,
+    *,
+    provider: str,
+    model: str,
+    owner_id: str = "",
+    turn_id: str = "",
+    now: float | None = None,
+) -> dict:
+    """Create one bounded lease after correlated provider consumption."""
+
+    moment = time.time() if now is None else float(now)
+    route = _MODEL_ROUTE.get() or {}
+    expected_owner = str(owner_id or route.get("owner_id") or "")
+    expected_turn = str(turn_id or route.get("turn_id") or "")
+    with _ACTUATION_FRAME_LOCK:
+        _prune_visual_actuation_frames(now=moment)
+        entry = _ACTUATION_FRAMES.get(str(frame_id or ""))
+        if not isinstance(entry, dict):
+            return {"lease_state": "unavailable", "lease_expires_at": 0.0}
+        if (
+            str(entry.get("provider") or "") != str(provider or "")
+            or str(entry.get("model") or "") != str(model or "")
+            or (
+                expected_owner and str(entry.get("owner_id") or "")
+                != expected_owner
+            )
+            or (
+                expected_turn and str(entry.get("turn_id") or "")
+                != expected_turn
+            )
+        ):
+            return {"lease_state": "identity_mismatch", "lease_expires_at": 0.0}
+        lease_expires_at = min(
+            moment + _ACTUATION_FRAME_LEASE_SECONDS,
+            float(entry.get("retain_until") or 0.0),
+        )
+        if lease_expires_at <= moment:
+            return {"lease_state": "expired", "lease_expires_at": lease_expires_at}
+        entry["acknowledged_at"] = moment
+        entry["lease_expires_at"] = lease_expires_at
+        return {
+            "lease_state": "actuation_leased",
+            "acknowledged_at": moment,
+            "lease_expires_at": lease_expires_at,
+        }
+
+
+def _leased_visual_actuation_frame(
+    frame_id: str,
+    *,
+    provider: str,
+    model: str,
+    now: float | None = None,
+) -> tuple[object | None, str, dict]:
+    moment = time.time() if now is None else float(now)
+    route = _MODEL_ROUTE.get() or {}
+    expected_owner = str(route.get("owner_id") or "")
+    expected_turn = str(route.get("turn_id") or "")
+    with _ACTUATION_FRAME_LOCK:
+        _prune_visual_actuation_frames(now=moment)
+        entry = _ACTUATION_FRAMES.get(str(frame_id or ""))
+        if not isinstance(entry, dict):
+            return None, "VISUAL_FRAME_UNLEASED", {}
+        if (
+            str(entry.get("provider") or "") != str(provider or "")
+            or str(entry.get("model") or "") != str(model or "")
+            or (
+                expected_owner
+                and str(entry.get("owner_id") or "") != expected_owner
+            )
+            or (
+                expected_turn
+                and str(entry.get("turn_id") or "") != expected_turn
+            )
+        ):
+            return None, "VISUAL_FRAME_MODEL_MISMATCH", {}
+        if float(entry.get("acknowledged_at") or 0.0) <= 0.0:
+            return None, "VISUAL_FRAME_UNLEASED", dict(entry)
+        lease_expires_at = float(entry.get("lease_expires_at") or 0.0)
+        if lease_expires_at <= moment:
+            return None, "VISUAL_FRAME_LEASE_EXPIRED", dict(entry)
+        return entry.get("frame"), "", dict(entry)
+
+
+def invalidate_visual_actuation_frames(
+    *,
+    surface_ref: str = "",
+    window_generation: str = "",
+) -> None:
+    """Invalidate pre-transition localization for one exact surface lineage."""
+
+    expected_surface = str(surface_ref or "")
+    expected_generation = str(window_generation or "")
+    with _ACTUATION_FRAME_LOCK:
+        matching = [
+            frame_id for frame_id, entry in _ACTUATION_FRAMES.items()
+            if (not expected_surface or entry.get("surface_ref") == expected_surface)
+            and (
+                not expected_generation
+                or entry.get("window_generation") == expected_generation
+            )
+        ]
+        for frame_id in matching:
+            _ACTUATION_FRAMES.pop(frame_id, None)
+
+
+class SurfaceCoverage(str, Enum):
+    FULL_WINDOW = "full_window"
+    CLIENT_CONTENT = "client_content"
+    REGION = "region"
+    CHROME_ONLY = "chrome_only"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class NativeWindowSurfaceCandidate:
+    """Sanitized native hierarchy/geometry used for generic visual selection."""
+
+    hwnd: int
+    pid: int
+    process_started_at: float
+    class_name: str
+    title: str
+    parent_hwnd: int
+    owner_hwnd: int
+    root_hwnd: int
+    is_window: bool
+    visible: bool
+    cloaked: bool
+    bounds: SurfaceBounds | None
+    client_bounds: SurfaceBounds | None
+    monitor: str = ""
+    dpi: int = 96
+    surface_id: str = ""
+    generation: str = ""
+    uia_control_type: str = ""
+    content_host_signal: bool = False
+    tool_window: bool = False
+    popup_window: bool = False
+    foreground: bool = False
+    stale: bool = False
+
+    @property
+    def pixel_area(self) -> int:
+        bounds = self.client_bounds or self.bounds
+        return int(bounds.width * bounds.height) if bounds is not None else 0
+
+    def safe_dict(self, *, application_bounds: SurfaceBounds | None) -> dict:
+        return {
+            "hwnd": str(self.hwnd),
+            "pid": int(self.pid),
+            "process_start_identity": round(
+                float(self.process_started_at), 6,
+            ),
+            "window_class": _safe_label(self.class_name),
+            "title": _safe_label(self.title),
+            "parent_hwnd": str(self.parent_hwnd or ""),
+            "owner_hwnd": str(self.owner_hwnd or ""),
+            "root_hwnd": str(self.root_hwnd or ""),
+            "is_window": bool(self.is_window),
+            "visible": bool(self.visible),
+            "cloaked": bool(self.cloaked),
+            "window_bounds": (
+                self.bounds.to_safe_dict() if self.bounds is not None else {}
+            ),
+            "client_bounds": (
+                self.client_bounds.to_safe_dict()
+                if self.client_bounds is not None else {}
+            ),
+            "pixel_area": self.pixel_area,
+            "monitor": str(self.monitor or "")[:160],
+            "dpi": int(self.dpi),
+            "surface_id": str(self.surface_id or "")[:180],
+            "generation": str(self.generation or "")[:180],
+            "uia_root_control_type": str(
+                self.uia_control_type or ""
+            )[:120],
+            "contains_render_content_host": bool(self.content_host_signal),
+            "tool_window": bool(self.tool_window),
+            "popup_window": bool(self.popup_window),
+            "foreground": bool(self.foreground),
+            "coverage": _surface_candidate_coverage(
+                self, application_bounds,
+            ).value,
+        }
+
+
+@dataclass(frozen=True)
+class VisualSurfaceSelection:
+    capture: NativeWindowSurfaceCandidate | None
+    content: NativeWindowSurfaceCandidate | None
+    coverage: SurfaceCoverage
+    candidate_count: int
+
+    def safe_dict(
+        self,
+        candidates: Iterable[NativeWindowSurfaceCandidate],
+        *,
+        application_bounds: SurfaceBounds | None,
+        captured_dimensions: dict | None = None,
+    ) -> dict:
+        bounded = tuple(candidates)[:80]
+        captured_dimensions = (
+            captured_dimensions if isinstance(captured_dimensions, dict) else {}
+        )
+        selected_root = (
+            int(self.capture.root_hwnd or self.capture.hwnd)
+            if self.capture is not None else 0
+        )
+        return {
+            "schema_version": 1,
+            "candidate_count": int(self.candidate_count),
+            "same_root_candidate_count": sum(
+                int(item.root_hwnd or item.hwnd) == selected_root
+                for item in bounded
+            ) if selected_root else 0,
+            "selected_capture_hwnd": (
+                str(self.capture.hwnd) if self.capture is not None else ""
+            ),
+            "selected_content_hwnd": (
+                str(self.content.hwnd) if self.content is not None else ""
+            ),
+            "content_coverage": self.coverage.value,
+            "captured_frame_dimensions": {
+                "width": int(captured_dimensions.get("width") or 0),
+                "height": int(captured_dimensions.get("height") or 0),
+            },
+            "candidates": [
+                {
+                    **item.safe_dict(application_bounds=application_bounds),
+                    "capture_attempted": bool(
+                        self.capture is not None
+                        and item.hwnd == self.capture.hwnd
+                    ),
+                }
+                for item in bounded
+            ],
+        }
+
+
+def _surface_candidate_coverage(
+    candidate: NativeWindowSurfaceCandidate,
+    application_bounds: SurfaceBounds | None,
+) -> SurfaceCoverage:
+    bounds = candidate.client_bounds or candidate.bounds
+    if bounds is None or application_bounds is None or not bounds.valid():
+        return SurfaceCoverage.UNKNOWN
+    app_area = max(1, application_bounds.width * application_bounds.height)
+    area_ratio = (bounds.width * bounds.height) / float(app_area)
+    width_ratio = bounds.width / float(max(1, application_bounds.width))
+    height_ratio = bounds.height / float(max(1, application_bounds.height))
+    if height_ratio <= 0.24 and width_ratio >= 0.55:
+        return SurfaceCoverage.CHROME_ONLY
+    if (
+        candidate.hwnd == candidate.root_hwnd
+        and area_ratio >= 0.65
+        and width_ratio >= 0.75
+        and height_ratio >= 0.65
+    ):
+        return SurfaceCoverage.FULL_WINDOW
+    if (
+        area_ratio >= 0.40
+        and width_ratio >= 0.60
+        and height_ratio >= 0.45
+        and candidate.content_host_signal
+    ):
+        return SurfaceCoverage.CLIENT_CONTENT
+    return SurfaceCoverage.REGION
+
+
+def select_application_visual_surface(
+    candidates: Iterable[NativeWindowSurfaceCandidate],
+    semantic_hwnd: int,
+) -> VisualSurfaceSelection:
+    """Choose a composed application root plus its meaningful content host."""
+
+    records = tuple(candidates)
+    semantic = next(
+        (item for item in records if int(item.hwnd) == int(semantic_hwnd)),
+        None,
+    )
+    if semantic is None or not semantic.is_window:
+        return VisualSurfaceSelection(
+            None, None, SurfaceCoverage.UNKNOWN, len(records),
+        )
+    semantic_root = int(semantic.root_hwnd or semantic.hwnd)
+    related = [
+        item for item in records
+        if item.is_window
+        and not item.stale
+        and (
+            int(item.root_hwnd or item.hwnd) == semantic_root
+            or int(item.hwnd) == semantic_root
+        )
+    ]
+    roots = [
+        item for item in related
+        if int(item.hwnd) == semantic_root
+        and item.visible
+        and not item.cloaked
+        and not item.tool_window
+        and not item.popup_window
+    ]
+    capture = roots[0] if len(roots) == 1 else None
+    if capture is None and semantic in related and not (
+        semantic.tool_window or semantic.popup_window or semantic.cloaked
+    ):
+        capture = semantic
+    if capture is None:
+        return VisualSurfaceSelection(
+            None, None, SurfaceCoverage.UNKNOWN, len(records),
+        )
+    application_bounds = capture.bounds or semantic.bounds
+    content_candidates = [
+        item for item in related
+        if item.visible
+        and not item.cloaked
+        and not item.tool_window
+        and not item.popup_window
+        and _surface_candidate_coverage(
+            item, application_bounds,
+        ) in {
+            SurfaceCoverage.FULL_WINDOW,
+            SurfaceCoverage.CLIENT_CONTENT,
+        }
+    ]
+    content_candidates.sort(key=lambda item: (
+        item.content_host_signal,
+        _surface_candidate_coverage(item, application_bounds)
+        is SurfaceCoverage.CLIENT_CONTENT,
+        item.hwnd == capture.hwnd,
+        item.pixel_area,
+    ), reverse=True)
+    content = content_candidates[0] if content_candidates else capture
+    capture_coverage = _surface_candidate_coverage(capture, application_bounds)
+    content_coverage = _surface_candidate_coverage(content, application_bounds)
+    coverage = (
+        SurfaceCoverage.FULL_WINDOW
+        if capture_coverage is SurfaceCoverage.FULL_WINDOW else
+        content_coverage
+    )
+    return VisualSurfaceSelection(
+        capture, content, coverage, len(records),
+    )
 
 
 @dataclass(frozen=True)
@@ -169,6 +591,13 @@ class DesktopScene:
                 include_with_ancestors(item)
         for item in self.surfaces:
             include_with_ancestors(item)
+        coverage = (
+            EvidenceCoverage.COMPLETE
+            if self.accessibility_complete and self.uia_tree_observed else
+            EvidenceCoverage.PARTIAL
+            if self.uia_tree_observed else
+            EvidenceCoverage.UNKNOWN
+        )
         return {
             "application": self.application_id,
             "host_application": self.host_application_id or self.application_id,
@@ -180,6 +609,14 @@ class DesktopScene:
             "structural_epoch": self.structural_epoch,
             "accessibility_complete": self.accessibility_complete,
             "accessibility_quality": quality.value,
+            "evidence_semantics": observer_evidence_semantics(
+                EvidenceSource.UIA,
+                coverage,
+                target_identity=(
+                    f"{self.application_id}:{self.window_ref.window_generation}"
+                ),
+                surface_id=self.window_ref.ref_id,
+            ),
             "target_candidate_count": evidence.candidate_count,
             "target_actionable_candidate_count": (
                 evidence.actionable_candidate_count
@@ -272,12 +709,20 @@ def _surface_actuation_contract(
     }
 
 
-def bind_effective_model(provider: str, model: str):
+def bind_effective_model(
+    provider: str,
+    model: str,
+    *,
+    owner_id: str = "",
+    turn_id: str = "",
+):
     """Bind the exact route whose next provider request may receive an image."""
 
     return _MODEL_ROUTE.set({
         "provider": str(provider or "").lower(),
         "model": str(model or ""),
+        "owner_id": str(owner_id or ""),
+        "turn_id": str(turn_id or ""),
     })
 
 
@@ -285,18 +730,36 @@ def reset_effective_model(token) -> None:
     _MODEL_ROUTE.reset(token)
 
 
-def begin_desktop_turn() -> tuple[object, object]:
+def begin_desktop_turn() -> tuple[object, ...]:
     return (
         _SCENE_STORES.set(VisualObservationStore()),
         _LAST_SCENE.set(None),
+        _VISUAL_FRAMES.set({}),
     )
 
 
-def end_desktop_turn(tokens: tuple[object, object]) -> None:
+def end_desktop_turn(tokens: tuple[object, ...]) -> None:
     store = _SCENE_STORES.get()
     if store is not None:
         store.clear()
-    store_token, scene_token = tokens
+    frames = _VISUAL_FRAMES.get()
+    if frames is not None:
+        frames.clear()
+    owner_id, turn_id = effective_model_media_scope()
+    if owner_id and turn_id:
+        try:
+            from osia.image_inputs import (
+                release_media_owner,
+                turn_scoped_media_owner,
+            )
+
+            release_media_owner(
+                turn_scoped_media_owner(owner_id, turn_id)
+            )
+        except Exception:
+            pass
+    store_token, scene_token, frame_token = tokens
+    _VISUAL_FRAMES.reset(frame_token)
     _LAST_SCENE.reset(scene_token)
     _SCENE_STORES.reset(store_token)
 
@@ -310,6 +773,12 @@ def effective_model_supports_vision() -> bool:
     ).usable
 
 
+def effective_model_route_is_bound() -> bool:
+    """Whether the current execution context identifies an exact model route."""
+
+    return _MODEL_ROUTE.get() is not None
+
+
 def effective_model_image_route() -> tuple[str, str]:
     """Return the exact bound route; never resolve a companion Vision model."""
 
@@ -318,6 +787,14 @@ def effective_model_image_route() -> tuple[str, str]:
     model = str(route.get("model") or "")
     decision = image_input_decision(provider, model, ("image/png",))
     return (provider, model) if decision.usable else ("", "")
+
+
+def effective_model_media_scope() -> tuple[str, str]:
+    route = _MODEL_ROUTE.get() or {}
+    return (
+        str(route.get("owner_id") or ""),
+        str(route.get("turn_id") or ""),
+    )
 
 
 def _safe_label(value: object, *, password: bool = False) -> str:
@@ -515,6 +992,32 @@ def _window_bounds(hwnd: object) -> SurfaceBounds | None:
         return None
 
 
+def _window_client_origin(hwnd: object, fallback: tuple[int, int]) -> tuple[int, int]:
+    """Return the physical-screen origin of the native client area."""
+
+    if sys.platform != "win32":
+        return fallback
+    try:
+        from osia.tools import desktop_control as dc
+
+        loaded = dc._load_win32()
+        if not loaded:
+            return fallback
+        win32gui, _win32process = loaded
+        x, y = win32gui.ClientToScreen(int(hwnd), (0, 0))
+        return int(x), int(y)
+    except Exception:
+        return fallback
+
+
+def _foreground_native_window_id(snapshot: object) -> object:
+    """Extract the HWND from the canonical foreground-window snapshot."""
+
+    if isinstance(snapshot, (tuple, list)):
+        return snapshot[0] if snapshot else 0
+    return snapshot or 0
+
+
 def _window_is_minimized(hwnd: object) -> bool:
     if sys.platform != "win32":
         return False
@@ -525,6 +1028,32 @@ def _window_is_minimized(hwnd: object) -> bool:
         return bool(loaded and loaded[0].IsIconic(int(hwnd)))
     except Exception:
         return False
+
+
+def _window_capture_protection_reason(hwnd: object) -> str:
+    """Return the declared Win32 capture restriction without changing it."""
+
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+
+        affinity = ctypes.c_uint(0)
+        get_affinity = ctypes.windll.user32.GetWindowDisplayAffinity
+        get_affinity.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        get_affinity.restype = ctypes.c_bool
+        queried = get_affinity(
+            int(hwnd), ctypes.byref(affinity),
+        )
+        if not queried or affinity.value == 0:
+            return ""
+        if affinity.value == 0x11:  # WDA_EXCLUDEFROMCAPTURE
+            return "window_excluded_from_capture"
+        if affinity.value == 0x01:  # WDA_MONITOR
+            return "window_monitor_only_capture"
+        return "window_capture_affinity_restricted"
+    except Exception:
+        return ""
 
 
 def _window_packaged_application_id(hwnd: object) -> str:
@@ -573,6 +1102,275 @@ def _owner_window_id(hwnd: object) -> int:
         return int(loaded[0].GetWindow(int(hwnd), 4) or 0) if loaded else 0
     except Exception:
         return 0
+
+
+def _window_client_bounds(hwnd: object) -> SurfaceBounds | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        from osia.tools import desktop_control as dc
+
+        loaded = dc._load_win32()
+        if not loaded:
+            return None
+        win32gui, _win32process = loaded
+        left, top, right, bottom = win32gui.GetClientRect(int(hwnd))
+        screen_left, screen_top = win32gui.ClientToScreen(
+            int(hwnd), (int(left), int(top)),
+        )
+        screen_right, screen_bottom = win32gui.ClientToScreen(
+            int(hwnd), (int(right), int(bottom)),
+        )
+        window = _window_bounds(hwnd)
+        dpi_scale = window.dpi_scale if window is not None else 1.0
+        bounds = SurfaceBounds(
+            int(screen_left), int(screen_top),
+            int(screen_right), int(screen_bottom),
+            dpi_scale=dpi_scale,
+        )
+        return bounds if bounds.valid() else None
+    except Exception:
+        return None
+
+
+def _window_is_cloaked(hwnd: object) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        value = ctypes.c_int(0)
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            int(hwnd), 14, ctypes.byref(value), ctypes.sizeof(value),
+        )
+        return bool(result == 0 and value.value)
+    except Exception:
+        return False
+
+
+def _native_window_surface_candidates(
+    scene: DesktopScene,
+) -> tuple[NativeWindowSurfaceCandidate, ...]:
+    """Enumerate one exact root tree; never widen capture to the desktop."""
+
+    native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    if native is None:
+        return ()
+    if sys.platform != "win32":
+        try:
+            native_hwnd = int(native.native_window_id or 0)
+        except (TypeError, ValueError, OverflowError):
+            native_hwnd = 0
+        return (NativeWindowSurfaceCandidate(
+            hwnd=native_hwnd,
+            pid=int(native.pid),
+            process_started_at=float(native.process_started_at),
+            class_name=str(native.class_name or ""),
+            title=scene.window_ref.accessible_label,
+            parent_hwnd=0,
+            owner_hwnd=0,
+            root_hwnd=native_hwnd,
+            is_window=True,
+            visible=not scene.minimized,
+            cloaked=False,
+            bounds=scene.window_ref.bounds,
+            client_bounds=scene.window_ref.bounds,
+            surface_id=scene.window_ref.ref_id,
+            generation=scene.window_ref.window_generation,
+            uia_control_type=scene.window_ref.role,
+            foreground=scene.foreground,
+        ),)
+    try:
+        from osia.tools import desktop_control as dc
+
+        loaded = dc._load_win32()
+        if not loaded:
+            return ()
+        win32gui, win32process = loaded
+        semantic_hwnd = int(native.native_window_id)
+        try:
+            root_hwnd = int(
+                win32gui.GetAncestor(semantic_hwnd, 2) or semantic_hwnd
+            )
+        except Exception:
+            root_hwnd = semantic_hwnd
+        root_hwnds = [root_hwnd]
+        for candidate in dc._enum_app_windows_win32()[:80]:
+            try:
+                candidate_hwnd, _title, candidate_pid, _class = candidate
+                if int(candidate_pid or 0) == int(native.pid):
+                    root_hwnds.append(int(candidate_hwnd))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        hwnds = []
+        for candidate_root in tuple(dict.fromkeys(root_hwnds)):
+            if len(hwnds) >= 80:
+                break
+            hwnds.append(candidate_root)
+
+            def add_child(hwnd, _extra):
+                if len(hwnds) < 80:
+                    hwnds.append(int(hwnd))
+                return len(hwnds) < 80
+
+            win32gui.EnumChildWindows(candidate_root, add_child, None)
+        foreground_snapshot = dc._foreground_window_win32()
+        foreground_hwnd = int(
+            _foreground_native_window_id(foreground_snapshot) or 0
+        )
+        auto = dc._load_uiautomation()
+    except Exception:
+        return ()
+
+    candidates: list[NativeWindowSurfaceCandidate] = []
+    for hwnd in tuple(dict.fromkeys(hwnds))[:80]:
+        try:
+            is_window = bool(win32gui.IsWindow(hwnd))
+            if not is_window:
+                continue
+            _thread, pid = win32process.GetWindowThreadProcessId(hwnd)
+            title = str(win32gui.GetWindowText(hwnd) or "")
+            class_name = str(win32gui.GetClassName(hwnd) or "")
+            parent_hwnd = int(win32gui.GetParent(hwnd) or 0)
+            owner_hwnd = int(win32gui.GetWindow(hwnd, 4) or 0)
+            try:
+                actual_root = int(win32gui.GetAncestor(hwnd, 2) or hwnd)
+            except Exception:
+                actual_root = root_hwnd
+            if (
+                int(pid or 0) != int(native.pid)
+                and actual_root != root_hwnd
+            ):
+                # Admit a separate renderer process only when Windows proves
+                # the HWND belongs to this exact semantic root tree.
+                continue
+            _candidate_application, candidate_started_at = _process_details(
+                int(pid or 0)
+            )
+            if float(candidate_started_at or 0.0) <= 0.0:
+                continue
+            try:
+                style = int(win32gui.GetWindowLong(hwnd, -16) or 0)
+                exstyle = int(win32gui.GetWindowLong(hwnd, -20) or 0)
+            except Exception:
+                style = exstyle = 0
+            uia_control_type = ""
+            if auto is not None:
+                try:
+                    control = auto.ControlFromHandle(hwnd)
+                    uia_control_type = str(
+                        getattr(control, "ControlTypeName", "") or ""
+                    )
+                except Exception:
+                    uia_control_type = ""
+            dpi = 96
+            monitor = ""
+            try:
+                import ctypes
+
+                dpi = max(1, int(
+                    ctypes.windll.user32.GetDpiForWindow(hwnd) or 96
+                ))
+                monitor = str(
+                    int(ctypes.windll.user32.MonitorFromWindow(hwnd, 2) or 0)
+                )
+            except Exception:
+                pass
+            bounds = _window_bounds(hwnd)
+            client_bounds = _window_client_bounds(hwnd)
+            candidates.append(NativeWindowSurfaceCandidate(
+                hwnd=hwnd,
+                pid=int(pid),
+                process_started_at=float(candidate_started_at),
+                class_name=class_name,
+                title=title,
+                parent_hwnd=parent_hwnd,
+                owner_hwnd=owner_hwnd,
+                root_hwnd=actual_root,
+                is_window=is_window,
+                visible=bool(win32gui.IsWindowVisible(hwnd)),
+                cloaked=_window_is_cloaked(hwnd),
+                bounds=bounds,
+                client_bounds=client_bounds,
+                monitor=monitor,
+                dpi=dpi,
+                surface_id=(
+                    scene.window_ref.ref_id
+                    if hwnd == semantic_hwnd else
+                    "nws_" + hashlib.sha256(
+                        (
+                            f"{pid}:{candidate_started_at:.6f}:"
+                            f"{hwnd}:{class_name}"
+                        ).encode("utf-8", errors="replace")
+                    ).hexdigest()[:24]
+                ),
+                generation=(
+                    scene.window_ref.window_generation
+                    if hwnd == semantic_hwnd else
+                    "win_" + hashlib.sha256(
+                        (
+                            f"{pid}:{candidate_started_at:.6f}:"
+                            f"{hwnd}:{class_name}"
+                        ).encode("utf-8", errors="replace")
+                    ).hexdigest()[:24]
+                ),
+                uia_control_type=uia_control_type,
+                content_host_signal=(
+                    uia_control_type in {
+                        "CustomControl", "DocumentControl", "PaneControl",
+                    }
+                ),
+                tool_window=bool(exstyle & 0x00000080),
+                popup_window=bool(owner_hwnd and style & 0x80000000),
+                foreground=bool(hwnd == foreground_hwnd),
+            ))
+        except Exception:
+            continue
+    if not candidates:
+        return ()
+    content_roots = set()
+    for root in tuple(
+        item for item in candidates if item.hwnd == item.root_hwnd
+    ):
+        if any(
+            item.hwnd != root.hwnd
+            and item.root_hwnd == root.hwnd
+            and item.content_host_signal
+            and _surface_candidate_coverage(item, root.bounds)
+            is SurfaceCoverage.CLIENT_CONTENT
+            for item in candidates
+        ):
+            content_roots.add(root.hwnd)
+    if content_roots:
+        candidates = [
+            replace(item, content_host_signal=True)
+            if item.hwnd in content_roots else item
+            for item in candidates
+        ]
+    return tuple(candidates)
+
+
+def _visual_surface_selection_for_scene(
+    scene: DesktopScene,
+) -> tuple[
+    tuple[NativeWindowSurfaceCandidate, ...],
+    VisualSurfaceSelection,
+]:
+    candidates = _native_window_surface_candidates(scene)
+    native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    try:
+        semantic_hwnd = (
+            int(native.native_window_id or 0) if native is not None else 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        semantic_hwnd = 0
+    return candidates, select_application_visual_surface(
+        candidates, semantic_hwnd,
+    )
 
 
 def _control_bounds(control, window_bounds: SurfaceBounds) -> SurfaceBounds | None:
@@ -1062,7 +1860,7 @@ def _observe_window_scene(
             and _application_identity(application_id) != "applicationframehost"
         ) else ""
     )
-    application_hint = _strategy_required_application() or str(target or "")
+    application_hint = str(target or "").strip() or _strategy_required_application()
     if (
         _application_identity(host_application_id) == "applicationframehost"
         and packaged_application_id
@@ -1106,6 +1904,7 @@ def _observe_window_scene(
         class_name=class_name,
     )
     owner_ref_id = None
+    owner_ref = None
     owner_hwnd = _owner_window_id(hwnd)
     if owner_hwnd:
         owner_title, owner_pid, owner_class, owner_bounds = _window_metadata(owner_hwnd)
@@ -1170,7 +1969,10 @@ def _observe_window_scene(
         stable_identity="window",
         patterns=("Window",),
     )
-    refs: list[DesktopSurfaceRef] = [window_ref]
+    refs: list[DesktopSurfaceRef] = [
+        window_ref,
+        *([owner_ref] if owner_ref is not None else []),
+    ]
     ref_by_index: dict[int, str] = {}
     for index, item in enumerate(controls):
         runtime_id = item["runtime_id"]
@@ -1273,6 +2075,9 @@ class TargetSurfaceSelection:
     identity_evidence: str = ""
     candidate_count: int = 0
     top_level_surfaces: tuple[dict, ...] = ()
+    requested_candidates: tuple[dict, ...] = ()
+    resolved_candidates: tuple[dict, ...] = ()
+    target_conflict: bool = False
 
 
 @dataclass(frozen=True)
@@ -1424,14 +2229,100 @@ def _strategy_required_application() -> str:
     return str(node.required_application or "").strip()
 
 
+def _strategy_target_hint() -> dict:
+    """Return the current bounded hint without upgrading it to exact truth."""
+
+    try:
+        from osia.execution_strategy import current_execution_strategy
+
+        strategy = current_execution_strategy()
+    except Exception:
+        strategy = None
+    if strategy is None:
+        return {}
+    node = (
+        strategy.node_by_id(strategy._frozen_node_id)
+        if strategy.frozen_reason else None
+    ) or strategy.goal
+    hint = node.target_hint if isinstance(node.target_hint, dict) else {}
+    if hint:
+        return dict(hint)
+    application = str(node.required_application or "").strip()
+    return (
+        {
+            "raw_text": application,
+            "normalized_value": application,
+            "source": "legacy_semantic_mission",
+            "confidence": 0.5,
+            "ambiguity": True,
+            "exactness": False,
+            "span": [0, 0],
+            "candidates": [application],
+        }
+        if application else {}
+    )
+
+
 def _requested_application(target: str) -> str:
-    required = _strategy_required_application()
-    if required:
-        return required
     value = " ".join(str(target or "").split())
-    if not value or re.fullmatch(r"[\d\s\u00a0\u202f.,'*/+\-=×÷−]+", value):
+    if not value:
+        return _strategy_required_application()
+    if re.fullmatch(r"[\d\s\u00a0\u202f.,'*/+\-=×÷−]+", value):
         return ""
-    return value[:160]
+    normalized = " ".join(_application_words(value))
+    generic_words = {
+        "app", "application", "current", "desktop", "exact", "exacte",
+        "exactement", "foreground", "fenetre", "native", "premier",
+        "plan", "requested", "visually", "visuellement", "window",
+    }
+    tokens = [
+        token for token in re.findall(r"[\w.-]+", normalized)
+        if token not in generic_words
+    ]
+    if 1 <= len(tokens) <= 4:
+        return " ".join(tokens)[:160]
+    if value:
+        return value[:160]
+    return _strategy_required_application()
+
+
+def _target_candidates(target: str) -> tuple[dict, ...]:
+    """Return explicit and strategy candidates in descending authority."""
+
+    raw_target = " ".join(str(target or "").split())
+    has_explicit_target = bool(
+        raw_target
+        and not re.fullmatch(
+            r"[\d\s\u00a0\u202f.,'*/+\-=×÷−]+", raw_target,
+        )
+    )
+    explicit = _requested_application(target) if has_explicit_target else ""
+    hint = _strategy_target_hint()
+    candidates = []
+    if has_explicit_target and explicit:
+        candidates.append({
+            "value": explicit,
+            "source": "model_tool_argument",
+            "confidence": 1.0,
+            "exactness": True,
+            "ambiguity": False,
+        })
+    hinted = str(hint.get("normalized_value") or "").strip()
+    if hinted and _application_identity(hinted) != _application_identity(explicit):
+        try:
+            confidence = min(
+                1.0, max(0.0, float(hint.get("confidence") or 0.0)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            confidence = 0.0
+        candidates.append({
+            "value": hinted,
+            "source": str(hint.get("source") or "strategy_target_hint")[:80],
+            "confidence": confidence,
+            "exactness": hint.get("exactness") is True,
+            "ambiguity": hint.get("ambiguity") is not False,
+        })
+    return tuple(candidates)
 
 
 def _window_title_matches_application(title: str, expected: str) -> bool:
@@ -1448,6 +2339,33 @@ def _window_title_matches_application(title: str, expected: str) -> bool:
     return any(
         title_words[index:index + width] == expected_words
         for index in range(len(title_words) - width + 1)
+    )
+
+
+def _scene_matches_application(
+    scene: DesktopScene,
+    expected: str,
+) -> bool:
+    """Match one semantic app against proven process/title/packaged identity."""
+
+    if not str(expected or "").strip():
+        return True
+    rank, _evidence = _scene_application_identity(scene, expected)
+    return rank > 0
+
+
+def _surface_matches_application(
+    surface: DesktopSurfaceRef,
+    expected: str,
+) -> bool:
+    if not str(expected or "").strip():
+        return True
+    return bool(
+        _application_identity(surface.application_id)
+        == _application_identity(expected)
+        or _window_title_matches_application(
+            surface.accessible_label, expected,
+        )
     )
 
 
@@ -1512,6 +2430,22 @@ def _resolve_target_scene(
             )
     best_rank = max(item[0] for item in ranked)
     best = [item for item in ranked if item[0] == best_rank]
+    if len(best) > 1:
+        primary_application_windows = [
+            item for item in best
+            if item[2].window_ref.surface_kind is SurfaceKind.WINDOW
+            and not item[2].window_ref.parent_ref
+        ]
+        if (
+            len(primary_application_windows) == 1
+            and all(
+                item in primary_application_windows
+                or item[2].window_ref.surface_kind is SurfaceKind.DIALOG
+                or bool(item[2].window_ref.parent_ref)
+                for item in best
+            )
+        ):
+            best = primary_application_windows
     if len(best) != 1:
         return TargetSurfaceSelection(
             requested_application=requested_application,
@@ -1537,13 +2471,18 @@ def _resolve_target_scene(
 
 def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
     foreground_scene = observe_foreground_scene(target=target)
-    requested_application = _requested_application(target)
+    requested_candidates = _target_candidates(target)
+    requested_application = str(
+        (requested_candidates[0] if requested_candidates else {}).get("value")
+        or ""
+    )
     if foreground_scene is None:
         return TargetSurfaceSelection(
             requested_application=requested_application,
             status="desktop_surface_unavailable",
             foreground_scene=None,
             target_scene=None,
+            requested_candidates=requested_candidates,
         )
     foreground_summary = _safe_top_level_surface(
         application=foreground_scene.application_id,
@@ -1568,10 +2507,25 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
             identity_evidence="current_foreground_without_application_target",
             candidate_count=1,
             top_level_surfaces=(foreground_summary,),
+            requested_candidates=requested_candidates,
         )
-    foreground_rank, foreground_evidence = _scene_application_identity(
-        foreground_scene, requested_application,
+    foreground_matches = [
+        (*_scene_application_identity(foreground_scene, item["value"]), item)
+        for item in requested_candidates
+    ]
+    foreground_matches = [item for item in foreground_matches if item[0] > 0]
+    foreground_matches.sort(
+        key=lambda item: (
+            item[2].get("source") == "model_tool_argument",
+            item[2].get("exactness") is True,
+            float(item[2].get("confidence") or 0.0),
+            item[0],
+        ),
+        reverse=True,
     )
+    foreground_rank, foreground_evidence = (
+        foreground_matches[0][0], foreground_matches[0][1]
+    ) if foreground_matches else (0, "")
     foreground_is_packaged_frame = bool(
         _application_identity(
             foreground_scene.host_application_id
@@ -1579,8 +2533,34 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
         ) == "applicationframehost"
         or foreground_scene.packaged_application_id
     )
-    if foreground_rank > 0 and (
+    foreground_authority = (
+        foreground_matches[0][2] if foreground_matches else {}
+    )
+    matched_candidate_values = {
+        _application_identity(item[2].get("value"))
+        for item in foreground_matches
+    }
+    unresolved_strong_candidates = [
+        item for item in requested_candidates
+        if _application_identity(item.get("value"))
+        not in matched_candidate_values
+        and (
+            item.get("exactness") is True
+            or float(item.get("confidence") or 0.0) >= 0.9
+        )
+    ]
+    if (
+        foreground_rank > 0
+        and (
+            len(requested_candidates) == 1
+            or (
+                foreground_authority.get("source") == "model_tool_argument"
+                and not unresolved_strong_candidates
+            )
+        )
+        and (
         sys.platform != "win32" or not foreground_is_packaged_frame
+        )
     ):
         return TargetSurfaceSelection(
             requested_application=requested_application,
@@ -1591,12 +2571,22 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
             identity_evidence=foreground_evidence,
             candidate_count=1,
             top_level_surfaces=(foreground_summary,),
+            requested_candidates=requested_candidates,
+            resolved_candidates=tuple(
+                dict(item[2]) for item in foreground_matches
+            ),
         )
     if sys.platform != "win32":
-        return _resolve_target_scene(
+        selection = _resolve_target_scene(
             (), requested_application,
             foreground_scene=foreground_scene,
             top_level_surfaces=(foreground_summary,),
+        )
+        return TargetSurfaceSelection(
+            **{
+                **selection.__dict__,
+                "requested_candidates": requested_candidates,
+            },
         )
 
     from osia.tools import desktop_control as dc
@@ -1620,10 +2610,11 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
             foreground=False,
         ))
         host_identity = _application_identity(host_application)
-        if not (
-            host_identity == _application_identity(requested_application)
+        if not any(
+            host_identity == _application_identity(item["value"])
             or host_identity == "applicationframehost"
-            or _window_title_matches_application(title, requested_application)
+            or _window_title_matches_application(title, item["value"])
+            for item in requested_candidates
         ):
             continue
         observed = _observe_window_scene(
@@ -1634,12 +2625,113 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
         )
         if observed is not None:
             candidates.append(observed)
-    selection = _resolve_target_scene(
-        candidates,
-        requested_application,
-        foreground_scene=foreground_scene,
-        top_level_surfaces=summaries[:80],
-    )
+    resolved = []
+    unresolved = []
+    for candidate in requested_candidates:
+        candidate_selection = _resolve_target_scene(
+            candidates,
+            str(candidate["value"]),
+            foreground_scene=foreground_scene,
+            top_level_surfaces=summaries[:80],
+        )
+        if candidate_selection.target_scene is not None:
+            resolved.append((candidate_selection, candidate))
+        else:
+            unresolved.append((candidate_selection, candidate))
+    target_scenes = {
+        item[0].target_scene.window_ref.ref_id
+        for item in resolved if item[0].target_scene is not None
+    }
+    if len(target_scenes) > 1:
+        explicit = [
+            item for item in resolved
+            if item[1].get("source") == "model_tool_argument"
+        ]
+        conflicting_strong = [
+            item for item in resolved
+            if item not in explicit
+            and (
+                item[1].get("exactness") is True
+                or float(item[1].get("confidence") or 0.0) >= 0.9
+            )
+        ]
+        if len(explicit) == 1 and not conflicting_strong:
+            selected, selected_authority = explicit[0]
+            selected_ref = selected.target_scene.window_ref.ref_id
+            aliases = tuple(
+                dict(candidate)
+                for candidate_selection, candidate in resolved
+                if candidate_selection.target_scene is not None
+                and candidate_selection.target_scene.window_ref.ref_id
+                == selected_ref
+            )
+            selection = TargetSurfaceSelection(
+                **{
+                    **selected.__dict__,
+                    "requested_application": str(
+                        selected_authority["value"]
+                    ),
+                    "requested_candidates": requested_candidates,
+                    "resolved_candidates": aliases,
+                    "target_conflict": False,
+                },
+            )
+        else:
+            selection = TargetSurfaceSelection(
+                requested_application=requested_application,
+                status="target_ambiguous",
+                foreground_scene=foreground_scene,
+                target_scene=None,
+                candidate_count=len(target_scenes),
+                top_level_surfaces=tuple(summaries[:80]),
+                requested_candidates=requested_candidates,
+                resolved_candidates=(),
+                target_conflict=True,
+            )
+    elif resolved:
+        resolved.sort(
+            key=lambda item: (
+                item[1].get("source") == "model_tool_argument",
+                item[1].get("exactness") is True,
+                float(item[1].get("confidence") or 0.0),
+                item[0].identity_strength,
+            ),
+            reverse=True,
+        )
+        selected, selected_authority = resolved[0]
+        selection = TargetSurfaceSelection(
+            **{
+                **selected.__dict__,
+                "requested_application": str(selected_authority["value"]),
+                "requested_candidates": requested_candidates,
+                "resolved_candidates": tuple(
+                    dict(candidate)
+                    for candidate_selection, candidate in resolved
+                    if candidate_selection.target_scene is not None
+                    and selected.target_scene is not None
+                    and candidate_selection.target_scene.window_ref.ref_id
+                    == selected.target_scene.window_ref.ref_id
+                ),
+                "target_conflict": False,
+            },
+        )
+    else:
+        conflict = len(requested_candidates) > 1
+        ambiguous_count = max(
+            (item[0].candidate_count for item in unresolved),
+            default=0,
+        )
+        selection = TargetSurfaceSelection(
+            requested_application=requested_application,
+            status="target_ambiguous" if conflict else "target_missing",
+            foreground_scene=foreground_scene,
+            target_scene=None,
+            candidate_count=ambiguous_count,
+            top_level_surfaces=tuple(summaries[:80]),
+            requested_candidates=requested_candidates,
+            resolved_candidates=(),
+            target_conflict=conflict,
+        )
     if selection.target_scene is not None:
         _LAST_SCENE.set(selection.target_scene)
     return selection
@@ -1771,12 +2863,19 @@ def _exact_observed_postcondition(
     if not target_text:
         return "", ""
     try:
-        from osia.execution_strategy import current_execution_strategy
+        from osia.execution_strategy import (
+            current_execution_strategy,
+            is_desktop_visual_read_mission,
+        )
 
         strategy = current_execution_strategy()
     except Exception:
         strategy = None
     if strategy is None:
+        return "", ""
+    if is_desktop_visual_read_mission(strategy):
+        # An exact UIA label can prove that the application exists, but never
+        # the appearance/content postcondition of an explicitly visual read.
         return "", ""
     frozen_attempt = (
         strategy.attempt_by_id(strategy._frozen_attempt_id)
@@ -1811,6 +2910,40 @@ def _exact_observed_postcondition(
         requested = _application_identity(target_text)
         if expected and (requested == expected or expected in requested):
             return postcondition, "application_open"
+    if goal.requested_action in {"activate", "click", "select"}:
+        normalized_target = " ".join(target_text.casefold().split())
+        required_surface = " ".join(
+            str(goal.required_surface or "").casefold().split()
+        )
+        target_object = " ".join(
+            str(goal.target_object or "").casefold().split()
+        )
+        required_application = " ".join(
+            str(goal.required_application or "").casefold().split()
+        )
+        if (
+            not normalized_target
+            or normalized_target == required_application
+            or (
+                required_surface
+                and normalized_target != required_surface
+                and required_surface not in normalized_target
+            )
+            or (
+                not required_surface
+                and normalized_target not in target_object
+            )
+        ):
+            return "", ""
+        for surface in scene.surfaces:
+            if (
+                surface.enabled
+                and surface.accessible_label.strip().casefold()
+                == normalized_target
+                and (surface.selected or surface.focused)
+            ):
+                return postcondition, "exact_postcondition"
+        return "", ""
     target_integer = re.sub(r"[\s\u00a0\u202f']", "", target_text)
     target_numbers = (
         {target_integer} if re.fullmatch(r"\d+", target_integer) else set()
@@ -2443,6 +3576,13 @@ def inspect_desktop_surfaces(target: str = "") -> dict:
                 "accessibility_quality", "",
             ),
             "top_level_surfaces": list(selection.top_level_surfaces),
+            "requested_target_candidates": list(
+                selection.requested_candidates
+            ),
+            "resolved_target_candidates": list(
+                selection.resolved_candidates
+            ),
+            "target_conflict": selection.target_conflict,
             "surfaces": [],
         }
         reason_code = (
@@ -2472,6 +3612,7 @@ def inspect_desktop_surfaces(target: str = "") -> dict:
                 "target_resolution": selection.status,
                 "target_candidate_count": selection.candidate_count,
                 "target_foreground": False,
+                "target_conflict": selection.target_conflict,
                 "foreground_application": scene_payload[
                     "foreground_application"
                 ],
@@ -2497,21 +3638,22 @@ def inspect_desktop_surfaces(target: str = "") -> dict:
             if foreground_scene is not None else ""
         ),
         "top_level_surfaces": list(selection.top_level_surfaces),
+        "requested_target_candidates": list(selection.requested_candidates),
+        "resolved_target_candidates": list(selection.resolved_candidates),
+        "target_conflict": selection.target_conflict,
     })
     model_projection = {
-        "instruction": (
-            "Use the exact requested target scene, not an unrelated foreground. "
-            "An enabled control whose actuation.background_safe is true may be "
-            "invoked directly while its exact application remains in the "
-            "background. Activate window_surface_ref only before a chosen "
-            "capability whose preconditions require target_foreground; keyboard "
-            "also requires fresh focus proof. Re-observe stale refs. Prefer native "
-            "accessibility; visual evidence is observation."
+        "contract": (
+            "READ_ONLY semantic desktop state bound to the reported application, "
+            "window generation, and opaque surface references. It is structured "
+            "accessibility evidence, not pixel evidence or action authority. "
+            "A missing item is UNKNOWN unless claim-level evidence explicitly "
+            "reports ABSENT_VERIFIED with complete relevant coverage."
         ),
         "scene": payload,
     }
-    exact_postcondition, semantic_postcondition = (
-        _exact_observed_postcondition(scene, target)
+    exact_postcondition, semantic_postcondition = _exact_observed_postcondition(
+        scene, target,
     )
     receipt = {
         "outcome": "observed",
@@ -2523,6 +3665,8 @@ def inspect_desktop_surfaces(target: str = "") -> dict:
         "target_resolution": selection.status,
         "target_identity_evidence": selection.identity_evidence,
         "target_foreground": bool(scene.foreground),
+        "target_conflict": selection.target_conflict,
+        "resolved_target_candidates": list(selection.resolved_candidates),
         "foreground_application": payload["foreground_application"],
     }
     if exact_postcondition:
@@ -2583,7 +3727,7 @@ def _capture_bounds(bounds: SurfaceBounds) -> bytes:
 def _capture_bounds_timed(bounds: SurfaceBounds) -> tuple[bytes, float, float]:
     if not bounds.valid():
         raise RuntimeError("invalid_surface_bounds")
-    from PIL import ImageGrab
+    from PIL import Image, ImageGrab
 
     _ensure_thread_physical_pixels()
     capture_started = time.perf_counter()
@@ -2599,57 +3743,1935 @@ def _capture_bounds_timed(bounds: SurfaceBounds) -> tuple[bytes, float, float]:
     return output.getvalue(), capture_latency_ms, preparation_latency_ms
 
 
+class _DisplayConfigLuid(ctypes.Structure):
+    _fields_ = [
+        ("LowPart", wintypes.DWORD),
+        ("HighPart", wintypes.LONG),
+    ]
+
+
+class _DisplayConfigRational(ctypes.Structure):
+    _fields_ = [
+        ("Numerator", ctypes.c_uint32),
+        ("Denominator", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfigPathSourceInfo(ctypes.Structure):
+    _fields_ = [
+        ("adapterId", _DisplayConfigLuid),
+        ("id", ctypes.c_uint32),
+        ("modeInfoIdx", ctypes.c_uint32),
+        ("statusFlags", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfigPathTargetInfo(ctypes.Structure):
+    _fields_ = [
+        ("adapterId", _DisplayConfigLuid),
+        ("id", ctypes.c_uint32),
+        ("modeInfoIdx", ctypes.c_uint32),
+        ("outputTechnology", ctypes.c_uint32),
+        ("rotation", ctypes.c_uint32),
+        ("scaling", ctypes.c_uint32),
+        ("refreshRate", _DisplayConfigRational),
+        ("scanLineOrdering", ctypes.c_uint32),
+        ("targetAvailable", wintypes.BOOL),
+        ("statusFlags", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfigPathInfo(ctypes.Structure):
+    _fields_ = [
+        ("sourceInfo", _DisplayConfigPathSourceInfo),
+        ("targetInfo", _DisplayConfigPathTargetInfo),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfig2DRegion(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_uint32), ("cy", ctypes.c_uint32)]
+
+
+class _DisplayConfigVideoSignalInfo(ctypes.Structure):
+    _fields_ = [
+        ("pixelRate", ctypes.c_uint64),
+        ("hSyncFreq", _DisplayConfigRational),
+        ("vSyncFreq", _DisplayConfigRational),
+        ("activeSize", _DisplayConfig2DRegion),
+        ("totalSize", _DisplayConfig2DRegion),
+        ("videoStandard", ctypes.c_uint32),
+        ("scanLineOrdering", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfigTargetMode(ctypes.Structure):
+    _fields_ = [("targetVideoSignalInfo", _DisplayConfigVideoSignalInfo)]
+
+
+class _DisplayConfigPointL(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _DisplayConfigSourceMode(ctypes.Structure):
+    _fields_ = [
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("pixelFormat", ctypes.c_uint32),
+        ("position", _DisplayConfigPointL),
+    ]
+
+
+class _DisplayConfigDesktopImageInfo(ctypes.Structure):
+    _fields_ = [
+        ("pathSourceSize", _DisplayConfig2DRegion),
+        ("desktopImageRegion", wintypes.RECT),
+        ("desktopImageClip", wintypes.RECT),
+    ]
+
+
+class _DisplayConfigModeUnion(ctypes.Union):
+    _fields_ = [
+        ("targetMode", _DisplayConfigTargetMode),
+        ("sourceMode", _DisplayConfigSourceMode),
+        ("desktopImageInfo", _DisplayConfigDesktopImageInfo),
+    ]
+
+
+class _DisplayConfigModeInfo(ctypes.Structure):
+    _anonymous_ = ("mode",)
+    _fields_ = [
+        ("infoType", ctypes.c_uint32),
+        ("id", ctypes.c_uint32),
+        ("adapterId", _DisplayConfigLuid),
+        ("mode", _DisplayConfigModeUnion),
+    ]
+
+
+class _DisplayConfigDeviceInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_uint32),
+        ("size", ctypes.c_uint32),
+        ("adapterId", _DisplayConfigLuid),
+        ("id", ctypes.c_uint32),
+    ]
+
+
+class _DisplayConfigSourceDeviceName(ctypes.Structure):
+    _fields_ = [
+        ("header", _DisplayConfigDeviceInfoHeader),
+        ("viewGdiDeviceName", ctypes.c_wchar * 32),
+    ]
+
+
+class _DisplayConfigAdvancedColorInfo(ctypes.Structure):
+    _fields_ = [
+        ("header", _DisplayConfigDeviceInfoHeader),
+        ("value", ctypes.c_uint32),
+        ("colorEncoding", ctypes.c_uint32),
+        ("bitsPerColorChannel", ctypes.c_uint32),
+    ]
+
+
+class _MonitorInfoExW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", ctypes.c_wchar * 32),
+    ]
+
+
+def _displayconfig_advanced_color_enabled(
+    device_name: str,
+    user32,
+) -> bool | None:
+    """Read Advanced Color state for one active GDI display source."""
+
+    get_sizes = user32.GetDisplayConfigBufferSizes
+    query = user32.QueryDisplayConfig
+    get_info = user32.DisplayConfigGetDeviceInfo
+    get_sizes.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    get_sizes.restype = wintypes.LONG
+    query.argtypes = [
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(_DisplayConfigPathInfo),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(_DisplayConfigModeInfo),
+        ctypes.c_void_p,
+    ]
+    query.restype = wintypes.LONG
+    get_info.argtypes = [ctypes.POINTER(_DisplayConfigDeviceInfoHeader)]
+    get_info.restype = wintypes.LONG
+
+    wanted = str(device_name or "").strip().casefold()
+    if not wanted:
+        return None
+    active_paths = 0x00000002  # QDC_ONLY_ACTIVE_PATHS
+    insufficient_buffer = 122
+    for _attempt in range(3):
+        path_count = ctypes.c_uint32(0)
+        mode_count = ctypes.c_uint32(0)
+        if get_sizes(
+            active_paths, ctypes.byref(path_count), ctypes.byref(mode_count),
+        ) != 0:
+            return None
+        if path_count.value <= 0 or mode_count.value <= 0:
+            return None
+        paths = (_DisplayConfigPathInfo * path_count.value)()
+        modes = (_DisplayConfigModeInfo * mode_count.value)()
+        result = query(
+            active_paths,
+            ctypes.byref(path_count),
+            paths,
+            ctypes.byref(mode_count),
+            modes,
+            None,
+        )
+        if result == insufficient_buffer:
+            continue
+        if result != 0:
+            return None
+
+        matched = 0
+        queried = 0
+        for path in paths[:path_count.value]:
+            source_name = _DisplayConfigSourceDeviceName()
+            source_name.header.type = 1  # GET_SOURCE_NAME
+            source_name.header.size = ctypes.sizeof(source_name)
+            source_name.header.adapterId = path.sourceInfo.adapterId
+            source_name.header.id = path.sourceInfo.id
+            if get_info(ctypes.byref(source_name.header)) != 0:
+                continue
+            if str(source_name.viewGdiDeviceName).strip().casefold() != wanted:
+                continue
+            matched += 1
+            color = _DisplayConfigAdvancedColorInfo()
+            color.header.type = 9  # GET_ADVANCED_COLOR_INFO
+            color.header.size = ctypes.sizeof(color)
+            color.header.adapterId = path.targetInfo.adapterId
+            color.header.id = path.targetInfo.id
+            if get_info(ctypes.byref(color.header)) != 0:
+                continue
+            queried += 1
+            if color.value & 0x2:  # advancedColorEnabled
+                return True
+        if matched and queried == matched:
+            return False
+        return None
+    return None
+
+
+def _window_advanced_color_enabled(native_window_id: int) -> bool | None:
+    """Return the target monitor's active Advanced Color/HDR state."""
+
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        monitor_from_window = user32.MonitorFromWindow
+        get_monitor_info = user32.GetMonitorInfoW
+        monitor_from_window.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        monitor_from_window.restype = ctypes.c_void_p
+        get_monitor_info.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(_MonitorInfoExW),
+        ]
+        get_monitor_info.restype = wintypes.BOOL
+        monitor = monitor_from_window(
+            int(native_window_id), 2,  # MONITOR_DEFAULTTONEAREST
+        )
+        if not monitor:
+            return None
+        monitor_info = _MonitorInfoExW()
+        monitor_info.cbSize = ctypes.sizeof(monitor_info)
+        if not get_monitor_info(monitor, ctypes.byref(monitor_info)):
+            return None
+        return _displayconfig_advanced_color_enabled(
+            monitor_info.szDevice, user32,
+        )
+    except Exception:
+        return None
+
+
+def _capture_window_graphics_image(native_window_id: int):
+    """Capture one stabilized HWND frame through Windows Graphics Capture."""
+
+    advanced_color = _window_advanced_color_enabled(native_window_id)
+    if advanced_color is True:
+        raise RuntimeError(
+            "windows_graphics_capture_advanced_color_unsupported"
+        )
+    if advanced_color is None:
+        raise RuntimeError(
+            "windows_graphics_capture_advanced_color_state_unavailable"
+        )
+    from PIL import Image
+    from windows_capture import WindowsCapture
+
+    ready = threading.Event()
+    captured: dict[str, object] = {"frames": [], "invalid_frames": 0}
+    capture = WindowsCapture(
+        cursor_capture=False,
+        window_hwnd=int(native_window_id),
+    )
+
+    @capture.event
+    def on_frame_arrived(frame, capture_control):
+        try:
+            pixels = frame.frame_buffer.copy()
+            shape = getattr(pixels, "shape", ())
+            if (
+                len(shape) != 3
+                or int(shape[2]) < 4
+                or int(shape[0]) <= 0
+                or int(shape[1]) <= 0
+            ):
+                captured["invalid_frames"] = int(
+                    captured.get("invalid_frames") or 0
+                ) + 1
+                return
+            if str(getattr(pixels, "dtype", "")) != "uint8":
+                captured["unsupported_pixel_format"] = str(
+                    getattr(pixels, "dtype", "unknown")
+                )[:40]
+                captured["invalid_frames"] = int(
+                    captured.get("invalid_frames") or 0
+                ) + 1
+                return
+            quality = _pixel_frame_quality(pixels[:, :, :3])
+            if quality[0] <= 0.0:
+                captured["invalid_frames"] = int(
+                    captured.get("invalid_frames") or 0
+                ) + 1
+                return
+            now = time.monotonic()
+            captured_at = time.time()
+            frames = captured["frames"]
+            frames.append((pixels, quality, now, captured_at))
+            if len(frames) > 12:
+                del frames[:-12]
+            if not captured.get("first_visible_at"):
+                captured["first_visible_at"] = now
+            same_geometry = sum(
+                item[0].shape == pixels.shape for item in frames
+            )
+            if (
+                same_geometry >= 2
+                and now - float(captured["first_visible_at"]) >= 0.18
+            ):
+                captured["stabilized"] = True
+                capture_control.stop()
+                ready.set()
+        except Exception as exc:
+            captured["error"] = exc
+
+    @capture.event
+    def on_closed():
+        if not captured.get("stabilized"):
+            captured["target_closed"] = True
+        ready.set()
+
+    control = capture.start_free_threaded()
+    frame_arrived = ready.wait(1.5)
+    control.stop()
+    shutdown_deadline = time.monotonic() + 0.5
+    while not control.is_finished() and time.monotonic() < shutdown_deadline:
+        time.sleep(0.005)
+    if not control.is_finished():
+        raise RuntimeError("windows_graphics_capture_shutdown_timeout")
+    # ``is_finished`` is only a state observation. Join the native capture
+    # thread before this session's Python/native owners can be released or a
+    # later exact-window snapshot creates another WGC session.
+    control.wait()
+    frames = list(captured.get("frames") or [])
+    if captured.get("unsupported_pixel_format"):
+        raise RuntimeError(
+            "windows_graphics_capture_hdr_format_unsupported"
+        )
+    if captured.get("target_closed"):
+        raise RuntimeError("windows_graphics_capture_target_closed")
+    if not frame_arrived and not frames:
+        raise RuntimeError("windows_graphics_capture_frame_unavailable")
+    stable_shape = tuple(int(value) for value in frames[-1][0].shape)
+    stable_frames = [
+        item for item in frames
+        if tuple(int(value) for value in item[0].shape) == stable_shape
+    ]
+    if not stable_frames or (len(frames) > 1 and len(stable_frames) < 2):
+        raise RuntimeError("windows_graphics_capture_geometry_unstable")
+    pixels, quality, captured_stamp, captured_at = stable_frames[-1]
+    shape = getattr(pixels, "shape", ())
+    if len(shape) != 3 or int(shape[2]) < 4:
+        raise RuntimeError("windows_graphics_capture_frame_invalid")
+    height, width = int(shape[0]), int(shape[1])
+    if width <= 0 or height <= 0:
+        raise RuntimeError("windows_graphics_capture_frame_empty")
+    image = Image.frombytes(
+        "RGB",
+        (width, height),
+        pixels[:, :, :4].tobytes(),
+        "raw",
+        "BGRX",
+        0,
+        1,
+    )
+    return image, {
+        "source_pixel_format": "BGRA8_UNORM",
+        "pixel_format_conversion": "BGRX_TO_RGB8",
+        "alpha_handling": "COMPOSITOR_ALPHA_IGNORED",
+        "source_color_space": "WINDOWS_COMPOSITOR_SDR_UNSPECIFIED",
+        "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+        "stabilized_frame_count": len(stable_frames),
+        "invalid_frame_count": int(captured.get("invalid_frames") or 0),
+        "visible_pixel_ratio": round(float(quality[0]), 6),
+        "luma_spread": round(float(quality[1]), 3),
+        "edge_energy": round(float(quality[2]), 3),
+        "content_band_count": int(quality[3]),
+        "frame_captured_monotonic": round(float(captured_stamp), 9),
+        "frame_captured_at": float(captured_at),
+    }
+
+
+class PersistentWgcWindowCapture:
+    """One exact-HWND WGC owner providing successive owned snapshots."""
+
+    def __init__(self, native_window_id: int) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("persistent_wgc_requires_win32")
+        self.native_window_id = int(native_window_id)
+        if self.native_window_id <= 0:
+            raise ValueError("persistent_wgc_hwnd_required")
+        advanced_color = _window_advanced_color_enabled(self.native_window_id)
+        if advanced_color is True:
+            raise RuntimeError(
+                "windows_graphics_capture_advanced_color_unsupported"
+            )
+        if advanced_color is None:
+            raise RuntimeError(
+                "windows_graphics_capture_advanced_color_state_unavailable"
+            )
+        self._condition = threading.Condition()
+        self._capture = None
+        self._control = None
+        self._latest = None
+        self._sequence = 0
+        self._last_snapshot_sequence = 0
+        self._invalid_frame_count = 0
+        self._target_closed = False
+        self._closed = False
+        self._capture_start_count = 0
+        self._capture_stop_count = 0
+
+    def _start(self) -> None:
+        if self._control is not None:
+            return
+        if self._closed:
+            raise RuntimeError("persistent_wgc_session_closed")
+        from windows_capture import WindowsCapture
+
+        capture = WindowsCapture(
+            cursor_capture=False,
+            dirty_region=False,
+            window_hwnd=self.native_window_id,
+        )
+
+        @capture.event
+        def on_frame_arrived(frame, _capture_control):
+            try:
+                pixels = frame.frame_buffer.copy()
+                shape = getattr(pixels, "shape", ())
+                if (
+                    len(shape) != 3
+                    or int(shape[0]) <= 0
+                    or int(shape[1]) <= 0
+                    or int(shape[2]) < 4
+                    or str(getattr(pixels, "dtype", "")) != "uint8"
+                ):
+                    raise RuntimeError("persistent_wgc_frame_invalid")
+                quality = _pixel_frame_quality(pixels[:, :, :3])
+                if quality[0] <= 0.0:
+                    raise RuntimeError("persistent_wgc_frame_incomplete")
+                captured_stamp = time.monotonic()
+                captured_at = time.time()
+            except Exception:
+                with self._condition:
+                    self._invalid_frame_count += 1
+                    self._condition.notify_all()
+                return
+            with self._condition:
+                # ``pixels`` is an owned NumPy copy; no native mapped view
+                # survives the callback boundary.
+                self._latest = (
+                    pixels,
+                    quality,
+                    captured_stamp,
+                    captured_at,
+                )
+                self._sequence += 1
+                self._condition.notify_all()
+
+        @capture.event
+        def on_closed():
+            with self._condition:
+                self._target_closed = True
+                self._condition.notify_all()
+
+        self._capture = capture
+        self._capture_start_count += 1
+        self._control = capture.start_free_threaded()
+
+    def snapshot(self, bounds: SurfaceBounds):
+        """Return the latest exact pixels after draining a newer frame if any."""
+
+        self._start()
+        deadline = time.monotonic() + 1.5
+        with self._condition:
+            while self._latest is None and not self._target_closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("persistent_wgc_frame_unavailable")
+                self._condition.wait(remaining)
+            if self._target_closed:
+                raise RuntimeError("windows_graphics_capture_target_closed")
+            prior = self._last_snapshot_sequence
+            if prior and self._sequence <= prior:
+                # The native session remains alive between snapshots. A newer
+                # dirty frame wins; no event means WGC continuously observed no
+                # pixel update, so the owned latest frame remains authoritative.
+                self._condition.wait_for(
+                    lambda: self._sequence > prior or self._target_closed,
+                    timeout=0.25,
+                )
+            if self._target_closed:
+                raise RuntimeError("windows_graphics_capture_target_closed")
+            pixels, quality, captured_stamp, frame_captured_at = self._latest
+            sequence = int(self._sequence)
+            unchanged = bool(prior and sequence <= prior)
+            self._last_snapshot_sequence = sequence
+            invalid_frame_count = int(self._invalid_frame_count)
+        from PIL import Image
+
+        height, width = int(pixels.shape[0]), int(pixels.shape[1])
+        image = Image.frombytes(
+            "RGB",
+            (width, height),
+            pixels[:, :, :4].tobytes(),
+            "raw",
+            "BGRX",
+            0,
+            1,
+        )
+        observed_at = time.time()
+        provenance = {
+            "source_pixel_format": "BGRA8_UNORM",
+            "pixel_format_conversion": "BGRX_TO_RGB8",
+            "alpha_handling": "COMPOSITOR_ALPHA_IGNORED",
+            "source_color_space": "WINDOWS_COMPOSITOR_SDR_UNSPECIFIED",
+            "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+            "stabilized_frame_count": 1,
+            "invalid_frame_count": invalid_frame_count,
+            "visible_pixel_ratio": round(float(quality[0]), 6),
+            "luma_spread": round(float(quality[1]), 3),
+            "edge_energy": round(float(quality[2]), 3),
+            "content_band_count": int(quality[3]),
+            "frame_captured_monotonic": round(float(captured_stamp), 9),
+            "frame_captured_at": float(frame_captured_at),
+            "observed_at": observed_at,
+            "wgc_session_sequence": sequence,
+            "wgc_capture_start_count": int(self._capture_start_count),
+            "continuous_unchanged_observation": unchanged,
+        }
+        return _finalize_exact_window_capture(
+            self.native_window_id,
+            bounds,
+            image,
+            "win32_windows_graphics_capture_persistent",
+            provenance,
+            [],
+        )
+
+    def lifecycle_snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "native_window_id": str(self.native_window_id),
+                "capture_start_count": int(self._capture_start_count),
+                "capture_stop_count": int(self._capture_stop_count),
+                "frame_sequence": int(self._sequence),
+                "latest_frame_retained": self._latest is not None,
+                "target_closed": bool(self._target_closed),
+                "closed": bool(self._closed),
+            }
+
+    def wait_closed(self, timeout: float) -> bool:
+        with self._condition:
+            return bool(self._condition.wait_for(
+                lambda: self._target_closed,
+                timeout=max(0.0, float(timeout)),
+            ))
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        control = self._control
+        capture = self._capture
+        if control is not None:
+            control.stop()
+            control.wait()
+            if not control.is_finished():
+                raise RuntimeError("persistent_wgc_shutdown_incomplete")
+            self._capture_stop_count += 1
+        with self._condition:
+            self._latest = None
+            self._condition.notify_all()
+        if capture is not None:
+            capture.frame_handler = None
+            capture.closed_handler = None
+        self._control = None
+        self._capture = None
+
+
+def _capture_print_window_image(
+    native_window_id: int,
+    bounds: SurfaceBounds,
+    *,
+    flags: int,
+):
+    """Capture one HWND with the legacy GDI PrintWindow primitive."""
+
+    if not _print_window_uses_physical_pixels(native_window_id):
+        raise RuntimeError("printwindow_physical_mapping_unproven")
+    from PIL import Image
+    import ctypes
+    import win32gui
+    import win32ui
+
+    window_dc = win32gui.GetWindowDC(int(native_window_id))
+    if not window_dc:
+        raise RuntimeError("exact_window_dc_unavailable")
+    source_dc = None
+    memory_dc = None
+    bitmap = None
+    try:
+        source_dc = win32ui.CreateDCFromHandle(window_dc)
+        memory_dc = source_dc.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(source_dc, bounds.width, bounds.height)
+        memory_dc.SelectObject(bitmap)
+        rendered = ctypes.windll.user32.PrintWindow(
+            int(native_window_id),
+            memory_dc.GetSafeHdc(),
+            int(flags),
+        )
+        if not rendered:
+            raise RuntimeError("exact_window_print_failed")
+        info = bitmap.GetInfo()
+        bits = bitmap.GetBitmapBits(True)
+        return Image.frombuffer(
+            "RGB",
+            (int(info["bmWidth"]), int(info["bmHeight"])),
+            bits,
+            "raw",
+            "BGRX",
+            0,
+            1,
+        ).copy()
+    finally:
+        if bitmap is not None:
+            try:
+                win32gui.DeleteObject(bitmap.GetHandle())
+            except Exception:
+                pass
+        if memory_dc is not None:
+            try:
+                memory_dc.DeleteDC()
+            except Exception:
+                pass
+        if source_dc is not None:
+            try:
+                source_dc.DeleteDC()
+            except Exception:
+                pass
+        win32gui.ReleaseDC(int(native_window_id), window_dc)
+
+
+def _print_window_uses_physical_pixels(native_window_id: int) -> bool:
+    """Whether PrintWindow coordinates are proven physical for this HWND."""
+
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        get_context = user32.GetWindowDpiAwarenessContext
+        get_context.argtypes = [ctypes.c_void_p]
+        get_context.restype = ctypes.c_void_p
+        get_awareness = user32.GetAwarenessFromDpiAwarenessContext
+        get_awareness.argtypes = [ctypes.c_void_p]
+        get_awareness.restype = ctypes.c_int
+        context = get_context(int(native_window_id))
+        # DPI_AWARENESS_PER_MONITOR_AWARE. System- and DPI-unaware targets can
+        # render logical pixels into a physical-sized destination bitmap.
+        return bool(context and int(get_awareness(context)) == 2)
+    except Exception:
+        return False
+
+
+def _exact_capture_has_visible_pixels(image) -> bool:
+    """Reject mechanically empty frames, not merely one non-black pixel."""
+
+    if image.width <= 0 or image.height <= 0:
+        return False
+    converted = image.convert("RGB")
+    sampled_image = converted.resize((
+        min(160, converted.width), min(120, converted.height),
+    ))
+    histogram = list(
+        sampled_image.get_flattened_data()
+        if hasattr(sampled_image, "get_flattened_data") else
+        sampled_image.getdata()
+    )
+    total = max(1, len(histogram))
+    visible = sum(max(pixel) > 8 for pixel in histogram)
+    height = min(120, converted.height)
+    width = min(160, converted.width)
+    pixels = histogram
+    bands = sum(
+        sum(
+            max(pixels[y * width + x]) > 8
+            for y in range(start, end)
+            for x in range(width)
+        ) / float(max(1, (end - start) * width)) >= 0.002
+        for start, end in (
+            (0, max(1, height // 3)),
+            (height // 3, max(height // 3 + 1, 2 * height // 3)),
+            (2 * height // 3, height),
+        )
+    )
+    return (
+        visible >= min(64, total)
+        and visible / float(total) >= 0.002
+        and bands >= 2
+    )
+
+
+def _pixel_frame_quality(bgr_pixels) -> tuple[float, float, float, int]:
+    """Return bounded, application-agnostic frame quality metrics."""
+
+    try:
+        sampled = bgr_pixels[
+            ::max(1, int(bgr_pixels.shape[0]) // 180),
+            ::max(1, int(bgr_pixels.shape[1]) // 240),
+            :3,
+        ]
+        visible = sampled.max(axis=2) > 8
+        visible_count = int(visible.sum())
+        total = max(1, int(visible.size))
+        if visible_count < min(64, total) or visible_count / float(total) < 0.002:
+            return (0.0, 0.0, 0.0, 0)
+        band_count = sum(
+            float(band.mean()) >= 0.002
+            for band in (
+                visible[:max(1, visible.shape[0] // 3), :],
+                visible[
+                    visible.shape[0] // 3:max(
+                        visible.shape[0] // 3 + 1,
+                        2 * visible.shape[0] // 3,
+                    ),
+                    :,
+                ],
+                visible[2 * visible.shape[0] // 3:, :],
+            )
+            if band.size
+        )
+        if band_count < 2:
+            return (0.0, 0.0, 0.0, band_count)
+        luminance = (
+            sampled[:, :, 2].astype("float32") * 0.2126
+            + sampled[:, :, 1].astype("float32") * 0.7152
+            + sampled[:, :, 0].astype("float32") * 0.0722
+        )
+        spread = float(luminance.std())
+        horizontal = float(abs(luminance[:, 1:] - luminance[:, :-1]).mean())
+        vertical = float(abs(luminance[1:, :] - luminance[:-1, :]).mean())
+        return (
+            visible_count / float(total),
+            spread,
+            horizontal + vertical,
+            band_count,
+        )
+    except Exception:
+        return (0.0, 0.0, 0.0, 0)
+
+
+def _finalize_exact_window_capture(
+    native_window_id: int,
+    bounds: SurfaceBounds,
+    image,
+    capture_method: str,
+    provenance: Mapping[str, Any] | None,
+    attempts: list[dict],
+):
+    """Validate one exact-HWND image and attach physical mapping metadata."""
+
+    image = image.convert("RGB")
+    current_bounds = _window_bounds(native_window_id)
+    if current_bounds is None:
+        raise RuntimeError("target_closed_during_capture")
+    if (
+        (
+            current_bounds.left,
+            current_bounds.top,
+            current_bounds.right,
+            current_bounds.bottom,
+        ) != (bounds.left, bounds.top, bounds.right, bounds.bottom)
+    ):
+        raise RuntimeError("resize_during_capture")
+    if not _exact_capture_has_visible_pixels(image):
+        raise RuntimeError("capture_frame_incomplete")
+    client_bounds = _window_client_bounds(native_window_id)
+    capture_extent = str((provenance or {}).get("capture_extent") or "auto")
+
+    def geometry_error(candidate: SurfaceBounds | None) -> float:
+        if candidate is None or not candidate.valid():
+            return float("inf")
+        scale_x = candidate.width / float(image.width)
+        scale_y = candidate.height / float(image.height)
+        if not (0.25 <= scale_x <= 4.0 and 0.25 <= scale_y <= 4.0):
+            return float("inf")
+        return abs(scale_x - scale_y) / max(scale_x, scale_y)
+
+    if capture_extent == "client_content" and client_bounds is not None:
+        captured_bounds = client_bounds
+    elif capture_extent == "full_window":
+        captured_bounds = bounds
+    else:
+        window_error = geometry_error(bounds)
+        client_error = geometry_error(client_bounds)
+        captured_bounds = (
+            client_bounds
+            if client_bounds is not None and client_error + 0.01 < window_error
+            else bounds
+        )
+        capture_extent = (
+            "client_content" if captured_bounds is client_bounds
+            else "full_window"
+        )
+    attempts.append({
+        "capture_driver": capture_method,
+        "outcome": "selected",
+        "reason_code": "capture_frame_stable",
+    })
+    return image, capture_method, {
+        **dict(provenance or {}),
+        "capture_extent": capture_extent,
+        "capture_screen_bounds": [
+            captured_bounds.left,
+            captured_bounds.top,
+            captured_bounds.right,
+            captured_bounds.bottom,
+        ],
+        "source_to_physical_scale": [
+            round(captured_bounds.width / float(image.width), 6),
+            round(captured_bounds.height / float(image.height), 6),
+        ],
+        "capture_attempts": attempts,
+        "fallback_used": len(attempts) > 1,
+        "captured_at": float(
+            (provenance or {}).get("observed_at") or time.time()
+        ),
+    }
+
+
+def _capture_exact_window_image(
+    native_window_id: int,
+    bounds: SurfaceBounds,
+):
+    """Capture one Win32 window without pixels from overlapping windows."""
+
+    from PIL import ImageGrab
+
+    candidates = (
+        (
+            "win32_windows_graphics_capture",
+            lambda: _capture_window_graphics_image(native_window_id),
+        ),
+        (
+            "win32_pillow_exact_window",
+            lambda: (
+                ImageGrab.grab(window=int(native_window_id)).convert("RGB"),
+                {
+                    "source_pixel_format": "PIL_RGB8",
+                    "pixel_format_conversion": "PIL_TO_RGB8",
+                    "alpha_handling": "OPAQUE_RGB",
+                    "source_color_space": "UNPROFILED_SDR",
+                    "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+                    "capture_extent": "client_content",
+                },
+            ),
+        ),
+        (
+            "win32_printwindow_full",
+            lambda: (
+                _capture_print_window_image(
+                    native_window_id, bounds, flags=2,
+                ),
+                {
+                    "source_pixel_format": "BGRX8_GDI",
+                    "pixel_format_conversion": "BGRX_TO_RGB8",
+                    "alpha_handling": "NO_ALPHA_CHANNEL",
+                    "source_color_space": "GDI_SDR_UNSPECIFIED",
+                    "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+                    "capture_extent": "full_window",
+                },
+            ),
+        ),
+        (
+            "win32_printwindow",
+            lambda: (
+                _capture_print_window_image(
+                    native_window_id, bounds, flags=0,
+                ),
+                {
+                    "source_pixel_format": "BGRX8_GDI",
+                    "pixel_format_conversion": "BGRX_TO_RGB8",
+                    "alpha_handling": "NO_ALPHA_CHANNEL",
+                    "source_color_space": "GDI_SDR_UNSPECIFIED",
+                    "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+                    "capture_extent": "full_window",
+                },
+            ),
+        ),
+    )
+    attempts = []
+    for capture_method, capture_candidate in candidates:
+        try:
+            image, provenance = capture_candidate()
+            return _finalize_exact_window_capture(
+                native_window_id,
+                bounds,
+                image,
+                capture_method,
+                provenance,
+                attempts,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "resize_during_capture":
+                raise
+            attempts.append({
+                "capture_driver": capture_method,
+                "outcome": "rejected",
+                "reason_code": (
+                    str(exc)[:80]
+                    if re.fullmatch(r"[a-z0-9_]{1,80}", str(exc)) else
+                    type(exc).__name__
+                ),
+            })
+            if str(exc) == "windows_graphics_capture_hdr_format_unsupported":
+                raise _ExactWindowCaptureUnsupported(attempts) from exc
+            continue
+        except Exception as exc:
+            attempts.append({
+                "capture_driver": capture_method,
+                "outcome": "rejected",
+                "reason_code": type(exc).__name__[:80],
+            })
+            continue
+    raise _ExactWindowCaptureFailure(attempts)
+
+
+class _ExactWindowCaptureFailure(RuntimeError):
+    """Typed, sanitized provenance when every exact HWND driver is rejected."""
+
+    def __init__(self, attempts: Iterable[dict]):
+        super().__init__("exact_window_capture_black_frame")
+        self.attempts = tuple(
+            dict(item) for item in attempts if isinstance(item, dict)
+        )[:8]
+
+
+class _ExactWindowCaptureUnsupported(RuntimeError):
+    """Fail closed when exact-window color data cannot be normalized safely."""
+
+    def __init__(self, attempts: Iterable[dict]):
+        super().__init__("windows_hdr_exact_capture_unsupported")
+        self.attempts = tuple(
+            dict(item) for item in attempts if isinstance(item, dict)
+        )[:8]
+
+
+class _ProtectedWindowCapture(RuntimeError):
+    """The target explicitly asked Windows to exclude its pixels."""
+
+    def __init__(self, protection_kind: str):
+        super().__init__("capture_protected_surface")
+        self.protection_kind = str(protection_kind or "capture_restricted")
+
+
+def _visual_target_for_scene(
+    scene: DesktopScene,
+    requested: DesktopSurfaceRef,
+) -> VisualTarget:
+    window_bounds = scene.window_ref.bounds
+    requested_bounds = requested.bounds or window_bounds
+    if window_bounds is None or requested_bounds is None:
+        raise VisionCaptureError(CaptureFailure.WRONG_DIMENSIONS)
+    native = DESKTOP_SURFACE_REGISTRY.native_identity(scene.window_ref.ref_id)
+    if native is None:
+        raise VisionCaptureError(CaptureFailure.STALE_TARGET)
+    bounded = (
+        max(requested_bounds.left, window_bounds.left),
+        max(requested_bounds.top, window_bounds.top),
+        min(requested_bounds.right, window_bounds.right),
+        min(requested_bounds.bottom, window_bounds.bottom),
+    )
+    return VisualTarget(
+        application_id=scene.application_id,
+        domain=VisionDomain.DESKTOP,
+        surface_id=requested.ref_id,
+        surface_generation=scene.window_ref.window_generation,
+        bounds=bounded,
+        visible=not scene.minimized,
+        minimized=scene.minimized,
+        native_window_id=str(native.native_window_id),
+        monitor_id=(
+            f"physical:{window_bounds.left}:{window_bounds.top}:"
+            f"{window_bounds.right}:{window_bounds.bottom}"
+        ),
+        dpi_scale=window_bounds.dpi_scale,
+    )
+
+
+def _capture_bound_visual_surface(
+    scene: DesktopScene,
+    requested: DesktopSurfaceRef,
+    *,
+    provider: str,
+    model: str,
+):
+    """Capture the proven surface and bind its full coordinate transform."""
+
+    from PIL import ImageGrab
+    from osia.vision_runtime import CoordinateTransform, prepare_capture
+
+    window_bounds = scene.window_ref.bounds
+    requested_bounds = requested.bounds or window_bounds
+    if (
+        window_bounds is None
+        or requested_bounds is None
+        or not window_bounds.valid()
+        or not requested_bounds.valid()
+    ):
+        raise RuntimeError("scoped_capture_bounds_unavailable")
+    native = DESKTOP_SURFACE_REGISTRY.native_identity(scene.window_ref.ref_id)
+    if native is None:
+        raise RuntimeError("native_window_identity_unavailable")
+
+    bounded = SurfaceBounds(
+        max(requested_bounds.left, window_bounds.left),
+        max(requested_bounds.top, window_bounds.top),
+        min(requested_bounds.right, window_bounds.right),
+        min(requested_bounds.bottom, window_bounds.bottom),
+        dpi_scale=window_bounds.dpi_scale,
+    )
+    if not bounded.valid():
+        raise RuntimeError("scoped_capture_bounds_unavailable")
+
+    _ensure_thread_physical_pixels()
+    exact_surface_pixels = False
+    capture_method = "foreground_visible_region"
+    source_width = bounded.width
+    source_height = bounded.height
+    source_box = (0.0, 0.0, float(source_width), float(source_height))
+    capture_provenance = {
+        "source_pixel_format": "PIL_RGB8",
+        "pixel_format_conversion": "PIL_TO_RGB8",
+        "alpha_handling": "OPAQUE_RGB",
+        "source_color_space": "UNPROFILED_SDR",
+        "color_space_conversion": "NO_EXPLICIT_ICC_CONVERSION",
+        "capture_attempts": [],
+        "fallback_used": False,
+        "captured_at": time.time(),
+    }
+    screen_bounds = (
+        bounded.left, bounded.top, bounded.right, bounded.bottom,
+    )
+    if sys.platform == "win32" and isinstance(native.native_window_id, int):
+        protection_kind = _window_capture_protection_reason(
+            native.native_window_id,
+        )
+        if protection_kind:
+            raise _ProtectedWindowCapture(protection_kind)
+        image, capture_method, capture_provenance = _capture_exact_window_image(
+            native.native_window_id, window_bounds,
+        )
+        if image.width <= 0 or image.height <= 0:
+            raise RuntimeError("exact_window_capture_empty")
+        raw_capture_bounds = capture_provenance.get("capture_screen_bounds")
+        if (
+            not isinstance(raw_capture_bounds, (list, tuple))
+            or len(raw_capture_bounds) != 4
+        ):
+            raise RuntimeError("exact_window_capture_bounds_unavailable")
+        capture_bounds = SurfaceBounds(
+            *(int(value) for value in raw_capture_bounds),
+            dpi_scale=window_bounds.dpi_scale,
+        )
+        if (
+            not capture_bounds.valid()
+            or capture_bounds.left < window_bounds.left - 8
+            or capture_bounds.top < window_bounds.top - 8
+            or capture_bounds.right > window_bounds.right + 8
+            or capture_bounds.bottom > window_bounds.bottom + 8
+        ):
+            raise RuntimeError("exact_window_capture_bounds_invalid")
+        captured_region = SurfaceBounds(
+            max(bounded.left, capture_bounds.left),
+            max(bounded.top, capture_bounds.top),
+            min(bounded.right, capture_bounds.right),
+            min(bounded.bottom, capture_bounds.bottom),
+            dpi_scale=window_bounds.dpi_scale,
+        )
+        if not captured_region.valid():
+            raise RuntimeError("exact_window_crop_empty")
+        source_width, source_height = image.size
+        scale_x = source_width / float(capture_bounds.width)
+        scale_y = source_height / float(capture_bounds.height)
+        crop_box = (
+            max(0, int(math.floor(
+                (captured_region.left - capture_bounds.left) * scale_x
+            ))),
+            max(0, int(math.floor(
+                (captured_region.top - capture_bounds.top) * scale_y
+            ))),
+            min(source_width, int(math.ceil(
+                (captured_region.right - capture_bounds.left) * scale_x
+            ))),
+            min(source_height, int(math.ceil(
+                (captured_region.bottom - capture_bounds.top) * scale_y
+            ))),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            raise RuntimeError("exact_window_crop_empty")
+        source_box = tuple(float(value) for value in crop_box)
+        image = image.crop(crop_box)
+        exact_surface_pixels = True
+        screen_bounds = (
+            capture_bounds.left,
+            capture_bounds.top,
+            capture_bounds.right,
+            capture_bounds.bottom,
+        )
+    else:
+        image = ImageGrab.grab(
+            bbox=(bounded.left, bounded.top, bounded.right, bounded.bottom),
+            all_screens=True,
+        ).convert("RGB")
+        capture_provenance["captured_at"] = time.time()
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    native_token = hashlib.sha256(
+        f"{native.pid}:{native.native_window_id}".encode(
+            "utf-8", errors="replace",
+        )
+    ).hexdigest()[:24]
+    current_client_bounds = _window_client_bounds(native.native_window_id)
+    transform = CoordinateTransform(
+        source_width=source_width,
+        source_height=source_height,
+        source_box=source_box,
+        screen_bounds=screen_bounds,
+        client_origin_screen=_window_client_origin(
+            native.native_window_id,
+            (window_bounds.left, window_bounds.top),
+        ),
+        dpi_scale=window_bounds.dpi_scale,
+        monitor_id=(
+            f"physical:{window_bounds.left}:{window_bounds.top}:"
+            f"{window_bounds.right}:{window_bounds.bottom}"
+        ),
+        window_bounds=(
+            window_bounds.left, window_bounds.top,
+            window_bounds.right, window_bounds.bottom,
+        ),
+        client_bounds=(
+            0, 0,
+            max(1, (
+                current_client_bounds.width
+                if current_client_bounds is not None else window_bounds.width
+            )),
+            max(1, (
+                current_client_bounds.height
+                if current_client_bounds is not None else window_bounds.height
+            )),
+        ),
+    )
+    visual_target = _visual_target_for_scene(scene, requested)
+    return prepare_capture(
+        output.getvalue(),
+        provider=provider,
+        model=model,
+        application_id=scene.application_id,
+        surface_ref=requested.ref_id,
+        window_generation=scene.window_ref.window_generation,
+        structural_epoch=scene.structural_epoch,
+        transform=transform,
+        native_window_token=native_token,
+        capture_method=capture_method,
+        exact_surface_pixels=exact_surface_pixels,
+        foreground=scene.foreground,
+        domain=VisionDomain.DESKTOP,
+        target_identity=visual_target.identity_key,
+        monitor_id=visual_target.monitor_id,
+        window_bounds=(
+            window_bounds.left, window_bounds.top,
+            window_bounds.right, window_bounds.bottom,
+        ),
+        client_bounds=(
+            0, 0,
+            max(1, (
+                current_client_bounds.width
+                if current_client_bounds is not None else window_bounds.width
+            )),
+            max(1, (
+                current_client_bounds.height
+                if current_client_bounds is not None else window_bounds.height
+            )),
+        ),
+        screen_origin=(screen_bounds[0], screen_bounds[1]),
+        captured_at=float(
+            capture_provenance.get("captured_at") or time.time()
+        ),
+        source_pixel_format=str(
+            capture_provenance.get("source_pixel_format") or ""
+        ),
+        pixel_format_conversion=str(
+            capture_provenance.get("pixel_format_conversion") or ""
+        ),
+        alpha_handling=str(
+            capture_provenance.get("alpha_handling") or ""
+        ),
+        source_color_space=str(
+            capture_provenance.get("source_color_space") or ""
+        ),
+        color_space_conversion=str(
+            capture_provenance.get("color_space_conversion") or ""
+        ),
+        capture_attempts=tuple(
+            item for item in capture_provenance.get("capture_attempts", [])
+            if isinstance(item, dict)
+        ),
+        fallback_used=capture_provenance.get("fallback_used") is True,
+    )
+
+
+def _capture_surface_coverage(
+    scene: DesktopScene,
+    requested: DesktopSurfaceRef,
+    capture,
+    selection: VisualSurfaceSelection,
+    *,
+    refinement_requested: bool,
+) -> SurfaceCoverage:
+    """Validate geometry/hierarchy only; never inspect screenshot semantics."""
+
+    if refinement_requested:
+        return SurfaceCoverage.REGION
+    window_bounds = scene.window_ref.bounds
+    requested_bounds = requested.bounds or window_bounds
+    if (
+        window_bounds is None
+        or requested_bounds is None
+        or capture.image_width <= 0
+        or capture.image_height <= 0
+    ):
+        return SurfaceCoverage.UNKNOWN
+    if requested.ref_id != scene.window_ref.ref_id:
+        ratio = (
+            requested_bounds.width * requested_bounds.height
+        ) / float(max(1, window_bounds.width * window_bounds.height))
+        return (
+            SurfaceCoverage.CLIENT_CONTENT
+            if ratio >= 0.40 else SurfaceCoverage.REGION
+        )
+    source_width = int(
+        capture.transform.source_width
+        if capture.transform is not None else capture.image_width
+    )
+    source_height = int(
+        capture.transform.source_height
+        if capture.transform is not None else capture.image_height
+    )
+    if source_width <= 0 or source_height <= 0:
+        return SurfaceCoverage.UNKNOWN
+    target_aspect = window_bounds.width / float(max(1, window_bounds.height))
+    source_aspect = source_width / float(max(1, source_height))
+    aspect_ratio = source_aspect / float(max(0.001, target_aspect))
+    if aspect_ratio > 1.8 or aspect_ratio < 0.55:
+        return SurfaceCoverage.CHROME_ONLY
+    if selection.coverage in {
+        SurfaceCoverage.FULL_WINDOW,
+        SurfaceCoverage.CLIENT_CONTENT,
+    }:
+        return selection.coverage
+    # Non-Windows deterministic fixtures and older native adapters still bind
+    # an exact window directly; matching full-frame geometry is sufficient.
+    if capture.exact_surface_pixels:
+        return SurfaceCoverage.FULL_WINDOW
+    return SurfaceCoverage.UNKNOWN
+
+
+def _visual_full_window_required() -> bool:
+    try:
+        from osia.execution_strategy import (
+            current_execution_strategy,
+            is_desktop_visual_read_mission,
+        )
+
+        strategy = current_execution_strategy()
+        return bool(
+            strategy is not None
+            and is_desktop_visual_read_mission(strategy)
+        )
+    except Exception:
+        return False
+
+
+def _record_surface_lifecycle(
+    diagnostics: dict | None,
+    phase: str,
+    **metadata,
+) -> None:
+    if diagnostics is None:
+        return
+    events = diagnostics.setdefault("events", [])
+    if isinstance(events, list):
+        events.append({"phase": str(phase), **metadata})
+
+
+def _diagnostic_bounds(bounds: SurfaceBounds | None) -> dict:
+    return bounds.to_safe_dict() if bounds is not None else {}
+
+
+def _refresh_windows_native_scene(
+    native_window_id: object,
+    *,
+    target: str = "",
+    expected_native: NativeSurfaceIdentity | None = None,
+    expected_application: str = "",
+    expected_window_generation: str = "",
+    diagnostics: dict | None = None,
+) -> tuple[DesktopScene | None, str]:
+    """Validate and refresh one real HWND without bounded list enumeration."""
+
+    if sys.platform != "win32":
+        return None, "SURFACE_NOT_DISCOVERED"
+    try:
+        from osia.tools import desktop_control as dc
+
+        loaded = dc._load_win32()
+        if not loaded:
+            return None, "SURFACE_NOT_DISCOVERED"
+        win32gui, _win32process = loaded
+        hwnd = int(native_window_id)
+    except (TypeError, ValueError, OverflowError):
+        return None, "WINDOW_NOT_FOUND"
+    except Exception:
+        return None, "SURFACE_NOT_DISCOVERED"
+
+    try:
+        if not win32gui.IsWindow(hwnd):
+            _record_surface_lifecycle(
+                diagnostics, "FRESHNESS_VALIDATION",
+                expected_hwnd=str(hwnd), current_hwnd=str(hwnd),
+                is_window=False, is_window_visible=False,
+                first_mismatch="is_window",
+            )
+            return None, "SURFACE_STALE_HWND_DESTROYED"
+        visible = bool(win32gui.IsWindowVisible(hwnd))
+        if not visible:
+            return None, "WINDOW_NOT_VISIBLE"
+    except Exception:
+        return None, "WINDOW_NOT_FOUND"
+
+    title, pid, class_name, bounds = _window_metadata(hwnd)
+    if pid <= 0:
+        return None, "PROCESS_IDENTITY_FAILED"
+    if bounds is None and not _window_is_minimized(hwnd):
+        return None, "SURFACE_NOT_DISCOVERED"
+    application_id, process_started_at = _process_details(pid)
+    _record_surface_lifecycle(
+        diagnostics, "NATIVE_REFRESH",
+        hwnd=str(hwnd), pid=int(pid), window_class=str(class_name or "")[:160],
+        process_started_at=round(float(process_started_at or 0.0), 6),
+        application=str(application_id or "")[:160],
+        bounds=_diagnostic_bounds(bounds),
+        is_window=True, is_window_visible=visible,
+    )
+    if (
+        not application_id
+        or application_id.startswith("process-")
+        or float(process_started_at or 0.0) <= 0.0
+    ):
+        return None, "PROCESS_IDENTITY_FAILED"
+    if expected_native is not None:
+        if int(pid) != int(expected_native.pid):
+            _record_surface_lifecycle(
+                diagnostics, "FRESHNESS_VALIDATION",
+                expected_pid=int(expected_native.pid), current_pid=int(pid),
+                expected_hwnd=str(expected_native.native_window_id),
+                current_hwnd=str(hwnd), first_mismatch="process_id",
+            )
+            return None, "SURFACE_STALE_HWND_RECYCLED"
+        if abs(
+            float(process_started_at)
+            - float(expected_native.process_started_at)
+        ) > 0.05:
+            _record_surface_lifecycle(
+                diagnostics, "FRESHNESS_VALIDATION",
+                expected_process_started_at=round(
+                    float(expected_native.process_started_at), 6,
+                ),
+                current_process_started_at=round(
+                    float(process_started_at), 6,
+                ),
+                first_mismatch="process_started_at",
+            )
+            return None, "SURFACE_STALE_PROCESS_CHANGED"
+        if str(class_name or "") != str(expected_native.class_name or ""):
+            _record_surface_lifecycle(
+                diagnostics, "FRESHNESS_VALIDATION",
+                expected_window_class=str(expected_native.class_name or "")[:160],
+                current_window_class=str(class_name or "")[:160],
+                first_mismatch="window_class",
+            )
+            return None, "SURFACE_STALE_IDENTITY_CHANGED"
+
+    try:
+        foreground = dc._foreground_window_win32()
+        foreground_hwnd = _foreground_native_window_id(foreground)
+        scene = _observe_window_scene(
+            (hwnd, title, pid),
+            target=target,
+            foreground=bool(
+                foreground_hwnd and int(foreground_hwnd) == hwnd
+            ),
+            class_name_hint=class_name,
+        )
+    except Exception:
+        return None, "SURFACE_REGISTRATION_FAILED"
+    if scene is None:
+        return None, "SURFACE_REGISTRATION_FAILED"
+    if expected_application and not _scene_matches_application(
+        scene, expected_application,
+    ):
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_application=str(expected_application)[:160],
+            current_application=str(scene.application_id or "")[:160],
+            first_mismatch="application_id",
+        )
+        return None, "SURFACE_STALE_IDENTITY_CHANGED"
+    if (
+        expected_window_generation
+        and scene.window_ref.window_generation != expected_window_generation
+    ):
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_generation=str(expected_window_generation)[:160],
+            current_generation=str(scene.window_ref.window_generation)[:160],
+            first_mismatch="window_generation",
+        )
+        return None, "SURFACE_STALE_GENERATION_MISMATCH"
+    refreshed_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    if refreshed_native is None:
+        return None, "SURFACE_REGISTRATION_FAILED"
+    _record_surface_lifecycle(
+        diagnostics, "CURRENT_REGISTRY_STATE",
+        current_surface_id=scene.window_ref.ref_id,
+        current_generation=scene.window_ref.window_generation,
+        current_scene_epoch=int(scene.structural_epoch),
+        current_bounds=_diagnostic_bounds(scene.window_ref.bounds),
+    )
+    return scene, ""
+
+
+def _observe_exact_bound_visual_scene(
+    surface_ref: str,
+    *,
+    target: str = "",
+    expected_application: str = "",
+    expected_window_generation: str = "",
+    expected_native_window_id: str = "",
+    diagnostics: dict | None = None,
+) -> tuple[DesktopScene | None, DesktopSurfaceRef | None, str]:
+    """Re-observe the exact native window already bound to an opaque ref."""
+
+    ref_id = str(surface_ref or "")
+    anchor = DESKTOP_SURFACE_REGISTRY.refresh_anchor(ref_id)
+    if anchor.surface is None or anchor.native is None:
+        # A newly discovered or structurally refreshed real window can be
+        # represented safely when ActionTruth supplies its full stable identity.
+        if (
+            sys.platform == "win32"
+            and str(expected_native_window_id or "")
+            and expected_application
+            and expected_window_generation
+        ):
+            scene, reason = _refresh_windows_native_scene(
+                expected_native_window_id,
+                target=target,
+                expected_application=expected_application,
+                expected_window_generation=expected_window_generation,
+                diagnostics=diagnostics,
+            )
+            if scene is not None:
+                _record_surface_lifecycle(
+                    diagnostics, "RESOLVER_OUTPUT",
+                    requested_surface_id=ref_id,
+                    current_surface_id=scene.window_ref.ref_id,
+                    current_generation=scene.window_ref.window_generation,
+                    current_scene_epoch=int(scene.structural_epoch),
+                    continuity="EXTERNAL_IDENTITY_REFRESHED",
+                    first_mismatch="",
+                )
+                return scene, scene.window_ref, ""
+            return None, None, reason
+        reason = anchor.reason or "SURFACE_NOT_DISCOVERED"
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            requested_surface_id=ref_id,
+            first_mismatch=reason,
+        )
+        return None, None, {
+            "unknown_surface_ref": "SURFACE_NOT_DISCOVERED",
+            "window_generation_changed": "SURFACE_STALE_GENERATION_MISMATCH",
+            "accessibility_runtime_id_disappeared": (
+                "SURFACE_STALE_IDENTITY_CHANGED"
+            ),
+        }.get(reason, "SURFACE_STALE_IDENTITY_CHANGED")
+
+    initial_surface = anchor.surface
+    native = anchor.native
+    _record_surface_lifecycle(
+        diagnostics, "RESOLVER_INPUT",
+        surface_id=initial_surface.ref_id,
+        stored_generation=initial_surface.window_generation,
+        stored_scene_epoch=int(initial_surface.structural_epoch),
+        stored_process_ref=initial_surface.process_ref,
+        stored_bounds=_diagnostic_bounds(initial_surface.bounds),
+        anchor_status=anchor.status,
+        anchor_reason=anchor.reason,
+        expected_hwnd=str(native.native_window_id),
+        expected_pid=int(native.pid),
+        expected_process_started_at=round(
+            float(native.process_started_at), 6,
+        ),
+        expected_window_class=str(native.class_name or "")[:160],
+    )
+    if (
+        str(expected_native_window_id or "")
+        and str(native.native_window_id) != str(expected_native_window_id)
+    ):
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_hwnd=str(expected_native_window_id),
+            current_hwnd=str(native.native_window_id),
+            first_mismatch="native_window_id",
+        )
+        return None, None, "SURFACE_STALE_IDENTITY_CHANGED"
+    if (
+        expected_window_generation
+        and expected_window_generation != initial_surface.window_generation
+    ):
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_generation=str(expected_window_generation)[:160],
+            current_generation=initial_surface.window_generation,
+            first_mismatch="window_generation",
+        )
+        return None, None, "SURFACE_STALE_GENERATION_MISMATCH"
+    if (
+        expected_application
+        and not _surface_matches_application(
+            initial_surface, expected_application,
+        )
+    ):
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_application=str(expected_application)[:160],
+            current_application=initial_surface.application_id,
+            first_mismatch="application_id",
+        )
+        return None, None, "SURFACE_STALE_IDENTITY_CHANGED"
+
+    if sys.platform == "win32":
+        scene, reason = _refresh_windows_native_scene(
+            native.native_window_id,
+            target=target,
+            expected_native=native,
+            expected_application=(
+                expected_application or initial_surface.application_id
+            ),
+            expected_window_generation=(
+                expected_window_generation
+                or initial_surface.window_generation
+            ),
+            diagnostics=diagnostics,
+        )
+        if scene is None:
+            return None, None, reason
+    else:
+        scene = observe_foreground_scene(target=target)
+
+    if scene is None:
+        return None, None, "SURFACE_NOT_DISCOVERED"
+    if (
+        scene.window_ref.process_ref != initial_surface.process_ref
+        or scene.window_ref.window_generation
+        != (expected_window_generation or initial_surface.window_generation)
+    ):
+        mismatch = (
+            "process_ref"
+            if scene.window_ref.process_ref != initial_surface.process_ref else
+            "window_generation"
+        )
+        _record_surface_lifecycle(
+            diagnostics, "FRESHNESS_VALIDATION",
+            expected_process_ref=initial_surface.process_ref,
+            current_process_ref=scene.window_ref.process_ref,
+            expected_generation=(
+                expected_window_generation
+                or initial_surface.window_generation
+            ),
+            current_generation=scene.window_ref.window_generation,
+            first_mismatch=mismatch,
+        )
+        return None, None, (
+            "SURFACE_STALE_PROCESS_CHANGED"
+            if mismatch == "process_ref" else
+            "SURFACE_STALE_GENERATION_MISMATCH"
+        )
+    refreshed_window_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    exact_window_continuity = bool(
+        initial_surface.surface_kind in {
+            SurfaceKind.WINDOW, SurfaceKind.DIALOG,
+        }
+        and refreshed_window_native is not None
+        and int(refreshed_window_native.pid) == int(native.pid)
+        and abs(
+            float(refreshed_window_native.process_started_at)
+            - float(native.process_started_at)
+        ) <= 0.05
+        and refreshed_window_native.native_window_id == native.native_window_id
+        and refreshed_window_native.class_name == native.class_name
+        and scene.window_ref.window_generation
+        == initial_surface.window_generation
+    )
+    if exact_window_continuity:
+        requested = scene.window_ref
+        rebound_native = refreshed_window_native
+        rebound_reason = "same_native_application_window_refreshed"
+    else:
+        rebound = DESKTOP_SURFACE_REGISTRY.rebind_same_target(
+            ref_id, scene.surfaces,
+        )
+        if (
+            not rebound.resolved
+            or rebound.surface is None
+            or rebound.native is None
+        ):
+            _record_surface_lifecycle(
+                diagnostics, "FRESHNESS_VALIDATION",
+                expected_surface_id=ref_id,
+                current_window_surface_id=scene.window_ref.ref_id,
+                expected_generation=initial_surface.window_generation,
+                current_generation=scene.window_ref.window_generation,
+                expected_scene_epoch=int(initial_surface.structural_epoch),
+                current_scene_epoch=int(scene.structural_epoch),
+                expected_bounds=_diagnostic_bounds(initial_surface.bounds),
+                current_bounds=_diagnostic_bounds(scene.window_ref.bounds),
+                first_mismatch=rebound.reason or "semantic_identity",
+            )
+            return None, None, "SURFACE_STALE_IDENTITY_CHANGED"
+        requested = rebound.surface
+        rebound_native = rebound.native
+        rebound_reason = rebound.reason
+    same_generation = bool(
+        initial_surface.window_generation == requested.window_generation
+    )
+    _record_surface_lifecycle(
+        diagnostics, "REGISTRATION_REFRESH",
+        previous_surface_id=ref_id,
+        current_surface_id=requested.ref_id,
+        previous_generation=initial_surface.window_generation,
+        current_generation=requested.window_generation,
+        generation_change_reason=(
+            "unchanged_same_native_identity"
+            if same_generation else "native_identity_changed"
+        ),
+        scene_epoch_before=int(initial_surface.structural_epoch),
+        scene_epoch_after=int(scene.structural_epoch),
+        new_ref_created=bool(requested.ref_id != ref_id),
+        representation_change_reason=(
+            anchor.reason or rebound_reason or "stable_reobservation"
+        ),
+    )
+    _record_surface_lifecycle(
+        diagnostics, "FRESHNESS_VALIDATION",
+        expected_surface_id=ref_id,
+        current_surface_id=requested.ref_id,
+        expected_generation=initial_surface.window_generation,
+        current_generation=requested.window_generation,
+        expected_scene_epoch=int(initial_surface.structural_epoch),
+        current_scene_epoch=int(scene.structural_epoch),
+        expected_hwnd=str(native.native_window_id),
+        current_hwnd=str(rebound_native.native_window_id),
+        expected_pid=int(native.pid),
+        current_pid=int(rebound_native.pid),
+        expected_process_started_at=round(
+            float(native.process_started_at), 6,
+        ),
+        current_process_started_at=round(
+            float(rebound_native.process_started_at), 6,
+        ),
+        expected_bounds=_diagnostic_bounds(initial_surface.bounds),
+        current_bounds=_diagnostic_bounds(requested.bounds),
+        first_mismatch="",
+        continuity=(
+            "SAME_TARGET_REFRESHED"
+            if requested.ref_id != ref_id
+            or requested.structural_epoch != initial_surface.structural_epoch
+            or requested.bounds != initial_surface.bounds
+            else "EXACT_CURRENT_TARGET"
+        ),
+    )
+    _record_surface_lifecycle(
+        diagnostics, "RESOLVER_OUTPUT",
+        surface_id=requested.ref_id,
+        generation=requested.window_generation,
+        scene_epoch=int(scene.structural_epoch),
+        target_identity="same_native_semantic_target",
+    )
+    return scene, requested, ""
+
+
+def _vision_failure_result(
+    *,
+    trace: VisionTrace,
+    stage: VisionStage,
+    failure: VisionFailure,
+    reason_code: str,
+    text: str,
+    surface_ref: str = "",
+    **metadata,
+) -> dict:
+    trace.fail(stage, failure, reason_code)
+    return {
+        "text": "ERROR: " + text,
+        "receipt": {
+            "schema_version": 1,
+            "dispatch_state": "not_dispatched",
+            "outcome": "confirmed_failure_before_effect",
+            "reason_code": reason_code,
+            "failure_class": failure.value,
+            "failed_stage": stage.value,
+            "surface_ref": str(surface_ref or ""),
+            **metadata,
+        },
+        "diagnostics": trace.safe_dict(),
+    }
+
+
 def request_visual_observation(
     surface_ref: str,
     reason: str,
     target: str = "",
     *,
+    visual_frame_id: str = "",
+    visual_bbox: dict | None = None,
     expected_application: str = "",
     expected_window_generation: str = "",
+    expected_native_window_id: str = "",
+    _surface_diagnostics: bool = False,
 ) -> dict:
-    """Capture only a proven current surface for the exact effective model."""
+    """Capture an exact frame for the active model's normal reasoning loop."""
 
-    if not effective_model_supports_vision():
-        return {
-            "text": (
-                "ERROR: effective model has no proven native Vision capability; "
+    trace = VisionTrace()
+    provider, model = effective_model_image_route()
+    if not provider or not model:
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.IMAGE_PART_BUILT,
+            failure=VisionFailure.IMAGE_PART_BUILD_FAILED,
+            reason_code="IMAGE_INPUT_UNAVAILABLE",
+            text=(
+                "the active model has no proven image-input capability; "
+                "no screenshot was captured or handed off."
+            ),
+            surface_ref=surface_ref,
+        )
+
+    surface_lifecycle = (
+        {"schema_version": 1, "events": []}
+        if _surface_diagnostics else None
+    )
+    bound_scene = _LAST_SCENE.get()
+    scene, requested, resolution_reason = _observe_exact_bound_visual_scene(
+        str(surface_ref or ""),
+        target=target,
+        expected_application=expected_application,
+        expected_window_generation=expected_window_generation,
+        expected_native_window_id=expected_native_window_id,
+        diagnostics=surface_lifecycle,
+    )
+    if scene is None or requested is None:
+        failure = (
+            VisionFailure.TARGET_STALE
+            if (
+                resolution_reason.startswith("SURFACE_STALE")
+                or resolution_reason == "GENERATION_MISMATCH"
+            )
+            else VisionFailure.TARGET_RESOLUTION_FAILED
+        )
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.TARGET_RESOLVED,
+            failure=failure,
+            reason_code=resolution_reason or "TARGET_RESOLUTION_FAILED",
+            text=(
+                "the exact desktop target could not be resolved safely; "
                 "no screenshot was captured or sent."
             ),
-            "receipt": {"reason_code": "effective_model_non_vision"},
-        }
-    scene = observe_foreground_scene(target=target)
-    if scene is None:
-        return {
-            "text": "ERROR: exact foreground desktop surface is unavailable.",
-            "receipt": {"reason_code": "desktop_surface_unavailable"},
-        }
+            surface_ref=surface_ref,
+            provider_id=provider,
+            model_id=model,
+            **(
+                {"surface_lifecycle": surface_lifecycle}
+                if surface_lifecycle is not None else {}
+            ),
+        )
     if (
-        (expected_application and scene.application_id != expected_application)
-        or (
-            expected_window_generation
-            and scene.window_ref.window_generation != expected_window_generation
+        bound_scene is not None
+        and (
+            scene.window_ref.process_ref != bound_scene.window_ref.process_ref
+            or scene.window_ref.window_generation
+            != bound_scene.window_ref.window_generation
         )
     ):
-        return {
-            "text": (
-                "ERROR: exact desktop window changed before targeted visual "
-                "observation; no screenshot was captured or sent."
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.TARGET_RESOLVED,
+            failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+            reason_code="TARGET_CONFLICT",
+            text=(
+                "the requested visual surface belongs to a different exact "
+                "application target; no screenshot was captured or sent."
             ),
-            "receipt": {"reason_code": "desktop_surface_identity_changed"},
-        }
-    requested = next(
-        (item for item in scene.surfaces if item.ref_id == str(surface_ref)),
-        None,
+            surface_ref=surface_ref,
+            provider_id=provider,
+            model_id=model,
+        )
+    surface_candidates, surface_selection = (
+        _visual_surface_selection_for_scene(scene)
     )
-    if requested is None:
-        resolved = DESKTOP_SURFACE_REGISTRY.resolve(str(surface_ref))
-        return {
-            "text": "ERROR: stale_reference; re-observe the desktop surface.",
-            "receipt": {
-                "reason_code": "stale_semantic_reference",
-                "stale_reason": resolved.reason or "surface_not_in_current_window",
-            },
-        }
+    current_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
+    if (
+        sys.platform == "win32"
+        and current_native is not None
+        and surface_selection.capture is not None
+        and int(surface_selection.capture.hwnd)
+        != int(current_native.native_window_id)
+    ):
+        selected = surface_selection.capture
+        corrected = _observe_window_scene(
+            (selected.hwnd, selected.title, selected.pid),
+            target=target,
+            foreground=selected.foreground,
+            class_name_hint=selected.class_name,
+        )
+        corrected_native = (
+            DESKTOP_SURFACE_REGISTRY.native_identity(
+                corrected.window_ref.ref_id,
+            ) if corrected is not None else None
+        )
+        same_selected_native = bool(
+            corrected_native is not None
+            and int(corrected_native.native_window_id) == int(selected.hwnd)
+            and int(corrected_native.pid) == int(selected.pid)
+            and abs(
+                float(corrected_native.process_started_at)
+                - float(selected.process_started_at)
+            ) <= 0.05
+            and str(corrected_native.class_name or "")
+            == str(selected.class_name or "")
+        )
+        same_semantic_application = bool(
+            corrected is not None
+            and (
+                _scene_matches_application(
+                    corrected,
+                    expected_application or scene.application_id,
+                )
+                or (
+                    _application_identity(
+                        corrected.window_ref.accessible_label
+                    )
+                    == _application_identity(
+                        scene.window_ref.accessible_label
+                    )
+                    and bool(scene.window_ref.accessible_label)
+                )
+            )
+        )
+        if (
+            corrected is None
+            or not same_selected_native
+            or not same_semantic_application
+        ):
+            return _vision_failure_result(
+                trace=trace,
+                stage=VisionStage.TARGET_RESOLVED,
+                failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+                reason_code="VISUAL_CONTENT_SURFACE_AMBIGUOUS",
+                text=(
+                    "the semantic application root/content surface could not "
+                    "be selected safely; no image was sent."
+                ),
+                surface_ref=requested.ref_id,
+            )
+        scene = corrected
+        requested = corrected.window_ref
+        _LAST_SCENE.set(corrected)
+        surface_candidates, surface_selection = (
+            _visual_surface_selection_for_scene(scene)
+        )
+    if scene.minimized:
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.CAPTURE_REQUESTED,
+            failure=VisionFailure.TARGET_STALE,
+            reason_code="WINDOW_NOT_VISIBLE",
+            text=(
+                "the exact desktop window is minimized; no screenshot was "
+                "captured or sent."
+            ),
+            surface_ref=surface_ref,
+        )
     if (
         scene.application_id in _SECURE_DESKTOP_PROCESS_NAMES
         or any(
@@ -2657,149 +5679,995 @@ def request_visual_observation(
             for item in scene.surfaces
         )
     ):
-        return {
-            "text": (
-                "ERROR: sensitive or secure desktop surface; no screenshot was "
-                "captured or sent."
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.CAPTURE_REQUESTED,
+            failure=VisionFailure.CAPTURE_ACCESS_DENIED,
+            reason_code="CAPTURE_ACCESS_DENIED",
+            text=(
+                "the target is sensitive or secure; no screenshot was captured "
+                "or sent."
             ),
-            "receipt": {"reason_code": "sensitive_capture_blocked"},
-        }
-    candidates = rank_surface_candidates(scene.surfaces, target)
+            surface_ref=surface_ref,
+        )
     try:
         observation_reason = ObservationReason(str(reason))
     except ValueError:
-        return {
-            "text": "ERROR: unsupported visual observation reason.",
-            "receipt": {"reason_code": "invalid_observation_reason"},
-        }
-    evidence = replace(
-        scene.target_evidence(target, requested=requested),
-        popup_suspected=bool(
-            observation_reason is ObservationReason.POPUP_OR_OVERLAY
-            and any(item.surface_kind is SurfaceKind.DIALOG for item in scene.surfaces)
-        ),
-        state_conflict=observation_reason is ObservationReason.STATE_CONFLICT,
-        ambiguous_view=(
-            observation_reason is ObservationReason.AMBIGUITY
-            and len(candidates) > 1
-        ),
-        visual_postcondition=observation_reason is ObservationReason.VERIFICATION,
-        structured_postcondition_complete=False,
-    )
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.TARGET_RESOLVED,
+            failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+            reason_code="TARGET_RESOLUTION_FAILED",
+            text="unsupported visual observation reason.",
+            surface_ref=surface_ref,
+        )
+
     store = _SCENE_STORES.get()
     if store is None:
         store = VisualObservationStore()
         _SCENE_STORES.set(store)
-    current_observation = store.current(
-        requested.ref_id,
-        scene.structural_epoch,
-    )
-    decision = decide_visual_observation(
-        evidence,
-        model_supports_vision=True,
-        budget_available=store.budget_allows(CaptureKind.WINDOW),
-        existing_current_observation=current_observation is not None,
-    )
-    if not decision.eligible:
-        if (
-            decision.reason_code == "current_observation_reused"
-            and current_observation is not None
-        ):
-            safe = current_observation.to_safe_dict()
-            safe["deduplicated"] = True
-            safe["new_image"] = False
-            return {
-                "text": json.dumps({
-                    "instruction": (
-                        "Reuse the prior image evidence only for this unchanged "
-                        "surface epoch; keep deterministic actuation preferred."
-                    ),
-                    "observation": safe,
-                    "scene": scene.safe_dict(target=target),
-                }, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                "observation": safe,
-                "scene": scene.safe_dict(target=target),
-                "receipt": {
-                    "outcome": "deduplicated",
-                    "reason_code": decision.reason_code,
-                    "surface_ref": requested.ref_id,
-                    "window_surface_ref": scene.window_ref.ref_id,
-                    "structural_epoch": scene.structural_epoch,
-                    "image_sha256": current_observation.image_sha256,
-                },
-            }
-        return {
-            "text": "No visual observation was needed; structured evidence is sufficient.",
-            "receipt": {"reason_code": decision.reason_code},
-        }
-    # Exact window is the privacy boundary. A control/pane crop stays inside it.
-    bounds = requested.bounds or scene.window_ref.bounds
-    if bounds is None:
-        return {
-            "text": "ERROR: scoped capture bounds are unavailable.",
-            "receipt": {"reason_code": "scoped_capture_bounds_unavailable"},
-        }
-    window_bounds = scene.window_ref.bounds
-    if window_bounds is not None and requested.ref_id != scene.window_ref.ref_id:
-        bounds = SurfaceBounds(
-            max(bounds.left, window_bounds.left),
-            max(bounds.top, window_bounds.top),
-            min(bounds.right, window_bounds.right),
-            min(bounds.bottom, window_bounds.bottom),
+    refinement_requested = bool(visual_frame_id or visual_bbox)
+    if refinement_requested and not (
+        str(visual_frame_id or "").strip() and isinstance(visual_bbox, dict)
+    ):
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.REFINE_REQUESTED,
+            failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+            reason_code="REFINE_INPUT_INVALID",
+            text=(
+                "visual refinement requires one current visual_frame_id and one "
+                "normalized visual_bbox; no image was sent."
+            ),
+            surface_ref=requested.ref_id,
         )
+    capture_kind = (
+        CaptureKind.REGION
+        if requested.ref_id != scene.window_ref.ref_id else CaptureKind.WINDOW
+    )
+    if refinement_requested:
+        capture_kind = CaptureKind.ZOOM_REFINE
+    if not store.budget_allows(capture_kind):
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.CAPTURE_REQUESTED,
+            failure=VisionFailure.CAPTURE_UNSUPPORTED,
+            reason_code="CAPTURE_BUDGET_EXHAUSTED",
+            text="visual observation budget exhausted; no image was sent.",
+            surface_ref=surface_ref,
+        )
+
+    runtime = VisionRuntime(provider, model)
+    visual_target = _visual_target_for_scene(scene, requested)
+    capture_metrics = {"latency_ms": 0.0}
+    refinement_source_frame_id = ""
+    content_coverage = SurfaceCoverage.UNKNOWN
+
+    def _capture_driver(_target: VisualTarget):
+        started = time.perf_counter()
+        try:
+            return _capture_bound_visual_surface(
+                scene,
+                requested,
+                provider=provider,
+                model=model,
+            )
+        finally:
+            capture_metrics["latency_ms"] = (
+                time.perf_counter() - started
+            ) * 1000.0
+
+    driver = (
+        WindowsCaptureDriver(_capture_driver)
+        if sys.platform == "win32" else _capture_driver
+    )
     try:
-        png_bytes, capture_latency_ms, preparation_latency_ms = (
-            _capture_bounds_timed(bounds)
+        resolved_target, trace = runtime.resolve_target(
+            target or requested.accessible_label,
+            resolver=lambda _semantic: visual_target,
+            trace=trace,
+        )
+        if refinement_requested:
+            try:
+                bbox = NormalizedBBox(
+                    left=float(visual_bbox.get("left")),
+                    top=float(visual_bbox.get("top")),
+                    right=float(visual_bbox.get("right")),
+                    bottom=float(visual_bbox.get("bottom")),
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return _vision_failure_result(
+                    trace=trace,
+                    stage=VisionStage.REFINE_REQUESTED,
+                    failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+                    reason_code="REFINE_BBOX_INVALID",
+                    text="the normalized refinement region is invalid; no image was sent.",
+                    surface_ref=requested.ref_id,
+                )
+            frames = _VISUAL_FRAMES.get() or {}
+            source_capture = frames.get(str(visual_frame_id or ""))
+            current_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+                scene.window_ref.ref_id,
+            )
+            current_native_token = (
+                hashlib.sha256(
+                    f"{current_native.pid}:{current_native.native_window_id}".encode(
+                        "utf-8", errors="replace",
+                    )
+                ).hexdigest()[:24]
+                if current_native is not None else ""
+            )
+            if (
+                source_capture is None
+                or source_capture.provider != provider
+                or source_capture.model != model
+                or source_capture.application_id != scene.application_id
+                or source_capture.window_generation
+                != scene.window_ref.window_generation
+                or source_capture.structural_epoch != scene.structural_epoch
+                or not source_capture.is_fresh()
+                or not current_native_token
+                or source_capture.native_window_token != current_native_token
+            ):
+                return _vision_failure_result(
+                    trace=trace,
+                    stage=VisionStage.REFINE_REQUESTED,
+                    failure=VisionFailure.TARGET_STALE,
+                    reason_code="REFINE_SOURCE_FRAME_STALE",
+                    text=(
+                        "the refinement frame is unavailable or belongs to another "
+                        "target/model generation; no image was sent."
+                    ),
+                    surface_ref=requested.ref_id,
+                    frame_id=str(visual_frame_id or ""),
+                )
+            pass_index = store.refinement_count + 1
+            trace.record(
+                VisionStage.REFINE_REQUESTED,
+                "bounded_roi_refinement_requested",
+                source_frame_id=source_capture.frame_id,
+                pass_index=pass_index,
+                roi=bbox.to_dict(),
+            )
+            capture = crop_capture(source_capture, bbox)
+            if capture is source_capture:
+                return _vision_failure_result(
+                    trace=trace,
+                    stage=VisionStage.REFINE_REQUESTED,
+                    failure=VisionFailure.CAPTURE_UNSUPPORTED,
+                    reason_code="REFINE_REGION_NOT_TIGHTER",
+                    text=(
+                        "the requested region would resend the unchanged full frame; "
+                        "no image was sent."
+                    ),
+                    surface_ref=requested.ref_id,
+                    frame_id=source_capture.frame_id,
+                )
+            refinement_source_frame_id = source_capture.frame_id
+        else:
+            capture, trace = runtime.capture(
+                resolved_target,
+                driver,
+                trace=trace,
+            )
+        if not scene.foreground and not capture.exact_surface_pixels:
+            raise VisionCaptureError(
+                CaptureFailure.UNSUPPORTED,
+                "background_capture_not_exact_target_bound",
+            )
+        content_coverage = _capture_surface_coverage(
+            scene,
+            requested,
+            capture,
+            surface_selection,
+            refinement_requested=refinement_requested,
+        )
+        if (
+            _visual_full_window_required()
+            and not refinement_requested
+            and requested.ref_id == scene.window_ref.ref_id
+            and content_coverage not in {
+                SurfaceCoverage.FULL_WINDOW,
+                SurfaceCoverage.CLIENT_CONTENT,
+            }
+        ):
+            raise VisionCaptureError(
+                CaptureFailure.WRONG_DIMENSIONS,
+                "CAPTURE_COVERAGE_INSUFFICIENT",
+            )
+
+        media_owner_id, media_turn_id = effective_model_media_scope()
+        from osia.image_inputs import turn_scoped_media_owner
+
+        scoped_media_owner = turn_scoped_media_owner(
+            media_owner_id, media_turn_id,
+        )
+        request = ImageInputTransport().build(
+            capture,
+            (
+                "Exact read-only UI frame attached for the active model. "
+                "Use it only as evidence for the current goal."
+            ),
+            {},
+            parent_image_id=None,
+            owner_id=scoped_media_owner,
+        )
+        image_reference = next(
+            (
+                dict(part)
+                for part in request.messages[0]["content"]
+                if isinstance(part, dict) and part.get("type") == "image_ref"
+            ),
+            {},
+        )
+        if not image_reference.get("image_id"):
+            raise VisionTransportError(
+                VisualStatus.CAPTURE_INVALID,
+                "image_reference_missing_after_registration",
+                failure=VisionFailure.IMAGE_PART_BUILD_FAILED,
+                stage=VisionStage.IMAGE_PART_BUILT,
+            )
+        capture = replace(
+            capture,
+            registered_image_id=str(image_reference["image_id"]),
+        )
+        # Recreate the artifact only as an identity assertion; bytes stay in
+        # the canonical media store and are not duplicated here.
+        capture.to_image_artifact()
+        trace.record(
+            VisionStage.IMAGE_PART_BUILT,
+            "active_model_image_part_built",
+            provider_id=provider,
+            model_id=model,
+            frame_id=capture.frame_id,
+            image_part_count=request.image_part_count,
+        )
+    except _ProtectedWindowCapture as exc:
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.CAPTURE_REQUESTED,
+            failure=VisionFailure.CAPTURE_PROTECTED,
+            reason_code="CAPTURE_PROTECTED",
+            text=(
+                "the application or Windows protects this exact target from "
+                "capture; no image input was produced."
+            ),
+            surface_ref=requested.ref_id,
+            protection_kind=exc.protection_kind,
+        )
+    except VisionTargetError as exc:
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.TARGET_RESOLVED,
+            failure=VisionFailure.TARGET_RESOLUTION_FAILED,
+            reason_code=exc.reason_code or "TARGET_RESOLUTION_FAILED",
+            text="visual target resolution failed; no image was sent.",
+            surface_ref=requested.ref_id,
+        )
+    except VisionCaptureError as exc:
+        reason_codes = {
+            CaptureFailure.ACCESS_DENIED: "CAPTURE_ACCESS_DENIED",
+            CaptureFailure.PROTECTED_CONTENT: "CAPTURE_PROTECTED",
+            CaptureFailure.MINIMIZED_TARGET: "WINDOW_NOT_VISIBLE",
+            CaptureFailure.STALE_TARGET: "SURFACE_STALE",
+            CaptureFailure.GENERATION_MISMATCH: "GENERATION_MISMATCH",
+            CaptureFailure.RESIZED_DURING_CAPTURE: "SURFACE_STALE",
+            CaptureFailure.EMPTY_FRAME: "CAPTURE_EMPTY",
+            CaptureFailure.BLACK_FRAME: "CAPTURE_EMPTY",
+            CaptureFailure.DEVICE_LOSS: "CAPTURE_DEVICE_FAILED",
+            CaptureFailure.WRONG_DIMENSIONS: "CAPTURE_EMPTY",
+            CaptureFailure.UNSUPPORTED: "CAPTURE_UNSUPPORTED",
+        }
+        reason_code = (
+            "CAPTURE_COVERAGE_INSUFFICIENT"
+            if exc.reason_code == "CAPTURE_COVERAGE_INSUFFICIENT" else
+            reason_codes[exc.failure]
+        )
+        return _vision_failure_result(
+            trace=trace,
+            stage=(trace.failed_stage or VisionStage.CAPTURE_REQUESTED),
+            failure={
+                CaptureFailure.ACCESS_DENIED: VisionFailure.CAPTURE_ACCESS_DENIED,
+                CaptureFailure.PROTECTED_CONTENT: VisionFailure.CAPTURE_PROTECTED,
+                CaptureFailure.MINIMIZED_TARGET: VisionFailure.TARGET_STALE,
+                CaptureFailure.STALE_TARGET: VisionFailure.TARGET_STALE,
+                CaptureFailure.GENERATION_MISMATCH: VisionFailure.TARGET_STALE,
+                CaptureFailure.RESIZED_DURING_CAPTURE: VisionFailure.TARGET_STALE,
+                CaptureFailure.EMPTY_FRAME: VisionFailure.CAPTURE_EMPTY,
+                CaptureFailure.BLACK_FRAME: VisionFailure.CAPTURE_EMPTY,
+                CaptureFailure.DEVICE_LOSS: VisionFailure.CAPTURE_DEVICE_FAILED,
+                CaptureFailure.WRONG_DIMENSIONS: VisionFailure.CAPTURE_DIMENSION_MISMATCH,
+                CaptureFailure.UNSUPPORTED: VisionFailure.CAPTURE_UNSUPPORTED,
+            }[exc.failure],
+            reason_code=reason_code,
+            text=(
+                "exact desktop capture failed safely; no global capture or "
+                "alternate model was used."
+            ),
+            surface_ref=requested.ref_id,
+            capture_attempts=[
+                dict(item) for item in getattr(
+                    getattr(exc, "__cause__", None), "attempts", ()
+                )
+                if isinstance(item, dict)
+            ],
+        )
+    except VisionTransportError as exc:
+        return _vision_failure_result(
+            trace=trace,
+            stage=exc.stage,
+            failure=exc.failure,
+            reason_code=exc.reason_code,
+            text=(
+                "the exact image part could not be built for the active model; "
+                "no alternate model was used."
+            ),
+            surface_ref=requested.ref_id,
         )
     except Exception:
-        return {
-            "text": "ERROR: scoped desktop capture failed; no global capture was used.",
-            "receipt": {"reason_code": "scoped_capture_failed"},
-        }
-    capture_kind = decision.capture_kind or CaptureKind.WINDOW
-    if requested.ref_id == scene.window_ref.ref_id:
-        capture_kind = CaptureKind.WINDOW
+        return _vision_failure_result(
+            trace=trace,
+            stage=VisionStage.IMAGE_PART_BUILT,
+            failure=VisionFailure.IMAGE_PART_BUILD_FAILED,
+            reason_code="IMAGE_PART_BUILD_FAILED",
+            text=(
+                "the scoped image input could not be prepared; no global "
+                "capture or alternate model was used."
+            ),
+            surface_ref=requested.ref_id,
+        )
+
     observation, is_new = store.add(
         surface_ref=requested.ref_id,
         capture_kind=capture_kind,
         reason=observation_reason,
-        width=bounds.width,
-        height=bounds.height,
+        width=capture.image_width,
+        height=capture.image_height,
         capture_epoch=store.capture_count,
         structural_epoch=scene.structural_epoch,
         surface_fingerprint=(
-            f"{scene.application_id}:{scene.window_ref.window_generation}:"
-            f"{scene.structural_epoch}"
+            f"{provider}:{model}:{scene.application_id}:"
+            f"{scene.window_ref.window_generation}:{scene.structural_epoch}"
         ),
-        png_bytes=png_bytes,
+        png_bytes=capture.image_bytes,
     )
     safe = observation.to_safe_dict()
-    safe["capture_latency_ms"] = round(capture_latency_ms, 3)
-    safe["image_preparation_latency_ms"] = round(preparation_latency_ms, 3)
-    safe["new_image"] = is_new
+    safe.update({
+        "capture_latency_ms": round(capture_metrics["latency_ms"], 3),
+        "image_preparation_latency_ms": round(
+            capture.preparation_latency_ms, 3,
+        ),
+        "new_image": is_new,
+        "frame_id": capture.frame_id,
+        "source_frame_id": refinement_source_frame_id,
+        "refine_count": store.refinement_count,
+        "content_coverage": content_coverage.value,
+        "evidence_semantics": observer_evidence_semantics(
+            EvidenceSource.VISION,
+            EvidenceCoverage.PARTIAL,
+            target_identity=(
+                f"{scene.application_id}:{scene.window_ref.window_generation}"
+            ),
+            surface_id=requested.ref_id,
+            frame_id=capture.frame_id,
+        ),
+    })
+    frames = _VISUAL_FRAMES.get()
+    if frames is None:
+        frames = {}
+        _VISUAL_FRAMES.set(frames)
+    frames[capture.frame_id] = capture
+    actuation_lease = register_visual_actuation_frame(capture)
+    while len(frames) > 8:
+        frames.pop(next(iter(frames)))
+
+    final_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id,
+    )
     result = {
         "text": json.dumps({
-            "instruction": (
-                "Use this targeted image only as semantic evidence. Choose an "
-                "opaque surface ref, then keep UIA/keyboard ahead of coordinates."
+            "contract": (
+                "READ_ONLY exact visual evidence attached to the active model's "
+                "current reasoning loop. It is not action authority. Visible positive "
+                "evidence may establish presence; an unreadable or omitted detail is "
+                "UNKNOWN, not absent. If more detail is needed, refine this frame with "
+                "one normalized bbox."
             ),
             "observation": safe,
-            "scene": scene.safe_dict(target=target),
+            "target_identity": {
+                "application": scene.application_id,
+                "surface_id": requested.ref_id,
+                "window_surface_id": scene.window_ref.ref_id,
+                "window_generation": scene.window_ref.window_generation,
+                "structural_epoch": scene.structural_epoch,
+            },
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "image_ref": image_reference,
         "observation": safe,
         "scene": scene.safe_dict(target=target),
         "receipt": {
-            "outcome": "observed" if is_new else "deduplicated",
-            "reason_code": decision.reason_code,
+            "schema_version": 1,
+            "dispatch_state": "not_dispatched",
+            "outcome": "observed",
+            "reason_code": "ACTIVE_MODEL_IMAGE_PART_BUILT",
             "surface_ref": requested.ref_id,
             "window_surface_ref": scene.window_ref.ref_id,
+            "application": scene.application_id,
+            "window_generation": scene.window_ref.window_generation,
             "structural_epoch": scene.structural_epoch,
+            "observed_at": scene.observed_at,
+            "captured_at": capture.captured_at,
+            "expires_at": capture.expires_at,
+            "actuation_lease_state": actuation_lease["lease_state"],
+            "actuation_lease_expires_at": actuation_lease["lease_expires_at"],
             "image_sha256": observation.image_sha256,
+            "image_id": str(image_reference.get("image_id") or ""),
+            "image_mime": str(image_reference.get("mime") or capture.mime),
+            "image_width": int(image_reference.get("width") or capture.image_width),
+            "image_height": int(image_reference.get("height") or capture.image_height),
+            "native_window_token": capture.native_window_token,
+            "native_window_id": str(
+                final_native.native_window_id if final_native is not None else ""
+            ),
+            "capture_method": capture.capture_method,
+            "capture_driver": capture.capture_method,
+            "capture_attempts": [
+                dict(item) for item in capture.capture_attempts
+            ],
+            "fallback_used": capture.fallback_used,
+            "source_pixel_format": capture.source_pixel_format,
+            "pixel_format_conversion": capture.pixel_format_conversion,
+            "alpha_handling": capture.alpha_handling,
+            "source_color_space": capture.source_color_space,
+            "color_space_conversion": capture.color_space_conversion,
+            "exact_surface_pixels": capture.exact_surface_pixels,
+            "target_foreground": bool(scene.foreground),
+            "frame_id": capture.frame_id,
+            "surface_generation": capture.surface_generation,
+            "provider_id": provider,
+            "model_id": model,
+            "image_part_count": request.image_part_count,
+            "dimensions": {
+                "width": capture.image_width,
+                "height": capture.image_height,
+            },
+            "image_part_dimensions": {
+                "width": capture.image_width,
+                "height": capture.image_height,
+            },
+            "source_dimensions": (
+                {
+                    "width": capture.transform.source_width,
+                    "height": capture.transform.source_height,
+                }
+                if capture.transform is not None else {}
+            ),
+            "mime": capture.mime,
+            "crop_rectangle": (
+                [round(value, 3) for value in capture.transform.source_box]
+                if capture.transform is not None else []
+            ),
+            "source_frame_id": refinement_source_frame_id,
+            "refine_count": store.refinement_count,
+            "crop_chain": {
+                "source_frame_id": refinement_source_frame_id,
+                "crop_rectangle": (
+                    [round(value, 3) for value in capture.transform.source_box]
+                    if capture.transform is not None else []
+                ),
+                "refine_count": store.refinement_count,
+            },
+            "target_identity": {
+                "application": scene.application_id,
+                "surface_id": requested.ref_id,
+                "window_surface_id": scene.window_ref.ref_id,
+                "window_generation": scene.window_ref.window_generation,
+                "structural_epoch": scene.structural_epoch,
+            },
+            "source_bounds": (
+                scene.window_ref.bounds.to_safe_dict()
+                if scene.window_ref.bounds is not None else {}
+            ),
+            "content_coverage": content_coverage.value,
+            "evidence_semantics": safe["evidence_semantics"],
+            "surface_selection": surface_selection.safe_dict(
+                surface_candidates,
+                application_bounds=scene.window_ref.bounds,
+                captured_dimensions={
+                    "width": capture.image_width,
+                    "height": capture.image_height,
+                },
+            ),
+            **(
+                {"surface_lifecycle": surface_lifecycle}
+                if surface_lifecycle is not None else {}
+            ),
+        },
+        "diagnostics": {
+            **trace.safe_dict(),
+            "image_input_available": True,
+            "image_input_sent": False,
+            "image_part_count": request.image_part_count,
+            "provider_id": provider,
+            "model_id": model,
+            "frame_id": capture.frame_id,
         },
     }
-    if is_new:
-        result["screenshot"] = store.image_base64(observation.observation_id)
     return result
+
+
+def _visual_action_receipt(
+    frame,
+    bbox: NormalizedBBox,
+    *,
+    target: str,
+    expected_postcondition: str,
+    dispatch_state: str,
+    outcome: str,
+    reason_code: str,
+    fresh_frame=None,
+    surface_ref: str = "",
+    window_generation: str = "",
+    native_window_id: str = "",
+    dispatch_count: int = 0,
+    actuation_lease: dict | None = None,
+) -> dict:
+    """Build one privacy-bounded proposal/dispatch receipt for ActionTruth."""
+
+    normalized_bbox = bbox.to_dict()
+    proposal_material = json.dumps(
+        {
+            "source_frame_id": frame.frame_id,
+            "normalized_bbox": normalized_bbox,
+            "semantic_target": str(target or "")[:500],
+            "expected_postcondition": str(expected_postcondition or "")[:500],
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "schema_version": 1,
+        "proposal_id": "vprop_" + hashlib.sha256(
+            proposal_material.encode("utf-8", errors="replace")
+        ).hexdigest()[:32],
+        "source_frame_id": frame.frame_id,
+        "fresh_frame_id": str(
+            getattr(fresh_frame, "frame_id", "") or ""
+        ),
+        "surface_ref": str(surface_ref or frame.surface_ref),
+        "surface_generation": str(
+            window_generation or frame.surface_generation
+            or frame.window_generation
+        ),
+        "window_generation": str(
+            window_generation or frame.window_generation
+        ),
+        "native_window_id": str(native_window_id or ""),
+        "application": str(frame.application_id or ""),
+        "frame_dimensions": {
+            "width": int(frame.image_width),
+            "height": int(frame.image_height),
+        },
+        "normalized_bbox": normalized_bbox,
+        "expected_postcondition": str(expected_postcondition or "")[:800],
+        "coordinate_transform": (
+            frame.transform.safe_dict() if frame.transform is not None else {}
+        ),
+        "dispatch_state": str(dispatch_state or "not_dispatched"),
+        "dispatch_count": max(0, min(1, int(dispatch_count))),
+        "outcome": str(outcome or "confirmed_failure_before_effect"),
+        "reason_code": str(reason_code or "VISUAL_PREFLIGHT_REJECTED"),
+        "actuator": "active_model_visual_bbox_local_mouse",
+        "actuation_lease": {
+            "state": (
+                "actuation_leased"
+                if isinstance(actuation_lease, dict)
+                and float(actuation_lease.get("lease_expires_at") or 0.0) > 0.0
+                else "unavailable"
+            ),
+            "acknowledged_at": round(float(
+                (actuation_lease or {}).get("acknowledged_at") or 0.0
+            ), 6),
+            "expires_at": round(float(
+                (actuation_lease or {}).get("lease_expires_at") or 0.0
+            ), 6),
+        },
+    }
+
+
+def vision_guided_desktop_click(
+    target: str,
+    dispatch_click,
+    *,
+    visual_frame_id: str = "",
+    visual_bbox: dict | None = None,
+    expected_postcondition: str = "",
+    surface_ref: str = "",
+    expected_application: str = "",
+    expected_window_generation: str = "",
+    expected_native_window_id: str = "",
+    before_dispatch=None,
+    prepare_dispatch=None,
+) -> dict:
+    """Dispatch one bbox selected by the active model from its exact frame."""
+
+    provider, model = effective_model_image_route()
+    if not provider or not model:
+        return {
+            "dispatched": False,
+            "outcome": "inapplicable",
+            "text": (
+                "ERROR: the active model has no image-input capability and no "
+                "alternate model is available."
+            ),
+            "reason_code": "IMAGE_INPUT_UNAVAILABLE",
+        }
+    frame_id = str(visual_frame_id or "")
+    frames = _VISUAL_FRAMES.get() or {}
+    context_frame = frames.get(frame_id)
+    frame, lease_reason, actuation_lease = _leased_visual_actuation_frame(
+        frame_id,
+        provider=provider,
+        model=model,
+    )
+    if frame is None:
+        return {
+            "dispatched": False,
+            "outcome": "inapplicable",
+            "text": (
+                "ERROR: desktop_click needs a provider-acknowledged leased "
+                "visual_frame_id and normalized visual_bbox from "
+                "request_visual_observation; no click was sent."
+            ),
+            "reason_code": (
+                lease_reason
+                if context_frame is not None
+                or lease_reason == "VISUAL_FRAME_LEASE_EXPIRED"
+                else "VISUAL_FRAME_REQUIRED"
+            ),
+        }
+    if frame.provider != provider or frame.model != model:
+        return {
+            "dispatched": False,
+            "outcome": "inapplicable",
+            "text": (
+                "ERROR: the visual frame belongs to a different model route; "
+                "no click was sent."
+            ),
+            "reason_code": "VISUAL_FRAME_MODEL_MISMATCH",
+        }
+    bound_native_window_id = str(
+        expected_native_window_id
+        or (
+            frame.target_identity[4]
+            if len(frame.target_identity) > 4 else ""
+        )
+        or ""
+    )
+    if before_dispatch is None or not callable(before_dispatch):
+        return {
+            "dispatched": False,
+            "outcome": "inapplicable",
+            "text": (
+                "ERROR: an authoritative ActionTruth dispatch context is "
+                "required; no click was sent."
+            ),
+            "reason_code": "ACTION_TRUTH_CONTEXT_REQUIRED",
+        }
+    try:
+        bbox = NormalizedBBox(**{
+            key: float((visual_bbox or {})[key])
+            for key in ("left", "top", "right", "bottom")
+        })
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {
+            "dispatched": False,
+            "outcome": "ambiguous",
+            "text": (
+                "ERROR: visual_bbox must be one finite normalized rectangle; "
+                "no click was sent."
+            ),
+            "reason_code": "VISUAL_BBOX_INVALID",
+        }
+
+    def _reject_after_proposal(
+        *, outcome: str, text: str, reason_code: str,
+        fresh_frame=None, surface_ref_value: str = "",
+        window_generation_value: str = "",
+    ) -> dict:
+        return {
+            "dispatched": False,
+            "outcome": outcome,
+            "text": text,
+            "reason_code": reason_code,
+            "receipt": _visual_action_receipt(
+                frame,
+                bbox,
+                target=target,
+                expected_postcondition=expected_postcondition,
+                dispatch_state="not_dispatched",
+                outcome="confirmed_failure_before_effect",
+                reason_code=reason_code,
+                fresh_frame=fresh_frame,
+                surface_ref=surface_ref_value,
+                window_generation=window_generation_value,
+                native_window_id=bound_native_window_id,
+                dispatch_count=0,
+                actuation_lease=actuation_lease,
+            ),
+        }
+
+    if frame.transform is None:
+        return _reject_after_proposal(
+            outcome="capture_invalid",
+            text="ERROR: the visual frame has no coordinate transform.",
+            reason_code="VISUAL_TRANSFORM_UNAVAILABLE",
+        )
+
+    current, requested, resolution_reason = _observe_exact_bound_visual_scene(
+        str(surface_ref or frame.surface_ref),
+        target=target,
+        expected_application=(
+            expected_application or frame.application_id
+        ),
+        expected_window_generation=(
+            expected_window_generation or frame.window_generation
+        ),
+        expected_native_window_id=bound_native_window_id,
+    )
+    if current is None or requested is None:
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact frame target changed before click; no click "
+                "was sent."
+            ),
+            reason_code=resolution_reason or "SURFACE_STALE",
+        )
+    if (
+        current.window_ref.window_generation != frame.window_generation
+        or current.application_id != frame.application_id
+        or current.structural_epoch != frame.structural_epoch
+    ):
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact surface generation changed before click; "
+                "no click was sent."
+            ),
+            reason_code="GENERATION_MISMATCH",
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+    current_window_bounds = current.window_ref.bounds
+    current_window_box = (
+        (
+            current_window_bounds.left,
+            current_window_bounds.top,
+            current_window_bounds.right,
+            current_window_bounds.bottom,
+        )
+        if current_window_bounds is not None else ()
+    )
+    if frame.window_bounds and current_window_box != tuple(frame.window_bounds):
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact window geometry changed after the visual "
+                "frame; re-observe before mouse dispatch."
+            ),
+            reason_code="SURFACE_STALE_GEOMETRY_CHANGED",
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+    if not current.foreground:
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact visual target is not foreground for local "
+                "mouse dispatch; no click was sent."
+            ),
+            reason_code="VISUAL_TARGET_NOT_FOREGROUND",
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+
+    try:
+        fresh_frame = _capture_bound_visual_surface(
+            current,
+            requested,
+            provider=provider,
+            model=model,
+        )
+    except _ProtectedWindowCapture:
+        return _reject_after_proposal(
+            outcome="capture_invalid",
+            text=(
+                "ERROR: the exact target became capture-protected before click; "
+                "no click was sent."
+            ),
+            reason_code="CAPTURE_PROTECTED",
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+    except Exception:
+        return _reject_after_proposal(
+            outcome="capture_invalid",
+            text=(
+                "ERROR: a fresh exact pixel preflight could not be completed; "
+                "no click was sent."
+            ),
+            reason_code="VISUAL_PREFLIGHT_CAPTURE_FAILED",
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+    leased_frame, lease_reason, current_lease = _leased_visual_actuation_frame(
+        frame_id,
+        provider=provider,
+        model=model,
+    )
+    if leased_frame is None or not fresh_frame.is_fresh():
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the visual actuation lease or fresh pixel preflight "
+                "expired; "
+                "no click was sent."
+            ),
+            reason_code=(lease_reason or "SURFACE_STALE"),
+            fresh_frame=fresh_frame,
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+    if not visual_frame_pixels_unchanged(frame, fresh_frame, bbox):
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact target pixels changed after the model selected "
+                "its bbox; re-observe before mouse dispatch."
+            ),
+            reason_code="SURFACE_STALE_PIXELS_CHANGED",
+            fresh_frame=fresh_frame,
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+
+    left, top, right, bottom = frame.transform.bbox_screen_pixels(bbox)
+    point = ((left + right) // 2, (top + bottom) // 2)
+    window_bounds = current_window_bounds
+    if (
+        window_bounds is None
+        or not (
+            window_bounds.left <= point[0] < window_bounds.right
+            and window_bounds.top <= point[1] < window_bounds.bottom
+        )
+    ):
+        return _reject_after_proposal(
+            outcome="ambiguous",
+            text=(
+                "ERROR: the mapped visual target is outside the exact window; "
+                "no click was sent."
+            ),
+            reason_code="VISUAL_POINT_OUTSIDE_TARGET",
+            fresh_frame=fresh_frame,
+            surface_ref_value=requested.ref_id,
+            window_generation_value=current.window_ref.window_generation,
+        )
+
+    prepared_dispatch = None
+    if callable(prepare_dispatch):
+        prepared_dispatch = prepare_dispatch(*point)
+        if (
+            isinstance(prepared_dispatch, str)
+            and prepared_dispatch.upper().startswith("ERROR")
+        ):
+            return _reject_after_proposal(
+                outcome="inapplicable",
+                text=prepared_dispatch,
+                reason_code="MOUSE_BACKEND_NOT_READY",
+                fresh_frame=fresh_frame,
+                surface_ref_value=requested.ref_id,
+                window_generation_value=current.window_ref.window_generation,
+            )
+
+    final_scene, final_requested, final_reason = (
+        _observe_exact_bound_visual_scene(
+            str(surface_ref or frame.surface_ref),
+            target=target,
+            expected_application=(expected_application or frame.application_id),
+            expected_window_generation=(
+                expected_window_generation or frame.window_generation
+            ),
+            expected_native_window_id=bound_native_window_id,
+        )
+    )
+    final_bounds = (
+        final_scene.window_ref.bounds
+        if final_scene is not None else None
+    )
+    if (
+        final_scene is None
+        or final_requested is None
+        or not final_scene.foreground
+        or final_scene.application_id != frame.application_id
+        or final_scene.window_ref.window_generation != frame.window_generation
+        or final_bounds is None
+        or not (
+            final_bounds.left <= point[0] < final_bounds.right
+            and final_bounds.top <= point[1] < final_bounds.bottom
+        )
+    ):
+        return _reject_after_proposal(
+            outcome="stale",
+            text=(
+                "ERROR: the exact target lost foreground/identity at the final "
+                "mouse boundary; no click was sent."
+            ),
+            reason_code=(final_reason or "LAST_MOMENT_FOREGROUND_LOST"),
+            fresh_frame=fresh_frame,
+            surface_ref_value=(
+                final_requested.ref_id if final_requested is not None else ""
+            ),
+            window_generation_value=(
+                final_scene.window_ref.window_generation
+                if final_scene is not None else ""
+            ),
+        )
+    before_dispatch()
+    try:
+        dispatched = (
+            dispatch_click(prepared_dispatch)
+            if callable(prepare_dispatch) else
+            dispatch_click(*point)
+        )
+    except Exception:
+        dispatched = "ERROR: click dispatch raised"
+    receipt = _visual_action_receipt(
+        frame,
+        bbox,
+        target=target,
+        expected_postcondition=expected_postcondition,
+        dispatch_state="effect_unknown",
+        outcome="outcome_unknown",
+        reason_code="VISUAL_CLICK_RECONCILIATION_REQUIRED",
+        fresh_frame=fresh_frame,
+        surface_ref=requested.ref_id,
+        window_generation=current.window_ref.window_generation,
+        native_window_id=bound_native_window_id,
+        dispatch_count=1,
+        actuation_lease=current_lease,
+    )
+    receipt.update({
+        "application": current.application_id,
+        "available_read_only_observers": [
+            "inspect_desktop_surfaces",
+            "request_visual_observation",
+        ],
+    })
+    if isinstance(dispatched, str) and dispatched.upper().startswith("ERROR"):
+        receipt["reason_code"] = "VISUAL_CLICK_DISPATCH_OUTCOME_UNKNOWN"
+        return {
+            "dispatched": True,
+            "outcome": "ambiguous",
+            "text": (
+                f"{dispatched} Effect is unknown after the single ActionTruth "
+                "boundary; report the uncertainty truthfully."
+            ),
+            "reason_code": receipt["reason_code"],
+            "receipt": receipt,
+        }
+    return {
+        "dispatched": True,
+        "outcome": "ambiguous",
+        "text": (
+            f'ERROR: clicked "{target}" once from '
+            "the active model's exact visual frame. The application effect is "
+            "unknown; you may inspect state or request another action."
+        ),
+        "reason_code": receipt["reason_code"],
+        "receipt": receipt,
+    }
 
 
 def _find_runtime_control(root, runtime_id: tuple[int, ...]):
@@ -2838,54 +6706,23 @@ def _pre_dispatch_failure(
     if scene is None:
         return result
 
+    window_native = DESKTOP_SURFACE_REGISTRY.native_identity(
+        scene.window_ref.ref_id
+    )
+    receipt["application_identity"] = scene.application_id
     quality = scene.accessibility_quality(target)
     receipt["accessibility_quality"] = quality.value
     receipt["window_surface_ref"] = scene.window_ref.ref_id
+    receipt["window_generation"] = scene.window_ref.window_generation
+    receipt["native_window_id"] = str(
+        window_native.native_window_id if window_native is not None else ""
+    )
     receipt["structural_epoch"] = scene.structural_epoch
-    if (
-        failure_class != "mechanism_failed_continue"
-        or quality is AccessibilityQuality.RICH_TARGET_RESOLVED
-    ):
-        receipt["adaptive_visual_observation"] = "not_needed"
-        return result
-    if not effective_model_supports_vision():
-        receipt["adaptive_visual_observation"] = "effective_model_non_vision"
-        return result
-
-    if any(
-        item.surface_kind is SurfaceKind.DIALOG for item in scene.surfaces
-    ):
-        observation_reason = ObservationReason.POPUP_OR_OVERLAY
-    elif quality is AccessibilityQuality.CUSTOM_RENDERED:
-        observation_reason = ObservationReason.CUSTOM_RENDERED
-    elif len(rank_surface_candidates(scene.surfaces, target)) > 1:
-        observation_reason = ObservationReason.AMBIGUITY
-    else:
-        observation_reason = ObservationReason.INCOMPLETE_ACCESSIBILITY
-    observation = request_visual_observation(
-        scene.window_ref.ref_id,
-        observation_reason.value,
-        target,
-        expected_application=scene.application_id,
-        expected_window_generation=scene.window_ref.window_generation,
+    receipt["available_read_only_observers"] = (
+        ["inspect_desktop_surfaces", "request_visual_observation"]
+        if effective_model_supports_vision() else
+        ["inspect_desktop_surfaces"]
     )
-    observation_receipt = (
-        observation.get("receipt") if isinstance(observation, dict) else None
-    )
-    observation_receipt = (
-        observation_receipt if isinstance(observation_receipt, dict) else {}
-    )
-    receipt["adaptive_visual_observation"] = str(
-        observation_receipt.get("outcome")
-        or observation_receipt.get("reason_code")
-        or "unavailable"
-    )
-    receipt["visual_reason_code"] = str(
-        observation_receipt.get("reason_code") or ""
-    )
-    for key in ("observation", "scene", "screenshot"):
-        if key in observation:
-            result[key] = observation[key]
     return result
 
 
@@ -3169,19 +7006,94 @@ def activate_desktop_surface(
                     },
                 },
             }
+        verified_selection = _select_desktop_target(prior_surface.application_id)
+        verified_scene = verified_selection.target_scene
+        verified_native = (
+            DESKTOP_SURFACE_REGISTRY.native_identity(
+                verified_scene.window_ref.ref_id,
+            )
+            if verified_scene is not None else None
+        )
+        exact_focus_verified = bool(
+            verified_selection.status == "exact_target"
+            and verified_scene is not None
+            and verified_scene.foreground
+            and verified_scene.application_id == scene.application_id
+            and verified_scene.window_ref.process_ref
+            == scene.window_ref.process_ref
+            and verified_scene.window_ref.window_generation
+            == scene.window_ref.window_generation
+            and verified_native is not None
+            and str(verified_native.native_window_id)
+            == str(resolution.native.native_window_id)
+            and int(verified_native.pid or 0) == int(resolution.native.pid or 0)
+        )
+        if not exact_focus_verified:
+            return {
+                "text": (
+                    "ERROR: target-window focus was dispatched but the exact "
+                    "HWND/process/surface foreground postcondition was not verified."
+                ),
+                "receipt": {
+                    "schema_version": 1,
+                    "dispatch_state": "effect_unknown",
+                    "outcome": "outcome_unknown",
+                    "reason_code": "desktop_target_focus_verification_failed",
+                    "failure_class": "effect_reconciliation_required",
+                    "surface_ref": surface_ref,
+                    "primitive": {
+                        "kind": "desktop_window_focus",
+                        "mechanism": "exact_window_focus",
+                        "dispatched_at": dispatched_at,
+                        "before": _primitive_state_projection(
+                            scene, resolution.surface,
+                        ),
+                    },
+                },
+            }
+        scene_payload = verified_scene.safe_dict(target=str(objective or ""))
+        scene_payload.update({
+            "requested_application": verified_selection.requested_application,
+            "target_resolution": verified_selection.status,
+            "target_identity_strength": verified_selection.identity_strength,
+            "target_identity_evidence": verified_selection.identity_evidence,
+            "target_candidate_count": verified_selection.candidate_count,
+            "target_foreground": True,
+            "foreground_application": verified_scene.application_id,
+            "foreground_window_surface_ref": verified_scene.window_ref.ref_id,
+            "top_level_surfaces": list(verified_selection.top_level_surfaces),
+            "requested_target_candidates": list(
+                verified_selection.requested_candidates
+            ),
+            "resolved_target_candidates": list(
+                verified_selection.resolved_candidates
+            ),
+            "target_conflict": verified_selection.target_conflict,
+        })
+        invalidate_visual_actuation_frames(
+            surface_ref=verified_scene.window_ref.ref_id,
+            window_generation=verified_scene.window_ref.window_generation,
+        )
         return {
             "text": (
-                "Exact desktop target-window activation dispatched; read-only "
-                "re-observation is required before actuation."
+                "Exact desktop target-window activation and fresh foreground "
+                "reinspection verified; pre-focus visual localization was invalidated."
             ),
+            "scene": scene_payload,
             "receipt": {
                 "schema_version": 1,
-                "dispatch_state": "dispatched",
-                "outcome": "success_unverified",
-                "reason_code": "desktop_target_focus_dispatched",
+                "dispatch_state": "effect_confirmed",
+                "outcome": "confirmed_success",
+                "reason_code": "desktop_target_focus_verified",
                 "surface_ref": surface_ref,
                 "mechanism": "exact_window_focus",
                 "structural_epoch": scene.structural_epoch,
+                "observed_at": verified_scene.observed_at,
+                "postcondition": "application_foreground",
+                "target_foreground": True,
+                "window_generation": verified_scene.window_ref.window_generation,
+                "native_window_id": str(verified_native.native_window_id),
+                "pid": int(verified_native.pid or 0),
                 "reresolved_from": reresolved_from,
                 "primitive": {
                     "kind": "desktop_window_focus",
@@ -3189,6 +7101,9 @@ def activate_desktop_surface(
                     "dispatched_at": dispatched_at,
                     "before": _primitive_state_projection(
                         scene, resolution.surface,
+                    ),
+                    "after": _primitive_state_projection(
+                        verified_scene, verified_scene.window_ref,
                     ),
                 },
             },
@@ -3489,11 +7404,16 @@ def activate_desktop_surface(
 
 __all__ = [
     "DesktopScene",
+    "NativeWindowSurfaceCandidate",
+    "SurfaceCoverage",
+    "VisualSurfaceSelection",
     "activate_desktop_surface",
     "begin_desktop_turn",
     "bind_effective_model",
     "effective_model_supports_vision",
+    "effective_model_route_is_bound",
     "effective_model_image_route",
+    "effective_model_media_scope",
     "end_desktop_turn",
     "focus_existing_application_window",
     "inspect_desktop_surfaces",
@@ -3502,4 +7422,6 @@ __all__ = [
     "request_visual_observation",
     "reset_effective_model",
     "scene_matches_application",
+    "select_application_visual_surface",
+    "vision_guided_desktop_click",
 ]

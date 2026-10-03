@@ -124,8 +124,14 @@ def test_agent_integration_is_confined_to_the_authorized_terminal_loop():
     )
     segment = ast.get_source_segment(source, target) or ""
 
-    assert segment.count("phase3_continuation_context(") == 1
-    assert segment.count("segment_input = continuation_context(decision)") == 3
+    assert "phase3_continuation_context(" not in segment
+    assert "adaptive_success_eligible" not in segment
+    # WOR-303: continuation binding is centralized in apply_continuation; the
+    # canonical driver owns every same-turn continuation.
+    assert segment.count("apply_continuation(") >= 8
+    assert segment.count(
+        "segment_input = continuation_context(decision)"
+    ) == 2
     assert segment.count("while True:") == 1
     assert "controller.evaluate(" in segment
     assert "controller.mark_terminal" not in segment

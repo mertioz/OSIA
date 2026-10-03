@@ -220,6 +220,16 @@ def _prepare_runtime() -> None:
     except Exception as exc:
         print(f"[CONFIG] ensure_config_files skipped: {exc}")
     _boot_mark("after ensure_config_files")
+    try:
+        from osia.image_inputs import (
+            cleanup_media_store,
+            cleanup_owned_temp_images,
+        )
+
+        cleanup_media_store()
+        cleanup_owned_temp_images()
+    except Exception:
+        pass
 
 
 def main() -> int:

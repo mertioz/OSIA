@@ -90,7 +90,6 @@ def _state_revision(
 ) -> int:
     return max(
         _safe_int(terminality_snapshot.get("evidence_revision")),
-        _safe_int(terminality_snapshot.get("progress_revision")),
         _safe_int(terminality_snapshot.get("strategy_attempt_revision")),
         _safe_int(strategy_snapshot.get("evidence_revision")),
     )

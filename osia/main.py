@@ -3,14 +3,14 @@ import os
 import sys
 # The Qt GUI must run under the X11 (xcb) platform plugin on Linux. On Windows
 # Qt uses its native "windows" plugin automatically, so xcb must NOT be forced
-# (it would fail to start). Guard it to Linux only — WOR-11 (Windows port).
+# (it would fail to start). Guard it to Linux only â€” WOR-11 (Windows port).
 if sys.platform.startswith("linux"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 # On Windows, the console's default encoding (cp1252) raises UnicodeEncodeError
-# when printing emoji / non-ASCII (e.g. the "▶" in "[OSIA Agent] ▶ tool:").
+# when printing emoji / non-ASCII (e.g. the "â–¶" in "[OSIA Agent] â–¶ tool:").
 # Reconfigure stdout/stderr to UTF-8 (replace on error) before any code prints
-# non-ASCII — WOR-11. Guarded for the detached-launch case (autostart under
-# pythonw), where stdout/stderr may be None or lack .reconfigure — this must
+# non-ASCII â€” WOR-11. Guarded for the detached-launch case (autostart under
+# pythonw), where stdout/stderr may be None or lack .reconfigure â€” this must
 # never crash startup.
 if sys.platform == "win32":
     for _stream in (sys.stdout, sys.stderr):
@@ -21,7 +21,7 @@ if sys.platform == "win32":
             pass
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 # WOR-46 (Windows UI Automation click backend): pin the process DPI awareness
-# ONCE, here at startup — BEFORE Qt's QApplication is ever constructed and BEFORE
+# ONCE, here at startup â€” BEFORE Qt's QApplication is ever constructed and BEFORE
 # the `uiautomation` library can be imported (it sets DPI awareness itself at
 # import time). DPI awareness can only be set once per process, so fixing it
 # FIRST means Qt (which would otherwise enable Per-Monitor-v2 on its own) and
@@ -29,7 +29,7 @@ if sys.platform == "win32":
 # The payoff: UIA BoundingRectangle, Pillow ImageGrab (vision capture) and
 # pyautogui clicks then all share ONE physical-pixel coordinate space, so a rect
 # center resolved by UIA lands exactly where the click is sent. We request
-# Per-Monitor-Aware-v2, which is already Qt6's default — so the GUI renders
+# Per-Monitor-Aware-v2, which is already Qt6's default â€” so the GUI renders
 # identically (no regression) and stays coherent with the PassThrough rounding
 # policy wake_mode() sets before its QApplication. Best-effort: every call is
 # wrapped in try/except so a missing API on older Windows never crashes startup.
@@ -47,7 +47,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 """
-OSIA main entry point — supports text mode, voice mode, wake-word mode.
+OSIA main entry point â€” supports text mode, voice mode, wake-word mode.
 
 Run:
   python osia/main.py              # Wake word mode with wake screen (default)
@@ -57,7 +57,7 @@ Run:
 """
 
 # Silence the noisy startup chatter from torch / transformers / kokoro.
-# Must run before any module that transitively imports them — otherwise the
+# Must run before any module that transitively imports them â€” otherwise the
 # import-time warnings have already been emitted.
 import warnings
 warnings.filterwarnings("ignore", module=r"torch.*")
@@ -71,6 +71,7 @@ import time
 import re
 import unicodedata
 import uuid
+import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -97,273 +98,28 @@ _SERVER_MOBILE_CATALOGUE_URL = (
 _SERVER_CHATGPT_ACCOUNT_URL = (
     "http://127.0.0.1:8765/internal/chatgpt_account_changed"
 )
-_SERVER_PERMISSION_CHANGED_URL = (
-    "http://127.0.0.1:8765/internal/permission_changed"
-)
 LIVEAPI_AVAILABLE = False
-# Desktop→server MCP state mirror (Phase 1, direction A). The desktop pings this
+# Desktopâ†’server MCP state mirror (Phase 1, direction A). The desktop pings this
 # after a local MCP connect/disconnect so the mobile server reconciles its OWN
 # manager and repaints every phone. Same loopback host as new_chat; carries only
 # {id, action} (no secret); localhost-only on the server side.
 _SERVER_MCP_SYNC_URL = "http://127.0.0.1:8765/internal/mcp_sync"
-# WOR-96 PART 1 — desktop entry point for an OAuth connect that completes via the
-# HTTPS tunnel callback (app.osia.space → the SERVER process). The desktop kicks the
+# WOR-96 PART 1 â€” desktop entry point for an OAuth connect that completes via the
+# HTTPS tunnel callback (app.osia.space â†’ the SERVER process). The desktop kicks the
 # server (which runs the OAuth provider so the tunnel redirect lands in the same
 # process as the PKCE state) and opens the returned authorize URL in the PC
 # browser. Separate from the existing loopback Connect button, which is unchanged.
 _SERVER_MCP_OAUTH_TUNNEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_tunnel_connect"
-# WOR-97 — desktop entry point to abort an in-flight OAuth login running in the
+# WOR-97 â€” desktop entry point to abort an in-flight OAuth login running in the
 # SERVER process (tunnel/PART-1 flow). The desktop POSTs {id} to this loopback
 # route, which calls MCPManager.cancel_pending server-side and rebroadcasts.
 _SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
-# WOR-98 — desktop entry point to "switch account" on a CONNECTED OAuth connector.
+# WOR-98 â€” desktop entry point to "switch account" on a CONNECTED OAuth connector.
 # The desktop POSTs {id} to this loopback route, which tears the session down,
 # REVOKES the grant (RFC 7009) AND forgets the DCR client (delete_mcp_oauth) so the
 # next Connect re-runs DCR + a fresh login, then rebroadcasts the reset.
 _SERVER_MCP_OAUTH_SWITCH_URL = "http://127.0.0.1:8765/internal/mcp_oauth_switch"
 _SERVER_CRON_NOTIFICATION_URL = "http://127.0.0.1:8765/internal/cron_notification"
-_SERVER_AUTONOMOUS_PC_STATE_URL = (
-    "http://127.0.0.1:8765/internal/autonomous_authorization_state"
-)
-_SERVER_CHAT_AUTONOMOUS_START_URL = (
-    "http://127.0.0.1:8765/internal/chat_autonomous_start"
-)
-_SERVER_CHAT_AUTONOMOUS_CANCEL_URL = (
-    "http://127.0.0.1:8765/internal/chat_autonomous_cancel"
-)
-_SERVER_LEGACY_EXECUTION_CANCEL_URL = (
-    "http://127.0.0.1:8765/internal/legacy_execution_cancel"
-)
-_SERVER_LEGACY_EXECUTION_RESUME_URL = (
-    "http://127.0.0.1:8765/internal/legacy_execution_resume"
-)
-
-
-def _launch_server_autonomous_from_chat(request: dict) -> dict:
-    """Launch one desktop-chat handoff through the canonical server runner."""
-
-    import json
-    import socket
-    import urllib.error
-    import urllib.request
-
-    turn_context = request.get("turn_context")
-    payload = {
-        key: request.get(key)
-        for key in (
-            "objective", "source_refs", "request_id", "conversation_id",
-            "source_request_id", "source_turn_id", "source_assistant_message_id",
-            "provider_id", "model_id", "reason_code", "confidence",
-            "explicit_request",
-        )
-    }
-    payload["language"] = str(getattr(turn_context, "language", "") or "")
-    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    try:
-        http_request = urllib.request.Request(
-            _SERVER_CHAT_AUTONOMOUS_START_URL,
-            data=encoded,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(http_request, timeout=250.0) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except (socket.timeout, TimeoutError):
-        return {"status": "outcome_unknown", "error_code": "start_timeout"}
-    except urllib.error.URLError as exc:
-        if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
-            return {"status": "outcome_unknown", "error_code": "start_timeout"}
-        return {
-            "status": "unavailable",
-            "error_code": "runner_transport_unavailable",
-        }
-    except Exception:
-        return {
-            "status": "unavailable",
-            "error_code": "runner_transport_unavailable",
-        }
-    return decoded if isinstance(decoded, dict) else {
-        "status": "failed",
-        "error_code": "invalid_server_response",
-    }
-
-
-def _load_server_autonomous_pc_state() -> dict | None:
-    """Fetch the server-owned mobile run for local PC review only."""
-
-    import json
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(
-            _SERVER_AUTONOMOUS_PC_STATE_URL, timeout=0.75,
-        ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return None
-    state = payload.get("state") if isinstance(payload, dict) else None
-    return state if payload.get("ok") is True and isinstance(state, dict) else None
-
-
-def _cancel_server_autonomous_from_chat(binding: dict) -> dict:
-    """Request exact cancellation of one desktop-Chat-owned durable run."""
-
-    import json
-    import urllib.request
-
-    payload = json.dumps({
-        key: str(binding.get(key) or "")
-        for key in ("conversation_id", "request_id", "turn_id", "task_id", "run_id")
-    }).encode("utf-8")
-    try:
-        request = urllib.request.Request(
-            _SERVER_CHAT_AUTONOMOUS_CANCEL_URL,
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=5.0) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return {"accepted": False, "outcome_unknown": True}
-    return decoded if isinstance(decoded, dict) else {
-        "accepted": False,
-        "outcome_unknown": True,
-    }
-
-
-def _post_server_legacy_execution_control(url: str, binding: dict) -> dict:
-    """Submit one exact legacy checkpoint control to the loopback server."""
-
-    import json
-    import urllib.request
-
-    raw = binding if isinstance(binding, dict) else {}
-    run_id = str(raw.get("run_id") or "")
-    task_id = str(raw.get("task_id") or "")
-    plan_revision = raw.get("plan_revision")
-    authorization_revision = raw.get("authorization_revision")
-    if (
-        raw.get("schema_version") != 1
-        or raw.get("compatibility_mode") != "legacy_autonomous_checkpoint"
-        or raw.get("legacy_compatibility") is not True
-        or not run_id
-        or len(run_id) > 256
-        or not task_id
-        or len(task_id) > 160
-        or type(plan_revision) is not int
-        or plan_revision < 0
-        or type(authorization_revision) is not int
-        or authorization_revision < 0
-    ):
-        return {"accepted": False, "error_code": "invalid_target"}
-    encoded = json.dumps({
-        "schema_version": 1,
-        "run_id": run_id,
-        "task_id": task_id,
-        "plan_revision": plan_revision,
-        "authorization_revision": authorization_revision,
-    }).encode("utf-8")
-    try:
-        request = urllib.request.Request(
-            url,
-            data=encoded,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=5.0) as response:
-            decoded = json.loads(response.read().decode("utf-8"))
-    except Exception:
-        return {"accepted": False, "outcome_unknown": True}
-    return decoded if isinstance(decoded, dict) else {
-        "accepted": False,
-        "outcome_unknown": True,
-    }
-
-
-def _cancel_server_legacy_execution(binding: dict) -> dict:
-    return _post_server_legacy_execution_control(
-        _SERVER_LEGACY_EXECUTION_CANCEL_URL, binding,
-    )
-
-
-def _resume_server_legacy_execution(binding: dict) -> dict:
-    return _post_server_legacy_execution_control(
-        _SERVER_LEGACY_EXECUTION_RESUME_URL, binding,
-    )
-
-
-def _wait_server_autonomous_from_chat(
-    initial_result: dict,
-    request: dict,
-    *,
-    progress_callback=None,
-    bind_execution=None,
-) -> dict:
-    """Follow one exact server checkpoint through restarts until terminal."""
-
-    del initial_result
-    last_progress = None
-    while True:
-        state = _load_server_autonomous_pc_state()
-        execution = (
-            state.get("chat_execution")
-            if isinstance(state, dict) else None
-        )
-        if isinstance(execution, dict) and (
-            execution.get("conversation_id") == request.get("conversation_id")
-            and execution.get("request_id") == request.get("source_request_id")
-            and execution.get("turn_id") == request.get("source_turn_id")
-        ):
-            if callable(bind_execution) and execution.get("run_id"):
-                try:
-                    bind_execution(execution, request)
-                except Exception:
-                    pass
-            identity = tuple(sorted(execution.items()))
-            if identity != last_progress and callable(progress_callback):
-                try:
-                    progress_callback(dict(execution))
-                except Exception:
-                    pass
-            last_progress = identity
-            if execution.get("terminal"):
-                return dict(execution)
-        try:
-            persisted = conversations.find_correlated_turn(
-                str(request.get("conversation_id") or ""),
-                str(request.get("source_request_id") or ""),
-            )
-        except ValueError:
-            persisted = None
-        if (
-            isinstance(persisted, dict)
-            and persisted.get("assistant_message_id")
-            == request.get("source_assistant_message_id")
-            and persisted.get("durable_run_id")
-            and isinstance(persisted.get("assistant_content"), str)
-        ):
-            return {
-                "status": str(persisted.get("durable_status") or "blocked"),
-                "progress_status": str(
-                    persisted.get("durable_status") or "blocked"
-                ),
-                "terminal": True,
-                "outcome_unknown": bool(
-                    persisted.get("durable_outcome_unknown")
-                ),
-                "conversation_id": str(persisted.get("conversation_id") or ""),
-                "request_id": str(persisted.get("request_id") or ""),
-                "turn_id": str(persisted.get("turn_id") or ""),
-                "assistant_message_id": str(
-                    persisted.get("assistant_message_id") or ""
-                ),
-                "run_id": str(persisted.get("durable_run_id") or ""),
-                "provider_id": str(persisted.get("durable_provider_id") or ""),
-                "model_id": str(persisted.get("durable_model_id") or ""),
-                "final_text": str(persisted.get("assistant_content") or "")[:32_000],
-            }
-        time.sleep(0.25)
 
 
 def _notify_mobile_new_chat() -> None:
@@ -401,12 +157,6 @@ def _notify_mobile_state_changed(url: str, label: str) -> None:
         name=f"osia-mobile-{label}-notify",
         daemon=True,
     ).start()
-
-
-def _notify_mobile_permission_changed(_epoch: int) -> None:
-    _notify_mobile_state_changed(
-        _SERVER_PERMISSION_CHANGED_URL, "permission-changed",
-    )
 
 
 def _notify_mobile_conversation_changed(
@@ -1228,12 +978,12 @@ def _dispatch_after_persisted_user(
 
 
 def _notify_mobile_mcp_sync(server_id: str, action: str) -> None:
-    """Best-effort desktop→server MCP state mirror (Phase 1, direction A).
+    """Best-effort desktopâ†’server MCP state mirror (Phase 1, direction A).
 
     After the DESKTOP manager connects/disconnects an MCP connector, tell the
     mobile WS server so it reconciles its OWN manager (headless, fresh-token
-    gated — never a browser) and broadcasts the resulting status to every
-    connected phone. Carries only ``{id, action}`` — no secret. Silent no-op when
+    gated â€” never a browser) and broadcasts the resulting status to every
+    connected phone. Carries only ``{id, action}`` â€” no secret. Silent no-op when
     the server isn't running. Called from the GUI's MCP background threads (never
     the Qt main thread), so the 1.5s timeout never blocks the UI."""
     import json
@@ -1279,13 +1029,13 @@ def _notify_mobile_cron_notification(
 
 
 def request_oauth_tunnel_connect(server_id: str) -> bool:
-    """WOR-96 PART 1 — start an OAuth connect that completes via the HTTPS tunnel
-    callback (app.osia.space → the SERVER process), and open the authorize URL in the
+    """WOR-96 PART 1 â€” start an OAuth connect that completes via the HTTPS tunnel
+    callback (app.osia.space â†’ the SERVER process), and open the authorize URL in the
     PC browser.
 
     POSTs ``{id}`` to the loopback trigger ``/internal/mcp_oauth_tunnel_connect``.
-    The SERVER runs the OAuth provider IN ITS OWN process — where the tunnel
-    redirect lands and the SDK's in-memory PKCE verifier/state live — and returns
+    The SERVER runs the OAuth provider IN ITS OWN process â€” where the tunnel
+    redirect lands and the SDK's in-memory PKCE verifier/state live â€” and returns
     the authorize URL, which we open HERE in the PC browser (the desktop process
     is the one allowed to open a browser; the server neutralises
     ``webbrowser.open``). The token exchange completes server-side when the user
@@ -1293,7 +1043,7 @@ def request_oauth_tunnel_connect(server_id: str) -> bool:
 
     Returns True iff the browser was opened. Best-effort; never raises. This is a
     SEPARATE path from the existing loopback Connect button (unchanged): it runs no
-    provider in the desktop process and gives the desktop no HTTP listener — it
+    provider in the desktop process and gives the desktop no HTTP listener â€” it
     only kicks the server and opens the returned URL. Call OFF the Qt main thread
     (it blocks up to ~35s waiting for discovery+DCR)."""
     import json
@@ -1330,7 +1080,7 @@ def request_oauth_tunnel_connect(server_id: str) -> bool:
 
 
 def request_oauth_cancel(server_id: str) -> bool:
-    """WOR-97 — desktop→server bridge to abort an in-flight OAuth login that runs
+    """WOR-97 â€” desktopâ†’server bridge to abort an in-flight OAuth login that runs
     in the SERVER process (a tunnel/PART-1 flow the desktop manager can't cancel
     locally). POSTs ``{id}`` to the loopback ``/internal/mcp_oauth_cancel``; the
     server calls ``MCPManager.cancel_pending`` and broadcasts the reset so every
@@ -1339,7 +1089,7 @@ def request_oauth_cancel(server_id: str) -> bool:
     Carries only an id (no secret). Best-effort, never raises; a silent no-op when
     the server isn't running. Call OFF the Qt main thread (the 1.5s timeout never
     blocks the UI). Returns True iff the server acked ok. The desktop only uses
-    this for connectors the LOOPBACK manager doesn't own — a PC-initiated login is
+    this for connectors the LOOPBACK manager doesn't own â€” a PC-initiated login is
     cancelled directly via ``get_manager().cancel_pending``."""
     import json
     import urllib.request
@@ -1358,7 +1108,7 @@ def request_oauth_cancel(server_id: str) -> bool:
 
 
 def request_oauth_switch(server_id: str) -> bool:
-    """WOR-98 — desktop→server bridge for "Switch account" on a CONNECTED OAuth
+    """WOR-98 â€” desktopâ†’server bridge for "Switch account" on a CONNECTED OAuth
     connector. POSTs ``{id}`` to the loopback ``/internal/mcp_oauth_switch``; the
     server tears the session down, REVOKES the grant (RFC 7009) AND forgets the DCR
     client blob (``delete_mcp_oauth``) so the next Connect re-runs DCR + a fresh
@@ -1368,7 +1118,7 @@ def request_oauth_switch(server_id: str) -> bool:
     Carries only an id (no secret). Best-effort, never raises; a silent no-op when
     the server isn't running. Call OFF the Qt main thread (the timeout never blocks
     the UI). Returns True iff the server acked ok. Used for BOTH loopback and tunnel
-    OAuth connectors — the revoke+forget logic lives server-side and
+    OAuth connectors â€” the revoke+forget logic lives server-side and
     ``oauth_tokens.json`` is shared via CONFIG_DIR, so one bridge route serves both.
     The route returns immediately (the revoke/forget runs on a server daemon
     thread), so the short timeout is ample."""
@@ -1392,7 +1142,7 @@ def _ensure_mobile_server_windows() -> None:
     """On Windows, make sure the OSIA mobile server (run_server.py) is running.
 
     The server normally starts at login via its own per-user Scheduled Task
-    ("OSIA Mobile Server", registered by ``install.bat``) — the Windows
+    ("OSIA Mobile Server", registered by ``install.bat``) â€” the Windows
     equivalent of the Linux ``osia-server.service`` systemd unit, fully
     independent of this GUI process. This call is a self-heal safety net: it
     registers the task if it is missing (e.g. an install that predates the task
@@ -1410,7 +1160,7 @@ def _ensure_mobile_server_windows() -> None:
     # survive restarts AND match the one the server uses). load_mobile_token()
     # returns "" when no token file exists yet; regenerate_mobile_token() then
     # creates one and writes config/mobile_token.txt. Idempotent (a no-op load
-    # once the file exists) and best-effort — it must never block server startup.
+    # once the file exists) and best-effort â€” it must never block server startup.
     try:
         from osia.config import load_mobile_token, regenerate_mobile_token
         if not load_mobile_token():
@@ -1468,7 +1218,7 @@ def _persist_agent_delta(
             # / empty-response guards) carry an _internal marker and must NEVER
             # be persisted. add_message stores only role+content, so a stored
             # steering frame loses its marker and resurfaces on reload as the
-            # user's own bubble — in the desktop popup AND on mobile, which
+            # user's own bubble â€” in the desktop popup AND on mobile, which
             # share this conversation store. This is the desktop counterpart of
             # the server's exported_history() filter (the single persistence
             # boundary for the local app).
@@ -1509,6 +1259,13 @@ def _persist_agent_delta(
                     "_language_mode": context.mode,
                     "_allowed_languages": list(context.allowed_languages),
                 }
+            if (
+                clean.get("role") == "user"
+                and isinstance(clean.get("_attachments"), list)
+                and clean.get("_attachments")
+            ):
+                metadata = dict(metadata or {})
+                metadata["_attachments"] = list(clean["_attachments"])
             if artifact_refs and index == final_assistant_index:
                 metadata = dict(metadata or {})
                 metadata["_artifact_refs"] = artifact_refs
@@ -1706,7 +1463,7 @@ def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
         )
 
 
-# ── Ctrl+Alt+P manual voice shortcut ───────────────────────────────────────
+# â”€â”€ Ctrl+Alt+P manual voice shortcut â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _start_ctrl_alt_p_listener(callback):
     """
@@ -1719,7 +1476,7 @@ def _start_ctrl_alt_p_listener(callback):
 
     def activate():
         try:
-            print("⌨️  Ctrl+Alt+P pressed — triggering OSIA")
+            print("âŒ¨ï¸  Ctrl+Alt+P pressed â€” triggering OSIA")
             callback()
         except Exception as exc:
             print(
@@ -1756,7 +1513,7 @@ def _start_popup_hotkey_listener(callback):
         return None
 
 
-# ── Voice shutdown lifecycle ────────────────────────────────────────────────
+# â”€â”€ Voice shutdown lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _shutdown_voice_runtime(
     *,
@@ -1802,7 +1559,7 @@ def _shutdown_voice_runtime(
     return worker_stopped
 
 
-# ── Modes ───────────────────────────────────────────────────────────────────
+# â”€â”€ Modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def text_mode():
     """Interactive text-based chat with OSIA."""
@@ -1814,11 +1571,11 @@ def text_mode():
             selected_model,
             provider=settings.get("selected_model_provider") or None,
         )
-    # No conversation is auto-created — one is created lazily when the
+    # No conversation is auto-created â€” one is created lazily when the
     # first message is sent, so the stored list never fills with empties.
     active_conv = None
     print("=" * 60)
-    print("  OSIA — Local AI Voice Assistant (text mode)")
+    print("  OSIA â€” Local AI Voice Assistant (text mode)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print("  Type 'exit' or 'quit' to stop, 'reset' to clear history")
     print("=" * 60)
@@ -1840,10 +1597,10 @@ def text_mode():
         if user_input.lower() == "reset":
             agent.reset()
             active_conv = None
-            print("[History cleared — next message starts a new conversation]")
+            print("[History cleared â€” next message starts a new conversation]")
             continue
 
-        # First message of this conversation — create it now, never earlier.
+        # First message of this conversation â€” create it now, never earlier.
         if active_conv is None:
             active_conv = conversations.create_conversation()
             _notify_mobile_conversation_changed(
@@ -1885,7 +1642,7 @@ def text_mode():
 
 
 def voice_mode():
-    """Single-shot voice mode: listen → agent → speak."""
+    """Single-shot voice mode: listen â†’ agent â†’ speak."""
     from osia import i18n
     from osia.config import load_settings
     from osia.turn_context import localized_text, resolve_turn_context
@@ -1893,11 +1650,11 @@ def voice_mode():
     from osia.voice.tts import speak
     from osia.agent import clean_response
 
-    # No conversation is auto-created — one is created lazily when the
+    # No conversation is auto-created â€” one is created lazily when the
     # first spoken command arrives.
     active_conv = None
     print("=" * 60)
-    print("  OSIA — Voice Mode")
+    print("  OSIA â€” Voice Mode")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print("=" * 60)
 
@@ -1915,7 +1672,7 @@ def voice_mode():
 
         user_text = listen(duration=5)
         if not user_text:
-            print("❌ Nothing heard.")
+            print("âŒ Nothing heard.")
             stored = (
                 conversations.get_conversation(active_conv["id"])
                 if active_conv is not None else None
@@ -1935,7 +1692,7 @@ def voice_mode():
 
         print(f"[STT] accepted voice input ({len(user_text)} chars).")
 
-        # First message — create the conversation now, never earlier.
+        # First message â€” create the conversation now, never earlier.
         if active_conv is None:
             active_conv = conversations.create_conversation()
             _notify_mobile_conversation_changed(
@@ -1945,7 +1702,7 @@ def voice_mode():
             )
             print(f"[New conversation: {active_conv['id']}]")
 
-        print("🤔 Thinking...")
+        print("ðŸ¤” Thinking...")
         turn_agent = OSIAAgent()
         settings = load_settings()
         selected_model = settings.get("selected_model")
@@ -2023,7 +1780,7 @@ def wake_mode():
     from osia.gui.main_popup import MainPopup
     from osia.voice.wake import VoiceSessionLifecycle, WakeAcceptanceGate
     # NOTE: osia.voice.stt (faster_whisper, ~4.3s to import on Windows) is NOT
-    # imported here. listen_for_command is only used on the wake daemon thread —
+    # imported here. listen_for_command is only used on the wake daemon thread â€”
     # it is imported lazily inside handle_wake()'s process() worker so the heavy
     # import never blocks GUI startup (WOR perf fix).
     from osia.voice.commands import is_new_chat_command
@@ -2070,33 +1827,32 @@ def wake_mode():
         assistant_stream_error = pyqtSignal(dict, str)
         chat_turn_started = pyqtSignal(dict)
         execution_trace = pyqtSignal(dict)
-        # Drive the island's visual state from a worker thread.
-        island_state = pyqtSignal(str)
+        # Request GUI reprojection without carrying a possibly stale state.
+        island_state = pyqtSignal()
         # Per-conversation desktop busy state for the popup input controls.
         conversation_busy_changed = pyqtSignal(str, bool)
         tool_attempt_status = pyqtSignal(dict, str)
         # Refresh the conversations panel (new active id) from a worker thread.
         conversations_changed = pyqtSignal(str)
-        # Reset chat (agent + GUI) from a worker thread — "nouveau chat" voice
+        # Canonical conversation deletion completes off the GUI thread.
+        conversation_delete_finished = pyqtSignal(dict)
+        # Reset chat (agent + GUI) from a worker thread â€” "nouveau chat" voice
         # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
         new_chat = pyqtSignal()
         # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
         toggle_popup = pyqtSignal()
         # Sanitized durable execution state projected into its originating Chat.
-        chat_execution_activity = pyqtSignal(dict)
-        # Persisted pre-Chat checkpoint shown as a separate, non-busy banner.
-        legacy_execution_activity = pyqtSignal(dict)
 
     bridge = Bridge()
 
     # Identify the app to the windowing system *before* any window is
     # created, so the taskbar/dock shows "OSIA" + the logo instead of
     # "python"/"osia_desktop" and a generic icon.
-    #   • applicationName / displayName  → the window title + dock label
-    #   • desktopFileName ("osia")       → Wayland/XCB map the window to
+    #   â€¢ applicationName / displayName  â†’ the window title + dock label
+    #   â€¢ desktopFileName ("osia")       â†’ Wayland/XCB map the window to
     #     ~/.local/share/applications/osia.desktop for its taskbar icon
-    #   • setWindowIcon (absolute path)  → the icon every window inherits,
+    #   â€¢ setWindowIcon (absolute path)  â†’ the icon every window inherits,
     #     resolved from the project root so it works from any CWD. Uses the
     #     tightly-cropped ICON_PATH (not the padded logo) so the taskbar/dock
     #     shows the swirl at a proper visible size.
@@ -2110,7 +1866,7 @@ def wake_mode():
     # the per-pixmap setDevicePixelRatio scaling in main_popup.py /
     # dynamic_island.py (which renders the logo at native resolution). We pin
     # PassThrough explicitly to document the fractional-scale rounding those
-    # DPR-tagged pixmaps assume — it equals the Qt6 default, so it is a no-op on
+    # DPR-tagged pixmaps assume â€” it equals the Qt6 default, so it is a no-op on
     # every platform today (integer-scale Linux/Mac included) and changes no
     # behaviour. Must run before the QApplication is constructed. (WOR-11.)
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -2130,18 +1886,6 @@ def wake_mode():
 
     island = DynamicIsland()
     popup = MainPopup()
-    try:
-        from osia.action_policy import get_default_permission_policy
-
-        permission_store = get_default_permission_policy().store
-        permission_store.add_epoch_listener(_notify_mobile_permission_changed)
-        app.aboutToQuit.connect(
-            lambda: permission_store.remove_epoch_listener(
-                _notify_mobile_permission_changed
-            )
-        )
-    except Exception:
-        pass
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
     # Release-only legal gate. The bundled documents are currently review
@@ -2176,6 +1920,9 @@ def wake_mode():
     # message, so the list can legitimately be (and stay) empty.
     agent = OSIAAgent()
     active_conv = None
+    selection_epoch = [0]
+    pending_delete_ids: set[str] = set()
+    pending_delete_contexts: dict[str, dict] = {}
 
     settings = load_settings()
     initial_model = settings.get("selected_model")
@@ -2187,27 +1934,10 @@ def wake_mode():
             print(f"[DEBUG] set_model({initial_model!r}) failed: {e}")
     popup.set_current_model(agent.model, agent.provider)
 
-    # WOR-44 Phase 5 (5-conf-b): register the DESKTOP confirmation provider so a
-    # write/destructive MCP tool prompts the user (modal) before it runs. The
-    # provider is invoked on the agent's worker thread and bridges to THIS Qt
-    # main thread. Registered ONLY on the desktop path — the mobile server keeps
-    # NO provider (hard-deny) until 5-conf-c. Done BEFORE app.exec(), so it is
-    # set before any user-triggered agent turn can run. Best-effort: a failure
-    # must never block GUI startup (the gate then hard-denies writes, which is
-    # the safe default). The controller is kept alive for wake_mode's lifetime.
-    mcp_confirm_controller = None
-    try:
-        from osia.gui.mcp_confirm import MCPConfirmController
-        from osia.mcp_client import registry as _mcp_registry
-        mcp_confirm_controller = MCPConfirmController(popup)
-        _mcp_registry.set_confirmation_provider(mcp_confirm_controller.confirm)
-    except Exception as e:
-        print(f"[OSIA] MCP confirm provider not registered: {e}")
-
     # WOR-44: auto-reconnect every ``enabled`` MCP connector at launch, so a
     # connector the user previously connected (its token / OAuth blob persisted)
     # is live again WITHOUT reopening Settings and clicking Connect. Reuses the
-    # SAME MCPManager.connect() path as the Connect button — idempotent, and the
+    # SAME MCPManager.connect() path as the Connect button â€” idempotent, and the
     # discovered tools register into the agent maps inside connect(), so they are
     # callable on the next turn. OAuth is allowed here (allow_oauth=True), but the
     # routine only attempts an OAuth connector whose stored token is still
@@ -2225,12 +1955,12 @@ def wake_mode():
         target=_reconnect_mcp_connectors, name="osia-mcp-reconnect", daemon=True
     ).start()
 
-    # WOR-44 Phase 2 (direction B, mobile→PC): an ALWAYS-ON daemon that reconciles
+    # WOR-44 Phase 2 (direction B, mobileâ†’PC): an ALWAYS-ON daemon that reconciles
     # THIS desktop process's MCPManager to the shared mcp_servers[].enabled flag.
     # When the user connects/disconnects an MCP connector FROM THE MOBILE app, the
     # server drives its own manager AND now persists enabled (Phase-2 server-side
     # write); this loop (~3s) sees the delta and connects/disconnects the desktop
-    # manager to match — so the desktop mirrors mobile-side changes even when the
+    # manager to match â€” so the desktop mirrors mobile-side changes even when the
     # popup is CLOSED (the Settings QTimer stops then, and the desktop has no HTTP
     # listener, so polling on that timer is insufficient). reconcile_to_enabled
     # keeps the STRICT OAuth gate (trust_present_token=False), so this UNATTENDED
@@ -2241,7 +1971,7 @@ def wake_mode():
     # Connect can't double-connect). Off the Qt main thread; a failure never
     # blocks GUI startup. When the popup is open, the existing Settings QTimer
     # repaints the pills from this SAME manager, so a daemon-driven change shows up
-    # within its poll interval — no GUI change needed.
+    # within its poll interval â€” no GUI change needed.
     def _reconcile_mcp_loop() -> None:
         while True:
             try:
@@ -2263,6 +1993,10 @@ def wake_mode():
     busy_conversations: set[str] = set()
     busy_turn_keys: dict[str, tuple[str, str, str, str]] = {}
     busy_lock = threading.Lock()
+
+    from osia.gui.island_lifecycle import IslandLifecycle
+
+    island_lifecycle = IslandLifecycle(bridge.island_state.emit)
 
     def _any_conversation_busy() -> bool:
         with busy_lock:
@@ -2460,6 +2194,7 @@ def wake_mode():
                 busy_conversations.add(conv_id)
                 if owner_key is not None:
                     busy_turn_keys[conv_id] = owner_key
+                    island_lifecycle.begin(("chat", conv_id), owner_key)
                 elif conv_id not in busy_turn_keys:
                     busy_turn_keys.pop(conv_id, None)
             else:
@@ -2472,14 +2207,28 @@ def wake_mode():
                     return False
                 busy_conversations.discard(conv_id)
                 busy_turn_keys.pop(conv_id, None)
-            any_busy = bool(busy_conversations)
+                if current_owner is not None:
+                    island_lifecycle.finish(("chat", conv_id), current_owner)
         bridge.conversation_busy_changed.emit(conv_id, busy)
-        voice_ui_lifecycle.emit_when_inactive(
-            lambda: bridge.island_state.emit(
-                "thinking" if any_busy else "idle"
-            )
-        )
         return True
+
+    def _set_chat_island_state(
+        binding: dict, state: str, *, terminal: bool = False,
+    ) -> None:
+        key = _chat_turn_key(binding)
+        if key is not None:
+            island_lifecycle.update(("chat", key[0]), key, state, terminal=terminal)
+
+    def _project_chat_island_trace(frame: dict) -> None:
+        if frame.get("terminal") or frame.get("kind") == "terminal":
+            _set_chat_island_state(frame, "idle", terminal=True)
+        elif frame.get("kind") in {"action", "waiting_permission"}:
+            _set_chat_island_state(frame, "idle")
+        elif frame.get("kind") in {
+            "goal", "result", "continuation", "reconciliation",
+            "public_reasoning_summary",
+        }:
+            _set_chat_island_state(frame, "thinking")
 
     def _ensure_active_conversation(seed_text: str | None = None) -> dict:
         nonlocal active_conv
@@ -2502,7 +2251,7 @@ def wake_mode():
         conv = conversations.get_conversation(conv_id)
         return list((conv or {}).get("messages") or [])
 
-    # ── Agent run helpers ────────────────────────────────────────────────
+    # â”€â”€ Agent run helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _register_chat_turn(binding: dict, turn_agent) -> None:
         key = _chat_turn_key(binding)
@@ -2513,6 +2262,7 @@ def wake_mode():
                 "agent": turn_agent,
                 "binding": dict(binding),
             }
+        _set_chat_island_state(binding, "thinking")
 
     def _release_chat_turn(binding: dict, turn_agent) -> None:
         key = _chat_turn_key(binding)
@@ -2522,6 +2272,7 @@ def wake_mode():
             current = active_chat_turns.get(key)
             if isinstance(current, dict) and current.get("agent") is turn_agent:
                 active_chat_turns.pop(key, None)
+                island_lifecycle.finish(("chat", key[0]), key)
 
     def _start_or_run_durable_worker(
         target,
@@ -2614,6 +2365,7 @@ def wake_mode():
         if not turn_id:
             return False
         lifecycle["persistence_retry_scheduled"] = True
+        _set_chat_island_state(binding or turn_meta, "idle", terminal=True)
         lifecycle["durable_wait"] = True
         if turn_agent is not None:
             trace_getter = getattr(turn_agent, "execution_trace_snapshot", None)
@@ -2744,6 +2496,7 @@ def wake_mode():
         if not turn_id:
             return False
         lifecycle["terminal_recovery_retry_scheduled"] = True
+        _set_chat_island_state(dict(lifecycle.get("binding") or turn_meta), "idle")
         lifecycle["durable_wait"] = True
         receipt_recorded = [not bool(str(failed_attempt_id or ""))]
 
@@ -2938,14 +2691,14 @@ def wake_mode():
             return None
 
         def on_stream_sentence(sentence: str) -> None:
-            # The agent's live callback is sentence-oriented and intentionally
-            # normalizes whitespace for speech. It is not a lossless Markdown
-            # transport. The canonical final is revealed progressively by the
-            # presentation-only UI buffer once terminality is verified.
+            # Sentence-oriented output is not a lossless Markdown transport.
+            # The exact canonical final is revealed by the presentation-only
+            # UI buffer once terminality has been verified.
             del sentence
 
         def on_execution_trace(frame: dict) -> None:
             if isinstance(frame, dict) and frame.get("type") == "execution_trace":
+                _project_chat_island_trace(frame)
                 bridge.execution_trace.emit(dict(frame))
 
         def on_tool_attempt_status(status: str, attempt_id: str) -> None:
@@ -2958,17 +2711,18 @@ def wake_mode():
             ):
                 return
             print(f"[OSIA] normal chat tool status: {status}")
-            safe_status = {
-                "action_starting": "action_starting",
-                "action_in_progress": "action_in_progress",
-                "waiting_tool_result": "waiting_tool_result",
-                "verifying_tool_result": "verifying",
-                "resuming_tool_turn": "resuming",
-                "cancellation_requested": "cancellation_requested",
-                "blocked_unknown_effect": "blocked_unknown_effect",
-            }.get(str(status), "action_in_progress")
+            from osia.chat_routing import project_chat_tool_attempt_status
+
+            safe_status = project_chat_tool_attempt_status(status)
             bridge.tool_attempt_status.emit(dict(turn_binding), safe_status)
-            bridge.island_state.emit("thinking")
+            # "verifying" merges passive receipt polling and an actual model
+            # continuation in Chat. Only the latter owns Thinking here.
+            _set_chat_island_state(
+                turn_binding,
+                "thinking" if status in {
+                    "resuming_tool_turn", "blocked_unknown_effect",
+                } else "idle",
+            )
 
         def on_tool_attempt_final(
             attempt_id: str,
@@ -3077,8 +2831,6 @@ def wake_mode():
                     if _voice_tts_allowed():
                         if emit_voice_state is not None:
                             emit_voice_state("speaking")
-                        else:
-                            bridge.island_state.emit("speaking")
                         speak_streaming(
                             clean_response(display),
                             session_id=tts_session_id,
@@ -3189,7 +2941,7 @@ def wake_mode():
             from osia.tool_attempts import WAITING_TOOL_RESULT
 
             if reply == WAITING_TOOL_RESULT:
-                bridge.island_state.emit("thinking")
+                _set_chat_island_state(turn_binding, "idle")
                 if not turn_agent.activate_pending_tool_attempt():
                     raise RuntimeError("pending tool attempt could not be activated")
                 suspended_tool_turn[0] = True
@@ -3210,7 +2962,7 @@ def wake_mode():
             if voice_response:
                 print(
                     f"[TTS] main.wake_mode: agent.run() returned "
-                    f"({len(reply or '')} chars) — sentences were streamed during the run",
+                    f"({len(reply or '')} chars) â€” sentences were streamed during the run",
                     flush=True,
                 )
             if not _persist_agent_delta(
@@ -3244,8 +2996,6 @@ def wake_mode():
             if _voice_tts_allowed():
                 if emit_voice_state is not None:
                     emit_voice_state("speaking")
-                else:
-                    bridge.island_state.emit("speaking")
                 speak_streaming(
                     clean_response(display),
                     session_id=tts_session_id,
@@ -3431,6 +3181,9 @@ def wake_mode():
         if persisted is None:
             controller = getattr(turn_agent, "_terminality_controller", None)
             if controller is None:
+                from osia.legacy_v2_recovery import recover_interrupted_v2_final
+                controller = recover_interrupted_v2_final(turn_id, objective, binding)
+            if controller is None:
                 try:
                     from osia.execution_strategy import derive_semantic_mission
                     from osia.goal_contract import (
@@ -3526,7 +3279,7 @@ def wake_mode():
                 terminal_state = TerminalState.USER_CANCELLED.value
                 reason_code = "authoritative_user_cancellation"
                 final_text = localized_text(
-                    "autonomous.status_cancelled_proven", context.language,
+                    "chat.status_cancelled_proven", context.language,
                 )
             elif (
                 cancellation.get("requested")
@@ -3535,13 +3288,13 @@ def wake_mode():
                 terminal_state = TerminalState.BLOCKED_VERIFIED.value
                 reason_code = "durable_outcome_unknown"
                 final_text = localized_text(
-                    "autonomous.status_outcome_unknown", context.language,
+                    "chat.status_outcome_unknown", context.language,
                 )
             elif hard_safety_reason:
                 terminal_state = TerminalState.HARD_SAFETY_BLOCK.value
                 reason_code = hard_safety_reason
                 final_text = (
-                    "Cette action est bloquée par une barrière de sécurité "
+                    "Cette action est bloquÃ©e par une barriÃ¨re de sÃ©curitÃ© "
                     "absolue."
                     if context.language == "fr" else
                     "This action is blocked by an absolute safety barrier."
@@ -3550,7 +3303,7 @@ def wake_mode():
                 terminal_state = TerminalState.BLOCKED_VERIFIED.value
                 reason_code = "durable_outcome_unknown"
                 final_text = localized_text(
-                    "autonomous.status_outcome_unknown", context.language,
+                    "chat.status_outcome_unknown", context.language,
                 )
             else:
                 terminal_state = TerminalState.BLOCKED_VERIFIED.value
@@ -3928,26 +3681,31 @@ def wake_mode():
                     language_text=str(candidate.get("objective") or ""),
                 )
 
-    # ── Manual activation handler (voice path) ──────────────────────────
+    # â”€â”€ Manual activation handler (voice path) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def handle_wake(generation: int):
         if not wake_gate.consume(
             generation,
             is_current=manual_activation_open.is_set() and generation == 0,
         ):
-            print("⚠️  Stale or unreserved wake event — ignored.")
+            print("âš ï¸  Stale or unreserved wake event â€” ignored.")
             return
 
         voice_session = object()
         if not voice_ui_lifecycle.begin(voice_session):
             wake_gate.finish()
             return
+        island_lifecycle.begin("voice", voice_session)
         owned_tts_session = [None]
 
         def _emit_voice_state(state: str) -> bool:
             return voice_ui_lifecycle.emit_if_current(
                 voice_session,
-                lambda: bridge.island_state.emit(state),
+                # Model activity is owned by the correlated Chat turn. Voice
+                # preparation/transcription alone does not prove reasoning.
+                lambda: island_lifecycle.update(
+                    "voice", voice_session, "idle" if state == "thinking" else state,
+                ),
             )
 
         _emit_voice_state("thinking")
@@ -3961,9 +3719,7 @@ def wake_mode():
                 )
 
             def _emit_post_voice_state() -> None:
-                bridge.island_state.emit(
-                    "thinking" if _any_conversation_busy() else "idle"
-                )
+                island_lifecycle.finish("voice", voice_session)
 
             voice_ui_lifecycle.finalize(
                 voice_session,
@@ -3972,10 +3728,10 @@ def wake_mode():
                 emit_final_state=_emit_post_voice_state,
             )
 
-        # Bloc 4 — Live API voice-to-voice. When enabled, OSIA's local STT
+        # Bloc 4 â€” Live API voice-to-voice. When enabled, OSIA's local STT
         # (Whisper) transcription and TTS speak steps are bypassed entirely:
         # the provider's live/realtime endpoint streams audio in and speaks
-        # back natively. The real WebSocket streaming is a separate task —
+        # back natively. The real WebSocket streaming is a separate task â€”
         # _connect_live_api() is currently a stub (see osia.voice.live_api).
         try:
             live_settings = load_settings()
@@ -3993,7 +3749,7 @@ def wake_mode():
             provider = live_settings.get("liveapi_provider", "google") or "google"
             model = live_settings.get("liveapi_model")
             print(
-                f"[LIVE API] active — STT and TTS bypassed, using {provider} "
+                f"[LIVE API] active â€” STT and TTS bypassed, using {provider} "
                 "live endpoint"
             )
 
@@ -4031,7 +3787,7 @@ def wake_mode():
                 # Optional spoken greeting before listening. When enabled, OSIA
                 # speaks the preconfigured text first, then starts capturing the
                 # command (speak() is synchronous, so the greeting finishes
-                # before the mic opens — it never bleeds into the recording).
+                # before the mic opens â€” it never bleeds into the recording).
                 if live_settings.get("wake_greeting_enabled"):
                     greeting = (live_settings.get("wake_greeting_text") or "").strip()
                     if greeting:
@@ -4044,10 +3800,7 @@ def wake_mode():
 
                 def _mark_listening_ready() -> None:
                     if not voice_shutdown_requested.is_set():
-                        voice_ui_lifecycle.emit_if_current(
-                            voice_session,
-                            lambda: bridge.island_state.emit("listening"),
-                        )
+                        _emit_voice_state("listening")
 
                 user_text = listen_for_command(
                     max_retries=3,
@@ -4076,7 +3829,7 @@ def wake_mode():
                     )
                     return
                 print(f"[STT] accepted voice input ({len(user_text)} chars).")
-                # WOR-10 — intercept "nouveau chat" / "new chat" before the LLM.
+                # WOR-10 â€” intercept "nouveau chat" / "new chat" before the LLM.
                 if is_new_chat_command(user_text):
                     print(
                         "[voice] local command accepted "
@@ -4131,7 +3884,7 @@ def wake_mode():
             on_start_failure=_finish_wake_turn,
         )
 
-    # ── Text handler (typed message in popup) ────────────────────────────
+    # â”€â”€ Text handler (typed message in popup) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _send_user_input(
         user_input,
@@ -4155,7 +3908,21 @@ def wake_mode():
         tts_stop()
         history = _history_for_conversation(conv_id)
         try:
-            persistence_metadata = None
+            persistence_metadata = {}
+            if attachment_turn:
+                from osia.image_inputs import image_references
+
+                attachment_metadata = [
+                    {"category": "image", **reference}
+                    for reference in image_references(user_input)
+                ]
+            else:
+                attachment_metadata = []
+            if attachment_metadata:
+                persistence_metadata["_attachments"] = [
+                    dict(item) for item in attachment_metadata
+                    if isinstance(item, dict)
+                ]
             if turn_directives is not None:
                 from osia.slash_commands import validate_live
 
@@ -4168,13 +3935,13 @@ def wake_mode():
                     current_conversation_id=conv_id,
                     has_attachment=attachment_turn,
                 )
-                persistence_metadata = {
-                    "_turn_directives_v1": turn_directives.to_wire(),
-                }
+                persistence_metadata["_turn_directives_v1"] = (
+                    turn_directives.to_wire()
+                )
             turn_meta = _persist_desktop_user_turn(
                 conv_id,
                 display_text,
-                metadata=persistence_metadata,
+                metadata=persistence_metadata or None,
                 turn_directives=turn_directives,
             )
         except Exception as exc:
@@ -4221,7 +3988,7 @@ def wake_mode():
     def handle_send_text(text: str):
         _send_user_input(text, text)
 
-    # ── Popup chat / message wiring ─────────────────────────────────────
+    # â”€â”€ Popup chat / message wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def handle_chat_message(role: str, text: str):
         popup.append_message(role, text)
@@ -4239,11 +4006,13 @@ def wake_mode():
             popup.append_assistant_stream_chunk(text, binding)
 
     def handle_assistant_stream_final(binding: dict, text: str):
+        _set_chat_island_state(binding, "idle", terminal=True)
         conv_id = str((binding or {}).get("conversation_id") or "")
         if active_conv and active_conv.get("id") == conv_id:
             popup.finalize_assistant_stream(text, binding)
 
     def handle_assistant_stream_error(binding: dict, text: str):
+        _set_chat_island_state(binding, "idle", terminal=True)
         conv_id = str((binding or {}).get("conversation_id") or "")
         if active_conv and active_conv.get("id") == conv_id:
             popup.fail_assistant_stream(text, binding)
@@ -4254,40 +4023,190 @@ def wake_mode():
     def handle_tool_attempt_status(binding: dict, status: str):
         popup.set_conversation_tool_status_for_turn(binding, status)
 
-    def handle_island_state(state: str):
-        island.set_state(state)
-
-    def handle_chat_execution_activity(payload: dict):
-        # GUI thread (queued from workers) — the popup performs a second
-        # bounded-field validation before rendering anything.
-        if not isinstance(payload, dict):
-            return
-        if payload.get("legacy_compatibility") is True or payload.get(
-            "compatibility_mode"
-        ) == "legacy_autonomous_checkpoint":
-            return
-        if not all(str(payload.get(field) or "").strip() for field in (
-            "conversation_id", "request_id", "turn_id", "run_id",
-            "provider_id", "model_id", "effective_reasoning",
-        )):
-            return
-        if not popup.update_chat_execution_activity(payload) and not bool(
-            (payload or {}).get("terminal")
-        ):
-            popup.restore_chat_execution_activity(payload)
-
-    def handle_legacy_execution_activity(payload: dict):
-        # This projection is deliberately global to the Chat page: it never
-        # allocates a turn, assistant stream, or per-conversation busy state.
-        popup.update_legacy_execution_activity(payload)
+    def handle_island_state():
+        # Re-read at delivery: Qt may deliver a queued notification after its
+        # owner finished or after another conversation/voice session started.
+        island.set_state(island_lifecycle.current_state())
 
     def handle_execution_trace(payload: dict):
         popup.update_chat_execution_activity(payload)
 
-    # ── Conversation management ──────────────────────────────────────────
+    # â”€â”€ Conversation management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _begin_conversation_delete_projection(
+        request_id: str,
+        conv_ids: set[str],
+        *,
+        action: str,
+    ) -> dict:
+        nonlocal active_conv
+        selected = (
+            active_conv
+            if active_conv and str(active_conv.get("id") or "") in conv_ids
+            else None
+        )
+        context = {
+            "action": action,
+            "conv_ids": set(conv_ids),
+            "active_conv": copy.deepcopy(selected) if selected else None,
+            "agent_messages": copy.deepcopy(agent.messages) if selected else None,
+            "selection_epoch": selection_epoch[0],
+            "snapshot": popup.conversation_snapshot(),
+        }
+        pending_delete_contexts[request_id] = context
+        pending_delete_ids.update(conv_ids)
+        popup.set_optimistic_conversation_deletions(conv_ids, True)
+        if selected:
+            tts_stop()
+            agent.reset()
+            active_conv = None
+            popup.set_messages([])
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+        return context
+
+    def _start_conversation_delete_worker(
+        request_id: str,
+        conv_ids: set[str],
+        *,
+        expected_count: int | None = None,
+        operation_id: str = "",
+    ) -> None:
+        def worker() -> None:
+            result = {
+                "request_id": request_id,
+                "action": "bulk" if expected_count is not None else "single",
+                "success": False,
+                "deleted_ids": [],
+                "revision": 0,
+                "operation_id": operation_id,
+            }
+            try:
+                if expected_count is None:
+                    conv_id = next(iter(conv_ids), "")
+                    result["success"] = bool(
+                        conv_id and conversations.delete_conversation(conv_id)
+                    )
+                    result["deleted_ids"] = (
+                        [conv_id] if result["success"] else []
+                    )
+                else:
+                    deletion = conversations.delete_confirmed_ungrouped_conversations(
+                        expected_count,
+                        operation_id=operation_id,
+                    )
+                    result.update(deletion)
+                    result["success"] = bool(deletion.get("success"))
+                    result["deleted_ids"] = list(
+                        deletion.get("deleted_ids") or []
+                    )
+                    result["revision"] = int(deletion.get("revision") or 0)
+                    result["operation_id"] = str(
+                        deletion.get("operation_id") or operation_id
+                    )
+            except Exception as exc:
+                result["error"] = type(exc).__name__
+                print(
+                    "[OSIA] Conversation deletion failed: "
+                    f"{type(exc).__name__}",
+                    flush=True,
+                )
+            try:
+                bridge.conversation_delete_finished.emit(result)
+            except RuntimeError:
+                pass
+
+        operation = "bulk" if expected_count is not None else "single"
+        thread = threading.Thread(
+            target=worker,
+            name=f"osia-conversation-delete-{operation}",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception as exc:
+            bridge.conversation_delete_finished.emit({
+                "request_id": request_id,
+                "action": operation,
+                "success": False,
+                "deleted_ids": [],
+                "operation_id": operation_id,
+                "error": type(exc).__name__,
+            })
+
+    def handle_conversation_delete_finished(result: dict) -> None:
+        nonlocal active_conv
+        request_id = str((result or {}).get("request_id") or "")
+        context = pending_delete_contexts.pop(request_id, None)
+        if not context:
+            return
+        conv_ids = set(context.get("conv_ids") or ())
+        pending_delete_ids.difference_update(conv_ids)
+
+        if not result.get("success"):
+            try:
+                rollback_snapshot = conversations.conversation_snapshot()
+            except Exception:
+                rollback_snapshot = context.get("snapshot")
+            popup.set_optimistic_conversation_deletions(
+                conv_ids,
+                False,
+                snapshot=rollback_snapshot,
+            )
+            active_before = context.get("active_conv")
+            if (
+                active_before
+                and selection_epoch[0] == context.get("selection_epoch")
+                and active_conv is None
+            ):
+                active_id = str(active_before.get("id") or "")
+                restored = conversations.get_conversation(active_id)
+                if restored is None and any(
+                    str(item.get("id") or "") == active_id
+                    for item in (rollback_snapshot or {}).get("items") or []
+                ):
+                    restored = copy.deepcopy(active_before)
+                if restored is not None:
+                    active_conv = restored
+                    agent.reset()
+                    agent.messages = copy.deepcopy(
+                        context.get("agent_messages") or []
+                    )
+                    popup.refresh_conversations(active_id)
+                    popup.set_messages(restored.get("messages") or [])
+            popup.show_conversation_delete_failed()
+            popup.refresh_conversations(
+                active_conv["id"] if active_conv else None
+            )
+            print(
+                "[OSIA] Conversation deletion rejected: "
+                f"{result.get('error') or 'canonical_store_rejected'}",
+                flush=True,
+            )
+            return
+
+        popup.set_optimistic_conversation_deletions(conv_ids, False)
+        deleted_ids = {
+            str(conv_id or "")
+            for conv_id in result.get("deleted_ids") or ()
+            if str(conv_id or "")
+        }
+        for conv_id in deleted_ids:
+            popup.discard_conversation_draft(conv_id)
+        if context.get("action") == "bulk":
+            _notify_mobile_conversation_changed(
+                "",
+                revision=result.get("revision", 0),
+                operation_id=result.get("operation_id", ""),
+                action="folders",
+            )
+        else:
+            for conv_id in deleted_ids:
+                _notify_mobile_conversation_changed(conv_id, action="delete")
+        popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
     def handle_new_conversation():
         nonlocal active_conv
+        selection_epoch[0] += 1
         tts_stop()
         agent.reset()
         active_conv = conversations.create_conversation()
@@ -4298,7 +4217,7 @@ def wake_mode():
         )
         popup.refresh_conversations(active_conv["id"])
         popup.set_messages([])
-        print(f"🆕 New conversation: {active_conv['id']}")
+        print(f"ðŸ†• New conversation: {active_conv['id']}")
 
     def handle_voice_new_chat():
         # GUI-thread reset for the "nouveau chat" voice command (WOR-10).
@@ -4306,6 +4225,7 @@ def wake_mode():
         # fresh conversation, and reset the chat view. The voice-session
         # finalizer remains the sole owner of the Dynamic Island ready state.
         nonlocal active_conv
+        selection_epoch[0] += 1
         agent.reset()
         active_conv = conversations.create_conversation()
         _notify_mobile_conversation_changed(
@@ -4315,68 +4235,64 @@ def wake_mode():
         )
         popup.refresh_conversations(active_conv["id"])
         popup.reset_conversation()
-        print(f"🆕 New conversation (voice): {active_conv['id']}")
+        print(f"ðŸ†• New conversation (voice): {active_conv['id']}")
 
     def handle_open_conversation(conv_id: str):
         nonlocal active_conv
         conv = conversations.get_conversation(conv_id)
         if not conv:
             return
+        selection_epoch[0] += 1
         tts_stop()
         agent.reset()
         msgs = conv.get("messages") or []
         # Seed the agent with history so the next turn keeps context.
         agent.messages = [agent.messages[0]] + [
-            {"role": m["role"], "content": m.get("content", "")}
+            {
+                "role": m["role"],
+                "content": m.get("content", ""),
+                **(
+                    {"_attachments": list(m["_attachments"])}
+                    if isinstance(m.get("_attachments"), list) else {}
+                ),
+            }
             for m in msgs
             if isinstance(m, dict) and m.get("role") in ("user", "assistant")
         ]
         active_conv = conv
         popup.refresh_conversations(active_conv["id"])
         popup.set_messages(msgs)
-        print(f"📂 Loaded conversation: {conv_id}")
+        print(f"ðŸ“‚ Loaded conversation: {conv_id}")
 
     def handle_delete_conversation(conv_id: str):
         nonlocal active_conv
+        if pending_delete_ids:
+            popup.show_conversation_delete_in_progress()
+            return
         if _is_conversation_busy(conv_id):
             popup.show_conversation_busy_notice()
             print(
                 f"Delete rejected while conversation {conv_id} is active."
             )
             return
-        existed_before_delete = conversations.get_conversation(conv_id) is not None
-        ok = conversations.delete_conversation(conv_id)
-        if not ok:
-            if existed_before_delete:
-                popup.show_conversation_busy_notice()
-            print(f"Delete rejected for conversation {conv_id}.")
+        cached_items = popup.conversation_snapshot().get("items") or []
+        if not any(str(item.get("id") or "") == str(conv_id) for item in cached_items):
+            popup.show_conversation_delete_failed()
             popup.refresh_conversations(
                 active_conv["id"] if active_conv else None
             )
             return
-        _notify_mobile_conversation_changed(conv_id, action="delete")
-        popup.discard_conversation_draft(conv_id)
-        print(f"🗑  Deleted conversation {conv_id}: ok")
-        if active_conv and conv_id == active_conv.get("id"):
-            tts_stop()
-            agent.reset()
-            # Do NOT auto-create a replacement — the list may go (and stay)
-            # empty. A new conversation is created only when the user clicks
-            # "New chat" or sends a first message.
-            active_conv = None
-            try:
-                popup.refresh_conversations(None)
-                popup.set_messages([])
-            except RuntimeError:
-                # A chat widget was already deleted on the Qt side — the
-                # popup guards against this too; never crash the handler.
-                pass
-        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+        request_id = f"desktop_delete_{uuid.uuid4().hex}"
+        conv_ids = {str(conv_id)}
+        _begin_conversation_delete_projection(
+            request_id, conv_ids, action="single",
+        )
+        _start_conversation_delete_worker(request_id, conv_ids)
 
     def handle_rename_conversation(conv_id: str, title: str):
         # WOR-76: PC rename. Persist to disk (trim + non-empty + TITLE_MAX_LEN
         # cap + manual_title flag all enforced in the store) then refresh the PC
-        # panel in-process — exactly like PC delete. The store re-reads from disk
+        # panel in-process â€” exactly like PC delete. The store re-reads from disk
         # on the next add_message, so active_conv's stale in-memory title is
         # harmless (only its id is ever consumed).
         ok = conversations.rename_conversation(conv_id, title)
@@ -4388,7 +4304,7 @@ def wake_mode():
                 operation_id=updated.get("last_operation_id", ""),
                 action="rename",
             )
-        print(f"✏️  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
+        print(f"âœï¸  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
     def handle_folder_mutation(request: dict):
@@ -4491,8 +4407,10 @@ def wake_mode():
             popup.show_chat()
 
     def handle_bulk_delete_ungrouped(expected_count: int):
-        nonlocal active_conv
-        snapshot = conversations.conversation_snapshot()
+        if pending_delete_ids:
+            popup.show_conversation_delete_in_progress()
+            return
+        snapshot = popup.conversation_snapshot()
         deleting_ids = {
             str(item.get("id") or "")
             for item in snapshot.get("items") or []
@@ -4502,41 +4420,34 @@ def wake_mode():
             popup.show_conversation_busy_notice()
             print("Bulk delete rejected while an ungrouped chat is active.")
             return
-        result = conversations.delete_confirmed_ungrouped_conversations(
-            expected_count,
-            operation_id=f"desktop_bulk_{uuid.uuid4().hex}",
-        )
-        if not result.get("success"):
+        if not deleting_ids:
+            popup.show_conversation_delete_failed()
+            popup.refresh_conversations(active_conv["id"] if active_conv else None)
             return
-        deleted_ids = set(result.get("deleted_ids") or [])
-        for conv_id in deleted_ids:
-            popup.discard_conversation_draft(conv_id)
-        if active_conv and active_conv.get("id") in deleted_ids:
-            tts_stop()
-            agent.reset()
-            active_conv = None
-            popup.refresh_conversations(None)
-            popup.set_messages([])
-        _notify_mobile_conversation_changed(
-            "",
-            revision=result.get("revision", 0),
-            operation_id=result.get("operation_id", ""),
-            action="folders",
+        request_id = f"desktop_bulk_delete_{uuid.uuid4().hex}"
+        operation_id = f"desktop_bulk_{uuid.uuid4().hex}"
+        _begin_conversation_delete_projection(
+            request_id, deleting_ids, action="bulk",
         )
-        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+        _start_conversation_delete_worker(
+            request_id,
+            deleting_ids,
+            expected_count=expected_count,
+            operation_id=operation_id,
+        )
 
-    # ── Model + settings wiring ─────────────────────────────────────────
+    # â”€â”€ Model + settings wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def handle_model_change(model: str, provider: str):
         try:
             agent.set_model(model, provider=provider)
         except Exception as e:
-            print(f"⚠️  Could not switch model: {e}")
+            print(f"âš ï¸  Could not switch model: {e}")
             return
         set_setting("selected_model", model)
         set_setting("selected_model_provider", provider)
         popup.set_current_model(model, provider)
-        print(f"🔄 Model changed to: {model} (provider: {agent.provider})")
+        print(f"ðŸ”„ Model changed to: {model} (provider: {agent.provider})")
 
     def handle_keys_saved(_keys):
         discover_models_async(
@@ -4564,7 +4475,6 @@ def wake_mode():
         popup.set_remote_models(remote)
 
     def handle_submit_draft(prompt: str, attachments) -> None:
-        from osia.action_policy import get_default_permission_policy
         from osia.desktop_attachments import (
             DesktopAttachmentError,
             prepare_desktop_turn,
@@ -4578,9 +4488,6 @@ def wake_mode():
                 provider=agent.provider,
                 model=agent.model,
                 owner_id=conv["id"],
-                permission_epoch=int(
-                    get_default_permission_policy().store.load_state().policy_epoch
-                ),
             )
         except DesktopAttachmentError as error:
             popup.show_attachment_error(error)
@@ -4596,7 +4503,6 @@ def wake_mode():
     def handle_submit_directive_draft(
         prompt: str, attachments, raw_directives,
     ) -> None:
-        from osia.action_policy import get_default_permission_policy
         from osia.desktop_attachments import (
             DesktopAttachmentError,
             prepare_desktop_turn,
@@ -4639,9 +4545,6 @@ def wake_mode():
                     provider=provider,
                     model=model,
                     owner_id=conv["id"],
-                    permission_epoch=int(
-                        get_default_permission_policy().store.load_state().policy_epoch
-                    ),
                 )
             except DesktopAttachmentError as error:
                 popup.show_attachment_error(error)
@@ -4668,20 +4571,6 @@ def wake_mode():
         from osia.reasoning import resolve_reasoning_option_id
         from osia.slash_commands import informational_payload, model_availability
 
-        try:
-            from osia.action_policy import (
-                PermissionMode,
-                get_default_permission_policy,
-            )
-
-            permission_mode = (
-                "Full"
-                if get_default_permission_policy().store.load_state().permission_mode
-                == PermissionMode.FULL_ACCESS
-                else "Standard"
-            )
-        except Exception:
-            permission_mode = "Unavailable"
         settings = load_settings() or {}
         provider_id = str(
             settings.get("selected_model_provider") or agent.provider or ""
@@ -4704,7 +4593,7 @@ def wake_mode():
             selected.get("label")
             or selected.get("displayName")
             or (
-                "Sélection indisponible"
+                "SÃ©lection indisponible"
                 if i18n.get_language() == "fr" else "Unavailable selection"
             )
         )
@@ -4717,7 +4606,6 @@ def wake_mode():
             provider_label=provider_label,
             model_label=model_label,
             reasoning=resolve_reasoning_option_id(provider_id, model_id),
-            permission_mode=permission_mode,
             provider_ready=bool(selected),
             routing_mode=(
                 "automatic" if settings.get("ai_hierarchy_enabled") else "exact"
@@ -4725,7 +4613,7 @@ def wake_mode():
         )
         popup.show_slash_information(payload)
 
-    # ── Signal wiring ───────────────────────────────────────────────────
+    # â”€â”€ Signal wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     bridge.wake_detected.connect(handle_wake)
     bridge.chat_message.connect(handle_chat_message)
@@ -4736,9 +4624,10 @@ def wake_mode():
     bridge.assistant_stream_error.connect(handle_assistant_stream_error)
     bridge.island_state.connect(handle_island_state)
     bridge.conversation_busy_changed.connect(handle_conversation_busy_changed)
+    bridge.conversation_delete_finished.connect(
+        handle_conversation_delete_finished
+    )
     bridge.tool_attempt_status.connect(handle_tool_attempt_status)
-    bridge.chat_execution_activity.connect(handle_chat_execution_activity)
-    bridge.legacy_execution_activity.connect(handle_legacy_execution_activity)
     bridge.execution_trace.connect(handle_execution_trace)
     bridge.remote_models_signal.connect(handle_remote_models)
     bridge.conversations_changed.connect(popup.refresh_conversations)
@@ -4766,14 +4655,14 @@ def wake_mode():
     # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
     popup.capsule_visibility_changed.connect(island.set_capsule_visible)
 
-    # Initial population — no active conversation yet; the panel shows the
+    # Initial population â€” no active conversation yet; the panel shows the
     # stored list (or its "No conversations" placeholder when empty).
     popup.refresh_conversations(None)
     discover_models_async(
         lambda remote: bridge.remote_models_signal.emit(remote)
     )
 
-    # ── Scheduled tasks + heartbeat (Bloc 5) ─────────────────────────────
+    # â”€â”€ Scheduled tasks + heartbeat (Bloc 5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Cron tasks run on a DEDICATED agent so a scheduled run never disturbs
     # the user's active conversation/history; the reply is spoken just like a
     # voice command. Both background threads serialise their speech with the
@@ -4792,7 +4681,7 @@ def wake_mode():
         scheduled_execution: dict | None = None,
     ) -> dict:
         if not handler_lock.acquire(timeout=120):
-            print(f"[CRON] busy — scheduled task skipped: {task_text[:60]}")
+            print(f"[CRON] busy â€” scheduled task skipped: {task_text[:60]}")
             return {
                 "status": "failed",
                 "message": "OSIA was busy; scheduled task skipped",
@@ -4825,7 +4714,7 @@ def wake_mode():
                     f"[CRON] linked conversation {conversation_id} not found; "
                     "running task without conversation persistence"
                 )
-            bridge.island_state.emit("thinking")
+            island_lifecycle.begin("cron", terminal_turn_id, "thinking")
             if conv is not None:
                 history = conv.get("messages") or []
                 print(f"[CRON] conversation {conversation_id}: loaded "
@@ -4869,14 +4758,16 @@ def wake_mode():
                         turn_id=terminal_turn_id,
                     )
             display = clean_response(reply or "")
+            island_lifecycle.update("cron", terminal_turn_id, "idle")
             if display:
                 if conv is not None and conversation_id:
                     bridge.chat_message_for_conversation.emit(
-                        conversation_id, "assistant", f"⏰ {display}"
+                        conversation_id, "assistant", f"â° {display}"
                     )
                     bridge.conversations_changed.emit(
                         active_conv["id"] if active_conv else ""
                     )
+                island_lifecycle.update("cron", terminal_turn_id, "speaking")
                 speak(
                     display,
                     language=getattr(
@@ -4899,7 +4790,7 @@ def wake_mode():
             return {"status": "failed", "message": str(e)}
         finally:
             cron_agent._disable_hierarchy_for_turn = False
-            bridge.island_state.emit("idle")
+            island_lifecycle.finish("cron", terminal_turn_id)
             handler_lock.release()
 
     def heartbeat_alert(message: str) -> None:
@@ -4907,12 +4798,12 @@ def wake_mode():
         # over it; if still busy, log rather than drop it silently.
         if not handler_lock.acquire(timeout=20):
             print(
-                f"[HEARTBEAT] busy — alert not spoken "
+                f"[HEARTBEAT] busy â€” alert not spoken "
                 f"({len(message)} chars)"
             )
             return
         try:
-            bridge.chat_message.emit("assistant", f"💓 {message}")
+            bridge.chat_message.emit("assistant", f"ðŸ’“ {message}")
             speak(message)
         finally:
             handler_lock.release()
@@ -4928,9 +4819,9 @@ def wake_mode():
 
         safe_title = safe_task_title(title)
         if status == "failed":
-            body = f"Tâche planifiée échouée: {safe_title}"
+            body = f"TÃ¢che planifiÃ©e Ã©chouÃ©e: {safe_title}"
         else:
-            body = f"Tâche planifiée terminée: {safe_title}"
+            body = f"TÃ¢che planifiÃ©e terminÃ©e: {safe_title}"
         notify("OSIA", body)
         _notify_mobile_cron_notification(
             task_id=task_id,
@@ -4957,95 +4848,6 @@ def wake_mode():
     )
     cron_manager.start()
     heartbeat_monitor.start()
-
-    restored_chat_runs: set[str] = set()
-    chat_execution_poll = {"key": ""}
-    legacy_execution_poll = {"key": None}
-
-    def _detach_restored_chat_execution(execution: dict) -> None:
-        """Remove only a poll-restored legacy/incomplete Chat projection."""
-
-        nonlocal active_conv
-        run_id = str(execution.get("run_id") or "")
-        conv_id = str(execution.get("conversation_id") or "")
-        if not run_id or run_id not in restored_chat_runs:
-            return
-        restored_chat_runs.discard(run_id)
-        if conv_id:
-            conv = conversations.get_conversation(conv_id)
-            if isinstance(conv, dict) and active_conv and (
-                active_conv.get("id") == conv_id
-            ):
-                active_conv = conv
-                popup.set_messages(conv.get("messages") or [])
-            _set_conversation_busy(conv_id, False, owner=execution)
-
-    def _poll_chat_execution_activity() -> bool:
-        """Poll correlated Chat activity and the distinct legacy banner."""
-
-        nonlocal active_conv
-        st = _load_server_autonomous_pc_state()
-        legacy_execution = (
-            st.get("legacy_execution") if isinstance(st, dict) else None
-        )
-        if isinstance(legacy_execution, dict):
-            legacy_key = tuple(
-                legacy_execution.get(name) for name in (
-                    "schema_version", "compatibility_mode",
-                    "legacy_compatibility", "run_id", "task_id",
-                    "plan_revision", "authorization_revision", "status",
-                    "run_state", "terminal", "outcome_unknown",
-                    "cancel_requested", "cancellable", "resumable",
-                )
-            )
-            if legacy_key != legacy_execution_poll["key"]:
-                legacy_execution_poll["key"] = legacy_key
-                bridge.legacy_execution_activity.emit(dict(legacy_execution))
-        elif legacy_execution_poll["key"] is not None:
-            legacy_execution_poll["key"] = None
-            bridge.legacy_execution_activity.emit({})
-
-        execution = st.get("chat_execution") if isinstance(st, dict) else None
-        if not isinstance(execution, dict):
-            return isinstance(legacy_execution, dict)
-        if execution.get("legacy_compatibility") is True or (
-            execution.get("compatibility_mode")
-            == "legacy_autonomous_checkpoint"
-        ):
-            chat_execution_poll["key"] = ""
-            _detach_restored_chat_execution(execution)
-            return isinstance(legacy_execution, dict)
-        if not all(str(execution.get(field) or "").strip() for field in (
-            "conversation_id", "request_id", "turn_id", "run_id",
-            "provider_id", "model_id", "effective_reasoning",
-        )):
-            chat_execution_poll["key"] = ""
-            _detach_restored_chat_execution(execution)
-            return False
-        key = "|".join(str(execution.get(name) or "") for name in (
-            "run_id", "status", "terminal", "outcome_unknown",
-            "tasks_done", "tasks_total", "cancel_requested",
-        ))
-        if key != chat_execution_poll["key"]:
-            chat_execution_poll["key"] = key
-            bridge.chat_execution_activity.emit(dict(execution))
-
-        conv_id = str(execution["conversation_id"])
-        run_id = str(execution["run_id"])
-        terminal = bool(execution.get("terminal"))
-        if not terminal and not _is_conversation_busy(conv_id):
-            restored_chat_runs.add(run_id)
-            _set_conversation_busy(conv_id, True, owner=execution)
-        elif terminal and run_id in restored_chat_runs:
-            restored_chat_runs.discard(run_id)
-            conv = conversations.get_conversation(conv_id)
-            if isinstance(conv, dict) and active_conv and (
-                active_conv.get("id") == conv_id
-            ):
-                active_conv = conv
-                popup.set_messages(conv.get("messages") or [])
-            _set_conversation_busy(conv_id, False, owner=execution)
-        return True
 
     def handle_chat_execution_cancel(binding: dict) -> None:
         """Cancel only the exact active Chat run, or a correlated legacy run."""
@@ -5080,7 +4882,6 @@ def wake_mode():
             # won synchronously above.
             popup.confirm_chat_execution_cancellation(binding)
             popup.cancel_assistant_stream(flush=False)
-            bridge.island_state.emit("idle")
 
             def _cancel_direct() -> None:
                 request_cancel = getattr(
@@ -5096,88 +4897,12 @@ def wake_mode():
             ).start()
             return
 
-        def _cancel() -> None:
-            result = _cancel_server_autonomous_from_chat(dict(binding or {}))
-            raw_status = str(result.get("status") or "")
-            status = (
-                raw_status
-                if raw_status in {"completed", "blocked", "cancelled"}
-                else "waiting"
-                if result.get("accepted")
-                else "recovering"
-            )
-            bridge.chat_execution_activity.emit({
-                **dict(binding or {}),
-                "status": status,
-                "terminal": bool(result.get("terminal")),
-                "cancel_requested": bool(result.get("accepted")),
-                "outcome_unknown": bool(result.get("outcome_unknown")),
-            })
-
-        threading.Thread(
-            target=_cancel,
-            name="osia-legacy-execution-cancel",
-            daemon=True,
-        ).start()
-
-    def _publish_legacy_control_result(result: dict) -> None:
-        state = result.get("state") if isinstance(result, dict) else None
-        projection = (
-            state.get("legacy_execution") if isinstance(state, dict) else None
-        )
-        if isinstance(state, dict):
-            bridge.legacy_execution_activity.emit(
-                dict(projection) if isinstance(projection, dict) else {}
-            )
-        else:
-            # A transport timeout proves neither acceptance nor rejection.
-            # Keep the controls fail-closed until the regular poll obtains a
-            # fresh server projection, but do not let its unchanged identity be
-            # suppressed by the previous de-duplication key forever.
-            legacy_execution_poll["key"] = None
-            bridge.legacy_execution_activity.emit({})
-
-    def handle_legacy_execution_cancel(binding: dict) -> None:
-        def _cancel() -> None:
-            _publish_legacy_control_result(
-                _cancel_server_legacy_execution(dict(binding or {}))
-            )
-
-        threading.Thread(
-            target=_cancel,
-            name="osia-legacy-banner-cancel",
-            daemon=True,
-        ).start()
-
-    def handle_legacy_execution_resume(binding: dict) -> None:
-        def _resume() -> None:
-            _publish_legacy_control_result(
-                _resume_server_legacy_execution(dict(binding or {}))
-            )
-
-        threading.Thread(
-            target=_resume,
-            name="osia-legacy-banner-resume",
-            daemon=True,
-        ).start()
-
     popup.chat_execution_cancel_requested.connect(handle_chat_execution_cancel)
-    popup.legacy_execution_cancel_requested.connect(
-        handle_legacy_execution_cancel
-    )
-    popup.legacy_execution_resume_requested.connect(
-        handle_legacy_execution_resume
-    )
-
-    chat_execution_timer = QTimer()
-    chat_execution_timer.setInterval(1000)
-    chat_execution_timer.timeout.connect(_poll_chat_execution_activity)
-    chat_execution_timer.start()
 
     trigger_label = "Press Ctrl+Alt+P to talk to OSIA"
 
     print("=" * 60)
-    print("  OSIA — Wake Mode (Dynamic Island)")
+    print("  OSIA â€” Wake Mode (Dynamic Island)")
     print(f"  Language: {DEFAULT_LANG.upper()}")
     print(f"  {trigger_label}")
     print("  Ctrl+Alt+O: show/hide the OSIA window")
@@ -5185,6 +4910,7 @@ def wake_mode():
 
     def on_quit():
         voice_ui_lifecycle.close()
+        island_lifecycle.close()
         owned_stops = [
             cron_manager.stop,
             unsubscribe_cron_wake,
@@ -5229,10 +4955,8 @@ def wake_mode():
 
     app.aboutToQuit.connect(on_quit)
 
-    # Reattach exact local direct-Chat receipts and project any persisted legacy
-    # server checkpoint through the separate non-busy Chat banner.
+    # Reattach exact local direct-Chat receipts.
     QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
-    QTimer.singleShot(0, _poll_chat_execution_activity)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())
@@ -5257,6 +4981,17 @@ def main():
     except Exception:
         pass
 
+    try:
+        from osia.image_inputs import (
+            cleanup_media_store,
+            cleanup_owned_temp_images,
+        )
+
+        cleanup_media_store()
+        cleanup_owned_temp_images()
+    except Exception:
+        pass
+
     # First-launch config bootstrap: create any missing config files
     # (settings.json, mobile pairing token) BEFORE anything starts the mobile
     # WebSocket server, so a fresh install works out of the box on any OS and the
@@ -5266,7 +5001,7 @@ def main():
     # Linux a separate systemd server process (run_server.py) is the single token
     # creator, so pass create_token=False to avoid two processes racing to
     # persist divergent tokens. settings.json is always created (GUI is its only
-    # creator). Idempotent + best-effort — it must never block startup.
+    # creator). Idempotent + best-effort â€” it must never block startup.
     try:
         from osia.config import ensure_config_files
         ensure_config_files(create_token=not sys.platform.startswith("linux"))
@@ -5292,7 +5027,7 @@ def main():
     # read, browser) are usable so missing dependencies show up at startup
     # instead of failing mid-conversation. It imports playwright and probes
     # PATH, so it runs on a daemon thread to keep it off the GUI startup path
-    # (WOR perf fix) — it must never block startup.
+    # (WOR perf fix) â€” it must never block startup.
     def _health_check():
         try:
             verify_tools()

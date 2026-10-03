@@ -331,10 +331,8 @@ class ProgressiveTTSSessionTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(server, "_SERVER_CRON_MANAGER", None),
             patch.object(server, "_SERVER_CRON_UNSUBSCRIBE", None),
-            patch.object(server, "_release_single_runner"),
-            patch.dict(server._autonomous, {"orch": None}),
         ):
-            await server._stop_autonomous_on_shutdown()
+            await server._cleanup_on_server_shutdown()
 
         self.assertTrue(task.done())
         self.assertEqual(server._POST_TURN_MEDIA_TASKS, set())

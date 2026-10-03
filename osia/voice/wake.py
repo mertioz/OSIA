@@ -809,7 +809,11 @@ def default_callback():
     from osia.voice.stt import listen_for_command
     from osia.agent import run_agent, clean_response
     from osia import i18n
-    from osia.turn_context import localized_text, resolve_turn_context
+    from osia.turn_context import (
+        localized_text,
+        normalize_locale,
+        resolve_turn_context,
+    )
     from osia.voice.tts import speak
 
     print("\n🎤 Listening for command...")
@@ -817,12 +821,12 @@ def default_callback():
 
     if not user_text:
         print("❌ No valid command heard.")
-        fallback_context = resolve_turn_context(
-            "", saved_language=i18n.get_language(),
+        fallback_language = (
+            normalize_locale(i18n.get_language()) or i18n.DEFAULT_LANG
         )
         speak(
-            localized_text("stt_not_understood", fallback_context.language),
-            language=fallback_context.language,
+            localized_text("stt_not_understood", fallback_language),
+            language=fallback_language,
         )
         return
 

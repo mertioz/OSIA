@@ -1,18 +1,16 @@
-"""WOR-264 Normal Chat Desktop continuation and permission-truth regressions."""
+"""WOR-264 Normal Chat Desktop continuation and terminality regressions.
+
+WOR-301: normal chat runs with permanent unconditional Full Access; what this
+file still validates is the same-turn desktop continuation, strategy
+terminality and the fact that no permission permit exists to gate a final
+commit.
+"""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-from osia.action_policy import (
-    AuthorizationSource,
-    DecisionType,
-    ExecutionType,
-    PermissionMode,
-    PermissionPolicy,
-    build_permission_request,
-    make_execution_context,
-)
+from osia.action_policy import guard_tool_call
 from osia.agent import OSIAAgent
 from osia import desktop_scene
 from osia.desktop_surface import (
@@ -33,11 +31,6 @@ from osia.execution_strategy import (
     tool_preflight,
 )
 from osia.permission_outcome import PermissionOutcome, PermissionResult
-from osia.permission_store import (
-    BackendAvailability,
-    PermissionStore,
-    SecureStorageBackend,
-)
 from osia.tool_contracts import (
     ConfirmationPolicy,
     ExecutionOutcome,
@@ -59,53 +52,6 @@ TOOLS = {
     "inspect_desktop_surfaces",
     "open_application",
 }
-
-
-class _ProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor264_synthetic", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W264" + bytes(value ^ 0xA4 for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W264"):
-            raise ValueError("invalid_protected_blob")
-        return bytes(value ^ 0xA4 for value in protected[4:])
-
-
-def _full_access_policy(tmp_path) -> PermissionPolicy:
-    store = PermissionStore(
-        tmp_path / "wor264-permissions.dat",
-        backend=_ProtectedBackend(),
-    )
-    store.set_permission_mode(PermissionMode.FULL_ACCESS)
-    return PermissionPolicy(store)
-
-
-def _permission_request(
-    policy: PermissionPolicy,
-    tool_name: str,
-    arguments: dict,
-    *,
-    operation_id: str,
-):
-    context = make_execution_context(
-        execution_type=ExecutionType.CHAT,
-        interactive=True,
-        owner_ref="owner:wor264",
-        machine_ref="machine:wor264",
-        execution_id="execution:" + operation_id,
-        operation_id=operation_id,
-        store=policy.store,
-    )
-    return build_permission_request(
-        tool_name,
-        arguments,
-        execution_context=context,
-        policy=policy,
-    )
 
 
 def _unknown_localized_open():
@@ -187,15 +133,6 @@ def test_01_normal_chat_localized_calculator_uses_canonical_windows_identity():
 def test_02_full_access_normal_chat_continues_same_turn_after_open(
     tmp_path,
 ):
-    policy = _full_access_policy(tmp_path)
-    request = _permission_request(
-        policy,
-        "open_application",
-        {"name": "Calculatrice"},
-        operation_id="normal-chat-open",
-    )
-    assert policy.evaluate(request).decision_type is DecisionType.ALLOW
-
     strategy, decision = _unknown_localized_open()
     _reconcile_localized_open(strategy, decision)
     controller = TurnTerminalityController(
@@ -312,10 +249,9 @@ def test_06_correlated_user_denial_still_projects_as_refusal():
     assert "permission was declined" in text
 
 
-def test_07_full_access_allows_synthetic_signal_final_send_without_dispatch(
+def test_07_final_send_is_allowed_without_a_permission_permit(
     tmp_path,
 ):
-    policy = _full_access_policy(tmp_path)
     arguments = {"key": "enter"}
     spec = get_tool_spec("desktop_press")
     contract = effective_contract(
@@ -323,19 +259,13 @@ def test_07_full_access_allows_synthetic_signal_final_send_without_dispatch(
         arguments,
         "Envoie le message déjà préparé dans Signal.",
     )
-    request = _permission_request(
-        policy,
-        "desktop_press",
-        arguments,
-        operation_id="synthetic-signal-final-enter",
-    )
-    decision = policy.evaluate(request)
+    request_text = "Envoie le message déjà préparé dans Signal."
 
     assert contract.side_effect is SideEffectClass.IRREVERSIBLE_EXTERNAL
     assert contract.confirmation is ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION
-    assert decision.decision_type is DecisionType.ALLOW
-    assert decision.authorization_source is AuthorizationSource.FULL_ACCESS
-    assert policy.mint_permit(request, decision) is not None
+    # WOR-301: a recognized final commit dispatches with no permit; only an
+    # integrity guard (e.g. system destruction) may refuse it.
+    assert guard_tool_call(request_text, "desktop_press", arguments) is None
 
 
 def test_08_outcome_unknown_still_blocks_replay():
@@ -356,27 +286,21 @@ def test_08_outcome_unknown_still_blocks_replay():
     ) == 1
 
 
-def test_09_chat_and_autonomous_share_strategy_and_terminality(
+def test_09_chat_and_scheduled_share_strategy_and_terminality(
     tmp_path,
 ):
-    autonomous_prompt = (
-        "You are executing ONE step of a larger autonomous task.\n"
-        "\nSTEP OBJECTIVE:\n"
-        + TASK
-        + "\nSUCCESS CRITERION (you are done only when this is OBSERVABLY true):\n"
-        "Calculator displays the exact result 28.\n\n"
-        "Use the canonical execution machinery."
-    )
+    # WOR-303: one canonical execution runtime.  The Scheduled temporal trigger
+    # and Chat share the same strategy and terminality semantics.
     chat = build_execution_strategy(TASK, TOOLS)
-    autonomous = build_execution_strategy(autonomous_prompt, TOOLS)
+    scheduled = build_execution_strategy(TASK, TOOLS)
 
-    assert chat.mission.public_dict() == autonomous.mission.public_dict()
+    assert chat.mission.public_dict() == scheduled.mission.public_dict()
     assert [item.mechanism_id for item in chat._mechanisms.values()] == [
-        item.mechanism_id for item in autonomous._mechanisms.values()
+        item.mechanism_id for item in scheduled._mechanisms.values()
     ]
 
     controllers = []
-    for name, strategy in (("chat", chat), ("autonomous", autonomous)):
+    for name, strategy in (("chat", chat), ("scheduled", scheduled)):
         controller = TurnTerminalityController(
             turn_id="wor264-" + name,
             objective=TASK,

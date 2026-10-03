@@ -41,21 +41,6 @@ def test_modifier_selection_creates_chip_and_enter_emits_typed_draft_only():
     chat.deleteLater()
 
 
-def test_exact_browser_prefix_creates_removable_turn_chip_and_serializes_enum():
-    chat = _ChatPage()
-    typed = QSignalSpy(chat.submit_directive_draft)
-    chat._input.setPlainText("/browser personal inspect this tab")
-    _APP.processEvents()
-    assert chat._input.toPlainText() == "inspect this tab"
-    assert chat._directives.browser_backend_override == "personal"
-    assert chat._directive_rows()[-1] == ("browser", "/browser personal")
-    chat._on_send()
-    assert typed[0][2]["browser_backend_override"] == "personal"
-    chat._remove_directive("browser")
-    assert chat._directives.browser_backend_override is None
-    chat.deleteLater()
-
-
 def test_informational_selection_is_immediate_and_never_emits_chat_turn():
     chat = _ChatPage()
     info = QSignalSpy(chat.informational_requested)

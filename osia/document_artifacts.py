@@ -1221,26 +1221,6 @@ def set_store_for_testing(store: ArtifactStore):
     return previous
 
 
-def _checkpoint_references() -> set[str]:
-    ids: set[str] = set()
-    config_dir = Path(_CONFIG_DIR)
-    for name in ("task_state.json", "task_state_mobile.json"):
-        path = config_dir / name
-        try:
-            if path.stat().st_size > 4 * 1024 * 1024:
-                continue
-            loaded = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
-            continue
-        if isinstance(loaded, dict):
-            resumable_failure = (
-                loaded.get("status") == "failed"
-                and isinstance(loaded.get("failure_diagnostic"), dict)
-                and loaded["failure_diagnostic"].get("resumable") is True
-            )
-            if loaded.get("status") == "in_progress" or resumable_failure:
-                ids.update(referenced_ids(loaded))
-    return ids
 
 
 def _conversation_references() -> set[str]:
@@ -1286,8 +1266,10 @@ def _conversation_references() -> set[str]:
 
 
 def cleanup_startup() -> dict:
+    # WOR-303: legacy autonomous checkpoints are never resumed, so no artifact
+    # is kept alive for a checkpoint; only live conversations pin artifacts.
     return get_store().cleanup(
-        _checkpoint_references() | _conversation_references(),
+        _conversation_references(),
         remove_unreferenced=True,
     )
 

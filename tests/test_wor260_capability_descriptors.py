@@ -10,7 +10,6 @@ from osia.capability_adapters import (
     RuntimeAvailability,
     UNKNOWN_METADATA,
     VerifierStrength,
-    adapt_browser_capability,
     adapt_federated_capabilities,
     adapt_mcp_metadata_snapshot,
     adapt_model_provider_capabilities,
@@ -26,7 +25,6 @@ from osia.tool_contracts import (
     dynamic_tool_specs,
     static_tool_prompt_block,
 )
-from osia.tools.browser_state import BrowserStateRef
 
 
 def test_family_vocabulary_covers_current_architecture_without_app_types():
@@ -37,7 +35,6 @@ def test_family_vocabulary_covers_current_architecture_without_app_types():
         "direct_api",
         "deep_link",
         "browser_dom",
-        "personal_browser",
         "desktop_uia",
         "desktop_keyboard",
         "vision_observation",
@@ -166,40 +163,6 @@ def test_account_model_uses_only_supplied_runtime_metadata_and_current_native_pr
         "webSearch",
         "commandExecution",
         "fileChange",
-    )
-
-
-def test_personal_browser_keeps_live_tab_session_authority_external():
-    spec = STATIC_TOOL_REGISTRY.get("navigate_browser")
-    assert spec is not None
-    state = BrowserStateRef(
-        schema_version=1,
-        browser_session_id="private-session-id",
-        context_id="private-context-id",
-        context_epoch=2,
-        page_id="private-page-id",
-        page_generation=3,
-        navigation_id="private-navigation-id",
-        document_epoch=4,
-        created_at=1.0,
-    )
-
-    descriptor = adapt_browser_capability(
-        spec, state_ref=state, personal_browser=True
-    )
-    serialized = json.dumps(descriptor.to_dict(), sort_keys=True)
-
-    assert descriptor.family == CapabilityFamily.PERSONAL_BROWSER.value
-    assert descriptor.live_eligibility_authority == (
-        "personal_browser_live_turn_binding"
-    )
-    assert descriptor.runtime_availability == RuntimeAvailability.UNKNOWN.value
-    assert "private-session-id" not in serialized
-    assert "private-page-id" not in serialized
-    assert '"authorized": true' not in serialized.lower()
-    assert any(
-        item.name == "exact_tab_session_eligibility_external"
-        for item in descriptor.deterministic_constraints
     )
 
 

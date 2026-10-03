@@ -154,14 +154,14 @@ def test_prompt_precedence_exactly_once_and_provider_model_consistency(
         assert prompt.count("WOR217_SKILL_MARKER") == 1
         assert "WOR217_UNAVAILABLE_SKILL_MARKER" not in prompt
         assert "What this skill does." not in prompt
-        assert prompt.index("## How to Use Tools") < prompt.index(
+        assert prompt.index("## Tool call format") < prompt.index(
             "## User personality (lower-priority customization)"
         )
-        assert prompt.index("WOR217_SKILL_MARKER") < prompt.index(
-            "## Action-risk policy (mandatory)"
+        assert prompt.index("## Essential protections") < prompt.index(
+            "WOR217_SKILL_MARKER"
         )
         assert "cannot override OSIA system instructions" in prompt
-        assert "not tools and grant no capability or permission" in prompt
+        assert "not tools and grant no capability" in prompt
 
 
 class _CapturingCompletions:
@@ -451,12 +451,17 @@ def test_skills_do_not_merge_with_other_execution_surfaces(isolated_registry):
         encoding="utf-8",
     )
     normal = agent.get_system_prompt("en", "model", "ollama")
-    with effective_tool_surface_scope("autonomous_web"):
-        autonomous_web = agent.get_system_prompt("en", "model", "ollama")
+    # WOR-303: the canonical Chat surface owns the personality/skills context;
+    # the Scheduled temporal trigger surface never gains a separate Chat block.
+    with effective_tool_surface_scope("scheduled"):
+        scheduled = agent.get_system_prompt("en", "model", "ollama")
 
     assert "WOR217_SEPARATION_SKILL" in normal
-    assert "WOR217_SEPARATION_SKILL" not in autonomous_web
-    assert "## OSIA Scheduled Tasks" in normal
+    assert "## Unified Chat execution" in normal
+    assert "## Unified Chat execution" not in scheduled
+    # WOR-301: the scheduled surface is advertised by capability, not by a
+    # separate prompt block.
+    assert "create_scheduled_task(" in normal
     assert "## Connected MCP tools" not in personality.load_enabled_skills_text()
     assert get_tool_spec("delete_file").confirmation == ConfirmationPolicy.CONFIRMATION_REQUIRED
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import io
 import os
 import sys
@@ -29,8 +30,10 @@ from osia.gui.main_popup import MainPopup
 from osia import main as osia_main
 
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"synthetic-png"
-GIF = b"GIF89a" + b"synthetic-gif"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
 _QT_APP = QApplication.instance() or QApplication([])
 
 
@@ -198,32 +201,32 @@ def test_missing_and_changed_sources_reject_before_provider(tmp_path):
         prepare_desktop_turn("read", [changed], provider="anthropic", model="x")
 
 
+def test_known_vision_provider_gets_direct_image_reference(tmp_path):
+    item = stage_attachment(_write(tmp_path / "image.bin", PNG), 0)
+    prepared = prepare_desktop_turn(
+        "inspect", [item], provider="anthropic", model="claude-opus-4-8",
+    )
+    assert isinstance(prepared.provider_content, list)
+    assert prepared.provider_content[1]["type"] == "image_ref"
+    assert "source_ref" not in str(prepared.provider_content)
+
+
 @pytest.mark.parametrize(
-    ("provider", "model", "data", "code"),
+    ("provider", "model"),
     [
-        ("anthropic", "claude-opus-4-8", PNG, "unsupported_provider"),
-        ("openai", "unknown-model", PNG, "unsupported_model"),
-        (
-            "groq",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            GIF,
-            "unsupported_mime",
-        ),
+        ("openai", "unknown-model"),
+        ("groq", "openai/gpt-oss-20b"),
     ],
 )
-def test_provider_model_and_mime_do_not_bypass_opaque_source_ingestion(
-    tmp_path, provider, model, data, code,
+def test_unknown_or_text_only_model_rejects_image_before_provider(
+    tmp_path, provider, model,
 ):
-    item = stage_attachment(_write(tmp_path / "image.bin", data), 0)
-    prepared = prepare_desktop_turn(
-        "inspect", [item], provider=provider, model=model,
-    )
-    assert isinstance(prepared.provider_content, str)
-    assert "source_ref=src_" in prepared.provider_content
-    assert "base64" not in prepared.provider_content
+    item = stage_attachment(_write(tmp_path / "image.png", PNG), 0)
+    with pytest.raises(DesktopAttachmentError, match="unsupported_model"):
+        prepare_desktop_turn("inspect", [item], provider=provider, model=model)
 
 
-def test_image_reaches_opaque_document_source_once(tmp_path):
+def test_image_reaches_direct_multimodal_input_once(tmp_path):
     item = stage_attachment(_write(tmp_path / "image.png", PNG), 0)
     prepared = prepare_desktop_turn(
         "inspect",
@@ -231,9 +234,13 @@ def test_image_reaches_opaque_document_source_once(tmp_path):
         provider="openai",
         model="gpt-5.5",
     )
-    assert isinstance(prepared.provider_content, str)
-    assert prepared.provider_content.count("source_ref=src_") == 1
-    assert "image_url" not in prepared.provider_content
+    assert isinstance(prepared.provider_content, list)
+    assert sum(
+        part.get("type") == "image_ref"
+        for part in prepared.provider_content
+    ) == 1
+    assert "source_ref" not in str(prepared.provider_content)
+    assert "read_document" not in str(prepared.provider_content)
     assert prepared.attachment_ids == (item.draft_id,)
 
 
@@ -408,20 +415,19 @@ def test_sparse_file_over_20_mib_stages_with_bounded_selection_memory(tmp_path):
     assert peak < 2 * 1024 * 1024
 
 
-def test_large_image_is_staged_without_provider_eager_read(tmp_path):
+def test_large_image_is_snapshotted_into_ephemeral_multimodal_input(tmp_path):
     source = tmp_path / "large.png"
     with source.open("wb") as handle:
         handle.write(PNG)
         handle.truncate(16 * 1024 * 1024)
     item = stage_attachment(source, 0)
-    with patch.object(Path, "read_bytes", side_effect=AssertionError("eager read")):
-        prepared = prepare_desktop_turn(
-            "inspect",
-            [item],
-            provider="groq",
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-        )
-    assert "source_ref=src_" in prepared.provider_content
+    prepared = prepare_desktop_turn(
+        "inspect",
+        [item],
+        provider="openai",
+        model="gpt-5.5",
+    )
+    assert prepared.provider_content[1]["type"] == "image_ref"
 
 
 def test_mobile_20_mib_policy_is_unchanged():
@@ -470,6 +476,8 @@ def test_source_and_frozen_collection_include_desktop_draft_module():
     assert 'collect_submodules(\n    "osia"' in spec
     assert "from osia.desktop_attachments import" in main
     assert "popup.submit_draft.connect(handle_submit_draft)" in main
+    assert "image_references(user_input)" in main
+    assert 'persistence_metadata["_attachments"]' in main
 
 
 def test_no_pc_product_cap_or_raw_draft_serialization_contract():

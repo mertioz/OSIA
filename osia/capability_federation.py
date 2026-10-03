@@ -1,14 +1,17 @@
 """Canonical planner-facing inventory of capabilities available to OSIA.
 
 Availability and execution authorization are deliberately separate here.  The
-inventory depends on the active execution surface and connected providers, but
-never on Standard, delegated, or Full Access permission state.
+inventory depends on genuine runtime availability (platform, provider,
+connected connectors) but never on the request, the execution surface, or
+Standard/delegated/Full Access permission state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+from pathlib import Path
 from typing import Any, Mapping
 
 from osia.tool_contracts import (
@@ -16,7 +19,6 @@ from osia.tool_contracts import (
     SideEffectClass,
     dynamic_tool_specs,
     effective_static_tool_specs,
-    tool_is_eligible_in_current_surface,
 )
 
 
@@ -128,7 +130,12 @@ def _tool_descriptor(spec, *, provider: str, source: str) -> CapabilityDescripto
 
 
 def federated_capabilities(provider: str) -> tuple[CapabilityDescriptor, ...]:
-    """Return the actual planner capability view for the active surface.
+    """Return the actual capability view of the current runtime.
+
+    WOR-300: the view is composed from genuine runtime availability alone
+    (provider support, platform capability, connector/dynamic registration).
+    Request wording, GoalContract/ExecutionStrategy state and the engine
+    surface never change it.
 
     This function intentionally has no permission-mode argument and does not
     read the permission store.  Standard, grants, and Full Access therefore
@@ -145,8 +152,7 @@ def federated_capabilities(provider: str) -> tuple[CapabilityDescriptor, ...]:
     capabilities.extend(
         _tool_descriptor(spec, provider=spec.connector_id, source="mcp")
         for spec in dynamic_tool_specs()
-        if tool_is_eligible_in_current_surface(spec)
-        and (not spec.providers or provider_id in spec.providers)
+        if not spec.providers or provider_id in spec.providers
     )
     if provider_id == "chatgpt_account":
         capabilities.extend(_CHATGPT_ACCOUNT_NATIVE)
@@ -178,8 +184,25 @@ def mutation_equivalence_arguments(
     name = str(tool_name or "")
     values = arguments if isinstance(arguments, Mapping) else {}
     if name in {"bash", "run_command"}:
-        command = " ".join(str(values.get("command") or "").split())
-        return {"class": "local_command", "command": command} if command else None
+        # Shell whitespace and quoting are executable data: collapsing spaces
+        # can conflate distinct quoted arguments. The runtime's fixed default
+        # working directory also belongs to the operation, while a timeout is
+        # only an observation budget and cannot authorize replay.
+        command = str(values.get("command") or "")
+        if not command.strip():
+            return None
+        cwd = values.get("cwd") or str(Path(__file__).resolve().parent.parent)
+        return {
+            "class": "local_command",
+            "command": command,
+            "cwd": os.path.normcase(os.path.abspath(os.fspath(cwd))),
+            "arguments": json.dumps(
+                {key: value for key, value in values.items()
+                 if key not in {"command", "cwd", "timeout"}},
+                sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                default=lambda _value: "<unsupported>",
+            ),
+        }
     path_field = {
         "write_file": "path",
         "edit_file_lines": "path",

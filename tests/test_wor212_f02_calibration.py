@@ -195,7 +195,7 @@ def test_manual_ui_listening_state_comes_only_from_stt_ready_callback():
     from osia import main
 
     source = inspect.getsource(main.wake_mode)
-    assert source.count('bridge.island_state.emit("listening")') == 1
+    assert source.count('_emit_voice_state("listening")') == 1
     assert "def _mark_listening_ready()" in source
     assert "on_ready=_mark_listening_ready" in source
     assert "max_retries=3" in source

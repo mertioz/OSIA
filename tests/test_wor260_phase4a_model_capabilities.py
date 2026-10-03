@@ -15,7 +15,7 @@ def _scenario(identity):
 def test_representative_static_pairs_are_read_from_current_registry():
     expected = {
         ("openai", "gpt-5.5"): ("auto", "off", "low", "medium", "high", "xhigh"),
-        ("deepseek", "deepseek-v4-pro"): ("auto", "off", "high", "max"),
+        ("deepseek", "deepseek-flash"): ("auto", "off", "low", "high", "max"),
         ("groq", "openai/gpt-oss-120b"): ("auto", "low", "medium", "high"),
         ("mistral", "mistral-medium-3-5"): ("auto", "off", "high"),
     }

@@ -80,8 +80,8 @@ def build_deterministic_snapshots() -> dict[str, str]:
     chat_en = _prompt(lang="en")
     chat_fr = _prompt(lang="fr")
     rich = _prompt(lang="fr", rich=True)
-    autonomous = _prompt(lang="en", surface="autonomous")
-    autonomous_web = _prompt(lang="fr", surface="autonomous_web")
+    scheduled = _prompt(lang="en", surface="scheduled")
+    scheduled_fr = _prompt(lang="fr", surface="scheduled")
 
     context_agent = object.__new__(agent.OSIAAgent)
     context_agent.provider = "deepseek"
@@ -117,8 +117,8 @@ def build_deterministic_snapshots() -> dict[str, str]:
     account_combined = account_base + "\n\n" + account_provider._DEVELOPER_INSTRUCTIONS
 
     return {
-        "autonomous_api_en": autonomous,
-        "autonomous_web_api_fr": autonomous_web,
+        "scheduled_api_en": scheduled,
+        "scheduled_api_fr": scheduled_fr,
         "chat_api_en": chat_en,
         "chat_api_fr": chat_fr,
         "chat_api_fr_rich": rich,

@@ -672,6 +672,10 @@ class RelayBridge:
         """Discard only peer-bound state; keep this socket's seq/key material."""
 
         await self._close_local()
+        # A replacement peer invalidates the old WebRTC E2E session too. Close
+        # it before the new peer can commit relay, so its application lease is
+        # released at this peer-replacement boundary.
+        await self._webrtc_manager.close()
         self._webrtc_manager.reset_signaling_epoch()
         self.e2e_context = None
         self.e2e_keys = None

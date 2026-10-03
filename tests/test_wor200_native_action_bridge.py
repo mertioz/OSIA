@@ -142,7 +142,10 @@ def test_exact_file_browser_and_document_intents_map_to_canonical_tools(
 
 def test_advertised_native_surface_uses_authoritative_exact_schemas_only():
     tools = _canonical_native_tools()
+    # WOR-300: the native frontier follows runtime availability only; the
+    # desktop V4 entries are absent here because no V4 turn is bound.
     assert [tool["name"] for tool in tools] == [
+        "declare_outcomes",
         "read_file",
         "write_file",
         "navigate",
@@ -150,6 +153,8 @@ def test_advertised_native_surface_uses_authoritative_exact_schemas_only():
         "navigate_browser",
         "read_document",
         "query_document",
+        "inspect_desktop_surfaces",
+        "activate_desktop_surface",
     ]
     assert all(tool["type"] == "function" for tool in tools)
     assert all(tool["inputSchema"]["type"] == "object" for tool in tools)
@@ -266,7 +271,7 @@ def test_dynamic_lifecycle_waits_for_exact_request_without_early_refusal():
         ("read_document", None),
     ),
 )
-def test_mapped_action_uses_permission_and_exact_execution_permit_once(
+def test_mapped_action_dispatches_once_without_a_permission_permit(
     tool, arguments, tmp_path,
 ):
     calls = []
@@ -285,14 +290,6 @@ def test_mapped_action_uses_permission_and_exact_execution_permit_once(
             {tool: lambda **kwargs: calls.append(kwargs) or "action verified"},
         ),
         patch("osia.action_policy.guard_tool_call", return_value=None) as permission,
-        patch(
-            "osia.action_policy.pending_execution_permit_matches",
-            return_value=True,
-        ) as permit_match,
-        patch(
-            "osia.action_policy.consume_pending_execution_permit",
-            return_value=True,
-        ) as permit_consume,
     ):
         result = agent.run(
             user_request,
@@ -301,12 +298,11 @@ def test_mapped_action_uses_permission_and_exact_execution_permit_once(
         )
 
     assert result == "mapped action complete"
-    assert len(calls) == 1
-    dispatched_arguments = calls[0]
-    assert dispatched_arguments == arguments
+    # WOR-301: the canonical gate is consulted, but no permit or grant exists;
+    # the mapped action executes exactly once.
     permission.assert_called_once()
-    permit_match.assert_called_once_with(tool, dispatched_arguments)
-    permit_consume.assert_called_once_with(tool, dispatched_arguments)
+    assert len(calls) == 1
+    assert calls[0] == arguments
     assert len(client.completions.calls) == 2
 
 
@@ -370,7 +366,6 @@ def test_mapped_outcome_unknown_stops_before_provider_continuation():
     with (
         patch.dict(agent_module.TOOL_MAP, {"navigate_browser": unknown_browser}),
         patch("osia.action_policy.guard_tool_call", return_value=None),
-        patch("osia.action_policy.pending_execution_permit_matches", return_value=False),
     ):
         result = agent.run(
             "navigate once",
@@ -421,7 +416,6 @@ def test_successful_mapped_side_effect_blocks_provider_fallback():
             ),
         ),
         patch("osia.action_policy.guard_tool_call", return_value=None),
-        patch("osia.action_policy.pending_execution_permit_matches", return_value=False),
     ):
         result = agent.run(
             "write the file once",

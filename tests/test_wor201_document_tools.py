@@ -634,19 +634,23 @@ def test_dedicated_document_routing_has_one_final_and_no_shell_fallback(monkeypa
 
     prompt = static_tool_prompt_block("en")
     read_line = next(
-        line for line in prompt.splitlines() if line.startswith("- read_document:")
+        line for line in prompt.splitlines()
+        if line.startswith("- read_document(")
     )
-    assert "(path:string; optional:source_ref:string" in read_line
-    assert windows_example in read_line
-    assert "never shell, read_file, or render_pdf" in read_line
-    assert "whole-document safety ceiling" in read_line
+    assert "(path:string; optional:source_ref" in read_line
+    # The Windows example and the whole-document ceiling live in the tool
+    # capability text (asserted above); the prompt line is the compact schema
+    # summary since WOR-300 and is truncated deterministically.
+    assert "never shell" in read_line
+    assert "authorized_document_source" in read_line
 
     query_description = get_tool_spec("query_document").capability
     assert "pages lists rendered page-frame metadata" in query_description
     query_line = next(
-        line for line in prompt.splitlines() if line.startswith("- query_document:")
+        line for line in prompt.splitlines()
+        if line.startswith("- query_document(")
     )
-    assert "search with the user's semantic target" in query_line
+    assert "authorized_live_artifact" in query_line
 
     calls = []
     monkeypatch.setitem(
@@ -662,6 +666,8 @@ def test_dedicated_document_routing_has_one_final_and_no_shell_fallback(monkeypa
     _install_stream_rounds(agent, [
         '<tool_call>{"tool":"read_document","path":"'
         'C:\\\\Users\\\\fixture\\\\Desktop\\\\WOR201-document-e2e.pdf"}</tool_call>',
+        "The dedicated document result produced this single final response.",
+        # WOR-303: one canonical continuation round when evidence is missing.
         "The dedicated document result produced this single final response.",
     ])
     visible = []

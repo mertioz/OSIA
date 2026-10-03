@@ -270,8 +270,6 @@ def _suppression_codes(context: CriticTriggerContext) -> tuple[str, ...]:
         codes.append(
             f"runtime_capability_{context.runtime_capability_state.value}"
         )
-    if context.outcome_unknown_mutation_replay_blocked:
-        codes.append("outcome_unknown_mutation_replay_blocked")
     return tuple(dict.fromkeys(codes))
 
 

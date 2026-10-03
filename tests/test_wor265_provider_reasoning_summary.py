@@ -46,7 +46,11 @@ def test_turn_opts_in_only_when_public_summary_has_a_consumer(request_summary):
             )
         client._dispatch_notification(
             "item/agentMessage/delta",
-            {"threadId": thread_id, "delta": "One final answer."},
+            {
+                "threadId": thread_id,
+                "turnId": native_turn_id,
+                "delta": "One final answer.",
+            },
         )
         client._dispatch_notification(
             "turn/completed",

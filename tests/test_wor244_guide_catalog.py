@@ -94,7 +94,11 @@ def test_catalog_preserves_audited_source_copy_and_only_corrects_settings_facts(
         if "settings" in slide.id or slide.id == "essential.pc-settings-map"
     )
     assert "eleven real categories" in settings
-    assert "Permissions" in settings
+    # WOR-301: no permission/Full-Access toggle survives in the guide.
+    assert "Permissions" not in settings
+    assert "Full Access" not in settings
+    assert "always full-access" in settings
+    assert "only system-critical destruction is blocked" in settings
     assert "ten real categories" not in settings
     assert not any(
         token in slide.id

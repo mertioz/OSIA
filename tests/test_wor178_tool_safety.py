@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 import time
 import types
-from pathlib import Path
 
 import pytest
 
@@ -20,39 +19,6 @@ from osia.tool_contracts import (
     get_static_registry,
     shell_command_is_proven_read_only,
 )
-from osia.action_policy import PermissionPolicy
-from osia.permission_store import (
-    BackendAvailability,
-    PermissionStore,
-    SecureStorageBackend,
-)
-
-
-class _HermeticProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor178_test", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W178" + bytes(value ^ 0x6D for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W178"):
-            raise ValueError("invalid_test_blob")
-        return bytes(value ^ 0x6D for value in protected[4:])
-
-
-@pytest.fixture(autouse=True)
-def _isolated_ask_permissions(tmp_path: Path):
-    policy = PermissionPolicy(PermissionStore(
-        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
-    ))
-    action_policy.set_default_permission_policy(policy)
-    try:
-        yield
-    finally:
-        action_policy.clear_pending_execution_permit()
-        action_policy.set_default_permission_policy(None)
 
 
 def test_representative_static_side_effect_and_confirmation_classes():
@@ -104,35 +70,26 @@ def test_confirmation_ledger_is_exact_expiring_and_single_use():
     assert ledger.consume(grant.token, "delete_file", {"path": "opaque-a"}) is False
 
 
-def test_contract_confirmation_is_safe_and_denial_dispatches_nothing(monkeypatch):
+def test_contract_gate_dispatches_without_any_confirmation_prompt(monkeypatch):
     prompts = []
-    calls = []
     monkeypatch.setattr(
         mcp_registry,
         "_confirmation_provider",
         lambda server, tool, summary: prompts.append((server, tool, summary)) or False,
     )
     secret = "WOR178_CONFIRM_SECRET"
-    error = action_policy.guard_tool_call(
+    assert action_policy.guard_tool_call(
         "Run the requested local command.",
         "run_command",
         {"command": f"echo {secret}"},
-    )
-    if error is None:
-        calls.append("dispatched")
-    assert error.startswith("ERROR:")
-    assert calls == []
-    assert len(prompts) == 1
-    assert secret not in prompts[0][2]
-
-    prompts.clear()
+    ) is None
     assert action_policy.guard_tool_call(
         "Read system information.", "get_system_info", {},
     ) is None
     assert prompts == []
 
 
-def test_each_approved_confirmation_is_one_exact_call(monkeypatch):
+def test_connector_writes_proceed_without_consulting_any_approver(monkeypatch):
     prompts = []
     monkeypatch.setattr(
         mcp_registry,
@@ -147,29 +104,7 @@ def test_each_approved_confirmation_is_one_exact_call(monkeypatch):
         "osia", "delete_file", "Delete one local item",
         call_arguments={"path": "opaque-b"},
     ) is None
-    assert len(prompts) == 2
-
-
-def test_confirmation_expiry_is_enforced_across_the_prompt_wait(monkeypatch):
-    from osia import tool_contracts
-
-    now = [10.0]
-    monkeypatch.setattr(
-        tool_contracts,
-        "CONFIRMATION_LEDGER",
-        ConfirmationLedger(ttl_seconds=1.0, clock=lambda: now[0]),
-    )
-
-    def delayed_approval(_server, _tool, _summary):
-        now[0] += 2.0
-        return True
-
-    monkeypatch.setattr(mcp_registry, "_confirmation_provider", delayed_approval)
-    error = mcp_registry.confirm_connector_write(
-        "osia", "delete_file", "Delete one local item",
-        call_arguments={"path": "opaque"},
-    )
-    assert error.endswith("confirmation scope unavailable")
+    assert prompts == []
 
 
 def test_gmail_confirmation_summaries_never_include_private_values():

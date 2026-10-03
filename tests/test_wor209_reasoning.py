@@ -21,8 +21,7 @@ EXPECTED_STATIC_OPTIONS = {
     ("openai", "gpt-4.1"): [],
     ("openai", "gpt-4.1-mini"): [],
     ("openai", "gpt-4.1-nano"): [],
-    ("deepseek", "deepseek-v4-pro"): ["auto", "off", "high", "max"],
-    ("deepseek", "deepseek-v4-flash"): ["auto", "off", "high", "max"],
+    ("deepseek", "deepseek-flash"): ["auto", "off", "low", "high", "max"],
     ("google", "gemini-3.5-flash"): ["auto", "minimal", "low", "medium", "high"],
     ("google", "gemini-3.1-pro-preview"): ["auto", "low", "medium", "high"],
     ("google", "gemini-3-flash-preview"): ["auto", "minimal", "low", "medium", "high"],
@@ -107,8 +106,8 @@ def test_account_options_and_defaults_come_only_from_app_server(account_metadata
         ("anthropic", "claude-sonnet-4-6", "max", "output_config.effort", "max"),
         ("openai", "gpt-5.5", "off", "reasoning_effort", "none"),
         ("openai", "gpt-5.4-mini", "xhigh", "reasoning_effort", "xhigh"),
-        ("deepseek", "deepseek-v4-pro", "high", "reasoning_effort", "high"),
-        ("deepseek", "deepseek-v4-flash", "max", "reasoning_effort", "max"),
+        ("deepseek", "deepseek-flash", "high", "reasoning_effort", "high"),
+        ("deepseek", "deepseek-flash", "max", "reasoning_effort", "max"),
         ("google", "gemini-3.5-flash", "minimal", "reasoning_effort", "minimal"),
         ("google", "gemini-3.1-pro-preview", "medium", "reasoning_effort", "medium"),
         ("google", "gemini-2.5-flash", "off", "reasoning_effort", "none"),
@@ -161,22 +160,14 @@ def test_payload_harness_captures_every_account_option(account_metadata):
             )
 
 
-def test_invalid_saved_value_migrates_to_default(monkeypatch):
-    current = {
-        "default": "auto",
-        "providers": {},
-        "models": {"deepseek-v4-pro": "normal"},
-    }
+def test_invalid_deepseek_saved_value_is_rejected_without_remapping(monkeypatch):
+    current = {"default": "auto", "models": {"deepseek-flash": "normal"}}
     saved = []
     monkeypatch.setattr(reasoning, "get_reasoning_settings", lambda: current)
     monkeypatch.setattr(reasoning, "set_reasoning_settings", saved.append)
-
-    request = reasoning.build_reasoning_request("deepseek", "deepseek-v4-pro")
-
-    assert request["diagnostic"]["requested_reasoning"] == "normal"
-    assert request["diagnostic"]["effective_reasoning"] == "auto"
-    assert request["diagnostic"]["mapping_state"] == "rejected"
-    assert saved[-1]["models"]["deepseek-v4-pro"] == "auto"
+    with pytest.raises(ValueError, match="unsupported DeepSeek reasoning"):
+        reasoning.build_reasoning_request("deepseek", "deepseek-flash")
+    assert saved == []
 
 
 def test_syntax_normalization_preserves_runtime_ids_for_model_validation():
@@ -227,9 +218,11 @@ class _CaptureCompletions:
 def _agent_with_capture(completions):
     agent = OSIAAgent.__new__(OSIAAgent)
     agent.provider = "deepseek"
-    agent.model = "deepseek-v4-pro"
+    agent.model = "deepseek-flash"
     agent.messages = [{"role": "user", "content": "harmless"}]
     agent.turn_context = None
+    agent._chatgpt_conversation_id = None
+    agent._execution_generation_local = SimpleNamespace()
     agent.lang = "en"
     agent.client = SimpleNamespace(
         chat=SimpleNamespace(completions=completions),
@@ -245,7 +238,7 @@ def test_adapter_records_sanitized_accepted_payload(monkeypatch):
     monkeypatch.setattr(
         reasoning,
         "get_reasoning_settings",
-        lambda: {"default": "auto", "providers": {}, "models": {"deepseek-v4-pro": "high"}},
+        lambda: {"default": "auto", "providers": {}, "models": {"deepseek-flash": "high"}},
     )
     monkeypatch.setattr(reasoning, "record_reasoning_outcome", lambda diagnostic, **state: receipts.append((diagnostic, state)))
 
@@ -266,7 +259,7 @@ def test_adapter_records_sanitized_rejection(monkeypatch):
     monkeypatch.setattr(
         reasoning,
         "get_reasoning_settings",
-        lambda: {"default": "auto", "providers": {}, "models": {"deepseek-v4-pro": "max"}},
+        lambda: {"default": "auto", "providers": {}, "models": {"deepseek-flash": "max"}},
     )
     monkeypatch.setattr(reasoning, "record_reasoning_outcome", lambda diagnostic, **state: receipts.append((diagnostic, state)))
 

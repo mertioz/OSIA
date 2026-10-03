@@ -72,7 +72,7 @@ def verify_tools() -> dict:
 
     # Log the outcome ---------------------------------------------------------
     for category, ok in results.items():
-        status = "✓ available" if ok else "✗ UNAVAILABLE"
+        status = "available" if ok else "UNAVAILABLE"
         print(f"[OSIA Tools] {category}: {status}")
     unavailable = [k for k, ok in results.items() if not ok]
     summary = f"{len(results) - len(unavailable)}/{len(results)} tool categories available"

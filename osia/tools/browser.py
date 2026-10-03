@@ -1522,7 +1522,20 @@ class _AsyncBrowserOwner:
             return None
 
     async def _result(self, text, page):
-        return {"text": text, "screenshot": await self._screenshot_b64(page)}
+        screenshot = await self._screenshot_b64(page)
+        try:
+            state = self._current_state(page).to_dict()
+        except Exception:
+            state = {}
+        return {
+            "text": text,
+            "screenshot": screenshot,
+            "vision_target": {
+                "state": state,
+                "frame_id": "main",
+                "capture_method": "browser_exact_page",
+            },
+        }
 
     async def _page_url(self, page):
         if self._active_browser_type == "bidi":

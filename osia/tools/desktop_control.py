@@ -681,62 +681,107 @@ def _ydotool_position(x, y, env):
                 None, "click_at", env=env)
 
 
-# ---------------------------------------------------------------------------
-# Public input primitives
-# ---------------------------------------------------------------------------
-def click_at(x, y, button: str = "left", double: bool = False):
-    """Move the cursor to absolute screen pixel ``(x, y)`` and click."""
+_PreparedClick = namedtuple(
+    "PreparedClick",
+    "backend x y button double success_message backend_value",
+)
+
+
+def prepare_click(x, y, button: str = "left", double: bool = False):
+    """Complete fallible validation/backend loading without input dispatch."""
+
     try:
         x = int(round(float(x)))
         y = int(round(float(y)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return f"ERROR: click_at: x and y must be numbers, got {x!r}, {y!r}"
+    if not (
+        -2_147_483_648 <= x <= 2_147_483_647
+        and -2_147_483_648 <= y <= 2_147_483_647
+    ):
+        return "ERROR: click_at: coordinates are outside the supported virtual screen range"
     button = (button or "left").lower()
     if button not in ("left", "right", "middle"):
         return f"ERROR: click_at: button must be left/right/middle, got {button!r}"
     ok = f"clicked {button}{' (double)' if double else ''} at ({x}, {y})"
     backend = _backend()
-
     if backend == "pyautogui":
         err = _pyautogui_ready_error()
         if err:
             return err
         pg = _load_pyautogui()
-        try:
-            btn = _PYAUTOGUI_BUTTON.get(button, "left")
-            if double:
-                pg.doubleClick(x, y, button=btn)
-            else:
-                pg.click(x, y, button=btn)
-            return ok
-        except Exception as e:
-            return f"ERROR: click_at via pyautogui: {e}"
-
+        return _PreparedClick(
+            backend, x, y, button, bool(double), ok, pg,
+        )
     if backend == "x11":
         err = _x11_ready_error()
         if err:
             return err
-        btn = {"left": "1", "middle": "2", "right": "3"}[button]
-        cmd = ["xdotool", "mousemove", str(x), str(y), "click"]
-        if double:
-            cmd += ["--repeat", "2"]
-        cmd.append(btn)
-        return _run(cmd, ok, "click_at")
-
-    # wayland
+        return _PreparedClick(
+            backend,
+            x,
+            y,
+            button,
+            bool(double),
+            ok,
+            {"left": "1", "middle": "2", "right": "3"}[button],
+        )
     err = _wayland_ready_error()
     if err:
         return err
-    env = _ydotool_env()
-    moved = _ydotool_position(x, y, env)  # calibrated reset-to-corner + relative move
+    return _PreparedClick(
+        backend, x, y, button, bool(double), ok, _ydotool_env(),
+    )
+
+
+def dispatch_prepared_click(prepared):
+    """Invoke the prepared platform input callback with no readiness work."""
+
+    if not isinstance(prepared, _PreparedClick):
+        return "ERROR: click_at: invalid prepared click"
+    if prepared.backend == "pyautogui":
+        pg = prepared.backend_value
+        try:
+            btn = _PYAUTOGUI_BUTTON.get(prepared.button, "left")
+            if prepared.double:
+                pg.doubleClick(prepared.x, prepared.y, button=btn)
+            else:
+                pg.click(prepared.x, prepared.y, button=btn)
+            return prepared.success_message
+        except Exception as e:
+            return f"ERROR: click_at via pyautogui: {e}"
+    if prepared.backend == "x11":
+        cmd = [
+            "xdotool", "mousemove", str(prepared.x), str(prepared.y), "click",
+        ]
+        if prepared.double:
+            cmd += ["--repeat", "2"]
+        cmd.append(prepared.backend_value)
+        return _run(cmd, prepared.success_message, "click_at")
+    env = prepared.backend_value
+    moved = _ydotool_position(
+        prepared.x, prepared.y, env,
+    )  # calibrated reset-to-corner + relative move
     if moved is not None:
         return moved
     time.sleep(0.05)  # let the compositor register the move before clicking
     cmd = ["ydotool", "click"]
-    if double:
+    if prepared.double:
         cmd += ["--repeat", "2"]
-    cmd.append(_YDOTOOL_CLICK_CODES[button])
-    return _run(cmd, ok, "click_at", env=env)
+    cmd.append(_YDOTOOL_CLICK_CODES[prepared.button])
+    return _run(cmd, prepared.success_message, "click_at", env=env)
+
+
+# ---------------------------------------------------------------------------
+# Public input primitives
+# ---------------------------------------------------------------------------
+def click_at(x, y, button: str = "left", double: bool = False):
+    """Move the cursor to absolute screen pixel ``(x, y)`` and click."""
+
+    prepared = prepare_click(x, y, button=button, double=double)
+    if isinstance(prepared, str):
+        return prepared
+    return dispatch_prepared_click(prepared)
 
 
 def move_to(x, y):
@@ -2425,7 +2470,11 @@ def _kbd_arrow_keys(control_type_name):
     return None
 
 
-def activate_by_keyboard(description: str) -> "str | None":
+def activate_by_keyboard(
+    description: str,
+    *,
+    before_dispatch=None,
+) -> "str | None":
     """Best-effort keyboard activation of the native element described by
     ``description`` (Windows-only). Returns a short SUCCESS string after a verified
     activation, or ``None`` on EVERY non-resolution path — not on Windows,
@@ -2494,6 +2543,8 @@ def activate_by_keyboard(description: str) -> "str | None":
             recheck = get_focused_element()
             if not _confirmed(recheck) or _kbd_identity(recheck) != _kbd_identity(foc):
                 return None
+            if before_dispatch is not None:
+                before_dispatch()
             r = press_key(key)
             if isinstance(r, str) and r.upper().startswith("ERROR"):
                 return None

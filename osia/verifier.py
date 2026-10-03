@@ -98,7 +98,7 @@ def _required_strength(node: GoalNodeContract, item: EvidenceItem) -> int:
 def _required_observation_types(node: GoalNodeContract) -> tuple[str, ...]:
     surface = _normal(node.required_surface)
     application = _normal(node.application)
-    if surface in {"browser", "web", "dom", "personal browser"}:
+    if surface in {"browser", "web", "dom"}:
         return ("current_browser_document_state",)
     if surface not in {"", NOT_SPECIFIED, "unknown"} or application not in {
         "", NOT_SPECIFIED, "unknown"

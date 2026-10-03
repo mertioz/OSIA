@@ -3,19 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
-
 import pytest
 
 from osia import action_policy
-from osia.action_policy import (
-    PermissionMode,
-    PermissionPolicy,
-    build_permission_request,
-    create_grant,
-    execution_context_scope,
-    make_execution_context,
-)
 from osia.capability_federation import federated_capabilities
 from osia.chatgpt_account.app_server_client import (
     AppServerClient,
@@ -26,12 +16,7 @@ from osia.chatgpt_account.app_server_client import (
 from osia.chatgpt_account.provider import _CONTAINMENT_INSTRUCTIONS
 from osia.execution_strategy import build_execution_strategy
 from osia.mcp_client import registry as mcp_registry
-from osia.permission_store import (
-    BackendAvailability,
-    PermissionStore,
-    SecureStorageBackend,
-)
-from osia.tool_attempts import ToolAttemptStatus, ToolAttemptStore
+from osia.tool_attempts import ToolAttemptStore
 from osia.tool_contracts import (
     effective_tool_surface_scope,
     register_dynamic_tool,
@@ -39,42 +24,16 @@ from osia.tool_contracts import (
 )
 
 
-class _ProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor250_synthetic", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W250" + bytes(value ^ 0x5A for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W250"):
-            raise ValueError("invalid_protected_blob")
-        return bytes(value ^ 0x5A for value in protected[4:])
-
-
 @pytest.fixture(autouse=True)
-def _reset_permission_runtime():
+def _reset_confirmation_runtime():
     action_policy.clear_pending_execution_permit()
-    action_policy.set_default_permission_policy(None)
     previous_provider = mcp_registry.get_confirmation_provider()
     mcp_registry.set_confirmation_provider(None)
     try:
         yield
     finally:
         action_policy.clear_pending_execution_permit()
-        action_policy.set_default_permission_policy(None)
         mcp_registry.set_confirmation_provider(previous_provider)
-
-
-def _policy(tmp_path: Path, name: str, *, full_access: bool = False):
-    store = PermissionStore(
-        tmp_path / name,
-        backend=_ProtectedBackend(),
-    )
-    if full_access:
-        store.set_permission_mode(PermissionMode.FULL_ACCESS)
-    return PermissionPolicy(store)
 
 
 def _identities(provider: str) -> tuple[tuple[str, str], ...]:
@@ -114,14 +73,7 @@ def _approve_command(
     attempt: _TurnAttempt,
     *, item_id: str, command: str, request_id: int,
 ) -> None:
-    attempt.native_items[item_id] = {
-        "id": item_id,
-        "type": "commandExecution",
-        "status": "inProgress",
-        "command": command,
-        "cwd": str(client.workspace_dir),
-        "commandActions": [{"type": "unknown", "command": command}],
-    }
+    client._attempts[attempt.thread_id] = attempt
     client._resolve_native_approval(attempt, {
         "method": "item/commandExecution/requestApproval",
         "request_id": request_id,
@@ -142,6 +94,7 @@ def _complete_command(
     *, item_id: str, command: str, status: str = "completed",
     exit_code: int | None = 0,
 ) -> None:
+    client._attempts[attempt.thread_id] = attempt
     item = {
         "id": item_id,
         "type": "commandExecution",
@@ -155,30 +108,27 @@ def _complete_command(
     client._complete_native_item(attempt, item)
 
 
-def test_permission_matrix_changes_friction_not_planner_capabilities(tmp_path):
-    ask = _policy(tmp_path, "ask.dat")
-    full = _policy(tmp_path, "full.dat", full_access=True)
-
-    action_policy.set_default_permission_policy(ask)
-    chat_ask = _identities("chatgpt_account")
-    api_ask = _identities("deepseek")
-    with effective_tool_surface_scope("autonomous"):
-        autonomous_ask = _identities("chatgpt_account")
+def test_capability_identities_are_config_free_and_surface_scoped():
+    chat_first = _identities("chatgpt_account")
+    api_first = _identities("deepseek")
+    with effective_tool_surface_scope("chat"):
+        autonomous_first = _identities("chatgpt_account")
     with effective_tool_surface_scope("scheduled"):
-        scheduled_ask = _identities("chatgpt_account")
+        scheduled_first = _identities("chatgpt_account")
 
-    action_policy.set_default_permission_policy(full)
-    assert _identities("chatgpt_account") == chat_ask
-    assert _identities("deepseek") == api_ask
-    with effective_tool_surface_scope("autonomous"):
-        assert _identities("chatgpt_account") == autonomous_ask
+    # WOR-301: no permission configuration exists that could add or remove a
+    # capability identity; repeated composition is stable and scope-driven.
+    assert _identities("chatgpt_account") == chat_first
+    assert _identities("deepseek") == api_first
+    with effective_tool_surface_scope("chat"):
+        assert _identities("chatgpt_account") == autonomous_first
     with effective_tool_surface_scope("scheduled"):
-        assert _identities("chatgpt_account") == scheduled_ask
+        assert _identities("chatgpt_account") == scheduled_first
 
-    assert len(chat_ask) == len(set(chat_ask))
-    assert len(chat_ask) > len(api_ask)
+    assert len(chat_first) == len(set(chat_first))
+    assert len(chat_first) > len(api_first)
     assert {"webSearch", "commandExecution", "fileChange"} <= {
-        identity for source, identity in chat_ask if source.startswith("provider")
+        identity for source, identity in chat_first if source.startswith("provider")
     }
 
 
@@ -208,8 +158,9 @@ def test_native_osia_and_mcp_are_voluntary_direct_peers():
             item.source == "mcp" and item.identity == registered.name
             for item in view
         )
-        assert "optional additions" in _CONTAINMENT_INSTRUCTIONS
-        assert "choose the best valid path" in _CONTAINMENT_INSTRUCTIONS
+        containment = " ".join(_CONTAINMENT_INSTRUCTIONS.split())
+        assert "listed OSIA capabilities are both available" in containment
+        assert "same permission, ActionTruth, and evidence rules" in containment
         assert "never invoke or request Codex-native" not in _CONTAINMENT_INSTRUCTIONS
 
         native = _exact_canonical_native_call({
@@ -227,7 +178,7 @@ def test_native_osia_and_mcp_are_voluntary_direct_peers():
         unregister_dynamic_tools((registered.name,))
 
 
-def test_observable_native_read_command_needs_no_osia_rewrite(tmp_path):
+def test_observable_native_read_command_is_still_rejected(tmp_path):
     client, _sent = _client(tmp_path, "native-read")
     attempt = _native_attempt(
         conversation_id="conversation:native-read",
@@ -245,16 +196,16 @@ def test_observable_native_read_command_needs_no_osia_rewrite(tmp_path):
     }
     client._complete_native_item(attempt, completed)
     client._complete_native_item(attempt, completed)
-    assert attempt.outcome_unknown is False
-    assert attempt.native_action is False
+    assert attempt.outcome_unknown is True
     assert [
         (event.identity, event.phase, event.outcome)
         for event in attempt.capability_events
-    ] == [("commandExecution", "completed", "success_verified")]
+    ] == [("commandExecution", "completed", "outcome_unknown")]
+    assert not any(event.tool_attempt_id for event in attempt.capability_events)
+    assert list(client._attempt_store().attempts_dir.glob("attempt_*.json")) == []
 
 
-def test_standard_native_command_pauses_then_continues_exact_action(tmp_path):
-    action_policy.set_default_permission_policy(_policy(tmp_path, "ask.dat"))
+def test_raw_command_approval_never_starts_any_executor(tmp_path):
     prompts = []
     mcp_registry.set_confirmation_provider(
         lambda *args: prompts.append(args) or True,
@@ -270,59 +221,14 @@ def test_standard_native_command_pauses_then_continues_exact_action(tmp_path):
         client, attempt,
         item_id="item:standard", command="echo wor250", request_id=1,
     )
-    assert sent == [{"id": 1, "result": {"decision": "accept"}}]
-    assert len(prompts) == 1
-    dispatch = attempt.native_dispatches["item:standard"]
-    assert dispatch.arguments == {
-        "command": "echo wor250",
-        "cwd": str(client.workspace_dir.resolve(strict=False)),
-    }
-    assert dispatch.started is True
-    assert client._attempt_store().get_attempt(dispatch.tool_attempt_id)[
-        "status"
-    ] == ToolAttemptStatus.RUNNING.value
-
-    _complete_command(
-        client, attempt,
-        item_id="item:standard", command="echo wor250",
-    )
-    receipt = client._attempt_store().get_attempt(dispatch.tool_attempt_id)
-    assert receipt["status"] == ToolAttemptStatus.SUCCEEDED.value
-    assert receipt["terminal_outcome"] == "success_verified"
-    assert receipt["final_response_message_id"] == "assistant:turn:standard"
-    assert receipt["continuation_state"] == "not_claimed"
-
-
-def test_full_access_same_native_command_has_no_redundant_prompt(tmp_path):
-    action_policy.set_default_permission_policy(
-        _policy(tmp_path, "full.dat", full_access=True),
-    )
-    prompts = []
-    mcp_registry.set_confirmation_provider(
-        lambda *args: prompts.append(args) or True,
-    )
-    client, sent = _client(tmp_path)
-    attempt = _native_attempt(
-        conversation_id="conversation:full",
-        turn_id="turn:full",
-        user_request="Run the isolated synthetic command.",
-    )
-
-    _approve_command(
-        client, attempt,
-        item_id="item:full", command="echo wor250", request_id=2,
-    )
-    assert sent == [{"id": 2, "result": {"decision": "accept"}}]
+    assert sent == [{"id": 1, "result": {"decision": "decline"}}]
     assert prompts == []
-    _complete_command(
-        client, attempt, item_id="item:full", command="echo wor250",
-    )
+    assert attempt.capability_events[-1].reason_code == "CANONICAL_OSIA_TOOL_REQUIRED"
+    assert not attempt.capability_events[-1].tool_attempt_id
+    assert list(client._attempt_store().attempts_dir.glob("attempt_*.json")) == []
 
 
-def test_native_completion_must_match_the_approved_lifecycle(tmp_path):
-    action_policy.set_default_permission_policy(
-        _policy(tmp_path, "lifecycle.dat", full_access=True),
-    )
+def test_unapproved_native_completion_stays_unknown_without_receipt(tmp_path):
     client, _sent = _client(tmp_path, "lifecycle")
     attempt = _native_attempt(
         conversation_id="conversation:lifecycle",
@@ -342,121 +248,24 @@ def test_native_completion_must_match_the_approved_lifecycle(tmp_path):
         item_id="item:lifecycle",
         command="echo different",
     )
-    dispatch = attempt.native_dispatches["item:lifecycle"]
-    receipt = client._attempt_store().get_attempt(dispatch.tool_attempt_id)
-    assert receipt["status"] == ToolAttemptStatus.UNKNOWN_AFTER_START.value
-    assert receipt["terminal_outcome"] == "outcome_unknown"
+    assert not any(event.tool_attempt_id for event in attempt.capability_events)
     assert attempt.outcome_unknown is True
+    assert list(client._attempt_store().attempts_dir.glob("attempt_*.json")) == []
 
 
-def test_denial_does_not_remove_native_capability_from_future_planning(tmp_path):
-    action_policy.set_default_permission_policy(_policy(tmp_path, "ask.dat"))
-    client, sent = _client(tmp_path)
-    before = _identities("chatgpt_account")
-    attempt = _native_attempt(
-        conversation_id="conversation:deny",
-        turn_id="turn:deny",
-        user_request="Run the isolated synthetic command.",
-    )
-    mcp_registry.set_confirmation_provider(lambda *_args: False)
-    _approve_command(
-        client, attempt,
-        item_id="item:deny", command="echo denied", request_id=3,
-    )
-    assert sent[-1] == {"id": 3, "result": {"decision": "decline"}}
-    assert attempt.native_dispatches == {}
-    assert _identities("chatgpt_account") == before
-
-    mcp_registry.set_confirmation_provider(lambda *_args: True)
-    retry = _native_attempt(
-        conversation_id="conversation:retry",
-        turn_id="turn:retry",
-        user_request="Run the isolated synthetic command.",
-    )
-    _approve_command(
-        client, retry,
-        item_id="item:retry", command="echo denied", request_id=4,
-    )
-    assert sent[-1] == {"id": 4, "result": {"decision": "accept"}}
-    _complete_command(
-        client, retry, item_id="item:retry", command="echo denied",
-    )
-
-
-def test_grant_covered_call_skips_prompt_and_uncovered_call_requests_it(tmp_path):
-    policy = _policy(tmp_path, "grant.dat")
-    action_policy.set_default_permission_policy(policy)
-    context = make_execution_context(
-        owner_ref="owner:wor250",
-        machine_ref="machine:wor250",
-        execution_id="execution:wor250",
-        operation_id="operation:wor250",
-        store=policy.store,
-    )
-    arguments = {"level": 25}
-    request = build_permission_request(
-        "set_volume",
-        arguments,
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    policy.store.add_grant(create_grant(request))
-    prompts = []
-    mcp_registry.set_confirmation_provider(
-        lambda *args: prompts.append(args) or True,
-    )
-
-    with execution_context_scope(context):
-        covered = mcp_registry.confirm_sensitive_action(
-            mcp_registry.ConfirmationDomain.NATIVE,
-            "osia", "set_volume", "Change one local setting",
-            call_arguments=arguments,
-        )
-        assert covered is None
-        assert prompts == []
-        assert action_policy.consume_pending_execution_permit(
-            "set_volume", arguments,
-        ) is True
-
-    uncovered_context = make_execution_context(
-        owner_ref="owner:wor250",
-        machine_ref="machine:wor250",
-        execution_id="execution:wor250-uncovered",
-        operation_id="operation:wor250-uncovered",
-        store=policy.store,
-    )
-    with execution_context_scope(uncovered_context):
-        uncovered_arguments = {"level": 30}
-        uncovered = mcp_registry.confirm_sensitive_action(
-            mcp_registry.ConfirmationDomain.NATIVE,
-            "osia", "set_volume", "Change one local setting",
-            call_arguments=uncovered_arguments,
-        )
-        assert uncovered is None
-        assert len(prompts) == 1
-        assert action_policy.consume_pending_execution_permit(
-            "set_volume", uncovered_arguments,
-        ) is True
-
-
-def test_native_file_and_osia_equivalent_execute_exactly_once(tmp_path):
+def test_native_file_change_is_declined_without_fake_dispatch(tmp_path):
     client, sent = _client(tmp_path, "file")
     attempt = _native_attempt(
         conversation_id="conversation:file",
         turn_id="turn:file",
         user_request="Create the isolated fixture.",
     )
-    target = tmp_path / "fixture.txt"
     change = {
-        "path": str(target),
+        "path": str(tmp_path / "fixture.txt"),
         "diff": "+native content",
         "kind": {"type": "add"},
     }
-    attempt.native_items["item:file"] = {
-        "id": "item:file", "type": "fileChange", "status": "inProgress",
-        "changes": [change],
-    }
+    client._attempts[attempt.thread_id] = attempt
     client._resolve_native_approval(attempt, {
         "method": "item/fileChange/requestApproval",
         "request_id": 5,
@@ -466,62 +275,17 @@ def test_native_file_and_osia_equivalent_execute_exactly_once(tmp_path):
             "itemId": "item:file",
         },
     })
-    assert sent[-1] == {"id": 5, "result": {"decision": "accept"}}
+    assert sent[-1] == {"id": 5, "result": {"decision": "decline"}}
     client._complete_native_item(attempt, {
         "id": "item:file", "type": "fileChange", "status": "completed",
         "changes": [change],
     })
-
-    duplicate_change = {
-        **change,
-        "diff": "+different representation of the same mutation",
-    }
-    attempt.native_items["item:file-duplicate"] = {
-        "id": "item:file-duplicate",
-        "type": "fileChange",
-        "status": "inProgress",
-        "changes": [duplicate_change],
-    }
-    client._resolve_native_approval(attempt, {
-        "method": "item/fileChange/requestApproval",
-        "request_id": 51,
-        "params": {
-            "threadId": attempt.thread_id,
-            "turnId": attempt.turn_id,
-            "itemId": "item:file-duplicate",
-        },
-    })
-    assert sent[-1] == {"id": 51, "result": {"decision": "decline"}}
-    assert "item:file-duplicate" not in attempt.native_dispatches
-
-    from osia import agent as agent_module
-
-    osia_dispatches = []
-    with patch.dict(
-        agent_module.TOOL_MAP,
-        {"write_file": lambda **kwargs: osia_dispatches.append(kwargs) or "ok"},
-    ):
-        record = agent_module._execute_tool_with_policy(
-            "write_file",
-            {"path": str(target), "content": "native content"},
-            attempt_context={
-                "enabled": True,
-                "store": client._attempt_store(),
-                "conversation_id": attempt.conversation_id,
-                "turn_id": attempt.osia_turn_id,
-                "request_id": "request:osia",
-                "tool_call_id": "toolcall:osia",
-                "provider_id": "chatgpt_account",
-                "model_id": attempt.model_id,
-            },
-        )
-    assert record.dispatched is False
-    assert "durable receipt" in str(record.result)
-    assert osia_dispatches == []
+    assert attempt.outcome_unknown is True
+    assert not any(event.tool_attempt_id for event in attempt.capability_events)
+    assert list(client._attempt_store().attempts_dir.glob("attempt_*.json")) == []
 
 
-def test_outcome_unknown_freezes_every_effectful_equivalent_path(tmp_path):
-    action_policy.set_default_permission_policy(_policy(tmp_path, "ask.dat"))
+def test_unexpected_provider_effect_never_becomes_canonical_attempt(tmp_path):
     mcp_registry.set_confirmation_provider(lambda *_args: True)
     client, sent = _client(tmp_path, "unknown")
     attempt = _native_attempt(
@@ -548,74 +312,8 @@ def test_outcome_unknown_freezes_every_effectful_equivalent_path(tmp_path):
         request_id=61,
     )
     assert sent[-1] == {"id": 61, "result": {"decision": "decline"}}
-    assert "item:after-unknown" not in attempt.native_dispatches
-
-    from osia import agent as agent_module
-
-    osia_dispatches = []
-    with patch.dict(
-        agent_module.TOOL_MAP,
-        {"write_file": lambda **kwargs: osia_dispatches.append(kwargs) or "ok"},
-    ):
-        record = agent_module._execute_tool_with_policy(
-            "write_file",
-            {"path": str(tmp_path / "different.txt"), "content": "other"},
-            attempt_context={
-                "enabled": True,
-                "store": client._attempt_store(),
-                "conversation_id": attempt.conversation_id,
-                "turn_id": attempt.osia_turn_id,
-                "request_id": "request:unknown",
-                "tool_call_id": "toolcall:unknown",
-                "provider_id": "chatgpt_account",
-                "model_id": attempt.model_id,
-            },
-        )
-    assert record.dispatched is False
-    assert osia_dispatches == []
-
-
-def test_revoking_full_access_restores_prompt_without_removing_capabilities(tmp_path):
-    policy = _policy(tmp_path, "revoke.dat", full_access=True)
-    action_policy.set_default_permission_policy(policy)
-    prompts = []
-    mcp_registry.set_confirmation_provider(
-        lambda *args: prompts.append(args) or True,
-    )
-    client, sent = _client(tmp_path, "revoke")
-    before = _identities("chatgpt_account")
-
-    full = _native_attempt(
-        conversation_id="conversation:revoke-full",
-        turn_id="turn:revoke-full",
-        user_request="Run the isolated synthetic command.",
-    )
-    _approve_command(
-        client, full,
-        item_id="item:revoke-full", command="echo before", request_id=7,
-    )
-    _complete_command(
-        client, full, item_id="item:revoke-full", command="echo before",
-    )
-    assert prompts == []
-    assert sent[-1]["result"]["decision"] == "accept"
-
-    policy.store.revoke_full_access()
-    standard = _native_attempt(
-        conversation_id="conversation:revoke-ask",
-        turn_id="turn:revoke-ask",
-        user_request="Run the isolated synthetic command.",
-    )
-    _approve_command(
-        client, standard,
-        item_id="item:revoke-ask", command="echo after", request_id=8,
-    )
-    assert len(prompts) == 1
-    assert sent[-1]["result"]["decision"] == "accept"
-    assert _identities("chatgpt_account") == before
-    _complete_command(
-        client, standard, item_id="item:revoke-ask", command="echo after",
-    )
+    assert all(not event.tool_attempt_id for event in attempt.capability_events)
+    assert list(client._attempt_store().attempts_dir.glob("attempt_*.json")) == []
 
 
 def test_wor248_strategy_and_wor249_prompt_compactness_remain_intact():
@@ -623,16 +321,12 @@ def test_wor248_strategy_and_wor249_prompt_compactness_remain_intact():
         "Open Steam and go to my Library.",
         ("open_uri", "navigate_browser", "desktop_click"),
     ).model_instruction()
-    expected_layers = (
-        "0 exact direct provider/API/MCP/OSIA capability",
-        "1 deep link or deterministic route",
-        "2 DOM/Playwright",
-        "3 native accessibility",
-        "4 keyboard with observable focus",
-        "5 local/zoomed vision",
-        "6 global coordinates",
-    )
-    positions = [instruction.index(layer) for layer in expected_layers]
-    assert positions == sorted(positions)
+    assert '"unverified_outcomes"' in instruction
+    assert '"applicable_capabilities"' not in instruction
+    assert '"semantic_mission"' not in instruction
+    assert '"goal_contract"' not in instruction
+    assert "0 exact direct provider/API/MCP/OSIA capability" not in instruction
     assert len(_CONTAINMENT_INSTRUCTIONS) < 1_200
-    assert _CONTAINMENT_INSTRUCTIONS.count("optional additions") == 1
+    assert " ".join(_CONTAINMENT_INSTRUCTIONS.split()).count(
+        "listed OSIA capabilities"
+    ) == 1

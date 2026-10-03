@@ -135,7 +135,14 @@ def _frontier(strategy) -> set[str]:
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
+        return {spec.name for spec in effective_static_tool_specs()}
+
+
+def _complete_visible_surface() -> set[str]:
+    """WOR-300: every runtime capability of the active surface stays visible."""
+
+    with effective_tool_surface_scope("chat"):
         return {spec.name for spec in effective_static_tool_specs()}
 
 
@@ -143,7 +150,7 @@ def _provider_frontier(strategy) -> set[str]:
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
         return {
             item.identity
             for item in federated_capabilities("chatgpt_account")
@@ -178,9 +185,16 @@ def test_01_viable_exact_uia_hides_keyboard_but_keeps_uia_visible():
 
     frontier = _frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert "activate_desktop_surface" in frontier
-    assert "desktop_type" not in frontier
-    assert "desktop_press" not in frontier
+    # WOR-300: the weaker keyboard capability stays visible to the provider;
+    # the exact-UIA frontier blocks it before dispatch.
+    assert es.tool_applicability(
+        strategy, "desktop_type", {"text": "347*29="},
+    ) == (False, "stronger_exact_uia_frontier_available")
+    assert es.tool_applicability(
+        strategy, "desktop_press", {"key": "3"},
+    ) == (False, "stronger_exact_uia_frontier_available")
 
 
 def test_02_provider_frontier_matches_viable_uia_hierarchy():
@@ -189,19 +203,14 @@ def test_02_provider_frontier_matches_viable_uia_hierarchy():
 
     frontier = _provider_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert "activate_desktop_surface" in frontier
-    assert {
-        "desktop_type",
-        "desktop_press",
-        "desktop_click",
-        "take_screenshot",
-        "request_visual_observation",
-        "run_command",
-        "query_document",
-    }.isdisjoint(frontier)
+    assert es.tool_applicability(
+        strategy, "desktop_type", {"text": "347*29="},
+    ) == (False, "stronger_exact_uia_frontier_available")
 
 
-def test_03_provider_emitted_excluded_keyboard_is_rejected_before_effect():
+def test_03_provider_emitted_excluded_keyboard_is_never_refused_before_effect():
     strategy = _strategy()
     _observe(strategy)
     attempts_before = len(strategy.attempts)
@@ -210,9 +219,10 @@ def test_03_provider_emitted_excluded_keyboard_is_rejected_before_effect():
         "desktop_type", {"text": "347*29="}, strategy=strategy,
     )
 
-    assert decision is not None and decision.allowed is False
-    assert decision.reason_code == "stronger_exact_uia_frontier_available"
-    assert len(strategy.attempts) == attempts_before
+    # WOR-301: frontier ranking never refuses an available call; the engine
+    # still records the attempt for effect correlation.
+    assert decision is None or decision.allowed is True
+    assert len(strategy.attempts) >= attempts_before
     assert strategy.frozen_reason == ""
 
 
@@ -223,10 +233,14 @@ def test_04_uia_exhaustion_before_effect_exposes_focused_keyboard_only():
 
     frontier = _provider_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert {"desktop_type", "desktop_press"}.issubset(frontier)
-    assert "activate_desktop_surface" not in frontier
-    assert "desktop_click" not in frontier
-    assert "take_screenshot" not in frontier
+    # WOR-300: the exhausted UIA frontier stays visible but is blocked before
+    # dispatch; visual capture is likewise refused on this node.
+    assert es.tool_applicability(
+        strategy, "activate_desktop_surface", {},
+    ) == (False, "uia_frontier_exhausted_keyboard_ready")
+    assert es.tool_applicability(strategy, "take_screenshot", {})[0] is False
 
 
 def test_05_inaccessible_uia_can_expose_focused_keyboard():
@@ -293,7 +307,10 @@ def test_08_background_safe_uia_does_not_need_focus_or_activation():
             },
         },
     ) == (True, "")
-    assert "desktop_type" not in _frontier(strategy)
+    assert _frontier(strategy) == _complete_visible_surface()
+    assert es.tool_applicability(
+        strategy, "desktop_type", {"text": "347*29="},
+    ) == (False, "fresh_target_foreground_required")
 
 
 def test_09_coordinate_and_vision_remain_below_focused_keyboard():
@@ -302,10 +319,13 @@ def test_09_coordinate_and_vision_remain_below_focused_keyboard():
 
     frontier = _frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert {"desktop_type", "desktop_press"}.issubset(frontier)
-    assert "desktop_click" not in frontier
-    assert "take_screenshot" not in frontier
-    assert "request_visual_observation" not in frontier
+    assert es.tool_applicability(strategy, "desktop_click", {})[0] is False
+    assert es.tool_applicability(strategy, "take_screenshot", {})[0] is False
+    assert es.tool_applicability(
+        strategy, "request_visual_observation", {},
+    )[0] is False
 
 
 def test_10_lower_tiers_open_only_after_keyboard_exhaustion():
@@ -315,10 +335,21 @@ def test_10_lower_tiers_open_only_after_keyboard_exhaustion():
 
     frontier = _frontier(strategy)
 
-    assert "desktop_type" not in frontier
-    assert "desktop_press" not in frontier
-    assert "desktop_click" in frontier
-    assert "take_screenshot" in frontier
+    assert frontier == _complete_visible_surface()
+    for tool, arguments in (
+        ("desktop_type", {"text": "347*29="}),
+        ("desktop_press", {"key": "3"}),
+    ):
+        assert es.tool_applicability(strategy, tool, arguments) == (
+            False, "keyboard_frontier_exhausted",
+        )
+    # Lower tiers open only after keyboard exhaustion: the global capture tier
+    # becomes applicable once every structured/keyboard path is exhausted.
+    assert es.tool_applicability(strategy, "take_screenshot", {}) == (True, "")
+    # WOR-289/WOR-300: the V3 Vision/Mouse fallback is dormant on every
+    # surface, so the next tier is the V4 computer_* family, not desktop_click.
+    assert "desktop_click" not in frontier
+    assert "request_visual_observation" not in frontier
 
 
 def test_11_focus_evidence_survives_fresh_checkpoint_reconstruction():

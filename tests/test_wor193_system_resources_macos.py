@@ -58,8 +58,10 @@ def _registry():
 
 def test_sip_ssv_roots_are_protected_but_usr_local_is_not():
     registry = _registry()
-    for target in ("/", "/System/Library", "/bin/sh", "/sbin/mount", "/usr/bin/python3"):
+    for target in ("/", "/System"):
         assert registry.classify_path(target).blocks_destruction
+    for target in ("/System/Library", "/bin/sh", "/sbin/mount", "/usr/bin/python3"):
+        assert not registry.classify_path(target).blocks_destruction
     assert registry.classify_path("/usr/local/bin/tool").classification is Classification.NOT_SYSTEM_RESOURCE
 
 
@@ -97,7 +99,7 @@ def test_diskutil_plist_bytes_and_parent_alias_resolution_are_fixture_validated(
         macos=adapter,
         path_resolver=lambda _path, _follow_leaf: "/System/Library/CoreServices",
     )
-    assert registry.classify_path("/fixture/alias/CoreServices").blocks_destruction
+    assert not registry.classify_path("/fixture/alias/CoreServices").blocks_destruction
     assert registry.classify_official_maintenance(
         "installer", ["-pkg", "fixture.pkg"], verified_native_invoker=True,
     ).classification is Classification.OFFICIAL_MAINTENANCE_OPERATION

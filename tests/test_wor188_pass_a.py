@@ -13,13 +13,6 @@ import pytest
 
 from osia import agent as agent_module
 from osia import pdf_renderer
-from osia.action_policy import (
-    PermissionPolicy,
-    automatic_permission_category,
-    build_permission_request,
-    make_execution_context,
-)
-from osia.permission_store import PermissionStore, UnavailableSecureStorageBackend
 from osia.server import server
 from osia.tool_contracts import (
     ExecutionOutcome,
@@ -68,9 +61,10 @@ def test_render_pdf_contract_is_static_bounded_and_authoritative():
     assert validate_arguments(spec.input_schema, VALID_PDF_ARGUMENTS) == VALID_PDF_ARGUMENTS
     assert spec.permission_category == "files_modify"
     assert spec.verified_success is True
-    assert spec.chat_eligible is True
-    assert spec.autonomous_eligible is True
-    assert spec.scheduled_eligible is False
+    # WOR-301: eligibility metadata is gone; availability is the contract.
+    assert not hasattr(spec, "chat_eligible")
+    assert not hasattr(spec, "autonomous_eligible")
+    assert not hasattr(spec, "scheduled_eligible")
     assert spec.timeout_seconds == agent_module.TOOL_TIMEOUT_SECONDS == 30.0
     assert agent_module.TOOL_MAP["render_pdf"] is agent_module.tool_render_pdf
     without_optional_level = json.loads(json.dumps(VALID_PDF_ARGUMENTS))
@@ -78,9 +72,10 @@ def test_render_pdf_contract_is_static_bounded_and_authoritative():
     assert validate_arguments(spec.input_schema, without_optional_level) == without_optional_level
     prompt = static_tool_prompt_block("en")
     assert "render_pdf" in prompt
-    assert "destination exactly 'desktop' (never a path)" in prompt
-    assert "Every block is one flat object with a type field" in prompt
-    assert "'type':'flow_diagram'" in prompt
+    assert "destination:enum[desktop]" in prompt
+    assert "page_size:enum[A4|Letter]" in prompt
+    assert "blocks=heading{text,level?}|paragraph{text}" in prompt
+    assert "flow_diagram{nodes,edges}" in prompt
 
 
 @pytest.mark.parametrize(
@@ -109,25 +104,6 @@ def test_render_pdf_rejects_external_payloads_and_raw_paths_before_dispatch(
     assert record.outcome == ExecutionOutcome.REJECTED_BEFORE_EXECUTION
     assert record.dispatched is False
     assert calls == []
-
-
-def test_render_pdf_permission_is_exact_desktop_files_modify(tmp_path):
-    store = PermissionStore(
-        tmp_path / "permissions.dat",
-        backend=UnavailableSecureStorageBackend(),
-    )
-    policy = PermissionPolicy(store)
-    context = make_execution_context(store=store)
-    request = build_permission_request(
-        "render_pdf",
-        VALID_PDF_ARGUMENTS,
-        execution_context=context,
-        policy=policy,
-    )
-    assert request.safe_category == "local_destination"
-    assert request.private_scope.grantable is True
-    assert request.tool_category == "filesystem"
-    assert automatic_permission_category(request) == "files_modify"
 
 
 def test_one_valid_render_dispatch_produces_one_pdfium_verified_pdf(tmp_path, monkeypatch):
@@ -331,14 +307,13 @@ def test_translation_multilingual_and_neutral_followup_modes_are_explicit():
     bilingual = resolve_turn_context("R\u00e9ponds en fran\u00e7ais et en anglais.")
     assert bilingual.mode == "multilingual"
     assert bilingual.allowed_languages == ("fr", "en")
-    assert "(French, English)" in language_instruction(bilingual)
+    assert "French, English" in language_instruction(bilingual)
 
     neutral = resolve_turn_context(
         "?",
         history=[{"role": "assistant", "content": "Bien s\u00fbr.", "_language": "fr"}],
     )
-    assert neutral.language == "fr"
-    assert neutral.source == "persisted_previous"
+    assert neutral.source == "natural_model"
 
 
 def test_unsupported_local_tts_language_never_fakes_an_english_voice(monkeypatch):
@@ -374,9 +349,13 @@ def test_progressive_tts_uses_the_turns_authoritative_language(monkeypatch):
             {
                 "conversation_id": "wor188-conversation",
                 "request_id": "wor188-request",
-                "client_request_id": "wor188-request",
-                "turn_id": "wor188-turn",
-                "user_message_id": "wor188-user",
+                    "client_request_id": "wor188-request",
+                    "turn_id": "wor188-turn",
+                    "run_id": "wor188-turn",
+                    "provider_id": "ollama",
+                    "model_id": "llama3",
+                    "effective_reasoning": "auto",
+                    "user_message_id": "wor188-user",
                 "assistant_message_id": "wor188-assistant",
                 "language": "fr",
                 "_event_sequence": 0,

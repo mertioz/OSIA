@@ -347,11 +347,9 @@ def _error_result(error: DocumentReadError) -> dict:
 
 
 def _document_policy_epoch() -> int:
-    from osia.action_policy import get_default_permission_policy
-
-    return int(
-        get_default_permission_policy().store.load_state().policy_epoch,
-    )
+    # WOR-301: no permission epochs remain; document binding uses a constant
+    # generation so freshness is proven against the source itself.
+    return 0
 
 
 def read_document(

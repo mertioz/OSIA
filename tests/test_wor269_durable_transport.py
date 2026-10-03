@@ -333,22 +333,6 @@ def test_08_duplicate_stop_has_one_cancellation_claim(tmp_path):
     assert duplicate.result == {"accepted": True}
 
 
-def test_09_duplicate_permission_response_cannot_change_decision(tmp_path):
-    store = DurableTransportStore(tmp_path / "transport")
-    first = store.claim_command(
-        command_id="command_permission_wor269b",
-        command_type="mcp_confirm_response",
-        binding={"confirmation_id": "confirm_wor269b", "approved": False},
-    )
-    conflict = store.claim_command(
-        command_id="command_permission_wor269b",
-        command_type="mcp_confirm_response",
-        binding={"confirmation_id": "confirm_wor269b", "approved": True},
-    )
-    assert first.disposition is InboxDisposition.CLAIMED
-    assert conflict.disposition is InboxDisposition.CONFLICT
-
-
 # PROVIDER CONTINUATION
 
 
@@ -467,10 +451,10 @@ def test_14_late_callback_after_terminal_cannot_overwrite_verified_truth(tmp_pat
     assert loaded["status"] == ToolAttemptStatus.SUCCEEDED.value
 
 
-# ACTION TRUTH
+# FACTUAL ACTION HISTORY — a prior state never vetoes a new request
 
 
-def test_15_dispatch_started_then_process_death_reconciles_without_replay(tmp_path):
+def test_15_dispatch_started_fact_survives_restart_without_vetoing_new_request(tmp_path):
     root = tmp_path / "attempts"
     store, attempt = _create_attempt(root)
     _dispatch(store, attempt["tool_attempt_id"])
@@ -485,10 +469,10 @@ def test_15_dispatch_started_then_process_death_reconciles_without_replay(tmp_pa
         state=unresolved[0]["action_truth"]["current_state"],
         effect_truth=unresolved[0]["action_truth"]["effect_truth"],
         dispatch_started=True,
-    ).allowed is False
+    ).allowed is True
 
 
-def test_16_verified_effect_plus_transport_failure_replays_event_only(tmp_path):
+def test_16_verified_effect_fact_does_not_veto_new_request(tmp_path):
     truth = transition_action_truth(
         _started(_truth()),
         state=ActionState.EFFECT_VERIFIED,
@@ -511,10 +495,10 @@ def test_16_verified_effect_plus_transport_failure_replays_event_only(tmp_path):
         state=truth["current_state"],
         effect_truth=truth["effect_truth"],
         dispatch_started=True,
-    ).allowed is False
+    ).allowed is True
 
 
-def test_17_exact_non_application_allows_alternate_strategy():
+def test_17_exact_non_application_remains_fact_for_model_choice():
     truth = transition_action_truth(
         _started(_truth()),
         state=ActionState.NOT_APPLIED_VERIFIED,
@@ -531,7 +515,7 @@ def test_17_exact_non_application_allows_alternate_strategy():
         dispatch_started=True,
     )
     assert decision.allowed is True
-    assert decision.alternate_mechanism_only is True
+    assert decision.alternate_mechanism_only is False
 
 
 def test_18_observer_failure_keeps_read_only_recovery_open():
@@ -602,7 +586,7 @@ def test_21_stale_tab_is_typed_separately():
     assert decision.effect_truth is EffectTruth.POSSIBLE
 
 
-def test_22_lost_read_only_website_result_is_safely_retryable():
+def test_22_lost_read_only_result_allows_a_fresh_request():
     truth = _started(_truth(
         effect_class=CanonicalEffectClass.READ_ONLY,
         operation="read_page",
@@ -615,10 +599,10 @@ def test_22_lost_read_only_website_result_is_safely_retryable():
         dispatch_started=True,
     )
     assert decision.allowed is True
-    assert decision.reason_code == "read_only_reexecution_safe"
+    assert decision.reason_code == 'new_request_allowed'
 
 
-def test_23_site_audit_continues_without_global_unknown_barrier():
+def test_23_site_audit_history_does_not_gate_new_reads():
     navigation = _record(_started(_truth(
         operation="navigate",
         target={"kind": "browser", "safe_url": "https://example.com"},
@@ -632,7 +616,7 @@ def test_23_site_audit_continues_without_global_unknown_barrier():
         [navigation],
     )
     assert read_gate.allowed is True
-    assert read_gate.reason_code == "read_only_allowed_during_reconciliation"
+    assert read_gate.reason_code == 'new_request_allowed'
 
 
 # DESKTOP
@@ -866,7 +850,7 @@ def _legacy_unknown() -> dict:
     })
 
 
-def test_35_old_outcome_unknown_record_loads_fail_closed():
+def test_35_old_outcome_unknown_record_stays_factual_and_allows_new_request():
     truth = _legacy_unknown()
     decision = retry_decision(
         effect_class=truth["effect_class"],
@@ -875,7 +859,7 @@ def test_35_old_outcome_unknown_record_loads_fail_closed():
         dispatch_started=True,
     )
     assert truth["legacy"] is True
-    assert decision.allowed is False
+    assert decision.allowed is True
 
 
 def test_36_old_record_still_allows_read_only_reconciliation():
@@ -1164,14 +1148,14 @@ def test_formal_invariants_i1_through_i10(tmp_path, invariant):
             state=started["current_state"],
             effect_truth=started["effect_truth"],
             dispatch_started=True,
-        ).allowed is False
+        ).allowed is True
     elif invariant == 4:
         assert retry_decision(
             effect_class=started["effect_class"],
             state=started["current_state"],
             effect_truth=started["effect_truth"],
             dispatch_started=True,
-        ).allowed is False
+        ).allowed is True
     elif invariant == 6:
         verified = transition_action_truth(
             started,
@@ -1186,7 +1170,7 @@ def test_formal_invariants_i1_through_i10(tmp_path, invariant):
             state=verified["current_state"],
             effect_truth=verified["effect_truth"],
             dispatch_started=True,
-        ).allowed is False
+        ).allowed is True
     elif invariant == 5:
         assert gate_action(
             ActionIntent(CanonicalEffectClass.READ_ONLY), [unresolved],
@@ -1241,4 +1225,6 @@ def test_formal_invariants_i1_through_i10(tmp_path, invariant):
             evidence={"safe_paths_exhausted": True},
         ) is True
         controller.set_strategy_frontier(())
-        assert controller.evaluate().terminal_state == "blocked_verified"
+        decision = controller.evaluate()
+        assert decision.terminal_state == ""
+        assert decision.action == "continue"

@@ -858,34 +858,6 @@ class AttachmentBatchManager:
             for item in sorted(batch.files.values(), key=lambda value: value.logical_order)
         ]
 
-    def consume_for_autonomous(
-        self,
-        batch_id: str,
-        request_id: str,
-    ) -> list[CommittedAttachment]:
-        """Consume one committed Autonomous batch without Chat binding."""
-
-        batch = self.validate_turn_reference(batch_id, "", request_id)
-        if batch.attachment_purpose != "autonomous":
-            raise AttachmentProtocolError("attachment_purpose_mismatch")
-        batch.consumed = True
-        batch.consumed_request_id = request_id
-        return [
-            CommittedAttachment(
-                attachment_id=item.internal_id,
-                file_id=item.file_id,
-                logical_order=item.logical_order,
-                display_name=item.display_name,
-                path=item.ready_path,
-                byte_size=item.bytes_written,
-                sha256=item.declared_sha256,
-                detected_category=item.detected_category,
-                detected_mime=item.detected_mime,
-            )
-            for item in sorted(
-                batch.files.values(), key=lambda value: value.logical_order,
-            )
-        ]
 
     def validate_turn_reference(
         self,
@@ -976,25 +948,17 @@ class AttachmentBatchManager:
             self._tombstones.popitem(last=False)
 
 
-def _build_image_content(prompt: str, images: list[tuple[str, str, bytes]]) -> list[dict]:
-    image_names = ", ".join(name for name, _mime, _data in images)
-    text = (
-        "[Images jointes présentes dans les parties visuelles qui suivent : "
-        f"{image_names}. Si le fournisseur sélectionné ne donne pas accès "
-        "aux parties visuelles, signale explicitement cette incapacité du "
-        "fournisseur ; ne prétends pas qu'aucune image n'a été jointe.]\n\n"
-        f"{prompt.strip()}"
-    ).strip()
-    content: list[dict] = []
-    if text:
-        content.append({"type": "text", "text": text})
-    for _name, mime, data in images:
-        encoded = base64.b64encode(data).decode("ascii")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{encoded}"},
-        })
-    return content
+def _build_image_content(
+    prompt: str,
+    images,
+    *,
+    owner_id: str = "",
+) -> list[dict]:
+    """Build provider-neutral content; provider adapters own wire encoding."""
+
+    from osia.image_inputs import content_with_images
+
+    return content_with_images(prompt, images, owner_id=owner_id)
 
 
 def build_local_attachment_input(
@@ -1003,7 +967,7 @@ def build_local_attachment_input(
     *,
     owner_id: str | None = None,
 ) -> tuple[str | list[dict], str]:
-    """Capture one desktop attachment before its selected path can disappear."""
+    """Snapshot one local selection into image input or an opaque document."""
 
     source = Path(path)
     display_name = sanitize_display_name(source.name)
@@ -1021,6 +985,38 @@ def build_local_attachment_input(
     if len(data) != before.st_size:
         raise AttachmentProtocolError("file_size_mismatch")
 
+    image_mime = detect_image_mime(data)
+    declared_image_mime = _IMAGE_MIME.get(source.suffix.lower())
+    if (
+        declared_image_mime in {
+            "image/gif", "image/jpeg", "image/png", "image/webp",
+        }
+        and image_mime is None
+    ):
+        raise AttachmentProtocolError("invalid_image")
+    if image_mime:
+        from osia.image_inputs import (
+            ImageInputError,
+            ImageSourceType,
+            create_image_artifact,
+        )
+
+        try:
+            artifact = create_image_artifact(
+                data,
+                image_mime,
+                ImageSourceType.USER_UPLOAD,
+                maximum_bytes=MAX_ATTACHMENT_BYTES,
+            )
+        except ImageInputError as exc:
+            raise AttachmentProtocolError("invalid_image") from exc
+        text = str(prompt or "").strip() or "Analyze the attached image."
+        return _build_image_content(
+            text,
+            [artifact],
+            owner_id=str(owner_id or ""),
+        ), display_name
+
     from osia.document_sources import get_source_store
 
     if owner_id:
@@ -1037,7 +1033,7 @@ def build_local_attachment_input(
             display_name=display_name,
         )
     text = (
-        "[Document attachment available through structured tools: "
+        "[Non-image document attachment available through structured tools: "
         f"source_ref={capability['source_ref']} "
         f"type={capability['type_label']} state={capability['state']}]"
     )
@@ -1053,11 +1049,19 @@ def build_agent_input(
     owner_id: str | None = None,
     permission_epoch: int | None = None,
     source_refs_out: list[str] | None = None,
+    image_artifacts_out: list | None = None,
 ) -> str | list[dict]:
-    """Create opaque local sources before any provider input."""
+    """Create direct image inputs and opaque non-image document sources."""
 
     ordered = sorted(attachments, key=lambda item: item.logical_order)
-    sources = list(ordered)
+    image_items = [
+        item for item in ordered
+        if item.detected_category == "image"
+        and item.detected_mime in {
+            "image/gif", "image/jpeg", "image/png", "image/webp",
+        }
+    ]
+    sources = [item for item in ordered if item not in image_items]
     text = prompt.strip()
     if sources:
         from osia.document_sources import get_source_store
@@ -1091,9 +1095,40 @@ def build_agent_input(
             for index, item in enumerate(capabilities, start=1)
         )
         text = (
-            "[Document/media attachments in original order. Use read_document with "
-            "each opaque source_ref, then query_document; never request or "
+            "[Non-image document attachments in original order. Use read_document "
+            "with each opaque source_ref, then query_document; never request or "
             "infer a local path:\n"
             f"{bullets}\n]\n\n{text}"
         ).strip()
-    return text
+    if not image_items:
+        return text
+
+    from osia.image_inputs import (
+        ImageInputError,
+        ImageSourceType,
+        create_image_artifact,
+    )
+
+    artifacts = []
+    for item in image_items:
+        try:
+            data = item.path.read_bytes()
+        except OSError as exc:
+            raise AttachmentProtocolError("file_read_failed") from exc
+        try:
+            artifact = create_image_artifact(
+                data, item.detected_mime, ImageSourceType.USER_UPLOAD,
+                maximum_bytes=MAX_ATTACHMENT_BYTES,
+            )
+        except ImageInputError as exc:
+            raise AttachmentProtocolError("invalid_image") from exc
+        artifacts.append(artifact)
+        if image_artifacts_out is not None:
+            image_artifacts_out.append(artifact)
+    if not text:
+        text = "Analyze the attached image or images."
+    return _build_image_content(
+        text,
+        artifacts,
+        owner_id=str(owner_id or ""),
+    )

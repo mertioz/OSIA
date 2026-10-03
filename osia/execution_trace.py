@@ -1,10 +1,10 @@
 """Bounded public execution-status projection for Mobile (WOR-254).
 
-This module never accepts raw reasoning, ordinary model prose, tool
-arguments/results, paths, provider payloads, or exception text. Producers select
-one deterministic display key from the allowlist below. The sole bounded-text
-exception is a provider-designated public reasoning summary, ingested through a
-dedicated sanitizer rather than the general event API.
+This module never accepts raw reasoning, tool arguments/results, paths,
+provider payloads, or exception text. Producers select one deterministic
+display key from the allowlist below. Bounded public assistant progress and a
+provider-designated public summary use the same dedicated text sanitizer rather
+than the general event API.
 """
 
 from __future__ import annotations
@@ -26,6 +26,27 @@ MAX_SERIALIZED_BYTES = 12 * 1024
 MAX_RELAY_SNAPSHOT_EVENTS = 8
 MAX_RELAY_SNAPSHOT_BYTES = 4 * 1024
 MAX_PUBLIC_REASONING_SUMMARY_CHARS = 1_600
+MAX_PUBLIC_NARRATION_CHARS = 500
+MAX_PUBLIC_NARRATION_EVENTS = 8
+
+_SENSITIVE_PUBLIC_TEXT_PATTERNS = (
+    re.compile(
+        r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|"
+        r"secret|password|passphrase|credential|private[_ -]?key)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE),
+    re.compile(r"\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+    re.compile(r"(?<!\w)\+?(?:\d[\s().-]?){8,}\d(?!\w)"),
+    re.compile(
+        r"<\s*/?\s*(?:system|developer)\b|"
+        r"\b(?:system|developer)\s+prompt\s*[:=]",
+        re.IGNORECASE,
+    ),
+)
 
 EVENT_KINDS = frozenset({
     "goal",
@@ -54,6 +75,7 @@ DISPLAY_SPECS: dict[str, tuple[str, frozenset[str]]] = {
     "execution.action.capability": ("action", frozenset()),
     "execution.permission.waiting": ("waiting_permission", frozenset()),
     "execution.result.completed": ("result", frozenset()),
+    "execution.result.observed": ("result", frozenset()),
     "execution.result.needs_attention": ("result", frozenset()),
     "execution.result.cancelled": ("result", frozenset()),
     "execution.continuation.new_strategy": ("continuation", frozenset()),
@@ -163,6 +185,8 @@ def sanitize_public_reasoning_summary(value: object) -> str:
         flags=re.IGNORECASE,
     ):
         return ""
+    if any(pattern.search(text) for pattern in _SENSITIVE_PUBLIC_TEXT_PATTERNS):
+        return ""
     # Directional overrides/isolates can make a benign-looking UI string render
     # differently from its stored value. They are never needed in a summary.
     text = text.translate({
@@ -184,6 +208,21 @@ def sanitize_public_reasoning_summary(value: object) -> str:
         compacted.append(line)
     text = "\n".join(compacted)
     return text[:MAX_PUBLIC_REASONING_SUMMARY_CHARS].rstrip()
+
+
+def sanitize_public_model_narration(value: object) -> str:
+    """Bound optional public progress text before it enters a turn trace."""
+
+    text = sanitize_public_reasoning_summary(value)
+    if len(text) > MAX_PUBLIC_NARRATION_CHARS:
+        return ""
+    normalized = re.sub(r"[.!…]+$", "", text.strip()).casefold()
+    if normalized in {
+        "thinking", "planning", "analyzing", "analysing", "working",
+        "je réfléchis", "analyse", "en cours", "je travaille",
+    }:
+        return ""
+    return text
 
 
 def _safe_args(display_key: str, value: object) -> dict:
@@ -465,6 +504,37 @@ class ExecutionTraceLedger:
             dedupe_key="provider_public_reasoning_summary",
             _public_reasoning_summary=summary,
         )
+
+    def record_public_narration(
+        self,
+        narration: str,
+    ) -> SafeExecutionTraceEvent | None:
+        """Append one bounded, deduplicated public model progress statement."""
+
+        summary = sanitize_public_model_narration(narration)
+        if not summary:
+            return None
+        slot = "model_public_narration:" + hashlib.sha256(
+            summary.encode("utf-8")
+        ).hexdigest()[:32]
+        with self._lock:
+            for event in self._events:
+                if (
+                    event.kind == "public_reasoning_summary"
+                    and event.summary == summary
+                ):
+                    return event
+            if sum(
+                event.kind == "public_reasoning_summary"
+                for event in self._events
+            ) >= MAX_PUBLIC_NARRATION_EVENTS:
+                return None
+            return self.record(
+                kind="public_reasoning_summary",
+                display_key="execution.reasoning.summary",
+                dedupe_key=slot,
+                _public_reasoning_summary=summary,
+            )
 
     def _publish(self, event: SafeExecutionTraceEvent) -> None:
         if self._callback is None:

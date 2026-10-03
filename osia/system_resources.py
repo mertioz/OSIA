@@ -1,4 +1,4 @@
-"""Trusted cross-platform evidence for the universal system-destruction barrier.
+"""Trusted cross-platform evidence for the catastrophic host-destruction guard.
 
 The public result is deliberately categorical.  Raw paths and storage labels stay
 inside the registry instance and never appear in ``repr`` or public metadata.
@@ -118,7 +118,20 @@ class DestructiveOperation(str, Enum):
     FORMAT = "format"
     PARTITION_DELETE = "partition_delete"
     VOLUME_DELETE = "volume_delete"
-    PROTECTED_REGISTRY_DELETE = "protected_registry_delete"
+
+
+_HOST_TREE_DESTRUCTION_OPERATIONS = frozenset({
+    DestructiveOperation.DELETE,
+    DestructiveOperation.RECURSIVE_DELETE,
+})
+_HOST_VOLUME_DESTRUCTION_OPERATIONS = frozenset({
+    DestructiveOperation.DELETE,
+    DestructiveOperation.RECURSIVE_DELETE,
+    DestructiveOperation.RAW_ERASE,
+    DestructiveOperation.FORMAT,
+    DestructiveOperation.PARTITION_DELETE,
+    DestructiveOperation.VOLUME_DELETE,
+})
 
 
 _EVIDENCE_SEAL = object()
@@ -151,11 +164,12 @@ class SystemResourceEvidence:
 
     @property
     def blocks_destruction(self) -> bool:
-        return self.classification in {
-            SystemResourceClassification.PROTECTED_SYSTEM_RESOURCE,
-            SystemResourceClassification.PROTECTED_SYSTEM_VOLUME,
-            SystemResourceClassification.INDETERMINATE_PROTECTED_TARGET,
-        }
+        if self.classification is SystemResourceClassification.PROTECTED_SYSTEM_VOLUME:
+            return True
+        return (
+            self.classification is SystemResourceClassification.PROTECTED_SYSTEM_RESOURCE
+            and self.evidence_category == "catastrophic_os_root"
+        )
 
     def public_metadata(self) -> dict[str, Any]:
         return {
@@ -248,14 +262,12 @@ class WindowsRuntimeAdapter:
         system_directory: str | None = None,
         system_windows_directory: str | None = None,
         wrp_probe=None,
-        wrp_key_probe=None,
         storage_rows: Sequence[Mapping[str, Any]] | None = None,
     ):
         self._windows_directory = windows_directory
         self._system_directory = system_directory
         self._system_windows_directory = system_windows_directory
         self._wrp_probe = wrp_probe
-        self._wrp_key_probe = wrp_key_probe
         self._storage_rows = tuple(storage_rows) if storage_rows is not None else None
 
     @staticmethod
@@ -303,30 +315,6 @@ class WindowsRuntimeAdapter:
             if result:
                 return True
             return False if error == 0 else None
-        except (AttributeError, OSError):
-            return None
-
-    def wrp_key_status(self, root: str, subkey: str | None) -> bool | None:
-        if self._wrp_key_probe is not None:
-            value = self._wrp_key_probe(root, subkey)
-            return value if isinstance(value, bool) else None
-        if sys.platform != "win32":
-            return None
-        root_handles = {
-            "HKEY_CLASSES_ROOT": 0x80000000,
-            "HKEY_CURRENT_USER": 0x80000001,
-            "HKEY_LOCAL_MACHINE": 0x80000002,
-            "HKEY_USERS": 0x80000003,
-        }
-        handle = root_handles.get(root)
-        if handle is None:
-            return None
-        try:
-            sfc = ctypes.WinDLL("sfc.dll", use_last_error=True)
-            fn = sfc.SfcIsKeyProtected
-            fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
-            fn.restype = ctypes.c_int
-            return bool(fn(ctypes.c_void_p(handle), subkey or None, 0))
         except (AttributeError, OSError):
             return None
 
@@ -852,62 +840,6 @@ class SystemResourceRegistry:
     ) -> SystemResourceEvidence:
         return self._indeterminate(reason_code, "destructive_semantics", "")
 
-    def classify_registry_key(self, key: str) -> SystemResourceEvidence:
-        """Classify literal Windows registry deletion without trusting labels."""
-
-        if self.platform_family != "windows":
-            return self._indeterminate(
-                "windows_registry_on_non_windows", "protected_registry", str(key or "")
-            )
-        normalized = str(key or "").strip().strip("'\"").replace("/", "\\")
-        normalized = re.sub(r"^(?:registry::)?", "", normalized, flags=re.IGNORECASE)
-        aliases = {
-            "HKLM": "HKEY_LOCAL_MACHINE",
-            "HKCU": "HKEY_CURRENT_USER",
-            "HKCR": "HKEY_CLASSES_ROOT",
-            "HKU": "HKEY_USERS",
-            "HKCC": "HKEY_CURRENT_CONFIG",
-        }
-        head, separator, tail = normalized.partition("\\")
-        head = head.rstrip(":").upper()
-        canonical = aliases.get(head, head) + ("\\" + tail if separator else "")
-        canonical = canonical.upper().rstrip("\\")
-        if not canonical.startswith("HKEY_") or re.search(r"[`$%*?\[\](){}]", canonical):
-            return self._indeterminate(
-                "registry_target_not_normalizable", "protected_registry", normalized
-            )
-        protected = (
-            "HKEY_LOCAL_MACHINE\\BCD00000000",
-            "HKEY_LOCAL_MACHINE\\SYSTEM",
-            "HKEY_LOCAL_MACHINE\\SAM",
-            "HKEY_LOCAL_MACHINE\\SECURITY",
-            "HKEY_LOCAL_MACHINE\\COMPONENTS",
-        )
-        if canonical in {"HKEY_LOCAL_MACHINE", "HKEY_CURRENT_CONFIG"} or any(
-            canonical == root or canonical.startswith(root + "\\")
-            for root in protected
-        ):
-            return self._protected(
-                normalized,
-                "protected_windows_registry",
-                "boot_system_registry",
-            )
-        root, separator, subkey = canonical.partition("\\")
-        wrp = self.windows.wrp_key_status(root, subkey if separator else None)
-        if wrp is True:
-            return self._protected(
-                normalized,
-                "windows_registry_protection",
-                "protected_registry",
-            )
-        if wrp is None:
-            return self._indeterminate(
-                "wrp_registry_status_unavailable",
-                "protected_registry",
-                normalized,
-            )
-        return self._not_system(normalized, "ordinary_registry_data")
-
     def _not_system(self, target: str, reason: str = "ordinary_data") -> SystemResourceEvidence:
         return _evidence(
             SystemResourceClassification.NOT_SYSTEM_RESOURCE,
@@ -963,7 +895,7 @@ class SystemResourceRegistry:
             volume_root and os.path.normcase(os.path.normpath(normalized))
             == os.path.normcase(os.path.normpath(volume_root))
         )
-        if target_is_volume_root and any(
+        if target_is_volume_root and operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS and any(
             _path_within(root, volume_root, casefold=True) for root in roots
         ):
             return self._protected(target, "active_windows_volume", "active_os_volume", volume=True)
@@ -984,12 +916,25 @@ class SystemResourceRegistry:
                     )
                 )
             )
-            if matches and (
+            if matches and operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS and (
                 row.get("IsBoot") is True
                 or row.get("IsSystem") is True
                 or guid in {_ESP_GUID, _MSR_GUID, _WINRE_GUID}
             ):
                 return self._protected(target, "protected_windows_partition", "boot_recovery_partition", volume=True)
+        normalized_key = os.path.normcase(os.path.normpath(normalized))
+        if (
+            operation in _HOST_TREE_DESTRUCTION_OPERATIONS
+            and any(
+                normalized_key == os.path.normcase(os.path.normpath(root))
+                for root in roots
+            )
+        ):
+            return self._protected(
+                target,
+                "catastrophic_windows_root_destruction",
+                "catastrophic_os_root",
+            )
         if any(_path_within(normalized, root, casefold=True) for root in roots):
             wrp = self.windows.wrp_status(normalized)
             if wrp is True:
@@ -1004,7 +949,7 @@ class SystemResourceRegistry:
 
     def _classify_macos(self, target: str, operation: DestructiveOperation) -> SystemResourceEvidence:
         normalized = os.path.normpath(target).replace("\\", "/")
-        if normalized == "/":
+        if normalized == "/" and operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS:
             return self._protected(
                 target,
                 "active_macos_root",
@@ -1014,13 +959,25 @@ class SystemResourceRegistry:
         if normalized == "/usr/local" or _path_within(normalized, "/usr/local"):
             return self._not_system(target, "usr_local_third_party")
         for root in ("/System", "/bin", "/sbin", "/usr"):
+            if normalized == root and operation in _HOST_TREE_DESTRUCTION_OPERATIONS:
+                return self._protected(
+                    target,
+                    "catastrophic_macos_root_destruction",
+                    "catastrophic_os_root",
+                )
             if _path_within(normalized, root):
                 return self._protected(target, "sip_ssv_critical_root", "protected_os_resource")
         relationships = self.macos.active_relationships()
         identifier = normalized.removeprefix("/dev/")
-        if identifier and identifier in relationships.get("active", set()):
+        if (
+            operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+            and identifier and identifier in relationships.get("active", set())
+        ):
             return self._protected(target, "active_apfs_system_volume", "active_system_volume", volume=True)
-        if identifier and identifier in relationships.get("associated", set()):
+        if (
+            operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+            and identifier and identifier in relationships.get("associated", set())
+        ):
             return self._protected(target, "associated_apfs_system_volume", "system_volume_group", volume=True)
         if normalized.startswith("/dev/"):
             return self._indeterminate("unknown_macos_storage_role", "storage_role", target)
@@ -1032,6 +989,12 @@ class SystemResourceRegistry:
             return self._not_system(target, "usr_local_third_party")
         critical = ("/boot", "/efi", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32")
         for root in critical:
+            if normalized == root and operation in _HOST_TREE_DESTRUCTION_OPERATIONS:
+                return self._protected(
+                    target,
+                    "catastrophic_linux_root_destruction",
+                    "catastrophic_os_root",
+                )
             if _path_within(normalized, root):
                 return self._protected(target, "linux_critical_prefix", "active_os_resource")
         for database in ("/var/lib/pacman", "/var/lib/rpm", "/usr/lib/sysimage/rpm", "/var/lib/dpkg"):
@@ -1039,11 +1002,17 @@ class SystemResourceRegistry:
                 return self._protected(target, "package_database_required", "package_management_resource")
         mount = self.linux.mount_for(normalized)
         protected_mounts = {"/", "/usr", "/boot", "/boot/efi", "/efi"}
-        if mount is not None and mount.mount_point in protected_mounts:
+        if (
+            operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+            and mount is not None and mount.mount_point in protected_mounts
+        ):
             if normalized == mount.mount_point:
                 return self._protected(target, "active_linux_filesystem", "active_system_volume", volume=True)
         if normalized.startswith("/dev/"):
-            if normalized in self.linux.active_block_identities():
+            if (
+                operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+                and normalized in self.linux.active_block_identities()
+            ):
                 return self._protected(target, "active_linux_block_role", "active_system_volume", volume=True)
             device_mount = next(
                 (item for item in self.linux.mounts if item.source == normalized),
@@ -1051,10 +1020,16 @@ class SystemResourceRegistry:
             )
             if device_mount is None:
                 return self._indeterminate("unknown_linux_block_role", "storage_role", target)
-            if device_mount.mount_point in protected_mounts or "swap" in device_mount.fs_type.lower():
+            if (
+                operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+                and (device_mount.mount_point in protected_mounts or "swap" in device_mount.fs_type.lower())
+            ):
                 return self._protected(target, "active_linux_block_role", "active_system_volume", volume=True)
         ubuntu_core_roles = {"/run/mnt/ubuntu-seed", "/run/mnt/ubuntu-boot", "/run/mnt/ubuntu-save", "/run/mnt/ubuntu-data"}
-        if any(_path_within(normalized, root) for root in ubuntu_core_roles):
+        if (
+            operation in _HOST_VOLUME_DESTRUCTION_OPERATIONS
+            and any(normalized == root for root in ubuntu_core_roles)
+        ):
             return self._protected(target, "ubuntu_core_active_role", "active_system_volume", volume=True)
         if self.linux.package_ownership(normalized) is True:
             return self._protected(target, "package_owned_system_resource", "package_owned_resource")
@@ -1079,106 +1054,85 @@ def classify_non_deletion_system_mutation(
     *,
     registry: SystemResourceRegistry | None = None,
 ) -> SystemResourceEvidence | None:
-    """Classify truncation, replacement, move-out and raw storage operations."""
+    """Recognize only a direct, standalone host-volume formatter/wiper."""
+
+    if str(tool_name or "") not in {"bash", "run_command"}:
+        return None
+    values = dict(arguments) if isinstance(arguments, Mapping) else {}
+    command = str(values.get("command") or "").strip()
+    if not command or any(char in command for char in "\r\n;&|<>`"):
+        return None
 
     active = registry or get_default_system_resource_registry()
-    tool = str(tool_name or "")
-    values = dict(arguments) if isinstance(arguments, Mapping) else {}
-    if tool == "write_file":
-        return active.classify_path(
-            str(values.get("path") or ""),
-            operation=(
-                DestructiveOperation.TRUNCATE
-                if str(values.get("content") or "") == ""
-                else DestructiveOperation.REPLACE_UNUSABLE
-            ),
-        )
-    if tool == "edit_file_lines" and str(values.get("new_content") or "") == "":
-        return active.classify_path(
-            str(values.get("path") or ""),
-            operation=DestructiveOperation.REPLACE_UNUSABLE,
-        )
-    if tool == "rename_file":
-        return active.classify_path(
-            str(values.get("old_path") or ""),
-            operation=DestructiveOperation.MOVE_OUT,
-        )
-    if tool not in {"bash", "run_command"}:
-        return None
-    command = str(values.get("command") or "").strip()
-    if not command:
-        return None
-    truncating_redirect = re.compile(
-        r"(?<!>)>(?!>)\s*(\"[^\"]*\"|'[^']*'|[^\s|;&<>]+)"
-    )
-    redirect_matches = list(truncating_redirect.finditer(command))
-    if re.search(r"(?<!>)>(?!>)", command):
-        if not redirect_matches:
-            return active.indeterminate_destructive_target(
-                "shell_redirection_not_normalizable"
-            )
-        ordinary_evidence = None
-        for match in redirect_matches:
-            raw_target = match.group(1).strip("'\"")
-            if not raw_target or re.search(r"[`$%*?\[\](){}]", raw_target):
-                return active.indeterminate_destructive_target(
-                    "shell_redirection_not_normalizable"
-                )
-            evidence = active.classify_path(
-                raw_target,
-                operation=DestructiveOperation.TRUNCATE,
-            )
-            if (
-                evidence.classification
-                is not SystemResourceClassification.NOT_SYSTEM_RESOURCE
-            ):
-                return evidence
-            ordinary_evidence = evidence
-        return ordinary_evidence
-    raw_pattern = re.compile(
-        r"(?i)\b(?:format|format-volume|remove-partition|remove-volume|clear-disk|"
-        r"diskpart|mkfs(?:\.[a-z0-9]+)?|wipefs|sgdisk|fdisk|parted|zfs\s+destroy|"
-        r"btrfs\s+subvolume\s+delete|lvremove|vgremove|pvremove)\b|"
-        r"\bdd\b[^\r\n]*\bof="
-    )
-    registry_match = re.match(
-        r"(?is)^\s*reg(?:\.exe)?\s+delete\s+(\"[^\"]+\"|'[^']+'|\S+)",
-        command,
-    )
-    if registry_match is None:
-        registry_match = re.match(
-            r"(?is)^\s*remove-item\b.*?-literalpath\s+"
-            r"(\"[^\"]+\"|'[^']+'|(?:registry::)?(?:hkey_[a-z_]+|hk[a-z]{1,2}):?\\\S+)",
-            command,
-        )
-    if registry_match is not None:
-        return active.classify_registry_key(registry_match.group(1))
-    if raw_pattern.search(command):
-        return active.indeterminate_destructive_target("raw_storage_or_registry_operation")
-    operation = None
-    if re.match(r"(?i)^\s*(?:truncate\b|clear-content\b)", command):
-        operation = DestructiveOperation.TRUNCATE
-    elif re.match(r"(?i)^\s*(?:mv\b|move-item\b|ren(?:ame)?\b)", command):
-        operation = DestructiveOperation.MOVE_OUT
-    if operation is None:
-        return None
-    if re.search(r"[`$%*?\[\]|;&()]", command):
-        return active.indeterminate_destructive_target("dynamic_system_mutation_target")
     try:
         parts = shlex.split(command, posix=active.platform_family != "windows")
     except (TypeError, ValueError):
-        return active.indeterminate_destructive_target("malformed_system_mutation")
-    candidates = [
-        part.strip("'\"")
-        for part in parts[1:]
-        if part
-        and not part.startswith("-")
-        and not re.fullmatch(r"/[A-Za-z]+", part)
-    ]
-    if not candidates:
-        return active.indeterminate_destructive_target("system_mutation_target_missing")
-    target = candidates[-1] if operation is DestructiveOperation.TRUNCATE else candidates[0]
-    return active.classify_path(target, operation=operation)
+        return None
+    if not parts:
+        return None
+
+    executable = os.path.basename(parts[0].strip("'\"")).casefold()
+    args = parts[1:]
+    if any(
+        item.casefold() in {"/?", "-?", "/help", "/h", "--help", "-h", "--version"}
+        for item in args
+    ):
+        return None
+    target = None
+    if active.platform_family == "windows":
+        if executable in {"format", "format.com"}:
+            target = next(
+                (item for item in args if re.fullmatch(r"[A-Za-z]:\\?", item)),
+                None,
+            )
+        elif executable == "format-volume":
+            drive_letter_args = [
+                index for index, item in enumerate(args[:-1])
+                if item.casefold() == "-driveletter"
+            ]
+            what_if = any(
+                re.fullmatch(
+                    r"-(?:w|wh|wha|what|whati|whatif)(?::.*)?",
+                    item,
+                    re.IGNORECASE,
+                )
+                and not re.fullmatch(r"-whatif:\s*\$?false", item, re.IGNORECASE)
+                for item in args
+            )
+            if what_if or len(drive_letter_args) != 1:
+                return None
+            index = drive_letter_args[0]
+            if re.fullmatch(r"[A-Za-z]", args[index + 1]):
+                target = args[index + 1] + ":\\"
+    else:
+        if executable == "wipefs":
+            recognized_flags = {"-a", "--all", "-f", "--force", "-q", "--quiet"}
+            if all(item.casefold() in recognized_flags for item in args if item.startswith("-")):
+                operands = [item for item in args if not item.startswith("-")]
+                if len(operands) == 1:
+                    target = operands[0]
+        elif executable in {"mkfs"} or re.fullmatch(r"mkfs\.[a-z0-9]+", executable):
+            recognized_flags = {"-f", "-q", "-v"}
+            if all(item.casefold() in recognized_flags for item in args if item.startswith("-")):
+                operands = [item for item in args if not item.startswith("-")]
+                if len(operands) == 1:
+                    target = operands[0]
+        elif executable == "dd":
+            outputs = [item[3:] for item in args if item.casefold().startswith("of=")]
+            zero_count = any(re.fullmatch(r"count=0+", item, re.IGNORECASE) for item in args)
+            if len(outputs) == 1 and not zero_count:
+                target = outputs[0]
+
+    if not target:
+        return None
+    if active.platform_family == "windows" and re.fullmatch(
+        r"[A-Za-z]:", target,
+    ):
+        target += "\\"
+    return active.classify_path(
+        target,
+        operation=DestructiveOperation.VOLUME_DELETE,
+    )
 
 
 __all__ = [

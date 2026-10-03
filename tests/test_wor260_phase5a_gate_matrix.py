@@ -61,12 +61,14 @@ def test_agent_changes_are_confined_to_two_authorized_functions():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    assert "OSIA_ADAPTIVE_REASONING_AUTO" in functions["_reasoning_request"]
-    assert "OSIA_ADAPTIVE_REASONING_AUTO" in functions["_drive_terminal_turn"]
-    assert source.count('"OSIA_ADAPTIVE_REASONING_AUTO"') == 2
+    assert "OSIA_ADAPTIVE_REASONING_AUTO" not in functions["_reasoning_request"]
+    assert "OSIA_ADAPTIVE_REASONING_AUTO" not in functions["_drive_terminal_turn"]
+    assert source.count('"OSIA_ADAPTIVE_REASONING_AUTO"') == 0
     assert functions["_drive_terminal_turn"].count(
         "phase3_continuation_context("
-    ) == 1
-    assert functions["_drive_terminal_turn"].count(
+    ) == 0
+    drive = functions["_drive_terminal_turn"]
+    assert drive.count("apply_continuation(") >= 8
+    assert drive.count(
         "segment_input = continuation_context(decision)"
-    ) == 3
+    ) == 2

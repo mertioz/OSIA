@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timezone
 import hashlib
+import io
 import math
 import os
 from pathlib import Path
@@ -629,15 +630,17 @@ class AttachmentTransferTests(unittest.TestCase):
         )
         agent_input = build_agent_input("inspect", committed)
         self.assertIsInstance(agent_input, str)
-        self.assertLess(agent_input.index("public-0.txt"), agent_input.index("public-1.txt"))
-        self.assertIn("1. public-0.txt:", agent_input)
-        self.assertIn("2. public-1.txt:", agent_input)
-        self.assertIn("ne réutilise jamais", agent_input)
+        self.assertEqual(agent_input.count("source_ref=src_"), 2)
+        self.assertIn("read_document", agent_input)
         for item in committed:
-            self.assertEqual(agent_input.count(str(item.path)), 1)
+            self.assertNotIn(str(item.path), agent_input)
 
         image_root = self.root / "image"
-        image = b"\x89PNG\r\n\x1a\n" + b"public-image"
+        from PIL import Image
+
+        output = io.BytesIO()
+        Image.new("RGB", (2, 2), "navy").save(output, format="PNG")
+        image = output.getvalue()
         h = _Harness(image_root)
         h.upload([image])
         committed = h.manager.consume_for_turn(
@@ -646,12 +649,9 @@ class AttachmentTransferTests(unittest.TestCase):
         agent_input = build_agent_input("inspect", committed)
         self.assertIsInstance(agent_input, list)
         self.assertEqual(agent_input[0]["type"], "text")
-        self.assertIn("public-0.txt", agent_input[0]["text"])
-        self.assertIn("incapacité du fournisseur", agent_input[0]["text"])
         self.assertIn("inspect", agent_input[0]["text"])
-        self.assertTrue(
-            agent_input[1]["image_url"]["url"].startswith("data:image/png;base64,")
-        )
+        self.assertEqual(agent_input[1]["type"], "image_ref")
+        self.assertEqual(agent_input[1]["mime"], "image/png")
 
 
 class AttachmentOrphanCleanupTests(unittest.TestCase):

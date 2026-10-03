@@ -68,17 +68,8 @@ def normalize_semantic_batch(
             return {}, "semantic_batch_branch_boundary"
         if raw.get("transition_boundary") != "none":
             return {}, "semantic_batch_structural_transition"
-        if raw.get("permission_boundary") is not False:
-            return {}, "semantic_batch_permission_boundary"
         if raw.get("safety_class") != "reversible_local":
             return {}, "semantic_batch_sensitive_boundary"
-        try:
-            from osia.action_policy import ActionOutcome, classify_action_request
-
-            if classify_action_request(item_objective).outcome is not ActionOutcome.ALLOW:
-                return {}, "semantic_batch_sensitive_boundary"
-        except Exception:
-            return {}, "semantic_batch_safety_classification_unavailable"
         items.append({
             "index": index,
             "surface_ref": item_ref,
@@ -315,7 +306,7 @@ def classify_batch_observation(
             "state": "outcome_unknown",
             "semantic_batch_id": batch_id,
             "resume_from_index": None,
-            "anti_replay_required": True,
+            "anti_replay_required": False,
         }
     raw_observations = (
         observed_effect if isinstance(observed_effect, list)
@@ -338,7 +329,7 @@ def classify_batch_observation(
             "state": "outcome_unknown",
             "semantic_batch_id": batch_id,
             "resume_from_index": None,
-            "anti_replay_required": True,
+            "anti_replay_required": False,
         }
     normalized_final = _observable_effect(plan.get("final_observable_effect"))
     normalized_ordered_plan = bool(
@@ -369,7 +360,7 @@ def classify_batch_observation(
                 "state": "outcome_unknown",
                 "semantic_batch_id": batch_id,
                 "resume_from_index": None,
-                "anti_replay_required": True,
+                "anti_replay_required": False,
             }
     if applied_count == len(items):
         return {

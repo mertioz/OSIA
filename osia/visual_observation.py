@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import secrets
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -67,7 +66,6 @@ class VisualObservation:
 @dataclass
 class _StoredObservation:
     public: VisualObservation
-    png_bytes: bytes = field(repr=False)
 
 
 class VisualObservationStore:
@@ -76,10 +74,10 @@ class VisualObservationStore:
     def __init__(
         self,
         *,
-        maximum_captures: int = 4,
+        maximum_captures: int = 3,
         maximum_global_captures: int = 1,
-        maximum_refinements: int = 1,
-        ttl_seconds: float = 90.0,
+        maximum_refinements: int = 2,
+        ttl_seconds: float = 8.0,
     ) -> None:
         self.maximum_captures = max(1, int(maximum_captures))
         self.maximum_global_captures = max(0, int(maximum_global_captures))
@@ -96,6 +94,10 @@ class VisualObservationStore:
     @property
     def capture_count(self) -> int:
         return self._capture_count
+
+    @property
+    def refinement_count(self) -> int:
+        return self._refine_count
 
     @property
     def stagnation_count(self) -> int:
@@ -136,6 +138,13 @@ class VisualObservationStore:
         dedup_key = (str(surface_ref), int(structural_epoch), image_hash)
         now = time.time()
         with self._lock:
+            if not self.budget_allows(capture_kind):
+                raise RuntimeError("visual_observation_budget_exhausted")
+            self._capture_count += 1
+            if capture_kind is CaptureKind.GLOBAL:
+                self._global_count += 1
+            if capture_kind is CaptureKind.ZOOM_REFINE:
+                self._refine_count += 1
             prior_id = self._dedup.get(dedup_key)
             prior = self._observations.get(prior_id or "")
             if prior is not None and now < prior.public.expires_at:
@@ -147,8 +156,6 @@ class VisualObservationStore:
                     }
                 )
                 return duplicate, False
-            if not self.budget_allows(capture_kind):
-                raise RuntimeError("visual_observation_budget_exhausted")
             observation = VisualObservation(
                 observation_id="vobs_" + secrets.token_urlsafe(18),
                 surface_ref=str(surface_ref),
@@ -165,22 +172,14 @@ class VisualObservationStore:
             )
             self._observations[observation.observation_id] = _StoredObservation(
                 observation,
-                bytes(png_bytes),
             )
             self._dedup[dedup_key] = observation.observation_id
-            self._capture_count += 1
-            if capture_kind is CaptureKind.GLOBAL:
-                self._global_count += 1
-            if capture_kind is CaptureKind.ZOOM_REFINE:
-                self._refine_count += 1
             return observation, True
 
     def image_base64(self, observation_id: str) -> str | None:
-        with self._lock:
-            stored = self._observations.get(str(observation_id or ""))
-            if stored is None or time.time() >= stored.public.expires_at:
-                return None
-            return base64.b64encode(stored.png_bytes).decode("ascii")
+        """Compatibility shim: observations no longer own duplicate pixels."""
+
+        return None
 
     def current(
         self,

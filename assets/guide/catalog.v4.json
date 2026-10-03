@@ -116,7 +116,7 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "OSIA works from your PC and phone, but supported tools, connections and your approval still set its practical limits.",
+                "en": "OSIA works from your PC and phone, but supported tools and connections still set its practical limits.",
                 "fr": "OSIA fonctionne depuis le PC et le téléphone, mais ses limites dépendent des outils, des connexions et de vos choix."
               }
             }
@@ -623,8 +623,8 @@
             "fr": "Naviguer dans OSIA PC"
           },
           "subtitle": {
-            "en": "Memory — review and control long-term local memory. Permissions — choose Standard or Full Access and review action approvals. Permissions — choose Standard or Full Access and review action approvals. MCP / Connectors — optional external tool connections and write-safety choices. Connection / Mobile — phone pairing and owned server startup.",
-            "fr": "Mémoire — consultation et contrôle de la mémoire locale durable. Permissions — choix entre Accès standard ou complet et validation des actions. Permissions — choix entre Accès standard ou complet et validation des actions. MCP / Connecteurs — connexions facultatives à des outils externes et sécurité des écritures. Connexion / Mobile — association du téléphone et démarrage du serveur."
+            "en": "Memory — review and control long-term local memory. Execution — OSIA is always full-access; only system-critical destruction is blocked. Execution — OSIA is always full-access; only system-critical destruction is blocked. MCP / Connectors — optional external tool connections and write-safety choices. Connection / Mobile — phone pairing and owned server startup. Advanced — scheduled tasks and PC health monitoring.",
+            "fr": "Mémoire — consultation et contrôle de la mémoire locale durable. Exécution — OSIA est toujours en accès complet ; seule la destruction système critique est bloquée. Exécution — OSIA est toujours en accès complet ; seule la destruction système critique est bloquée. MCP / Connecteurs — connexions facultatives à des outils externes et sécurité des écritures. Connexion / Mobile — association du téléphone et démarrage du serveur. Avancé — tâches planifiées et surveillance du PC."
           },
           "body_blocks": [],
           "callouts": [
@@ -665,8 +665,8 @@
             "fr": "Naviguer dans OSIA Mobile"
           },
           "subtitle": {
-            "en": "Advanced — scheduled tasks and PC health monitoring. Updates — versions, changes and update status. Legal — versions, privacy and legal information. The bottom navigation also opens Conversations, Models, Settings, OSIA personality/skills, and Autonomous mode. Features that are disabled or unavailable remain visibly unavailable; the guide does not activate them.",
-            "fr": "Avancé — tâches planifiées et surveillance du PC. Mises à jour — versions, changements et état des mises à jour. Légal — versions, confidentialité et informations légales. La navigation inférieure ouvre aussi Conversations, Modèles, Réglages, la personnalité/les compétences OSIA et le mode Autonome. Les fonctions désactivées ou indisponibles le restent ; le guide ne les active pas."
+            "en": "Updates — versions, changes and update status. Legal — versions, privacy and legal information. The bottom navigation also opens Conversations, Models, Settings, and OSIA personality/skills. Every request starts and finishes in Chat; durable actions do not open a second mode. Features that are disabled or unavailable remain visibly unavailable; the guide does not activate them.",
+            "fr": "Mises à jour — versions, changements et état des mises à jour. Légal — versions, confidentialité et informations légales. La navigation inférieure ouvre aussi Conversations, Modèles, Réglages et la personnalité/les compétences OSIA. Chaque demande commence et se termine dans Chat ; les actions durables n’ouvrent pas un second mode. Les fonctions désactivées ou indisponibles le restent ; le guide ne les active pas."
           },
           "body_blocks": [],
           "callouts": [
@@ -705,8 +705,8 @@
               },
               "body_blocks": [
                 {
-                  "en": "Conversations manages chats; Autonomous follows longer PC tasks; Settings holds notifications and preferences; Memory shows local memories; Providers and system pages configure the PC; Connection handles pairing and recovery.",
-                  "fr": "Conversations gère les discussions ; Autonome suit les tâches PC longues ; Réglages contient notifications et préférences ; Mémoire affiche les souvenirs locaux ; Fournisseurs et les pages système configurent le PC ; Connexion gère association et récupération."
+                  "en": "Chat continues the same conversation across PC and phone; Conversations manages chats; Settings holds notifications and preferences; Memory shows saved memories; Models and OSIA configure providers, skills and personality; Connection handles pairing and recovery.",
+                  "fr": "Chat poursuit la même conversation sur PC et téléphone ; Conversations gère les discussions ; Réglages contient les notifications et préférences ; Mémoire affiche les souvenirs enregistrés ; Modèles et OSIA configurent les fournisseurs, compétences et la personnalité ; Connexion gère l’association et la récupération."
                 }
               ],
               "callouts": [
@@ -833,8 +833,8 @@
             "fr": "La voix est facultative"
           },
           "subtitle": {
-            "en": "For important actions, ask OSIA to explain the plan or show the proposed result first. Check names, dates, recipients and files before approving anything consequential.",
-            "fr": "Pour les actions importantes, demandez d’abord à OSIA d’expliquer le plan ou de montrer le résultat prévu. Vérifiez noms, dates, destinataires et fichiers avant toute validation importante."
+            "en": "For important actions, ask OSIA to explain the plan or show the proposed result first. Check names, dates, recipients and files before any consequential action.",
+            "fr": "Pour les actions importantes, demandez d’abord à OSIA d’expliquer le plan ou de montrer le résultat prévu. Vérifiez noms, dates, destinataires et fichiers avant toute action importante."
           },
           "body_blocks": [],
           "callouts": [
@@ -1469,7 +1469,7 @@
             "fr": "Vision et modèles locaux"
           },
           "subtitle": {
-            "en": "If the selected main model cannot process images, a separately configured vision companion may describe the image first. Local Ollama models can avoid a remote chat request when installed, but capability, speed and memory use depend on the PC and model.",
+            "en": "When the selected model supports image input, OSIA can offer exact-target visual observation alongside structured state. Local Ollama models can avoid a remote image request when installed, but capability, speed and memory use depend on the PC and model.",
             "fr": "Si le modèle principal ne comprend pas les images, un modèle visuel séparé peut d’abord les décrire. Les modèles Ollama locaux peuvent éviter un appel de discussion distant s’ils sont installés, mais leurs capacités, vitesse et mémoire dépendent du PC et du modèle."
           },
           "body_blocks": [],
@@ -1675,18 +1675,23 @@
           ]
         },
         {
-          "slide_id": "mastery.autonomous-scope",
+          "slide_id": "mastery.durable-chat",
           "track_id": "master-osia",
           "order": 15,
           "title": {
-            "en": "Set an autonomous scope",
-            "fr": "Définir le périmètre autonome"
+            "en": "Durable Chat execution",
+            "fr": "Exécution durable dans Chat"
           },
           "subtitle": {
-            "en": "Autonomous mode is for a bounded multi-step mission, not a routine follow-up question. Describe the objective, choose its provider/model and monitor phases, tasks and confirmations. One machine-wide runner is allowed.",
-            "fr": "Le mode autonome sert à une mission bornée en plusieurs étapes, pas à une question de suivi ordinaire. Décrivez l’objectif, choisissez son fournisseur/modèle et surveillez phases, tâches et confirmations. Une seule mission globale peut tourner."
+            "en": "Chat can carry a bounded multi-action objective without changing mode or exposing a generated task plan.",
+            "fr": "Chat peut mener un objectif borné en plusieurs actions sans changer de mode ni afficher un plan de tâches généré."
           },
-          "body_blocks": [],
+          "body_blocks": [
+            {
+              "en": "Describe the objective in Chat and keep its target, constraints and negative instructions explicit. OSIA preserves the selected provider/model, chooses the next applicable action from current evidence, checkpoints uncertain or waiting work, verifies the observed result and continues in the same conversation. Stop targets only that exact turn and run.",
+              "fr": "Décrivez l’objectif dans Chat et précisez cible, contraintes et interdictions. OSIA conserve le fournisseur/modèle sélectionné, choisit l’action suivante selon les preuves courantes, sauvegarde les attentes ou incertitudes, vérifie le résultat observé puis continue dans la même conversation. Arrêter ne vise que ce tour et ce run exacts."
+            }
+          ],
           "callouts": [
             {
               "kind": "example",
@@ -1695,41 +1700,10 @@
                 "fr": "En pratique"
               },
               "body": {
-                "en": "Use it to inspect a project, propose a plan and apply approved fixes; use normal chat to rephrase one paragraph.",
-                "fr": "Utilisez-le pour inspecter un projet, proposer un plan et appliquer des corrections approuvées ; utilisez le chat pour reformuler un paragraphe."
+                "en": "Ask Chat to inspect a project and apply approved fixes, then expand Thinking to inspect only real public activity.",
+                "fr": "Demandez dans Chat d’inspecter un projet et d’appliquer les corrections approuvées, puis développez Réflexion pour consulter uniquement l’activité publique réelle."
               }
-            }
-          ],
-          "visual": {
-            "kind": "native",
-            "key": "mastery.autonomous-scope",
-            "alt": {
-              "en": "OSIA visual explaining set an autonomous scope.",
-              "fr": "Visuel OSIA expliquant définir le périmètre autonome."
-            }
-          },
-          "action": {
-            "type": "none",
-            "target": ""
-          },
-          "legacy_ids": [
-            "mastery.autonomous"
-          ]
-        },
-        {
-          "slide_id": "mastery.autonomous-lifecycle",
-          "track_id": "master-osia",
-          "order": 16,
-          "title": {
-            "en": "Pause, resume or abandon",
-            "fr": "Interrompre, reprendre ou abandonner"
-          },
-          "subtitle": {
-            "en": "Interrupt pauses a resumable checkpoint; Abandon ends it and removes that checkpoint. Plans and retries are bounded, and external writes still follow confirmation policy.",
-            "fr": "Interrompre met en pause un point de reprise ; Abandonner termine la mission et le retire. Plans et tentatives sont bornés, et les écritures externes gardent leurs confirmations."
-          },
-          "body_blocks": [],
-          "callouts": [
+            },
             {
               "kind": "remember",
               "title": {
@@ -1744,24 +1718,22 @@
           ],
           "visual": {
             "kind": "native",
-            "key": "mastery.autonomous-lifecycle",
+            "key": "mastery.durable-chat",
             "alt": {
-              "en": "OSIA visual explaining pause, resume or abandon.",
-              "fr": "Visuel OSIA expliquant interrompre, reprendre ou abandonner."
+              "en": "OSIA visual explaining durable chat execution.",
+              "fr": "Visuel OSIA expliquant exécution durable dans chat."
             }
           },
           "action": {
             "type": "none",
             "target": ""
           },
-          "legacy_ids": [
-            "mastery.autonomous"
-          ]
+          "legacy_ids": []
         },
         {
           "slide_id": "mastery.personality",
           "track_id": "master-osia",
-          "order": 17,
+          "order": 16,
           "title": {
             "en": "Personality",
             "fr": "Personnalité"
@@ -1791,14 +1763,14 @@
         {
           "slide_id": "mastery.skills",
           "track_id": "master-osia",
-          "order": 18,
+          "order": 17,
           "title": {
             "en": "Skills",
             "fr": "Compétences"
           },
           "subtitle": {
-            "en": "Personality changes style, not permissions or factual capability. Skills are local Markdown instruction files that can be created, edited, enabled or disabled.",
-            "fr": "La personnalité change le style, pas les autorisations ni les capacités réelles. Les compétences sont des fichiers d’instructions Markdown locaux pouvant être créés, modifiés, activés ou désactivés."
+            "en": "Personality changes style, not tools or factual capability. Skills are local Markdown instruction files that can be created, edited, enabled or disabled.",
+            "fr": "La personnalité change le style, pas les outils ni les capacités réelles. Les compétences sont des fichiers d’instructions Markdown locaux pouvant être créés, modifiés, activés ou désactivés."
           },
           "body_blocks": [],
           "callouts": [],
@@ -1821,7 +1793,7 @@
         {
           "slide_id": "mastery.tools",
           "track_id": "master-osia",
-          "order": 19,
+          "order": 18,
           "title": {
             "en": "Tools",
             "fr": "Outils"
@@ -1851,14 +1823,14 @@
         {
           "slide_id": "mastery.schedules",
           "track_id": "master-osia",
-          "order": 20,
+          "order": 19,
           "title": {
             "en": "Scheduled tasks",
             "fr": "Tâches planifiées"
           },
           "subtitle": {
-            "en": "External write actions may require confirmation; unattended connector writes are a separate advanced safety choice and are off by default. Settings → Advanced can schedule repeated or one-time tasks and optionally bind a conversation/model.",
-            "fr": "Les écritures externes peuvent demander confirmation ; les écritures sans surveillance sont un choix de sécurité avancé, désactivé par défaut. Réglages → Avancé peut planifier des tâches répétées ou ponctuelles et leur associer une conversation/un modèle."
+            "en": "External writes run under permanent full access; a connector can still fail for a technical reason or be stopped by system-destruction protection. Settings → Advanced can schedule repeated or one-time tasks and optionally bind a conversation/model.",
+            "fr": "Les écritures externes s’exécutent en accès complet permanent ; un connecteur peut néanmoins échouer pour une raison technique ou être arrêté par la protection contre la destruction du système. Réglages → Avancé peut planifier des tâches répétées ou ponctuelles et leur associer une conversation/un modèle."
           },
           "body_blocks": [],
           "callouts": [
@@ -1893,7 +1865,7 @@
         {
           "slide_id": "mastery.heartbeat",
           "track_id": "master-osia",
-          "order": 21,
+          "order": 20,
           "title": {
             "en": "Heartbeat monitoring",
             "fr": "Surveillance Heartbeat"
@@ -1911,8 +1883,8 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "Instructions shape behavior; tools provide capability; schedules trigger work. None should be treated as permission to ignore confirmations or review.",
-                "fr": "Les instructions façonnent le comportement ; les outils donnent la capacité ; les horaires déclenchent le travail. Aucun ne remplace les confirmations ni la vérification."
+                "en": "Instructions shape behavior; tools provide capability; schedules trigger work. Verify outcomes instead of assuming them.",
+                "fr": "Les instructions façonnent le comportement ; les outils donnent la capacité ; les horaires déclenchent le travail. Vérifiez les résultats au lieu de les supposer."
               }
             }
           ],
@@ -1935,7 +1907,7 @@
         {
           "slide_id": "mastery.connector-auth",
           "track_id": "master-osia",
-          "order": 22,
+          "order": 21,
           "title": {
             "en": "Connectors and authentication",
             "fr": "Connecteurs et authentification"
@@ -1977,14 +1949,14 @@
         {
           "slide_id": "mastery.connector-safety",
           "track_id": "master-osia",
-          "order": 23,
+          "order": 22,
           "title": {
             "en": "Connector write safety",
             "fr": "Sécurité des écritures connecteur"
           },
           "subtitle": {
-            "en": "Connected tools are namespaced and may request confirmation before writes; unattended connector writes are denied by default. Mobile mirrors status and confirmations, while unavailable catalog entries remain clearly unavailable.",
-            "fr": "Les outils connectés sont nommés séparément et peuvent demander confirmation avant une écriture ; les écritures sans surveillance sont refusées par défaut. Le mobile reflète états et confirmations."
+            "en": "Connected tools are namespaced and run under permanent full access; write failures surface as technical errors. Mobile mirrors status and results, while unavailable catalog entries remain clearly unavailable.",
+            "fr": "Les outils connectés sont nommés séparément et s’exécutent en accès complet permanent ; les échecs d’écriture apparaissent comme erreurs techniques. Le mobile reflète états et résultats, tandis qu’une entrée indisponible reste clairement indisponible."
           },
           "body_blocks": [],
           "callouts": [
@@ -2019,7 +1991,7 @@
         {
           "slide_id": "mastery.history-vs-memory",
           "track_id": "master-osia",
-          "order": 24,
+          "order": 23,
           "title": {
             "en": "History is not memory",
             "fr": "L’historique n’est pas la mémoire"
@@ -2049,7 +2021,7 @@
         {
           "slide_id": "mastery.memory-control",
           "track_id": "master-osia",
-          "order": 25,
+          "order": 24,
           "title": {
             "en": "Control persistent memory",
             "fr": "Contrôler la mémoire durable"
@@ -2091,7 +2063,7 @@
         {
           "slide_id": "mastery.memory-privacy",
           "track_id": "master-osia",
-          "order": 26,
+          "order": 25,
           "title": {
             "en": "Memory and privacy",
             "fr": "Mémoire et confidentialité"
@@ -2133,7 +2105,7 @@
         {
           "slide_id": "mastery.control-hierarchy",
           "track_id": "master-osia",
-          "order": 27,
+          "order": 26,
           "title": {
             "en": "Computer-control hierarchy",
             "fr": "Hiérarchie de contrôle du PC"
@@ -2175,14 +2147,14 @@
         {
           "slide_id": "mastery.verify-control",
           "track_id": "master-osia",
-          "order": 28,
+          "order": 27,
           "title": {
             "en": "Verify the result",
             "fr": "Vérifier le résultat"
           },
           "subtitle": {
-            "en": "Coordinates can be uncertain when layouts move. Confirm sensitive actions, state the target precisely and verify the resulting window, file or page.",
-            "fr": "Les coordonnées deviennent incertaines si la mise en page bouge. Confirmez les actions sensibles et vérifiez fenêtre, fichier ou page obtenus."
+            "en": "Coordinates can be uncertain when layouts move. State the target precisely and verify the resulting window, file or page.",
+            "fr": "Les coordonnées deviennent incertaines si la mise en page bouge. Précisez la cible et vérifiez fenêtre, fichier ou page obtenus."
           },
           "body_blocks": [],
           "callouts": [
@@ -2217,7 +2189,7 @@
         {
           "slide_id": "mastery.voice-tts",
           "track_id": "master-osia",
-          "order": 29,
+          "order": 28,
           "title": {
             "en": "TTS speaks",
             "fr": "La TTS parle"
@@ -2247,7 +2219,7 @@
         {
           "slide_id": "mastery.voice-stt",
           "track_id": "master-osia",
-          "order": 30,
+          "order": 29,
           "title": {
             "en": "STT listens",
             "fr": "La STT écoute"
@@ -2277,7 +2249,7 @@
         {
           "slide_id": "mastery.voice-recovery",
           "track_id": "master-osia",
-          "order": 31,
+          "order": 30,
           "title": {
             "en": "Recover from voice errors",
             "fr": "Corriger les erreurs vocales"
@@ -2319,7 +2291,7 @@
         {
           "slide_id": "mastery.voice-privacy",
           "track_id": "master-osia",
-          "order": 32,
+          "order": 31,
           "title": {
             "en": "Voice privacy",
             "fr": "Confidentialité vocale"
@@ -2361,7 +2333,7 @@
         {
           "slide_id": "mastery.mobile-pairing",
           "track_id": "master-osia",
-          "order": 33,
+          "order": 32,
           "title": {
             "en": "Pairing establishes trust",
             "fr": "L’association établit la confiance"
@@ -2391,7 +2363,7 @@
         {
           "slide_id": "mastery.mobile-transport",
           "track_id": "master-osia",
-          "order": 34,
+          "order": 33,
           "title": {
             "en": "Direct-first transport",
             "fr": "Transport direct d’abord"
@@ -2421,7 +2393,7 @@
         {
           "slide_id": "mastery.single-transport",
           "track_id": "master-osia",
-          "order": 35,
+          "order": 34,
           "title": {
             "en": "One committed transport",
             "fr": "Un seul transport engagé"
@@ -2463,7 +2435,7 @@
         {
           "slide_id": "mastery.mobile-offline",
           "track_id": "master-osia",
-          "order": 36,
+          "order": 35,
           "title": {
             "en": "What offline means",
             "fr": "Ce que signifie hors ligne"
@@ -2505,7 +2477,7 @@
         {
           "slide_id": "mastery.notifications",
           "track_id": "master-osia",
-          "order": 37,
+          "order": 36,
           "title": {
             "en": "Notifications and background work",
             "fr": "Notifications et arrière-plan"
@@ -2516,7 +2488,7 @@
           },
           "body_blocks": [
             {
-              "en": "PC notifications and Android local notifications are best effort and depend on system permissions. The Android foreground service can improve continuity but remains subject to Android power rules. Scheduled and autonomous work still needs OSIA running; after sleep or a network change, reopen the app and allow one clean reconnect.",
+              "en": "PC notifications and Android local notifications are best effort and depend on system permissions. The Android foreground service can improve continuity but remains subject to Android power rules. Scheduled and durable Chat work still needs OSIA running; after sleep or a network change, reopen the app and allow one clean reconnect.",
               "fr": "Les notifications PC et Android sont fournies au mieux et dépendent des autorisations système. Le service Android au premier plan améliore la continuité mais reste soumis aux règles d’énergie. Les tâches ont toujours besoin d’OSIA actif ; après veille ou changement réseau, rouvrez l’app et laissez une reconnexion propre."
             }
           ],
@@ -2563,7 +2535,7 @@
         {
           "slide_id": "mastery.settings",
           "track_id": "master-osia",
-          "order": 38,
+          "order": 37,
           "title": {
             "en": "Settings tour",
             "fr": "Visite des Réglages"
@@ -2574,8 +2546,8 @@
           },
           "body_blocks": [
             {
-              "en": "General covers language, appearance, capsule, startup and this guide. Models covers accounts, API keys, models, reasoning and hierarchies. Voice and Wake word configure audio. Memory reviews durable facts. Permissions controls Standard or Full Access and action approvals. MCP / Connectors manages integrations. Connection / Mobile manages pairing and server startup. Advanced contains schedules and PC health; Updates and Legal show release and policy information.",
-              "fr": "Général couvre langue, apparence, capsule, démarrage et ce guide. Modèles couvre comptes, clés API, modèles, raisonnement et hiérarchies. Voix et Mot d’activation règlent l’audio. Mémoire examine les faits durables. Permissions contrôle l’Accès standard ou complet et la validation des actions. MCP / Connecteurs gère les intégrations. Connexion / Mobile gère association et serveur. Avancé contient horaires et santé du PC ; Mises à jour et Légal affichent versions et règles."
+              "en": "General covers language, appearance, capsule, startup and this guide. Models covers accounts, API keys, models, reasoning and hierarchies. Voice and Wake word configure audio. Memory reviews durable facts. Execution is always full-access (only system-critical destruction is blocked). MCP / Connectors manages integrations. Connection / Mobile manages pairing and server startup. Advanced contains schedules and PC health; Updates and Legal show release and policy information.",
+              "fr": "Général couvre langue, apparence, capsule, démarrage et ce guide. Modèles couvre comptes, clés API, modèles, raisonnement et hiérarchies. Voix et Mot d’activation règlent l’audio. Mémoire examine les faits durables. L’exécution est toujours en accès complet (seule la destruction système critique est bloquée). MCP / Connecteurs gère les intégrations. Connexion / Mobile gère association et serveur. Avancé contient horaires et santé du PC ; Mises à jour et Légal affichent versions et règles."
             }
           ],
           "callouts": [
@@ -2597,8 +2569,8 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "Security-related toggles change permission boundaries; read their descriptions first.",
-                "fr": "Les réglages de sécurité modifient les limites d’autorisation ; lisez leur description."
+                "en": "Security-related toggles change execution boundaries; read their descriptions first.",
+                "fr": "Les réglages de sécurité modifient les limites d’exécution ; lisez leur description."
               }
             }
           ],
@@ -2621,7 +2593,7 @@
         {
           "slide_id": "mastery.update-flow",
           "track_id": "master-osia",
-          "order": 39,
+          "order": 38,
           "title": {
             "en": "Update flow",
             "fr": "Parcours de mise à jour"
@@ -2651,7 +2623,7 @@
         {
           "slide_id": "mastery.update-trust",
           "track_id": "master-osia",
-          "order": 40,
+          "order": 39,
           "title": {
             "en": "Trust the exact build",
             "fr": "Faire confiance au build exact"
@@ -2693,7 +2665,7 @@
         {
           "slide_id": "mastery.secret-safety",
           "track_id": "master-osia",
-          "order": 41,
+          "order": 40,
           "title": {
             "en": "Keep secrets out of evidence",
             "fr": "Écarter les secrets des preuves"
@@ -2735,7 +2707,7 @@
         {
           "slide_id": "mastery.diagnostic-layers",
           "track_id": "master-osia",
-          "order": 42,
+          "order": 41,
           "title": {
             "en": "Diagnose one layer",
             "fr": "Diagnostiquer une couche"
@@ -2793,7 +2765,7 @@
         {
           "slide_id": "mastery.workflow-pc-mobile",
           "track_id": "master-osia",
-          "order": 43,
+          "order": 42,
           "title": {
             "en": "PC and Mobile workflow",
             "fr": "Parcours PC et Mobile"
@@ -2823,7 +2795,7 @@
         {
           "slide_id": "mastery.workflow-voice",
           "track_id": "master-osia",
-          "order": 44,
+          "order": 43,
           "title": {
             "en": "Voice workflow",
             "fr": "Parcours vocal"
@@ -2853,7 +2825,7 @@
         {
           "slide_id": "mastery.workflow-models",
           "track_id": "master-osia",
-          "order": 45,
+          "order": 44,
           "title": {
             "en": "Model workflow",
             "fr": "Parcours modèles"
@@ -2895,7 +2867,7 @@
         {
           "slide_id": "mastery.workflow-troubleshoot",
           "track_id": "master-osia",
-          "order": 46,
+          "order": 45,
           "title": {
             "en": "Troubleshooting workflow",
             "fr": "Parcours de dépannage"
@@ -2963,8 +2935,8 @@
           },
           "body_blocks": [
             {
-              "en": "Execution, durable state and tools stay on the PC. The mobile is a second screen, networking prefers direct authenticated paths, provider adapters isolate external APIs, and the agent invokes only registered tools under confirmation policy.",
-              "fr": "L’exécution, l’état durable et les outils restent sur le PC. Le mobile est un second écran, le réseau préfère les chemins directs authentifiés, les adaptateurs isolent les API externes et l’agent n’appelle que les outils enregistrés selon la politique de confirmation."
+              "en": "Execution, durable state and tools stay on the PC. The mobile is a second screen, networking prefers direct authenticated paths, provider adapters isolate external APIs, and the agent invokes only registered tools with execution-integrity barriers.",
+              "fr": "L’exécution, l’état durable et les outils restent sur le PC. Le mobile est un second écran, le réseau préfère les chemins directs authentifiés, les adaptateurs isolent les API externes et l’agent n’appelle que les outils enregistrés avec les barrières d’intégrité d’exécution."
             }
           ],
           "callouts": [
@@ -4027,8 +3999,8 @@
           },
           "body_blocks": [
             {
-              "en": "Metadata identifies provider, reasoning support, vision and tool compatibility. Manual selection is global unless a feature such as autonomous or voice exposes its own selector; conversations do not invent an independent model override. Heavy/Medium hierarchy handles classified tasks, while an unknown image capability fails closed instead of guessing.",
-              "fr": "Les métadonnées indiquent fournisseur, raisonnement, vision et outils. La sélection manuelle est globale sauf lorsqu’une fonction comme Autonome ou Voix possède son propre sélecteur ; les conversations n’inventent pas de remplacement. La hiérarchie Lourde/Moyenne gère les tâches classées et une capacité image inconnue échoue fermée."
+              "en": "Metadata identifies provider, reasoning support, vision and tool compatibility. The provider/model selected in Chat remains authoritative for that entire turn, including durable execution, recovery and resume; voice may expose its documented selector. Heavy/Medium hierarchy handles classified tasks, while an unknown image capability fails closed instead of guessing.",
+              "fr": "Les métadonnées indiquent fournisseur, raisonnement, vision et outils. Le fournisseur/modèle sélectionné dans Chat reste l’autorité pendant tout le tour, y compris l’exécution durable, la récupération et la reprise ; la voix peut proposer son sélecteur documenté. La hiérarchie Lourde/Moyenne gère les tâches classées et une capacité image inconnue échoue fermée."
             }
           ],
           "callouts": [
@@ -4083,8 +4055,8 @@
           },
           "body_blocks": [
             {
-              "en": "Prompt assembly combines conversation, selected memory, personality/skills, system facts and current attachments. Provider output may stream text and tool calls; parsing occurs before raw tags are stripped, confirmations gate sensitive operations, and anti-loop detectors plus a per-turn time limit stop repeated or stalled behavior. The terminal contract must return useful text or an explicit ERROR state.",
-              "fr": "L’assemblage combine conversation, mémoire sélectionnée, personnalité/compétences, faits système et pièces jointes courantes. Le fournisseur diffuse texte et appels d’outils ; l’analyse précède le retrait des balises brutes, les confirmations protègent les opérations sensibles, et anti-boucle plus limite de tour arrêtent les répétitions. Le contrat final renvoie un texte utile ou un état ERROR explicite."
+              "en": "Prompt assembly combines conversation, selected memory, personality/skills, system facts and current attachments. Provider output may stream text and tool calls; parsing occurs before raw tags are stripped, effect-integrity barriers protect sensitive operations, and anti-loop detectors plus a per-turn time limit stop repeated or stalled behavior. The terminal contract must return useful text or an explicit ERROR state.",
+              "fr": "L’assemblage combine conversation, mémoire sélectionnée, personnalité/compétences, faits système et pièces jointes courantes. Le fournisseur diffuse texte et appels d’outils ; l’analyse précède le retrait des balises brutes, les barrières d’intégrité d’effet protègent les opérations sensibles, et anti-boucle plus limite de tour arrêtent les répétitions. Le contrat final renvoie un texte utile ou un état ERROR explicite."
             }
           ],
           "callouts": [
@@ -4126,21 +4098,21 @@
           "legacy_ids": []
         },
         {
-          "slide_id": "advanced.autonomous",
+          "slide_id": "advanced.durable-chat",
           "track_id": "osia-advanced",
           "order": 22,
           "title": {
-            "en": "Autonomous mode internals",
-            "fr": "Internes du mode autonome"
+            "en": "Unified Chat execution internals",
+            "fr": "Internes de l’exécution Unified Chat"
           },
           "subtitle": {
-            "en": "Autonomous mode orchestrates a persisted, bounded mission above normal agent turns.",
-            "fr": "Le mode autonome orchestre une mission persistante et bornée au-dessus des tours normaux."
+            "en": "A durable action remains one Chat turn governed by its immutable GoalContract and current evidence.",
+            "fr": "Une action durable reste un seul tour Chat régi par son GoalContract immuable et les preuves courantes."
           },
           "body_blocks": [
             {
-              "en": "The planner creates at most five phases of five tasks, tasks have bounded attempts and the mission has bounded replans. One machine-wide runner writes a crash-safe checkpoint. Interrupt preserves an in-progress state for Resume; Abort marks it terminal and removes the checkpoint. Progress includes planning, task, salvage, failure and terminal events, while each underlying agent turn keeps loop/time protections.",
-              "fr": "Le planificateur crée au plus cinq phases de cinq tâches, avec tentatives et replanifications bornées. Un exécuteur global écrit un point de reprise sûr. Interrompre conserve l’état pour Reprendre ; Abandonner le rend final et retire le point. La progression couvre plan, tâche, récupération, échec et fin, chaque tour gardant ses protections."
+              "en": "Each iteration restores the exact conversation/request/turn/run and provider/model identity, reduces the capability graph to applicable choices, validates one next semantic action, records its attempt and observation, verifies postconditions, then decides again. Waiting, cancellation, unknown-effect reconciliation and terminality are checkpointed without turning private reasoning into a plan or task list. Legacy pre-Chat checkpoints keep a read-only compatibility loader and their safety barriers, but no new request can create one.",
+              "fr": "Chaque itération restaure les identités exactes conversation/requête/tour/run et fournisseur/modèle, réduit le graphe aux capacités applicables, valide une action sémantique suivante, enregistre tentative et observation, vérifie les postconditions puis décide à nouveau. Attente, annulation, réconciliation d’effet inconnu et finalité sont sauvegardées sans transformer le raisonnement privé en plan ou liste de tâches. Les anciens points pré-Chat conservent un chargeur compatible en lecture seule et leurs barrières, mais aucune nouvelle demande n’en crée."
             }
           ],
           "callouts": [
@@ -4151,8 +4123,8 @@
                 "fr": "En pratique"
               },
               "body": {
-                "en": "Crash after one task, resume, and verify completed work is rechecked rather than blindly repeated.",
-                "fr": "Interrompez après une tâche, reprenez et vérifiez que le travail est contrôlé plutôt que répété aveuglément."
+                "en": "Interrupt after one verified action, resume, and confirm completed effects are reconciled instead of replayed.",
+                "fr": "Interrompez après une action vérifiée, reprenez et confirmez que les effets accomplis sont réconciliés plutôt que rejoués."
               }
             },
             {
@@ -4162,17 +4134,17 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "Unattended MCP writes remain denied unless the explicit advanced policy permits them.",
-                "fr": "Les écritures MCP sans surveillance restent refusées sauf politique avancée explicite."
+                "en": "Unattended MCP writes can only fail on technical errors or system-destruction protection; no permission gate exists.",
+                "fr": "Les écritures MCP sans surveillance ne peuvent échouer que sur une erreur technique ou la protection contre la destruction du système ; aucune autorisation n’existe."
               }
             }
           ],
           "visual": {
             "kind": "native",
-            "key": "advanced.autonomous",
+            "key": "advanced.durable-chat",
             "alt": {
-              "en": "OSIA visual explaining autonomous mode internals.",
-              "fr": "Visuel OSIA expliquant internes du mode autonome."
+              "en": "OSIA visual explaining unified chat execution internals.",
+              "fr": "Visuel OSIA expliquant internes de l’exécution unified chat."
             }
           },
           "action": {
@@ -4195,8 +4167,8 @@
           },
           "body_blocks": [
             {
-              "en": "Priority is API or command integration, URL/deep link, browser DOM and accessible names, native accessibility/UI Automation, keyboard navigation, then screenshot vision and coordinates. Browser sessions use isolated profiles and one managed launch path. Every action should observe resulting process, window, DOM or file state, and sensitive actions pass policy confirmation.",
-              "fr": "La priorité est API ou commande, URL/lien profond, DOM du navigateur et noms accessibles, accessibilité/UI Automation native, clavier, puis vision et coordonnées. Les sessions navigateur utilisent des profils isolés et un lancement géré. Chaque action observe ensuite processus, fenêtre, DOM ou fichier, et les actions sensibles passent par confirmation."
+              "en": "Priority is API or command integration, URL/deep link, browser DOM and accessible names, native accessibility/UI Automation, keyboard navigation, then screenshot vision and coordinates. Browser sessions use isolated profiles and one managed launch path. Every action should observe resulting process, window, DOM or file state, and sensitive actions keep effect-integrity barriers.",
+              "fr": "La priorité est API ou commande, URL/lien profond, DOM du navigateur et noms accessibles, accessibilité/UI Automation native, clavier, puis vision et coordonnées. Les sessions navigateur utilisent des profils isolés et un lancement géré. Chaque action observe ensuite processus, fenêtre, DOM ou fichier, et les actions sensibles gardent les barrières d’intégrité d’effet."
             }
           ],
           "callouts": [
@@ -4307,7 +4279,7 @@
           },
           "body_blocks": [
             {
-              "en": "Supported transports are stdio and streamable HTTP; legacy SSE is recognized but unsupported. Catalog entries define health and auth: OAuth may use Dynamic Client Registration or a static client, bearer tokens are validated, and custom connectors remain explicit. Connected tools are injected as namespaced agent tools. Lifecycle covers connect, cancel, disconnect, revoke and reconnect; mobile mirrors status and confirmation requests.",
+              "en": "Supported transports are stdio and streamable HTTP; legacy SSE is recognized but unsupported. Catalog entries define health and auth: OAuth may use Dynamic Client Registration or a static client, bearer tokens are validated, and custom connectors remain explicit. Connected tools are injected as namespaced agent tools. Lifecycle covers connect, cancel, disconnect, revoke and reconnect; mobile mirrors status and results.",
               "fr": "Les transports pris en charge sont stdio et HTTP streamable ; SSE ancien est reconnu mais non pris en charge. Le catalogue définit santé et auth : OAuth peut utiliser l’enregistrement dynamique ou un client statique, les jetons sont validés et les connecteurs personnalisés explicites. Les outils sont injectés avec namespace. Le cycle couvre connexion, annulation, déconnexion, révocation et reconnexion ; le mobile reflète l’état."
             }
           ],
@@ -4363,8 +4335,8 @@
           },
           "body_blocks": [
             {
-              "en": "The installed profile uses the resolved user data directory; source mode may use a project config only when its settings file exists. Conversations, memory JSON with atomic backup, settings, ignored API-key and OAuth stores, autonomous checkpoint, cron jobs, LAN identity and guide progress remain PC-owned. Mobile stores pairing plus interface preferences. Migration validates IDs and corruption falls back safely without reopening first-run UI.",
-              "fr": "Le profil installé utilise le dossier utilisateur résolu ; le mode source peut utiliser config du projet si settings existe. Conversations, mémoire JSON atomique, réglages, magasins ignorés de clés/OAuth, point autonome, tâches, identité LAN et progression restent PC. Le mobile garde association et préférences. La migration valide les ID et la corruption retombe sûrement sans rouvrir le premier lancement."
+              "en": "The installed profile uses the resolved user data directory; source mode may use a project config only when its settings file exists. Conversations, memory JSON with atomic backup, settings, ignored API-key and OAuth stores, durable Chat state, legacy execution checkpoints, cron jobs, LAN identity and guide progress remain PC-owned. Mobile stores pairing plus interface preferences. Migration validates IDs and corruption falls back safely without reopening first-run UI.",
+              "fr": "Le profil installé utilise le dossier utilisateur résolu ; le mode source peut utiliser config du projet si settings existe. Conversations, mémoire JSON atomique, réglages, magasins ignorés de clés/OAuth, état durable de Chat, anciens points d’exécution, tâches, identité LAN et progression restent PC. Le mobile garde association et préférences. La migration valide les ID et la corruption retombe sûrement sans rouvrir le premier lancement."
             }
           ],
           "callouts": [
@@ -4976,13 +4948,13 @@
             "fr": "Modèle de sécurité"
           },
           "subtitle": {
-            "en": "OSIA combines local ownership, authenticated transports, least privilege and explicit confirmation at sensitive boundaries.",
-            "fr": "OSIA combine propriété locale, transports authentifiés, moindre privilège et confirmation explicite aux frontières sensibles."
+            "en": "OSIA combines local ownership, authenticated transports, least privilege and effect-integrity barriers at sensitive boundaries.",
+            "fr": "OSIA combine propriété locale, transports authentifiés, moindre privilège et barrières d’intégrité d’effet aux frontières sensibles."
           },
           "body_blocks": [
             {
-              "en": "Pairing establishes mobile trust, device identity and session keys; encrypted transports protect content, while a blind Worker relay routes ciphertext without plaintext. Secrets stay in ignored stores or approved bindings, logs are redacted, files are validated, and replay/sequence guards reject stale traffic. Tools are allowlisted and risky actions require confirmation; unattended connectors are stricter. Signed metadata, size and SHA-256 protect update integrity. External AI providers still receive content required for configured requests under their own policies.",
-              "fr": "L’association établit confiance mobile, identité et clés de session ; les transports chiffrés protègent le contenu, tandis qu’un relais Worker aveugle route le chiffré sans texte clair. Les secrets restent dans des magasins ignorés ou bindings approuvés, les journaux sont masqués, les fichiers validés et les gardes de rejeu/séquence refusent l’ancien trafic. Les outils sont autorisés explicitement et les actions risquées demandent confirmation. Métadonnées signées, taille et SHA-256 protègent l’intégrité des mises à jour. Les fournisseurs IA externes reçoivent néanmoins le contenu nécessaire selon leurs règles."
+              "en": "Pairing establishes mobile trust, device identity and session keys; encrypted transports protect content, while a blind Worker relay routes ciphertext without plaintext. Secrets stay in ignored stores or approved bindings, logs are redacted, files are validated, and replay/sequence guards reject stale traffic. Tools are allowlisted and risky actions keep effect-integrity barriers. Signed metadata, size and SHA-256 protect update integrity. External AI providers still receive content required for configured requests under their own policies.",
+              "fr": "L’association établit confiance mobile, identité et clés de session ; les transports chiffrés protègent le contenu, tandis qu’un relais Worker aveugle route le chiffré sans texte clair. Les secrets restent dans des magasins ignorés ou bindings approuvés, les journaux sont masqués, les fichiers validés et les gardes de rejeu/séquence refusent l’ancien trafic. Les outils sont sur liste explicite et les actions risquées gardent des barrières d’intégrité d’effet. Métadonnées signées, taille et SHA-256 protègent l’intégrité des mises à jour. Les fournisseurs IA externes reçoivent néanmoins le contenu nécessaire selon leurs règles."
             }
           ],
           "callouts": [

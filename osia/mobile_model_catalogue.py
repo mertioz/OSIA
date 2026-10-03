@@ -19,7 +19,6 @@ from osia.models import (
     discover_models_async,
     get_all_models,
     invalidate_ollama_models_cache,
-    model_has_vision,
 )
 from osia.reasoning import get_reasoning_options, resolve_reasoning_option_id
 from osia.utils.key_chain import has_key
@@ -126,7 +125,7 @@ def _safe_model(raw: dict, provider: str | None = None) -> dict | None:
         "hidden": False,
         "usable": True,
         "selectable": True,
-        "vision": bool(model_has_vision(provider_id, model_id)),
+        "vision": "image" in safe_modalities,
         "reasoning": _reasoning_metadata(provider_id, model_id),
     }
 
@@ -322,6 +321,8 @@ def _canonical_entry(raw: dict, provider_id: str, source_type: str) -> dict | No
     model_id = str(raw.get("id") or raw.get("model") or "").strip()
     if not model_id:
         return None
+    if provider_id == "deepseek" and model_id != "deepseek-flash":
+        return None
     modalities = raw.get("inputModalities") or raw.get("input_modalities") or ["text"]
     if not isinstance(modalities, list):
         modalities = ["text"]
@@ -338,12 +339,20 @@ def _canonical_entry(raw: dict, provider_id: str, source_type: str) -> dict | No
         "ChatGPT" if provider_id == ACCOUNT_PROVIDER_ID
         else str(PROVIDERS.get(provider_id, {}).get("name") or provider_id)
     )
-    vision = raw.get("vision")
-    if not isinstance(vision, bool):
-        try:
-            vision = bool(model_has_vision(provider_id, model_id))
-        except Exception:
-            vision = False
+    from osia.model_capabilities import effective_route_capabilities
+
+    capabilities = effective_route_capabilities(
+        provider_id,
+        model_id,
+        model_metadata=raw,
+    )
+    if (
+        raw.get("inputModalities") is None
+        and raw.get("input_modalities") is None
+        and capabilities.input_modalities
+    ):
+        safe_modalities = list(capabilities.input_modalities)
+    vision = capabilities.vision_supported is True
     return {
         "provider_id": provider_id,
         "provider_display_name": provider_name,
@@ -425,156 +434,12 @@ def build_model_inventory(
     return entries
 
 
-def resolve_autonomous_selection(
-    inventory: list[dict],
-    *,
-    autonomous_provider: str = "",
-    autonomous_model: str = "",
-    main_provider: str = "",
-    main_model: str = "",
-    wire_value: str | None = None,
-) -> dict:
-    """Resolve one deterministic Autonomous selection without provider guessing."""
-    entries = [
-        entry for entry in inventory if isinstance(entry, dict)
-        and entry.get("available") and entry.get("picker_visible")
-    ]
-
-    def result(entry: dict | None, fallback: bool, reason: str) -> dict:
-        return {
-            "entry": entry,
-            "provider_id": str(entry.get("provider_id") or "") if entry else "",
-            "model_id": str(entry.get("model_id") or "") if entry else "",
-            "stable_key": str(entry.get("stable_key") or "") if entry else "",
-            "fallback_occurred": bool(fallback),
-            "reason": reason,
-        }
-
-    def exact(provider_id: str, model_id: str) -> dict | None:
-        wanted = (str(provider_id or "").strip().lower(), str(model_id or "").strip())
-        return next(
-            (entry for entry in entries
-             if (entry.get("provider_id"), entry.get("model_id")) == wanted),
-            None,
-        )
-
-    provider_id = str(autonomous_provider or "").strip().lower()
-    model_id = str(autonomous_model or "").strip()
-    explicit = bool(provider_id or model_id)
-    if wire_value is not None and str(wire_value or "").strip():
-        wire = str(wire_value or "").strip()
-        explicit = bool(wire)
-        stable = next((entry for entry in entries if entry.get("stable_key") == wire), None)
-        if stable is not None:
-            return result(stable, False, "exact_selection")
-        prefix, separator, remainder = wire.partition(":")
-        known_providers = set(PROVIDER_ORDER) | {
-            str(entry.get("provider_id") or "") for entry in entries
-        }
-        if separator and prefix.strip().lower() in known_providers:
-            provider_id = prefix.strip().lower()
-            model_id = remainder.strip()
-        else:
-            provider_id = ""
-            model_id = wire
-
-    stale_reason = ""
-    if provider_id and model_id:
-        selected = exact(provider_id, model_id)
-        if selected is not None:
-            return result(selected, False, "exact_selection")
-        stale_reason = "saved_selection_unavailable"
-    elif model_id:
-        matches = [entry for entry in entries if entry.get("model_id") == model_id]
-        if len(matches) == 1:
-            return result(matches[0], False, "legacy_model_migrated")
-        stale_reason = (
-            "legacy_model_ambiguous" if len(matches) > 1
-            else "legacy_model_unavailable"
-        )
-    elif provider_id:
-        stale_reason = "saved_selection_incomplete"
-    else:
-        main = exact(main_provider, main_model)
-        if main is not None:
-            return result(main, False, "seeded_from_main")
-        if str(main_provider or "").strip() or str(main_model or "").strip():
-            stale_reason = "main_selection_unavailable"
-
-    if entries:
-        return result(
-            entries[0],
-            bool(explicit or stale_reason),
-            stale_reason or "first_available",
-        )
-    return result(None, bool(explicit or stale_reason), "no_models_available")
 
 
-def persist_autonomous_selection(resolution: dict) -> None:
-    """Persist only the dedicated Autonomous pair from a safe resolution."""
-    provider_id = str(resolution.get("provider_id") or "").strip().lower()
-    model_id = str(resolution.get("model_id") or "").strip()
-    if not provider_id or not model_id:
-        return
-    settings = load_settings()
-    if settings.get("autonomous_model_provider") != provider_id:
-        set_setting("autonomous_model_provider", provider_id)
-    if settings.get("autonomous_model") != model_id:
-        set_setting("autonomous_model", model_id)
 
 
-def apply_autonomous_agent_model(agent, provider_id: str, model_id: str) -> None:
-    """Apply one already-resolved exact identity through the provider-aware API."""
-    provider = str(provider_id or "").strip().lower()
-    model = str(model_id or "").strip()
-    if not provider or not model:
-        raise ValueError("an exact provider/model identity is required")
-    agent.set_model(model, provider=provider)
 
 
-def resolve_current_autonomous_selection(
-    *,
-    provider_id: str = "",
-    model_id: str = "",
-    wire_value: str | None = None,
-    refresh_account: bool = True,
-    strict: bool = False,
-    persist: bool = True,
-) -> dict:
-    """Validate immediately against current configured state off the UI thread."""
-    catalogue = build_catalogue(
-        refresh_local=False,
-        refresh_account=refresh_account,
-    )
-    settings = load_settings()
-    use_saved_pair = not provider_id and not model_id and wire_value is None
-    resolution = resolve_autonomous_selection(
-        catalogue.get("inventory") or [],
-        autonomous_provider=(
-            settings.get("autonomous_model_provider") or ""
-            if use_saved_pair else provider_id
-        ),
-        autonomous_model=(
-            settings.get("autonomous_model") or ""
-            if use_saved_pair else model_id
-        ),
-        main_provider=settings.get("selected_model_provider") or "",
-        main_model=settings.get("selected_model") or "",
-        wire_value=wire_value,
-    )
-    if strict and resolution.get("fallback_occurred"):
-        return {
-            **resolution,
-            "provider_id": "",
-            "model_id": "",
-            "stable_key": "",
-            "reason": "strict_" + str(
-                resolution.get("reason") or "selection_unavailable"
-            ),
-        }
-    if persist:
-        persist_autonomous_selection(resolution)
-    return resolution
 
 
 def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True) -> dict:

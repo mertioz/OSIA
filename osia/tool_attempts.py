@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -82,11 +83,13 @@ _PROVIDER_REFERENCE_KEYS = frozenset({
     "provider_request_id", "provider_response_id", "tool_call_id", "call_id",
     "function_call_id", "continuation_id", "session_id",
     "external_operation_id", "status_id", "idempotency_key", "thread_id",
-    "turn_id", "item_id",
+    "turn_id", "item_id", "provider_native_call_id", "native_thread_id",
+    "native_turn_id",
 })
 _PROVIDER_OPERATION_REFERENCE_PRIORITY = (
     "external_operation_id", "status_id", "function_call_id", "call_id",
-    "provider_request_id", "provider_response_id", "tool_call_id", "item_id",
+    "provider_request_id", "provider_response_id", "provider_native_call_id",
+    "tool_call_id", "item_id",
     "continuation_id", "session_id",
 )
 
@@ -413,6 +416,10 @@ def _safe_primitive_journal(value: Any) -> list[dict[str, Any]]:
         entry = {
             "schema_version": 1,
             "primitive_id": _safe_primitive_text(raw.get("primitive_id")),
+            "action_id": _safe_primitive_text(raw.get("action_id")),
+            "semantic_effect_id": _safe_primitive_text(
+                raw.get("semantic_effect_id")
+            ),
             "effect_role": (
                 "preparatory"
                 if raw.get("effect_role") == "preparatory" else "semantic"
@@ -824,6 +831,91 @@ def _any_primitive_dispatch_started(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _exact_correlated_primitive_no_effect(record: Mapping[str, Any]) -> bool:
+    """Return True only for one fully correlated exact no-dispatch proof."""
+
+    attempt_id = str(record.get("tool_attempt_id") or "")
+    execution_epoch = str(record.get("execution_epoch") or "")
+    truth = normalize_action_truth(
+        record.get("action_truth"), legacy_record=record,
+    )
+    action_id = str(truth.get("action_id") or "")
+    semantic_effect_id = str(truth.get("semantic_effect_id") or "")
+    if not all((attempt_id, execution_epoch, action_id, semantic_effect_id)):
+        return False
+    if (
+        truth.get("current_state") != ActionState.NOT_APPLIED_VERIFIED.value
+        or truth.get("effect_truth") != "not_applied"
+        or float(truth.get("dispatch_started_at") or 0.0) != 0.0
+        or float(truth.get("dispatch_returned_at") or 0.0) != 0.0
+        or truth.get("current_reason")
+        != "action_primitive_not_applied_verified"
+        or str(truth.get("operation") or "")
+        != str(record.get("tool_name") or "")
+    ):
+        return False
+
+    provider_references = record.get("provider_references")
+    provider_references = (
+        provider_references if isinstance(provider_references, Mapping) else {}
+    )
+    provider_operation_ref = next((
+        provider_references.get(key)
+        for key in _PROVIDER_OPERATION_REFERENCE_PRIORITY
+        if provider_references.get(key)
+    ), "")
+    if provider_operation_ref and (
+        str(truth.get("provider_operation_ref") or "")
+        != str(provider_operation_ref)
+    ):
+        return False
+
+    journal = _safe_primitive_journal(record.get("primitive_journal"))
+    if (
+        not journal
+        or _any_primitive_dispatch_started(record)
+        or any(
+            item.get("tool_attempt_id") != attempt_id
+            or item.get("lifecycle") not in {"prepared", "not_applied"}
+            for item in journal
+        )
+        or not any(
+            item.get("lifecycle") == "not_applied"
+            and item.get("effect_classification") == "not_applied"
+            for item in journal
+        )
+    ):
+        return False
+
+    semantic_node_id = str(truth.get("semantic_node_id") or "")
+    if semantic_node_id and any(
+        item.get("semantic_node_id")
+        and str(item.get("semantic_node_id")) != semantic_node_id
+        for item in journal
+    ):
+        return False
+    if not any(
+        item.get("exact") is True
+        and item.get("reason_code")
+        == "action_primitive_not_applied_verified"
+        for item in truth.get("evidence") or []
+        if isinstance(item, Mapping)
+    ):
+        return False
+    return any(
+        isinstance(event, Mapping)
+        and event.get("attempt_id") == attempt_id
+        and event.get("execution_epoch") == execution_epoch
+        and event.get("action_id") == action_id
+        and event.get("semantic_effect_id") == semantic_effect_id
+        and event.get("state") == ActionState.NOT_APPLIED_VERIFIED.value
+        and event.get("effect_truth") == "not_applied"
+        and event.get("reason_code")
+        == "action_primitive_not_applied_verified"
+        for event in record.get("action_outbox") or []
+    )
+
+
 def _safe_turn_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = value if isinstance(value, Mapping) else {}
     allowed = [
@@ -909,6 +1001,125 @@ def _safe_identity_receipts(value: Any, *, maximum: int = 128) -> list[dict]:
             "stale": raw.get("stale") is True,
             "received_at": received_at,
         })
+    return result
+
+
+def _safe_visual_action_receipt(value: Any) -> dict[str, Any]:
+    """Privacy-bounded durable metadata for one canonical visual action."""
+
+    source = value if isinstance(value, Mapping) else {}
+    result = {}
+    for key in (
+        "action_id", "attempt_id", "semantic_effect_id", "source_frame_id",
+        "fresh_frame_id", "post_frame_id", "proposal_id", "surface_ref",
+        "surface_generation", "window_generation", "native_window_id",
+        "application", "dispatch_state",
+        "outcome", "reason_code", "reconciliation_status", "actuator",
+    ):
+        safe = _safe_primitive_text(source.get(key), maximum=512)
+        if safe:
+            result[key] = safe
+    expected = _safe_primitive_text(
+        source.get("expected_postcondition"), maximum=800,
+    )
+    if expected:
+        result["expected_postcondition"] = expected
+    if "dispatch_count" in source:
+        try:
+            dispatch_count = int(source.get("dispatch_count") or 0)
+        except (TypeError, ValueError, OverflowError):
+            dispatch_count = 0
+        result["dispatch_count"] = max(0, min(1, dispatch_count))
+    frame_dimensions = source.get("frame_dimensions")
+    frame_dimensions = (
+        frame_dimensions if isinstance(frame_dimensions, Mapping) else {}
+    )
+    try:
+        frame_width = max(0, int(frame_dimensions.get("width") or 0))
+        frame_height = max(0, int(frame_dimensions.get("height") or 0))
+    except (TypeError, ValueError, OverflowError):
+        frame_width, frame_height = 0, 0
+    if frame_width and frame_height:
+        result["frame_dimensions"] = {
+            "width": frame_width,
+            "height": frame_height,
+        }
+    lease = source.get("actuation_lease")
+    lease = lease if isinstance(lease, Mapping) else {}
+    lease_state = _safe_reason(lease.get("state"))
+    try:
+        acknowledged_at = max(0.0, float(lease.get("acknowledged_at") or 0.0))
+        lease_expires_at = max(0.0, float(lease.get("expires_at") or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        acknowledged_at = 0.0
+        lease_expires_at = 0.0
+    if lease_state:
+        result["actuation_lease"] = {
+            "state": lease_state,
+            "acknowledged_at": acknowledged_at,
+            "expires_at": lease_expires_at,
+        }
+    normalized_bbox = source.get("normalized_bbox")
+    normalized_bbox = (
+        normalized_bbox if isinstance(normalized_bbox, Mapping) else {}
+    )
+    try:
+        safe_bbox = {
+            key: float(normalized_bbox[key])
+            for key in ("left", "top", "right", "bottom")
+        }
+        if not all(math.isfinite(value) for value in safe_bbox.values()):
+            safe_bbox = {}
+        elif not (
+            0.0 <= safe_bbox["left"] < safe_bbox["right"] <= 1.0
+            and 0.0 <= safe_bbox["top"] < safe_bbox["bottom"] <= 1.0
+        ):
+            safe_bbox = {}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        safe_bbox = {}
+    if safe_bbox:
+        result["normalized_bbox"] = safe_bbox
+    transform = source.get("coordinate_transform")
+    transform = transform if isinstance(transform, Mapping) else {}
+
+    def _number_list(name: str, maximum: int) -> list[float]:
+        values = transform.get(name)
+        if not isinstance(values, (list, tuple)):
+            return []
+        safe_values = []
+        for item in list(values)[:maximum]:
+            try:
+                number = float(item)
+            except (TypeError, ValueError, OverflowError):
+                return []
+            if not math.isfinite(number):
+                return []
+            safe_values.append(number)
+        return safe_values
+
+    dimensions = transform.get("source_dimensions")
+    dimensions = dimensions if isinstance(dimensions, Mapping) else {}
+    try:
+        width = max(0, int(dimensions.get("width") or 0))
+        height = max(0, int(dimensions.get("height") or 0))
+    except (TypeError, ValueError, OverflowError):
+        width, height = 0, 0
+    safe_transform = {
+        "source_dimensions": {"width": width, "height": height},
+        "source_box": _number_list("source_box", 4),
+        "screen_bounds": _number_list("screen_bounds", 4),
+        "client_origin_screen": _number_list("client_origin_screen", 2),
+        "source_to_screen_affine": _number_list(
+            "source_to_screen_affine", 6,
+        ),
+        "mapping_chain": _safe_primitive_text(
+            transform.get("mapping_chain"), maximum=120,
+        ),
+    }
+    if safe_transform["source_box"] and safe_transform[
+        "source_to_screen_affine"
+    ]:
+        result["coordinate_transform"] = safe_transform
     return result
 
 
@@ -1463,6 +1674,13 @@ class ToolAttemptStore:
         record["action_truth"] = normalize_action_truth(
             record.get("action_truth"), legacy_record=record,
         )
+        if record.get("process_facts") is not None:
+            from osia.tool_contracts import normalize_process_facts
+
+            process_facts = normalize_process_facts(record["process_facts"])
+            if process_facts is None:
+                raise CorruptAttemptError("invalid_process_facts")
+            record["process_facts"] = process_facts
         execution_epoch = _safe_primitive_text(
             record.get("execution_epoch"), maximum=256,
         )
@@ -1501,6 +1719,9 @@ class ToolAttemptStore:
         record["observer_receipts"] = _safe_identity_receipts(
             record.get("observer_receipts")
         )
+        record["visual_action_receipt"] = _safe_visual_action_receipt(
+            record.get("visual_action_receipt")
+        )
         history = record.get("continuation_history")
         record["continuation_history"] = _safe_identity_receipts(
             history, maximum=64,
@@ -1535,6 +1756,9 @@ class ToolAttemptStore:
             if (
                 record.get("conversation_id") == conversation_id
                 and ToolAttemptStatus(record["status"]) not in TERMINAL_STATUSES
+                # Legacy journals can await proof after the worker has settled.
+                # They remain observable, but do not own a new dispatch.
+                and record.get("dispatch_state") != "owner_settled_unverified"
             ):
                 return record
         return None
@@ -1717,9 +1941,47 @@ class ToolAttemptStore:
                 primitive_id = "primitive_" + hashlib.sha256(
                     material.encode("utf-8", errors="replace")
                 ).hexdigest()[:20]
+                primitive_target = {
+                    "kind": "desktop",
+                    "application": str(
+                        binding.get("application_identity") or ""
+                    ),
+                    "surface_ref": str(binding.get("surface_ref") or ""),
+                    "native_window_id": str(
+                        binding.get("native_window_id") or ""
+                    ),
+                    "window_generation": str(
+                        binding.get("window_generation") or ""
+                    ),
+                    "conflict_scope": str(
+                        binding.get("surface_ref")
+                        or binding.get("application_identity")
+                        or ""
+                    ),
+                }
+                primitive_effect_id = semantic_effect_identity(
+                    turn_id=turn_id,
+                    semantic_node_id=str(
+                        binding.get("semantic_substep_id")
+                        or binding.get("semantic_node_id")
+                        or ""
+                    ),
+                    attempted_effect=str(
+                        binding.get("attempted_effect") or ""
+                    ),
+                    operation=str(binding.get("uia_pattern") or tool_name),
+                    target=primitive_target,
+                    argument_fingerprint=argument_fingerprint,
+                )
                 prepared_entries.append({
                     **dict(binding),
                     "primitive_id": primitive_id,
+                    "semantic_effect_id": primitive_effect_id,
+                    "action_id": action_identity(
+                        run_id=autonomous_run_id or turn_id,
+                        turn_id=turn_id,
+                        semantic_effect_id=primitive_effect_id,
+                    ),
                     "effect_role": effect_role,
                     "checkpoint_role": (
                         "intermediate"
@@ -1823,6 +2085,7 @@ class ToolAttemptStore:
             },
             "processed_provider_callbacks": [],
             "observer_receipts": [],
+            "visual_action_receipt": {},
             "continuation_history": [],
             "action_outbox": [],
             "primitive_journal": primitive_journal,
@@ -1945,6 +2208,7 @@ class ToolAttemptStore:
         attempt_id: str,
         *,
         owner_settled: bool = False,
+        allow_pending_owner: bool = False,
     ) -> tuple[dict, bool]:
         """Atomically choose cancellation or the external-call boundary.
 
@@ -1960,6 +2224,20 @@ class ToolAttemptStore:
         with self._store_lock():
             record = self._read_unlocked(attempt_id)
             current = ToolAttemptStatus(record["status"])
+            pending_owner_deadline = min(
+                float(record.get("hard_deadline_at") or 0.0),
+                float(
+                    record.get("inactivity_deadline_at")
+                    or record.get("hard_deadline_at")
+                    or 0.0
+                ),
+            )
+            pending_owner_active = bool(
+                allow_pending_owner
+                and current is ToolAttemptStatus.PENDING
+                and record.get("dispatch_state") == "worker_may_be_active"
+                and pending_owner_deadline > _now()
+            )
             if current is ToolAttemptStatus.CANCELLED_PROVEN:
                 return dict(record), False
             if current is ToolAttemptStatus.CANCELLATION_REQUESTED:
@@ -1971,6 +2249,11 @@ class ToolAttemptStore:
                         record.get("dispatch_state") in {
                             "not_dispatched", "owner_started",
                         }
+                        or (
+                            allow_pending_owner
+                            and record.get("dispatch_state")
+                            == "worker_may_be_active"
+                        )
                         or owner_settled
                     )
                 )
@@ -2004,8 +2287,13 @@ class ToolAttemptStore:
             if (
                 owner_settled
                 or not record.get("owner_dispatch_boundary_armed_at")
-                or current is not ToolAttemptStatus.RUNNING
-                or record.get("dispatch_state") != "owner_started"
+                or not (
+                    (
+                        current is ToolAttemptStatus.RUNNING
+                        and record.get("dispatch_state") == "owner_started"
+                    )
+                    or pending_owner_active
+                )
                 or _any_primitive_dispatch_started(record)
             ):
                 return dict(record), False
@@ -2271,6 +2559,43 @@ class ToolAttemptStore:
                 )
             record["revision"] = int(record["revision"]) + 1
             record["updated_at"] = now
+            self._write_atomic(self._path(attempt_id), record)
+            return dict(record)
+
+    def bind_visual_action_receipt(
+        self,
+        attempt_id: str,
+        receipt: Mapping[str, Any],
+    ) -> dict:
+        """Persist canonical visual proposal/transform identity, never pixels."""
+
+        safe = _safe_visual_action_receipt(receipt)
+        if not safe.get("proposal_id") or not safe.get("source_frame_id"):
+            raise IllegalTransition("visual_action_identity_incomplete")
+        with self._store_lock():
+            record = self._read_unlocked(attempt_id)
+            current = _safe_visual_action_receipt(
+                record.get("visual_action_receipt")
+            )
+            if current and current.get("proposal_id") != safe.get("proposal_id"):
+                raise IllegalTransition("visual_action_proposal_conflict")
+            record["visual_action_receipt"] = safe
+            truth = dict(record.get("action_truth") or {})
+            target = dict(truth.get("target") or {})
+            target["frame_id"] = safe["source_frame_id"]
+            if safe.get("surface_ref"):
+                target["surface_ref"] = safe["surface_ref"]
+            if safe.get("surface_generation") or safe.get("window_generation"):
+                target["window_generation"] = (
+                    safe.get("surface_generation")
+                    or safe.get("window_generation")
+                )
+            truth["target"] = target
+            record["action_truth"] = normalize_action_truth(
+                truth, legacy_record=record,
+            )
+            record["revision"] = int(record["revision"]) + 1
+            record["updated_at"] = _now()
             self._write_atomic(self._path(attempt_id), record)
             return dict(record)
 
@@ -2550,6 +2875,13 @@ class ToolAttemptStore:
         }.get(str(outcome or ""), ("unknown", "unknown", "unknown_at"))
         with self._store_lock():
             record = self._read_unlocked(attempt_id)
+            if (
+                lifecycle == "unknown"
+                and normalize_action_truth(
+                    record.get("action_truth"), legacy_record=record,
+                ).get("effect_truth") == "verified"
+            ):
+                return record
             journal = list(record.get("primitive_journal") or [])
             index = self._journal_entry_index(record, primitive_id)
             if index < 0:
@@ -3022,10 +3354,16 @@ class ToolAttemptStore:
         dispatch_state: str,
         reason_code: str = "",
         expected_revision: int | None = None,
+        process_facts: Mapping[str, Any] | None = None,
     ) -> tuple[dict, bool]:
         status = ToolAttemptStatus(status)
         if status not in TERMINAL_STATUSES:
             raise ValueError("terminal_status_required")
+        from osia.tool_contracts import normalize_process_facts
+
+        completed_process = normalize_process_facts(process_facts)
+        if process_facts is not None and completed_process is None:
+            raise ValueError("invalid_completed_process_facts")
         with self._store_lock():
             record = self._read_unlocked(attempt_id)
             current = ToolAttemptStatus(record["status"])
@@ -3055,6 +3393,16 @@ class ToolAttemptStore:
                 and dispatch_state in {
                     "not_dispatched", "cancelled_before_effect",
                 }
+                and not (
+                    status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                    and terminal_outcome in {
+                        "confirmed_failure_before_effect",
+                        "failed_before_effect",
+                        "not_applied_verified",
+                    }
+                    and dispatch_state == "not_dispatched"
+                    and _exact_correlated_primitive_no_effect(record)
+                )
             ):
                 status = ToolAttemptStatus.UNKNOWN_AFTER_START
                 terminal_outcome = "outcome_unknown"
@@ -3126,13 +3474,21 @@ class ToolAttemptStore:
                 record["semantic_settle"] = _safe_semantic_settle(settle)
             batch = _safe_semantic_batch_record(record.get("semantic_batch"))
             if batch["state"] != "inactive":
+                exact_batch_verified = (
+                    normalize_action_truth(
+                        record.get("action_truth"), legacy_record=record,
+                    ).get("effect_truth") == "verified"
+                )
                 batch_fully_dispatched = bool(
                     record.get("primitive_journal")
                 ) and all(
                     item.get("lifecycle") != "prepared"
                     for item in record.get("primitive_journal") or []
                 )
-                if status == ToolAttemptStatus.SUCCEEDED and batch_fully_dispatched:
+                if batch_fully_dispatched and (
+                    exact_batch_verified
+                    or status == ToolAttemptStatus.SUCCEEDED
+                ):
                     verified_journal = []
                     for raw in record.get("primitive_journal") or []:
                         item = dict(raw)
@@ -3154,7 +3510,10 @@ class ToolAttemptStore:
                     ) else
                     "verified"
                     if (
-                        status == ToolAttemptStatus.SUCCEEDED
+                        (
+                            exact_batch_verified
+                            or status == ToolAttemptStatus.SUCCEEDED
+                        )
                         and batch_fully_dispatched
                     ) else
                     "outcome_unknown"
@@ -3275,6 +3634,36 @@ class ToolAttemptStore:
                 # summary must not collapse that child truth back to generic
                 # effect_possible.
                 pass
+            elif (
+                terminal_outcome == "command_completed"
+                and completed_process is not None
+                and completed_process["source"] == "local_subprocess"
+                and record.get("tool_name") in {"bash", "run_command"}
+                and status in {ToolAttemptStatus.SUCCEEDED, ToolAttemptStatus.FAILED_AFTER_EFFECT}
+                and dispatch_state == "effect_confirmed"
+                and semantic_started
+            ):
+                truth = transition_action_truth(
+                    truth, state=ActionState.EFFECT_OBSERVED,
+                    reason_code=safe_reason or "completed_process_result",
+                    evidence=action_evidence,
+                    reconciliation_status=ReconciliationStatus.PENDING,
+                    exact=False, occurred_at=now,
+                )
+            elif (
+                terminal_outcome == "command_completed"
+                and truth.get("current_state") == ActionState.EFFECT_OBSERVED.value
+                and any(
+                    item.get("classification") == "command_completed"
+                    and item.get("execution_epoch") == record.get("execution_epoch")
+                    and item.get("stale") is False
+                    for item in record.get("continuation_history") or []
+                )
+            ):
+                # The fenced provider callback already observed process
+                # completion. Its nonzero exit proves neither the requested
+                # external effect nor non-application; retain that exact truth.
+                pass
             elif status is ToolAttemptStatus.SUCCEEDED:
                 verified = terminal_outcome in {
                     "success_verified", "confirmed_success",
@@ -3308,6 +3697,16 @@ class ToolAttemptStore:
                     occurred_at=now,
                 )
             record["action_truth"] = truth
+            if (
+                completed_process is not None
+                and record.get("tool_name") in {"bash", "run_command"}
+                and status in {ToolAttemptStatus.SUCCEEDED, ToolAttemptStatus.FAILED_AFTER_EFFECT}
+                and terminal_outcome in {"success_verified", "success_unverified", "command_completed", "failed_after_effect"}
+                and dispatch_state in {"effect_confirmed", "effect_applied"}
+                and semantic_started
+                and record.get("authority_state") not in {"cancelled", "superseded"}
+            ):
+                record["process_facts"] = completed_process
             self._write_atomic(self._path(attempt_id), record)
             return dict(record), True
 
@@ -3598,6 +3997,29 @@ class ToolAttemptStore:
                     record,
                 )
                 return dict(record)
+            batch_before = _safe_semantic_batch_record(
+                record.get("semantic_batch")
+            )
+            journal_before = list(record.get("primitive_journal") or [])
+            if (
+                target_state is ActionState.EFFECT_VERIFIED
+                and exact
+                and batch_before.get("state") != "inactive"
+                and journal_before
+                and any(
+                    item.get("lifecycle") == "prepared"
+                    for item in journal_before
+                )
+            ):
+                record["updated_at"] = (
+                    _now() if occurred_at is None else float(occurred_at)
+                )
+                record["revision"] = int(record.get("revision") or 0) + 1
+                self._write_atomic(
+                    barrier_path if is_barrier else attempt_path,
+                    record,
+                )
+                return dict(record)
             updated_truth = transition_action_truth(
                 current_truth,
                 state=state,
@@ -3608,6 +4030,41 @@ class ToolAttemptStore:
                 exact=exact,
                 occurred_at=occurred_at,
             )
+            batch = _safe_semantic_batch_record(record.get("semantic_batch"))
+            journal = list(record.get("primitive_journal") or [])
+            if (
+                target_state is ActionState.EFFECT_VERIFIED
+                and exact
+                and batch.get("state") != "inactive"
+                and journal
+                and all(
+                    item.get("lifecycle") in {
+                        "dispatch_started", "dispatch_returned",
+                        "receipt_bound", "unknown", "verified",
+                    }
+                    for item in journal
+                )
+            ):
+                verified_at = (
+                    _now() if occurred_at is None else float(occurred_at)
+                )
+                record["primitive_journal"] = _safe_primitive_journal([
+                    {
+                        **item,
+                        "lifecycle": "verified",
+                        "effect_classification": "verified",
+                        "verified_at": verified_at,
+                    }
+                    for item in journal
+                ])
+                batch.update({
+                    "state": "verified",
+                    "partial_batch_state": "completed_batch",
+                    "completed_dispatch_count": len(journal),
+                    "dispatched_count": len(journal),
+                    "stop_reason": reason_code,
+                })
+                record["semantic_batch"] = _safe_semantic_batch_record(batch)
             if authority_state == "cancelled":
                 updated_truth = transition_action_truth(
                     updated_truth,
@@ -3706,10 +4163,23 @@ class ToolAttemptStore:
             late = authority_state in {"cancelled", "terminal", "superseded"}
             refs = dict(record.get("provider_references") or {})
             supplied_refs = _safe_provider_references(provider_references)
-            for key, value in supplied_refs.items():
-                existing = refs.get(key)
-                if not existing or existing == value:
-                    refs[key] = value
+            invalid_command_binding = bool(
+                outcome == "command_completed" and (
+                    record.get("tool_name") != "run_command"
+                    or not evidence_ref
+                    or not (record.get("action_truth") or {}).get("dispatch_started_at")
+                    or any(
+                        not refs.get(key)
+                        or supplied_refs.get(key) != refs.get(key)
+                        for key in ("thread_id", "turn_id", "item_id", "tool_call_id")
+                    )
+                )
+            )
+            if not invalid_command_binding:
+                for key, value in supplied_refs.items():
+                    existing = refs.get(key)
+                    if not existing or existing == value:
+                        refs[key] = value
             record["provider_references"] = refs
             history = _safe_identity_receipts(
                 record.get("continuation_history"), maximum=64,
@@ -3719,13 +4189,14 @@ class ToolAttemptStore:
                 "classification": outcome,
                 "reason_code": (
                     "stale_execution_epoch" if stale_epoch
+                    else "invalid_command_callback_binding" if invalid_command_binding
                     else "late_provider_evidence" if late
                     else reason_code
                 ),
                 "failure_domain": failure_domain,
                 "execution_epoch": execution_epoch,
                 "target_generation": "",
-                "stale": stale_epoch,
+                "stale": stale_epoch or invalid_command_binding,
                 "received_at": _now(),
             })
             record["continuation_history"] = history[-64:]
@@ -3733,7 +4204,7 @@ class ToolAttemptStore:
                 "completed_with_receipt", "explicit_not_applied",
                 "failed_before_effect",
             }
-            authoritative = not stale_epoch and not late
+            authoritative = not stale_epoch and not late and not invalid_command_binding
             current_truth = normalize_action_truth(
                 record.get("action_truth"), legacy_record=record,
             )
@@ -3744,7 +4215,7 @@ class ToolAttemptStore:
                     "explicit_not_applied", "failed_before_effect",
                 } else ""
             )
-            should_apply = not stale_epoch and (
+            should_apply = not stale_epoch and not invalid_command_binding and (
                 authoritative or definitive
             ) and not (
                 current_effect in {"verified", "not_applied"}
@@ -3767,6 +4238,9 @@ class ToolAttemptStore:
                 if outcome == "completed_with_receipt":
                     target_state = ActionState.EFFECT_VERIFIED
                     exact = True
+                elif outcome == "command_completed" and dispatch_started:
+                    target_state = ActionState.EFFECT_OBSERVED
+                    exact = False
                 elif outcome == "explicit_not_applied" or (
                     outcome == "failed_before_effect" and dispatch_started
                 ):
@@ -3798,12 +4272,14 @@ class ToolAttemptStore:
                         current_truth,
                         state=target_state,
                         reason_code=reason_code,
-                        evidence=(evidence if definitive else None),
+                        evidence=(evidence if definitive or outcome == "command_completed" else None),
                         reconciliation_status=(
                             ReconciliationStatus.VERIFIED
                             if target_state is ActionState.EFFECT_VERIFIED else
                             ReconciliationStatus.NOT_APPLIED
                             if target_state is ActionState.NOT_APPLIED_VERIFIED else
+                            ReconciliationStatus.PENDING
+                            if target_state is ActionState.EFFECT_OBSERVED else
                             ReconciliationStatus.RUNNING
                         ),
                         exact=exact,
@@ -4024,88 +4500,11 @@ class ToolAttemptStore:
                     candidates.append(record)
         return candidates[0] if len(candidates) == 1 else None
 
-    def bind_autonomous(
-        self,
-        attempt_id: str,
-        *,
-        run_id: str,
-        task_id: str,
-        operation_id: str,
-        operation_revision: int,
-        permission_epoch: int,
-    ) -> dict:
-        """Attach one mission checkpoint to an existing common attempt.
-
-        The binding is value-free and immutable once established.  It never
-        claims the external action and therefore cannot authorize a redispatch.
-        """
-
-        values = {
-            "autonomous_run_id": _safe_token(
-                run_id, field="autonomous_run_id",
-            ),
-            "autonomous_task_id": _safe_token(
-                task_id, field="autonomous_task_id",
-            ),
-            "autonomous_operation_id": _safe_token(
-                operation_id, field="autonomous_operation_id",
-            ),
-        }
-        if (
-            isinstance(operation_revision, bool)
-            or not isinstance(operation_revision, int)
-            or operation_revision < 0
-            or isinstance(permission_epoch, bool)
-            or not isinstance(permission_epoch, int)
-            or permission_epoch < 0
-        ):
-            raise ValueError("invalid_autonomous_revision")
-        with self._store_lock():
-            record = self._read_unlocked(attempt_id)
-            already_bound = bool(
-                record.get("owner_scope") == "autonomous"
-                or any(record.get(key) for key in values)
-            )
-            for key, value in values.items():
-                existing = str(record.get(key) or "")
-                if existing and existing != value:
-                    raise IllegalTransition("tool_attempt_already_bound")
-            if already_bound and (
-                int(record.get("operation_revision") or 0)
-                != operation_revision
-                or int(record.get("permission_epoch") or 0)
-                != permission_epoch
-            ):
-                raise IllegalTransition("tool_attempt_already_bound")
-            record.update(values)
-            record["owner_scope"] = "autonomous"
-            record["operation_revision"] = operation_revision
-            record["permission_epoch"] = permission_epoch
-            record["revision"] = int(record["revision"]) + 1
-            record["updated_at"] = _now()
-            self._write_atomic(self._path(attempt_id), record)
-            return dict(record)
-
     def has_terminal_barrier(
         self, *, conversation_id: str, turn_id: str, tool_name: str,
         argument_fingerprint: str,
     ) -> bool:
-        for record in self._terminal_records_and_barriers():
-            if (
-                record.get("conversation_id") == conversation_id
-                and record.get("turn_id") == turn_id
-                and record.get("tool_name") == tool_name
-                and hmac.compare_digest(
-                    str(record.get("argument_fingerprint") or ""),
-                    str(argument_fingerprint or ""),
-                )
-                and (
-                    _any_primitive_dispatch_started(record)
-                    if record.get("tool_name") == "activate_desktop_surface"
-                    else record.get("dispatch_state") != "not_dispatched"
-                )
-            ):
-                return True
+        """Legacy API: persisted attempts never block a new dispatch."""
         return False
 
     def has_dispatch_barrier(
@@ -4113,88 +4512,20 @@ class ToolAttemptStore:
         argument_fingerprint: str, equivalence_fingerprint: str = "",
         block_unknown_effect: bool = True,
     ) -> bool:
-        """Check exact, equivalent, and unknown-effect barriers in one scan."""
-
-        for record in self._terminal_records_and_barriers():
-            if (
-                record.get("conversation_id") != conversation_id
-                or record.get("turn_id") != turn_id
-            ):
-                continue
-            semantic_started = (
-                _semantic_dispatch_started(record)
-                if record.get("tool_name") == "activate_desktop_surface"
-                else record.get("dispatch_state") != "not_dispatched"
-            )
-            exact_started = (
-                _any_primitive_dispatch_started(record)
-                if record.get("tool_name") == "activate_desktop_surface"
-                else record.get("dispatch_state") != "not_dispatched"
-            )
-            if (
-                block_unknown_effect
-                and record.get("terminal_outcome") == "outcome_unknown"
-                and semantic_started
-            ):
-                return True
-            if (
-                record.get("tool_name") == tool_name
-                and exact_started
-                and hmac.compare_digest(
-                    str(record.get("argument_fingerprint") or ""),
-                    str(argument_fingerprint or ""),
-                )
-            ):
-                return True
-            if semantic_started and equivalence_fingerprint and hmac.compare_digest(
-                str(record.get("equivalence_fingerprint") or ""),
-                equivalence_fingerprint,
-            ):
-                return True
+        """Legacy API: persisted attempts never block a new dispatch."""
         return False
 
     def has_equivalent_terminal_barrier(
         self, *, conversation_id: str, turn_id: str,
         equivalence_fingerprint: str,
     ) -> bool:
-        """Block another mutation that targets the same private equivalence key."""
-
-        if not re.fullmatch(r"hmac256:[0-9a-f]{64}", equivalence_fingerprint or ""):
-            return False
-        for record in self._terminal_records_and_barriers():
-            if (
-                record.get("conversation_id") == conversation_id
-                and record.get("turn_id") == turn_id
-                and hmac.compare_digest(
-                    str(record.get("equivalence_fingerprint") or ""),
-                    equivalence_fingerprint,
-                )
-                and (
-                    _semantic_dispatch_started(record)
-                    if record.get("tool_name") == "activate_desktop_surface"
-                    else record.get("dispatch_state") != "not_dispatched"
-                )
-            ):
-                return True
+        """Legacy API: persisted attempts never block a new dispatch."""
         return False
 
     def has_unknown_effect_barrier(
         self, *, conversation_id: str, turn_id: str,
     ) -> bool:
-        """Return whether any started mutation in this turn has unknown outcome."""
-
-        for record in self._terminal_records_and_barriers():
-            if (
-                record.get("conversation_id") == conversation_id
-                and record.get("turn_id") == turn_id
-                and record.get("terminal_outcome") == "outcome_unknown"
-                and (
-                    _semantic_dispatch_started(record)
-                    if record.get("tool_name") == "activate_desktop_surface"
-                    else record.get("dispatch_state") != "not_dispatched"
-                )
-            ):
-                return True
+        """Legacy API: persisted attempts never block a new dispatch."""
         return False
 
     def _terminal_records_and_barriers(self):
@@ -4376,6 +4707,13 @@ class ToolAttemptCoordinator:
         else:
             self._schedule_timer(attempt_id)
         return True
+
+    def has_registered_runtime(self, attempt_id: str) -> bool:
+        """Prove one exact in-process suspended continuation exists."""
+
+        with self._lock:
+            runtime = self._runtimes.get(str(attempt_id or ""))
+            return bool(runtime is not None and not runtime.activated)
 
     def notify_terminal(self, attempt_id: str, payload: Any) -> None:
         with self._lock:
@@ -5302,17 +5640,6 @@ def recover_orphaned_tool_attempts() -> list[dict]:
         return False
 
     for record in recovered:
-        if record.get("owner_scope") == "autonomous":
-            # The Autonomous checkpoint owns its exact task continuation.  A
-            # normal-chat assistant message here would duplicate that mission.
-            # If its fresh-process runtime is already reattached, deliver this
-            # terminal receipt through the same coordinator callback. This also
-            # closes the deadline race where the orphan timer wins the durable
-            # reconciliation claim while the restored verifier is waking.
-            get_tool_attempt_coordinator().notify_terminal(
-                str(record.get("tool_attempt_id") or ""), record,
-            )
-            continue
         canonical_state_exists, canonical_binding = _canonical_chat_binding(record)
         if canonical_state_exists:
             if canonical_binding is None:

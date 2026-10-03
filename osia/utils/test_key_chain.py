@@ -339,7 +339,7 @@ def test_copy_context_propagates_active_key_across_threads():
             seen = []
 
             def vision_call():
-                # k1 is rate-limited, k2 works — like a vision provider whose
+                # k1 is rate-limited, k2 works — like a provider whose
                 # primary key is throttled. with_key_rotation records the winner.
                 call, att = _caller({"k1": 429, "k2": "ok"})
                 out = kc.with_key_rotation("vis", call)

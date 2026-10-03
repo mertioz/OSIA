@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -35,7 +36,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum, IntEnum
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 
@@ -83,15 +84,43 @@ _SURFACE_ALIASES = {
 }
 
 _ACTION_PATTERNS = (
-    ("search", r"\b(search|find|look for|cherche|chercher|recherche|rechercher)\b"),
+    (
+        "observe",
+        r"\b(read|observe|inspect|releve|relever|lis|lire)\b",
+    ),
+    (
+        "observe",
+        r"(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bthis )(?<!\bthese )"
+        r"(?<!\bun )(?<!\bune )(?<!\bles )(?<!\bdes )(?<!\bmon )(?<!\bma )"
+        r"(?<!\bmy )\b(list|liste|lister)\b",
+    ),
+    (
+        "type",
+        r"\b(edit|modify|append|populate|fill|modifie|modifier|remplis|remplir)\b",
+    ),
+    (
+        "search",
+        r"\b(search|find|look for|locate|cherche|chercher|recherche|"
+        r"rechercher|trouve|trouver)\b",
+    ),
     ("open", r"\b(open|launch|start|ouvre|ouvrir|lance|lancer|demarre|demarrer)\b"),
-    ("navigate", r"\b(go to|navigate|visit|va a|aller a|rends toi|accede)\b"),
+    (
+        "navigate",
+        r"\b(reach|go (?:to|into|on)|navigate|visit|va (?:a|dans|sur)|"
+        r"aller (?:a|dans|sur)|rends toi|accede)\b",
+    ),
     ("activate", r"\b(click|select|activate|clique|selectionne|active)\b"),
     ("type", r"\b(type|enter|write|saisis|ecris|tape)\b"),
     ("calculate", r"\b(calculate|compute|calculer|calcule)\b"),
     ("send", r"\b(send|submit|envoie|envoyer|soumet|soumettre)\b"),
-    ("create", r"\b(create|add|cree|creer|ajoute|ajouter)\b"),
+    ("create", r"\b(create|add|build|make|develop|generate|produce|implement|"
+                r"assemble|construct|scaffold|bootstrap|cree|creer|ajoute|ajouter|"
+                r"construis|construire|genere|generer|developpe|developper)\b"),
     ("delete", r"\b(delete|remove|supprime|supprimer|efface|effacer)\b"),
+    ("copy", r"\b(copy|duplicate|copie|copier|duplique|dupliquer)\b"),
+    ("move", r"\b(move|rename|deplace|deplacer|renomme|renommer)\b"),
+    ("download", r"\b(download|telecharge|telecharger)\b"),
+    ("upload", r"\b(upload|televerse|televerser)\b"),
 )
 
 _NEGATIVE_PREFIX_RE = re.compile(
@@ -398,6 +427,40 @@ def _semantic_batch_proves_calculation_result(
 
 
 @dataclass
+class TargetHint:
+    """Bounded provenance for one semantic application candidate.
+
+    Parsed values may guide discovery without becoming exact target truth.
+    Runtime target resolution compares this hint with explicit tool arguments
+    and current observed window/process identities before binding a surface.
+    """
+
+    raw_text: str = ""
+    normalized_value: str = ""
+    source: str = "weak_natural_language_heuristic"
+    confidence: float = 0.0
+    ambiguity: bool = True
+    exactness: bool = False
+    span: tuple[int, int] = (0, 0)
+    candidates: tuple[str, ...] = ()
+
+    def public_dict(self) -> dict:
+        return {
+            "raw_text": _bounded(self.raw_text, 160),
+            "normalized_value": _bounded(self.normalized_value, 160),
+            "source": _bounded(self.source, 80),
+            "confidence": min(1.0, max(0.0, float(self.confidence))),
+            "ambiguity": bool(self.ambiguity),
+            "exactness": bool(self.exactness),
+            "span": [max(0, int(self.span[0])), max(0, int(self.span[1]))],
+            "candidates": [
+                _bounded(item, 160) for item in self.candidates
+                if _bounded(item, 160)
+            ][:8],
+        }
+
+
+@dataclass
 class SemanticActionNode:
     target_object: str
     required_application: str
@@ -414,6 +477,10 @@ class SemanticActionNode:
     requested_content: str = ""
     status: str = "pending"
     evidence_links: tuple[str, ...] = ()
+    target_hint: dict = field(default_factory=dict)
+    conditional_mode: str = ""
+    conditional_branches: tuple[dict[str, Any], ...] = ()
+    requires_observation_before_execution: bool = False
 
     def public_dict(self) -> dict:
         return asdict(self)
@@ -451,6 +518,517 @@ class SemanticMission:
 
 # Compatibility name for focused WOR-248 callers which construct one node.
 SemanticGoal = SemanticActionNode
+
+
+_INFORMATIONAL_DELIVERABLE_VERB_RE = re.compile(
+    r"\b(?:tell|say|explain|describe|summari[sz]e|translate|answer|"
+    r"raconte|dis(?:-moi)?|explique|decris|décris|resume|résume|"
+    r"traduis|reponds|réponds)\b",
+    re.IGNORECASE,
+)
+_INTERROGATIVE_CLAUSE_RE = re.compile(
+    r"\b(?:what|why|how|who|when|where|which|combien|pourquoi|comment|"
+    r"qui|quand|quel|quelle|quels|quelles|où)\b",
+    re.IGNORECASE,
+)
+
+
+def _clause_is_informational_deliverable(clause: str) -> bool:
+    """Positively identify a clause whose deliverable is the answer text.
+
+    Any other unclassified clause of an execution objective stays required
+    work, so a plain provider answer can never discharge it without evidence.
+    """
+
+    text = str(clause or "").strip()
+    if not text:
+        return False
+    if "?" in text or _INTERROGATIVE_CLAUSE_RE.search(text):
+        return True
+    return bool(_INFORMATIONAL_DELIVERABLE_VERB_RE.search(text))
+
+
+# Actions whose requested outcome is an external effect on one or more
+# concrete artifacts.  Only these carry an explicit effect contract; all other
+# nodes keep the historical single-postcondition proof model.
+_EFFECT_ACTIONS = frozenset({
+    "create", "type", "move", "copy", "download", "upload", "delete",
+})
+_QUANTITY_WORDS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "both": 2, "pair": 2, "couple": 2, "several": 3,
+    "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "sept": 7,
+    "huit": 8, "neuf": 9, "dix": 10, "onze": 11, "douze": 12,
+    "paire": 2,
+}
+_MEASURE_NOUNS = frozenset({
+    "second", "seconds", "minute", "minutes", "hour", "hours",
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "time", "times", "secondes", "heure", "heures", "jour", "jours",
+    "semaine", "semaines", "mois", "an", "ans", "annee", "annees",
+    "fois", "page", "pages", "paragraph", "paragraphs", "item", "items",
+    "element", "elements", "ligne", "lignes", "paragraphe", "paragraphes",
+})
+# Tokens that can only refer back to artifacts already named in the clause.
+_PRONOUN_BACKREFS = frozenset({
+    "it", "them", "they", "its", "their", "him", "her", "les", "le", "la",
+    "eux", "lui", "leur", "leurs",
+})
+# Tokens that cannot begin a residual predicate: determiners, possessives,
+# pronouns, prepositions, conjunctions and bare quantifiers.  A coordinated
+# fragment that starts with one of these is an object list, not new work.
+_FUNCTION_HEAD_TOKENS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those", "its", "their",
+    "his", "her", "our", "your", "my", "it", "them", "him", "they", "we",
+    "you", "i", "and", "or", "then", "but", "so", "with", "without",
+    "into", "in", "on", "inside", "at", "to", "from", "for", "of", "by",
+    "as", "about", "over", "under", "le", "la", "les", "un", "une", "des",
+    "du", "de", "ce", "cet", "cette", "ces", "son", "sa", "ses", "mon",
+    "ma", "mes", "ton", "ta", "tes", "notre", "nos", "votre", "vos",
+    "leur", "leurs", "et", "ou", "puis", "ensuite", "dans", "sur", "vers",
+    "pour", "avec", "sans", "par", "au", "aux", "en", "new", "more", "all",
+    "any", "each", "every", "some", "both", "using", "via",
+})
+_QUOTED_NAME_RE = re.compile(
+    r"[\"'\u201c\u201d\u00ab\u00bb]([^\"'\u201c\u201d\u00ab\u00bb]{1,80})"
+    r"[\"'\u201c\u201d\u00ab\u00bb]"
+)
+_FILENAME_RE = re.compile(
+    r"(?<![\w/\\])([A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,6})(?![\w])"
+)
+_NAMED_TARGET_RE = re.compile(
+    r"(?:\bnamed\b|\bcalled\b|\bappeles?\b|\bnommes?\b)\s+(.+)$"
+)
+_COLON_LIST_RE = re.compile(r":\s*(.+)$")
+_ENUM_SPLIT_RE = re.compile(r"\s*(?:,|\band\b|\bet\b)\s*")
+_ARTIFACT_NOUN_RE = re.compile(
+    r"\b(file|files|folder|folders|directory|directories|document|documents|"
+    r"note|notes|spreadsheet|workbook|pdf|presentation|slide|slides|"
+    r"image|photo|picture|video|audio|archive|zip|report|dossier|dossiers|"
+    r"fichier|fichiers|repertoire|repertoires|document|documents|"
+    r"classeur|feuille|diapositives?|image|photo|rapport)\b"
+)
+# External state a read-only receipt can actually observe.  Observation
+# clauses that name none of these remain text answers.
+_OBSERVABLE_TARGET_RE = re.compile(
+    r"\b(file|files|folder|folders|directory|directories|content|contents|"
+    r"tab|tabs|page|pages|window|windows|screen|screens|desktop|clipboard|"
+    r"download|downloads|fichier|fichiers|dossier|dossiers|repertoire|"
+    r"repertoires|contenu|contenus|onglet|onglets|fenetre|fenetres|"
+    r"ecran|ecrans|presse-papiers)\b"
+)
+_RESIDUAL_SPLIT_RE = re.compile(
+    r"(?:;|\s+\b(?:and|then|puis|ensuite|et)\b\s+)",
+    re.IGNORECASE,
+)
+
+
+def _effect_key_digest(value: object) -> str:
+    return hashlib.sha256(
+        _normalized(value).encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+
+
+def _effect_quantity(value: object) -> int:
+    """Return an explicit requested effect count above one, else zero."""
+
+    text = _normalized(value)
+    quantity_pattern = "|".join(
+        sorted(_QUANTITY_WORDS, key=len, reverse=True)
+    )
+    confirmed = 0
+    for match in re.finditer(
+        rf"(?<![\w./\\-])(\d{{1,3}}|{quantity_pattern})"
+        r"((?:\s+[a-z0-9_.-]+){0,4})",
+        text,
+    ):
+        word, tail = match.group(1), match.group(2)
+        if word.isdigit():
+            quantity = int(word)
+        else:
+            quantity = int(_QUANTITY_WORDS.get(word, 0))
+        if quantity < 2:
+            continue
+        noun = ""
+        for token in tail.split()[:4]:
+            token = token.strip(".,;:!?")
+            if not token:
+                continue
+            if token in _FUNCTION_HEAD_TOKENS:
+                continue
+            if token in _MEASURE_NOUNS:
+                break
+            if (
+                token.endswith("s")
+                or _ARTIFACT_NOUN_RE.match(token)
+                or _FILENAME_RE.fullmatch(token)
+            ):
+                noun = token
+                break
+        if not noun:
+            continue
+        confirmed = max(confirmed, quantity)
+    return confirmed
+
+
+_PREDICATE_CONTENT_BOUNDARY_RE = re.compile(
+    r"\b(?:with|containing|contains|avec|contenant)\s+"
+    r"(?:the\s+|le\s+|la\s+|les\s+|du\s+|de\s+|des\s+)?"
+    r"(?:contents?|content|textes?|texte|text|body|message|messages|"
+    r"value|values|valeur|valeurs|label|libelle|libelles)\b"
+    r"|\b(?:contents?|content|textes?|texte|text|body|message|messages|"
+    r"value|values|valeur|valeurs|label|libelle|libelles)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _effect_predicate_source(value: object) -> str:
+    """Return the clause with payload/content descriptions removed.
+
+    Numbers and conjunctions inside a requested file's *content* are not
+    independent requested effects.
+    """
+
+    text = str(value or "")
+    if not text:
+        return ""
+    cut = _PREDICATE_CONTENT_BOUNDARY_RE.search(text)
+    if cut is None:
+        return text
+    return text[:cut.start()]
+
+
+_CONTENT_MARKER_RE = re.compile(
+    r"\b(content|contents|text|body|message|value|label|following|below|"
+    r"contenu|contenus|texte|corps|message|valeur|libelle|suivant|suivants)"
+    r"\s*:?\s*$"
+)
+_TAIL_BOUNDARY_RE = re.compile(
+    r"\s+\b(?:with|containing|contains|content|contents|holding|"
+    r"and\s+(?:write|add|put|fill|populate|save)|"
+    r"avec|contenant|contenu|et\s+(?:ecris|ajoute|remplis))\b"
+)
+
+
+def _is_artifact_candidate(item: str) -> bool:
+    tokens = [token for token in item.split() if token]
+    if not tokens or len(tokens) > 3:
+        return False
+    if tokens[0] in _FUNCTION_HEAD_TOKENS:
+        return False
+    if all(token in _FUNCTION_HEAD_TOKENS for token in tokens):
+        return False
+    if _FILENAME_RE.search(item):
+        return True
+    if _ARTIFACT_NOUN_RE.search(item):
+        return True
+    # Short proper-name style targets ("ProjectX", "alpha", "notes").
+    return len(tokens) == 1 and 2 <= len(tokens[0]) <= 46
+
+
+def _enumerated_effect_targets(value: object) -> tuple[str, ...]:
+    """Return two or more explicitly enumerated artifact targets, if any."""
+
+    text = str(value or "")
+    quoted = [
+        item.strip() for item in _QUOTED_NAME_RE.findall(text)
+        if len(item.strip()) >= 2
+    ]
+    if len(quoted) >= 2:
+        return tuple(dict.fromkeys(quoted))[:12]
+    filenames = [
+        item for item in _FILENAME_RE.findall(text)
+        if len(item) >= 3
+    ]
+    if len(filenames) >= 2:
+        return tuple(dict.fromkeys(filenames))[:12]
+    normalized = _normalized(text)
+    tail = ""
+    named = _NAMED_TARGET_RE.search(normalized)
+    if named is not None and not re.match(
+        r"^(?:inside|in|within|dans|sur|with|avec|at|on|to)\b", named.group(1),
+    ):
+        tail = named.group(1)
+    else:
+        colon = _COLON_LIST_RE.search(text)
+        if colon is not None and not _CONTENT_MARKER_RE.search(
+            _normalized(text[:colon.start()]),
+        ):
+            tail = _normalized(colon.group(1))
+    if not tail:
+        return ()
+    tail = _TAIL_BOUNDARY_RE.split(tail)[0]
+    tail = re.split(r"[.!?]\s", tail)[0].strip(" .?!,;:")
+    parts = [
+        item.strip(" .?!,;:")
+        for item in _ENUM_SPLIT_RE.split(tail)
+        if item.strip(" .?!,;:")
+    ]
+    candidates = [item for item in parts if _is_artifact_candidate(item)]
+    if len(candidates) < 2:
+        return ()
+    return tuple(dict.fromkeys(candidates))[:12]
+
+
+def _has_explicit_effect_identity(value: object) -> bool:
+    """True when the clause names at least one concrete requested artifact."""
+
+    text = str(value or "")
+    if _enumerated_effect_targets(text):
+        return True
+    if _QUOTED_NAME_RE.search(text):
+        return True
+    if _FILENAME_RE.search(text):
+        return True
+    if _NAMED_TARGET_RE.search(_normalized(text)):
+        return True
+    if re.search(r"\b(?:https?://|www\.)[^\s]+", text, re.IGNORECASE):
+        return True
+    if _effect_quantity(text) > 1 and _ARTIFACT_NOUN_RE.search(
+        _normalized(text),
+    ):
+        # "write two files" names concrete artifacts; "list 3 ideas" does not.
+        return True
+    match = _ARTIFACT_NOUN_RE.search(_normalized(text))
+    if match is None:
+        return False
+    remainder = _normalized(text)[match.end():].strip(" .?!,;:")
+    if not remainder:
+        return False
+    first = remainder.split()[0]
+    return bool(
+        first not in _FUNCTION_HEAD_TOKENS
+        and first not in _MEASURE_NOUNS
+        and len(first) >= 2
+    )
+
+
+def _effect_content_tokens(value: object) -> list[str]:
+    return [
+        token.strip(":;,?!()[]{}") for token in _normalized(value).split()
+    ]
+
+
+def _residual_predicate_fragments(value: object) -> tuple[str, ...]:
+    """Return coordinated predicates the single parsed action cannot cover.
+
+    A fragment that only re-states the same artifact list (``and a README``,
+    ``and populate them``) folds into the parsed action.  A fragment that
+    introduces its own object (``and build the requested structure``) is a
+    distinct requested outcome that no single primitive receipt establishes.
+    """
+
+    fragments = _RESIDUAL_SPLIT_RE.split(str(value or ""))
+    if len(fragments) <= 1:
+        return ()
+    found: list[str] = []
+    for fragment in fragments[1:]:
+        tokens = [token for token in _effect_content_tokens(fragment) if token]
+        if not tokens:
+            continue
+        head = tokens[0]
+        if head in _FUNCTION_HEAD_TOKENS:
+            continue
+        if head in _MEASURE_NOUNS:
+            continue
+        remainder = [
+            token for token in tokens[1:]
+            if token not in _FUNCTION_HEAD_TOKENS
+        ]
+        if not remainder:
+            # Pure pronominal back-reference ("populate them") modifies the
+            # already parsed artifacts instead of requesting a new outcome.
+            continue
+        found.append(_bounded(" ".join(tokens), 160))
+    return tuple(dict.fromkeys(found))
+
+
+def _effect_slot_key(value: object) -> str:
+    """Return a stable artifact-slot key that preserves filenames intact."""
+
+    return re.sub(r"[^a-z0-9._-]+", "", _normalized(value))
+
+
+def _unclassified_requires_bound_verification(node: SemanticActionNode) -> bool:
+    """Return whether a required clause carries no classified action evidence.
+
+    A receipt must never prove such a clause merely because some words or
+    targets happen to overlap: the runtime cannot establish the required
+    effect it cannot classify.  Only fresh bound verification evidence, or
+    explicit postcondition verification, may complete it.  Visual-read and
+    conditional nodes have their own exact evidence paths and are excluded.
+    """
+
+    if node.requested_action or not node.requires_execution:
+        return False
+    if node.conditional_mode or node.requires_observation_before_execution:
+        return False
+    return not is_desktop_visual_read_node(node)
+
+
+def _single_effect_target(value: object) -> str:
+    """Return one explicitly named deliverable target, if any.
+
+    Quoted content that is not an artifact is not a target: typing "hello"
+    into a field must not require a receipt for an artifact named hello.
+    """
+
+    text = str(value or "")
+    if not text:
+        return ""
+    predicate = _effect_predicate_source(text) or text
+    filenames = [
+        item for item in _FILENAME_RE.findall(predicate) if len(item) >= 3
+    ]
+    if len(filenames) == 1:
+        return filenames[0]
+    paths = _ABSOLUTE_PATH_RE.findall(predicate)
+    if len(paths) == 1:
+        return paths[0]
+    named = _NAMED_TARGET_RE.search(_normalized(predicate))
+    if named is not None:
+        tail = re.split(r"[.!?]\s", named.group(1))[0].strip(" .?!,;:")
+        tail = _TAIL_BOUNDARY_RE.split(tail)[0].strip(" .?!,;:")
+        candidate = tail.split(",")[0].strip(" .?!,;:")
+        if (
+            candidate
+            and 2 <= len(candidate) <= 46
+            and not candidate.startswith(("\"", "'", "\u201c"))
+            and not all(
+                token in _FUNCTION_HEAD_TOKENS
+                for token in candidate.split()
+            )
+        ):
+            return candidate
+    normalized = _normalized(predicate)
+    for match in _ARTIFACT_NOUN_RE.finditer(normalized):
+        remainder_raw = normalized[match.end():]
+        if remainder_raw.lstrip().startswith("."):
+            continue
+        tokens = remainder_raw.strip(" .?!,;:").split()
+        while tokens and tokens[0] in _ARTIFACT_CONNECTOR_TOKENS:
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        first = tokens[0]
+        if (
+            first in _FUNCTION_HEAD_TOKENS
+            or first in _MEASURE_NOUNS
+            or first in _OBSERVATION_GENERIC_NOUNS
+            or first in _FILE_EXTENSION_TOKENS
+            or len(first) < 2
+        ):
+            continue
+        original_token = ""
+        for raw_token in re.finditer(r"[A-Za-z0-9_.\-]+", text):
+            if raw_token.group(0).lower() == first:
+                original_token = raw_token.group(0)
+                break
+        if not original_token or not (
+            any(character.isupper() for character in original_token)
+            or any(character.isdigit() for character in original_token)
+        ):
+            # "Create the file now." is not a named deliverable: only a
+            # distinctive name (proper noun, versioned/artifact-like token)
+            # may become the soft single-target requirement.
+            continue
+        return first
+    return ""
+
+
+def _explicit_effect_keys(node: SemanticActionNode) -> tuple[str, ...]:
+    """Return one key per independently requested effect of one node.
+
+    Empty means the historical single-effect proof model: the node's declared
+    postcondition is the whole requirement.  A non-empty tuple means every key
+    needs its own distinct witness before the node may claim completion.
+    Primitive receipts may never fill ``unresolved:`` or ``residual:`` keys;
+    only explicit full-outcome verification or fresh bound verification
+    evidence can.
+    """
+
+    if not node.requires_execution:
+        return ()
+    if _unclassified_requires_bound_verification(node):
+        clause = node.source_clause or ""
+        predicate_source = _effect_predicate_source(clause) or clause
+        if _has_explicit_effect_identity(predicate_source):
+            return ("residual:" + _effect_key_digest(clause),)
+        return ("unresolved:" + _effect_key_digest(clause),)
+    if node.requested_action not in _EFFECT_ACTIONS:
+        return ()
+    clause = node.source_clause or ""
+    predicate_source = _effect_predicate_source(clause) or clause
+    keys: list[str] = []
+    targets = _enumerated_effect_targets(predicate_source)
+    if len(targets) >= 2:
+        keys.extend(
+            "target:" + (_effect_slot_key(item) or _effect_key_digest(item))
+            for item in targets
+        )
+    else:
+        quantity = _effect_quantity(predicate_source)
+        if quantity > 1:
+            keys.extend(f"unit:{index}" for index in range(1, quantity + 1))
+        elif node.requested_action == "create" and not _has_explicit_effect_identity(
+            predicate_source,
+        ):
+            keys.append("unresolved:" + _effect_key_digest(clause))
+    enumerated_tokens = {
+        _effect_slot_key(item) for item in targets if _effect_slot_key(item)
+    }
+    for fragment in _residual_predicate_fragments(predicate_source):
+        if enumerated_tokens:
+            residue_tokens = _effect_content_tokens(fragment)
+            head = residue_tokens[0] if residue_tokens else ""
+            if head and _effect_slot_key(head) in enumerated_tokens:
+                # "b.txt to the archive" continues the same artifact list.
+                continue
+            object_tokens = residue_tokens[1:]
+            has_backreference = any(
+                token in _PRONOUN_BACKREFS for token in object_tokens
+            )
+            if has_backreference and all(
+                token in _FUNCTION_HEAD_TOKENS
+                or _effect_slot_key(token) in enumerated_tokens
+                for token in object_tokens
+            ):
+                # "populate them: a.txt, b.txt" restates the enumerated
+                # artifacts; it adds no new outcome.
+                continue
+        keys.append("residual:" + _effect_key_digest(fragment))
+    return tuple(dict.fromkeys(keys))
+
+
+def _effect_target_matches(
+    slot_key: str,
+    receipt_targets: Iterable[str],
+) -> bool:
+    """Return whether one receipt target establishes one enumerated slot.
+
+    Matching is exact after normalization (full value or final path segment).
+    Substring matching is never accepted: a receipt for ``nota.txt`` or
+    ``a.txt.bak`` must not discharge the requested ``a.txt``.
+    """
+
+    slot = _effect_slot_key(slot_key)
+    if not slot:
+        return False
+    slot_name = re.split(r"[/\\]", slot)[-1] or slot
+    for candidate in receipt_targets:
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        key = _effect_slot_key(raw)
+        if not key:
+            continue
+        if slot == key:
+            return True
+        basename = _effect_slot_key(re.split(r"[/\\]", raw)[-1])
+        if basename and (slot == basename or slot_name == basename):
+            return True
+    return False
 
 
 def _derive_semantic_node(
@@ -495,9 +1073,34 @@ def _derive_semantic_node(
     action_match = None
     for canonical, pattern in _ACTION_PATTERNS:
         for match in re.finditer(pattern, norm):
+            if canonical == "search":
+                before = norm[max(0, match.start() - 32):match.start()]
+                after = norm[match.end():match.end() + 32]
+                if (
+                    re.search(
+                        r"\b(?:bar|box|field|control|barre|champ|zone|"
+                        r"controle)\s+(?:de|of)\s*$",
+                        before,
+                    )
+                    or re.match(
+                        r"\s+(?:bar|box|field|control|barre|champ|zone|"
+                        r"controle)\b",
+                        after,
+                    )
+                ):
+                    continue
+            french_click_pronoun = bool(
+                canonical == "activate"
+                and match.group(0) == "clique"
+                and re.match(r"-(?:le|la|les)\b", norm[match.end():])
+            )
             if (
                 (match.start() > 0 and norm[match.start() - 1] in "-_")
-                or (match.end() < len(norm) and norm[match.end()] in "-_")
+                or (
+                    match.end() < len(norm)
+                    and norm[match.end()] in "-_"
+                    and not french_click_pronoun
+                )
                 or any(
                     start <= match.start() < end
                     for start, end in negative_spans
@@ -514,8 +1117,9 @@ def _derive_semantic_node(
         target = _bounded(quoted[-1], 160)
     if action == "search" and not quoted:
         search_match = re.search(
-            r"\b(?:search(?:\s+for)?|find|look\s+for|cherche(?:r)?|"
-            r"recherche(?:r)?)\b\s+(?:for\s+|pour\s+)?(.{1,220})$",
+            r"\b(?:search(?:\s+for)?|find|look\s+for|locate|"
+            r"cherche(?:r)?|recherche(?:r)?|trouve(?:r)?)\b\s+"
+            r"(?:for\s+|pour\s+)?(.{1,220})$",
             norm,
         )
         if search_match:
@@ -536,7 +1140,8 @@ def _derive_semantic_node(
             r"(?:[;!?]|\.(?:\s+|$))", candidate, maxsplit=1,
         )[0].strip()
         candidate = re.sub(
-            r"^(?:to|for|on|at|in|the|a|an|le|la|les|un|une|des|du|de|a|au|aux)\s+",
+            r"^(?:to|for|on|at|in|the|a|an|le|la|les|un|une|des|du|de|"
+            r"a|au|aux|sur|dans)\s+",
             "",
             candidate,
         )
@@ -547,6 +1152,13 @@ def _derive_semantic_node(
         )[0].strip(" .?!,;:")
         if candidate:
             target = _bounded(candidate, 160)
+    click_pronoun_target = re.search(
+        r"\b(?:control|controle|button|bouton)\s+(.{1,160}?)\s+"
+        r"(?:and|et)\s+clique-(?:le|la|les)\b",
+        norm,
+    )
+    if action == "activate" and click_pronoun_target is not None:
+        target = _bounded(click_pronoun_target.group(1), 160)
     if not target:
         target = application or surface or _bounded(source, 160)
 
@@ -563,6 +1175,16 @@ def _derive_semantic_node(
             success = f"{target} is visible in the search results"
             if where:
                 success += f" on {where}"
+        elif action == "activate" and re.search(
+            r"\b(?:search\s+(?:bar|box|field)|(?:bar|box|field)\s+(?:for\s+)?"
+            r"search|barre\s+de\s+recherche|champ\s+de\s+recherche|"
+            r"zone\s+de\s+recherche)\b",
+            norm,
+        ):
+            success = (
+                f"{application or 'the target application'} search field is "
+                "visibly focused and ready for typing"
+            )
         elif action in {"open", "navigate"}:
             success = f"{where or target} is visibly open at the requested destination"
         elif action:
@@ -575,8 +1197,13 @@ def _derive_semantic_node(
         or surface
         or re.search(
             r"\b(click|type|calculate|compute|calculer|calcule|send|submit|"
-            r"create|delete|remove|open|launch|"
-            r"navigate|search|clique|saisis|envoie|cree|supprime|ouvre|lance|va)\b",
+            r"create|build|make|develop|generate|produce|implement|assemble|"
+            r"construct|copy|move|download|upload|delete|remove|open|launch|"
+            r"navigate|search|find|look\s+for|locate|cherche|recherche|trouve|"
+            r"click|clique|"
+            r"type|enter|write|saisis|ecris|tape|edit|modify|append|populate|"
+            r"fill|modifie|modifier|remplis|remplir|read|observe|inspect|"
+            r"releve|lis|envoie|cree|supprime|ouvre|lance|va)\b",
             norm,
         )
     )
@@ -584,17 +1211,32 @@ def _derive_semantic_node(
         action == "create"
         and not application
         and not surface
+        and not _has_explicit_effect_identity(norm)
         and not re.search(
             r"\b(file|folder|directory|spreadsheet|workbook|document|pdf|"
             r"presentation|slides?|calendar|event|reminder|scheduled task|"
-            r"account|record|database|table|project|issue|ticket|fichier|"
-            r"dossier|repertoire|classeur|feuille de calcul|document|"
+            r"account|record|database|table|project|issue|ticket|"
+            r"app|apps|application|website|web\s*site|site|program|script|"
+            r"tool|package|module|library|api|service|server|bot|game|"
+            r"structure|system|dashboard|flow|"
+            r"fichier|dossier|repertoire|classeur|feuille de calcul|document|"
             r"presentation|diapos?|calendrier|evenement|rappel|tache|compte|"
-            r"enregistrement|base de donnees|tableau|projet|ticket)\b",
+            r"enregistrement|base de donnees|tableau|projet|ticket|"
+            r"application|site|programme|script|outil|paquet|module|"
+            r"bibliotheque|service|serveur|jeu|structure|systeme|tableau de bord)\b",
             norm,
         )
     ):
         requires_execution = False
+    if (
+        action == "observe"
+        and not application
+        and not surface
+        and re.search(_OBSERVABLE_TARGET_RE, norm)
+    ):
+        # "List the folder contents" observes external state and needs a real
+        # read; "list three benefits" stays a text answer.
+        requires_execution = True
     required = explicit_postconditions or (success,)
     payload = {
         "target_object": target,
@@ -641,40 +1283,648 @@ def derive_semantic_goal(
 
 
 _ACTION_WORDS = (
-    r"search|find|look\s+for|cherche|chercher|recherche|rechercher|"
+    r"read|observe|inspect|releve|relever|lis|lire|"
+    r"search|find|look\s+for|locate|cherche|chercher|recherche|rechercher|"
+    r"trouve|trouver|"
     r"open|launch|start|ouvre|ouvrir|lance|lancer|demarre|demarrer|"
-    r"go\s+to|navigate|visit|va\s+a|aller\s+a|rends\s+toi|accede|"
+    r"reach|go\s+(?:to|into|on)|navigate|visit|va\s+(?:a|dans|sur)|"
+    r"aller\s+(?:a|dans|sur)|rends\s+toi|accede|"
     r"click|select|activate|clique|selectionne|active|"
-    r"type|enter|write|saisis|ecris|tape|calculate|compute|calculer|calcule|"
+    r"type|enter|write|saisis|ecris|écris|ecrire|écrire|tape|"
+    r"calculate|compute|calculer|calcule|"
     r"send|submit|envoie|envoyer|"
     r"create|add|cree|creer|ajoute|ajouter|delete|remove|supprime|efface|"
     r"do|perform|execute|run|check|verify|confirm|report|"
-    r"faire|effectuer|executer|verifier|confirmer|rapporter"
+    r"list|show|display|fill|save|put|place|move|copy|rename|"
+    r"download|upload|zip|unzip|edit|update|append|write|read|"
+    r"faire|effectuer|executer|verifier|confirmer|rapporter|"
+    r"liste|lister|affiche|montre|remplis|sauvegarde|place|deplace|"
+    r"copie|renomme|telecharge|modifie|mets"
 )
 _ACTION_SPLIT_PATTERN = re.compile(
     rf"(?:\s*;\s*|\s*\.(?:\s+|$)\s*|"
-    rf"\s*,?\s*\b(?:and\s+then|then|puis|ensuite)\b\s*|"
+    rf"\s*,?\s*\b(?:and\s+then|then|puis|ensuite|apres|après)\b\s*|"
+    rf"\s*,\s*(?:and|et)\s+(?=(?:{_ACTION_WORDS})\b)|"
     rf"\s*,\s*(?=(?:{_ACTION_WORDS})\b)|"
     rf"\s+\b(?:and|et)\b\s+(?=(?:{_ACTION_WORDS})\b))",
     re.IGNORECASE,
 )
 
 
+def _coalesce_verification_clauses(clauses: Iterable[str]) -> list[str]:
+    values = list(clauses)
+    merged: list[str] = []
+    index = 0
+    while index < len(values):
+        clause = values[index]
+        if (
+            merged
+            and re.match(
+                r"^\s*(?:otherwise|else|sinon)\b",
+                _normalized(clause),
+            )
+        ):
+            merged[-1] = _bounded(merged[-1] + "; " + clause, 500)
+            index += 1
+            continue
+        if (
+            index + 1 < len(values)
+            and re.fullmatch(
+                r"(?:verify|check|confirm|verifie|verifier|confirme|confirmer)",
+                _normalized(clause).strip(" .?!,;:"),
+            )
+        ):
+            merged.append(clause + " " + values[index + 1])
+            index += 2
+            continue
+        merged.append(clause)
+        index += 1
+    return merged
+
+
+_CONDITIONAL_ACTION_RE = re.compile(
+    r"\b(?:click|select|activate|press|clique|selectionne|active|appuie|"
+    r"install|installe|installer|launch|start|run|play|lance|lancer|"
+    r"demarre|demarrer|joue|jouer)\b",
+    re.IGNORECASE,
+)
+
+
+def _canonical_conditional_target(action: str, remainder: str) -> str:
+    """Return one outcome label without binding it to a specific UI recipe."""
+
+    normalized_action = _normalized(action)
+    if normalized_action in {"install", "installe", "installer"}:
+        return "install"
+    if normalized_action in {
+        "launch", "start", "run", "play", "lance", "lancer",
+        "demarre", "demarrer", "joue", "jouer",
+    }:
+        return "play"
+    target = re.sub(
+        r"^(?:on|sur|the|le|la|les|un|une)(?:\s+|$)", "",
+        remainder.strip(),
+    ).strip(" .?!,;:")
+    target = re.split(
+        r"\b(?:if|si|otherwise|else|sinon)\b", target, maxsplit=1,
+    )[0].strip(" .?!,;:")
+    return _bounded(target, 80)
+
+
+def _conditional_action_targets(fragment: str) -> list[str]:
+    """Extract ordered branch outcomes from one bounded conditional fragment."""
+
+    normalized = _normalized(fragment)
+    matches = list(_CONDITIONAL_ACTION_RE.finditer(normalized))
+    targets: list[str] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(normalized)
+        target = _canonical_conditional_target(
+            match.group(0), normalized[match.end():end],
+        )
+        if target and target not in targets:
+            targets.append(target)
+    return targets
+
+
+def _conditional_branch(
+    target: str,
+    *,
+    priority: int,
+    condition: str,
+    requested_action: str = "activate",
+) -> dict[str, Any]:
+    material = f"{priority}:{condition}:{requested_action}:{target}"
+    return {
+        "branch_id": "branch_" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()[:16],
+        "priority": priority,
+        "condition": condition,
+        "requested_action": requested_action,
+        "target": _bounded(target, 80),
+    }
+
+
+def _conditional_branch_spec(clause: str) -> tuple[dict[str, Any], ...]:
+    """Represent explicit conditional outcomes without choosing a UI recipe."""
+
+    normalized = _normalized(clause).strip(" .?!,;:")
+    condition_match = re.search(
+        r"\b(?:if|si)\b|\bs['’]?il\b", normalized,
+    )
+    if condition_match is None:
+        return ()
+    alternative_match = re.search(
+        r"\b(?:otherwise|else|sinon)\b", normalized,
+    )
+    if alternative_match is not None:
+        left = normalized[:alternative_match.start()]
+        right = normalized[alternative_match.end():]
+        left_targets = _conditional_action_targets(left)
+        right_targets = _conditional_action_targets(right)
+        if not left_targets or not right_targets:
+            return ()
+        primary = left_targets[-1]
+        fallback = right_targets[-1]
+    else:
+        targets = _conditional_action_targets(normalized)
+        if len(targets) >= 2:
+            primary, fallback = targets[0], targets[-1]
+        elif len(targets) == 1:
+            primary, fallback = targets[0], "no_action_required"
+        else:
+            return ()
+    if not primary or not fallback or primary == fallback:
+        return ()
+    if {primary, fallback} == {"play", "install"}:
+        primary, fallback = "play", "install"
+    return (
+        _conditional_branch(
+            primary, priority=0, condition="target_available",
+        ),
+        _conditional_branch(
+            fallback,
+            priority=1,
+            condition="fallback_if_prior_unavailable_and_target_available",
+            requested_action=(
+                "observe" if fallback == "no_action_required" else "activate"
+            ),
+        ),
+    )
+
+
+def _conditional_semantic_node(
+    clause: str,
+    branches: tuple[dict[str, Any], ...],
+) -> SemanticActionNode:
+    targets = " or ".join(str(item["target"]) for item in branches)
+    has_observation_only_branch = any(
+        item.get("requested_action") == "observe" for item in branches
+    )
+    postcondition = (
+        "the observed condition is resolved by the applicable action or by "
+        "grounded proof that no action is required"
+        if has_observation_only_branch else
+        f"the visibly available conditional branch ({targets}) is observably activated"
+    )
+    material = json.dumps(
+        {"clause": _bounded(clause, 500), "branches": branches},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return SemanticActionNode(
+        target_object=_bounded(targets, 160),
+        required_application="",
+        required_surface="",
+        required_account="",
+        requested_action="activate",
+        observable_success_postcondition=_bounded(postcondition, 320),
+        fingerprint=hashlib.sha256(material.encode("utf-8")).hexdigest()[:24],
+        requires_execution=True,
+        required_postconditions=(_bounded(postcondition, 320),),
+        source_clause=_bounded(clause, 500),
+        conditional_mode="exactly_one_observed_branch",
+        conditional_branches=branches,
+        requires_observation_before_execution=True,
+    )
+
+
+def _split_embedded_condition_clause(clause: str) -> tuple[str, str] | None:
+    """Separate a prerequisite outcome from a following condition-first branch."""
+
+    condition = re.search(
+        r"\bif\b|\bsi\b|\bs['’]?il\b", clause, flags=re.IGNORECASE,
+    )
+    if condition is None:
+        return None
+    prefix = clause[:condition.start()].strip(" ,;:")
+    conditional = clause[condition.start():].strip(" ,;:")
+    alternative = re.search(
+        r"\b(?:otherwise|else|sinon)\b", conditional, flags=re.IGNORECASE,
+    )
+    condition_body = (
+        conditional[:alternative.start()] if alternative is not None
+        else conditional
+    )
+    if (
+        prefix
+        and _derive_semantic_node(prefix).requested_action
+        and _derive_semantic_node(condition_body).requested_action
+    ):
+        return prefix, conditional
+    prefix_actions = list(re.finditer(
+        rf"\b(?:{_ACTION_WORDS})\b", prefix, flags=re.IGNORECASE,
+    ))
+    if len(prefix_actions) < 2:
+        return None
+    branch_start = prefix_actions[-1].start()
+    prerequisite = prefix[:branch_start].strip(" ,;:")
+    prerequisite = re.sub(
+        r"(?:,?\s*(?:and|et))?\s*(?:finally|finalement|enfin)\s*$",
+        "",
+        prerequisite,
+        flags=re.IGNORECASE,
+    ).strip(" ,;:")
+    conditional = (prefix[branch_start:] + " " + conditional).strip()
+    return (prerequisite, conditional) if prerequisite else None
+
+
+def _split_compound_surface_progression(clause: str) -> tuple[str, str] | None:
+    """Split a surface transition from a later content-locating subgoal."""
+
+    normalized = _normalized(clause)
+    locate = re.search(
+        r"\b(?:search|find|look\s+for|locate|cherche|recherche|trouve)\b",
+        normalized,
+    )
+    if locate is None:
+        return None
+    surface_match = next((
+        match
+        for aliases in _SURFACE_ALIASES.values()
+        for alias in aliases
+        if (match := re.search(rf"\b{re.escape(alias)}\b", normalized))
+        and match.end() <= locate.start()
+    ), None)
+    if surface_match is None:
+        return None
+    prefix = clause[:surface_match.end()].strip(" ,;:")
+    suffix = clause[locate.start():].strip(" ,;:")
+    if not (
+        prefix
+        and suffix
+        and _derive_semantic_node(prefix).requested_action in {
+            "open", "navigate", "activate",
+        }
+        and _derive_semantic_node(suffix).requested_action == "search"
+    ):
+        return None
+    return prefix, suffix
+
+
+def _semantic_target_is_contextual(value: object) -> bool:
+    normalized = _normalized(value).strip(" .?!,;:")
+    return bool(
+        not normalized
+        or re.fullmatch(
+            r"(?:it|its|this|that|them|sa|son|ses|ce|cette|ces)?\s*"
+            r"(?:page|details?|result|resultat|entry|entree)",
+            normalized,
+        )
+        or normalized in {
+            "it", "its", "this", "that", "them", "lui", "le", "la",
+            "les", "sa page", "son detail", "ses details",
+        }
+    )
+
+
+def _dependent_semantic_target(
+    previous: SemanticActionNode,
+    current: SemanticActionNode,
+) -> str:
+    previous_target = _bounded(previous.target_object, 160)
+    current_target = _bounded(current.target_object, 160)
+    surface_aliases = tuple(
+        alias for aliases in _SURFACE_ALIASES.values() for alias in aliases
+    )
+    current_target = re.sub(
+        r"\s+(?:in|inside|dans|sur)\s+(?:(?:the|le|la|les)\s+)?"
+        rf"(?:{'|'.join(re.escape(alias) for alias in surface_aliases)})$",
+        "",
+        current_target,
+        flags=re.IGNORECASE,
+    ).strip(" .?!,;:")
+    if _semantic_target_is_contextual(current_target):
+        return previous_target or current_target
+    previous_key = _normalized(previous_target)
+    current_key = _normalized(current_target)
+    if previous_key and (
+        previous_key in current_key
+        or re.sub(r"^(?:the|le|la|les|un|une)\s+", "", previous_key)
+        == current_key
+        or re.search(r"\b(?:page|details?|result|resultat)\b", current_key)
+    ):
+        return previous_target
+    return current_target or previous_target
+
+
+def _page_content_target(clause: str) -> str:
+    """Extract the subject of an explicitly requested details page."""
+
+    match = re.search(
+        r"\b(?:open|ouvre|ouvrir)\b\s+"
+        r"(?:(?:(?:the|la|le)\s+)?page\s+(?:of|for|de)\s+(.+?)|"
+        r"(.+?)(?:'s|s')\s+page)"
+        r"\s*$",
+        clause.strip(" .?!,;:"),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return ""
+    target = next(
+        (group for group in match.groups() if group is not None), "",
+    )
+    return _bounded(target.strip(" .?!,;:\"'"), 160)
+
+
+def _conditional_subject_node(
+    clause: str,
+    branches: tuple[dict[str, Any], ...],
+    *,
+    application: str,
+    surface: str,
+) -> SemanticActionNode | None:
+    """Recover a named subject whose final outcome is itself conditional."""
+
+    quoted = [
+        next(group for group in match.groups() if group is not None)
+        for match in re.finditer(
+            r'\"([^\"]{1,160})\"|[\u201c\u00ab]([^\u201d\u00bb]{1,160})'
+            r"[\u201d\u00bb]|(?<!\w)'([^']{1,160})'(?!\w)",
+            clause,
+        )
+    ]
+    if quoted:
+        target = _bounded(quoted[0], 160)
+        subject_clause = clause[:clause.find(quoted[0]) + len(quoted[0]) + 1]
+    else:
+        condition = re.search(
+            r"\b(?:if|si)\b|\bs['’]?il\b", clause, flags=re.IGNORECASE,
+        )
+        subject_clause = (
+            clause[:condition.start()] if condition is not None else clause
+        ).split(",", 1)[0]
+        candidate = _derive_semantic_node(subject_clause)
+        if not candidate.requested_action:
+            return None
+        target = _bounded(candidate.target_object, 160)
+    branch_targets = {
+        _normalized(item.get("target")) for item in branches
+        if isinstance(item, dict)
+    }
+    if (
+        not target
+        or _normalized(target) in branch_targets
+        or _semantic_target_is_contextual(target)
+        or _looks_like_ui_surface_reference(target)
+    ):
+        return None
+    where = " ".join(item for item in (application, surface) if item)
+    postcondition = _bounded(
+        f"{target} details are visibly open"
+        + (f" in {where}" if where else ""),
+        320,
+    )
+    material = json.dumps(
+        {"target": target, "application": application, "surface": surface},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return SemanticActionNode(
+        target_object=target,
+        required_application=application,
+        required_surface=surface,
+        required_account="",
+        requested_action="open",
+        observable_success_postcondition=postcondition,
+        fingerprint=hashlib.sha256(material.encode("utf-8")).hexdigest()[:24],
+        requires_execution=True,
+        required_postconditions=(postcondition,),
+        source_clause=_bounded(subject_clause, 500),
+    )
+
+
+def _merge_dependent_semantic_nodes(
+    previous: SemanticActionNode,
+    current: SemanticActionNode,
+    *,
+    clause: str,
+    current_application: str,
+    current_surface: str,
+) -> SemanticActionNode:
+    """Compile dependent UI operations into one observable semantic outcome."""
+
+    source = _bounded(previous.source_clause + " and " + clause, 500)
+    merged = _derive_semantic_node(source)
+    merged.required_application = (
+        current.required_application
+        or previous.required_application
+        or current_application
+    )
+    merged.required_surface = (
+        current.required_surface
+        or previous.required_surface
+        or current_surface
+    )
+    merged.required_account = current.required_account or previous.required_account
+    merged.target_object = _dependent_semantic_target(previous, current)
+    previous_content = _bounded(previous.requested_content, 160)
+    if previous_content and (
+        _normalized(merged.target_object)
+        == re.sub(
+            r"^(?:the|le|la|les|un|une)\s+",
+            "",
+            _normalized(previous_content),
+        )
+    ):
+        merged.target_object = previous_content
+    merged.requested_content = (
+        current.requested_content or previous.requested_content
+    )
+    if (
+        current.requested_action in {"open", "activate", "navigate"}
+        and not _looks_like_ui_surface_reference(current.target_object)
+    ):
+        merged.requested_action = "open"
+        where = " ".join(
+            item for item in (
+                merged.required_application, merged.required_surface,
+            ) if item
+        )
+        merged.observable_success_postcondition = _bounded(
+            f"{merged.target_object} details are visibly open"
+            + (f" in {where}" if where else ""),
+            320,
+        )
+        merged.required_postconditions = (
+            merged.observable_success_postcondition,
+        )
+    return merged
+
+
+def _looks_like_ui_surface_reference(value: object) -> bool:
+    normalized = re.sub(
+        r"^(?:the|a|an|le|la|les|un|une|du|de|des|my|mon|ma|mes|"
+        r"on|in|inside|dans|sur)\s+",
+        "",
+        _normalized(value).strip(" .?!,;:"),
+    )
+    if not normalized:
+        return False
+    surface_head = re.split(
+        r"\b(?:and|et|then|puis|ensuite|verify|check|confirm|"
+        r"verifie|confirme)\b",
+        normalized,
+        maxsplit=1,
+    )[0].strip()
+    if any(
+        surface_head == alias
+        for aliases in _SURFACE_ALIASES.values()
+        for alias in aliases
+    ):
+        return True
+    return bool(re.search(
+        r"(?:\b(?:search|address|text|input|recherche|adresse)\b.{0,32}"
+        r"\b(?:bar|box|field|control|barre|champ|zone|controle)\b|"
+        r"\b(?:bar|box|field|button|tab|menu|pane|toolbar|sidebar|control|"
+        r"barre|champ|zone|bouton|onglet|panneau|controle)\b.{0,32}"
+        r"\b(?:search|address|text|input|recherche|adresse)\b)",
+        normalized,
+    ))
+
+
+def _targets_required_surface(node: SemanticActionNode) -> bool:
+    aliases = _SURFACE_ALIASES.get(node.required_surface, ())
+    target = re.sub(
+        r"^(?:the|a|an|le|la|les|un|une|my|mon|ma|mes|on|in|inside|"
+        r"dans|sur)\s+",
+        "",
+        _normalized(node.target_object).strip(" .?!,;:"),
+    )
+    return bool(
+        node.required_surface
+        and node.requested_action in {"open", "navigate", "activate", "search"}
+        and any(
+            target == alias
+            or re.fullmatch(
+                rf"(?:game|games|jeu|jeux)?\s*{re.escape(alias)}", target,
+            )
+            or re.fullmatch(
+                rf"{re.escape(alias)}\s+(?:in|inside|dans|sur)\s+.+",
+                target,
+            )
+            for alias in aliases
+        )
+    )
+
+
+def _requires_bounded_click_type_sequence(
+    node: SemanticActionNode | None,
+) -> bool:
+    """Intermediate V4 actions are model-selected, never parser-mandated."""
+
+    return False
+
+
+def _explicit_web_application(clause: str) -> str:
+    normalized = _normalized(clause)
+    if re.search(
+        r"\b(?:on|sur|dans)\s+(?:(?:the|le)\s+)?web\b|"
+        r"\b(?:on|sur|via|dans)\s+(?:google|bing|duckduckgo|"
+        r"a\s+web\s+browser|un\s+navigateur)\b|"
+        r"\b(?:web\s+search|recherche\s+web)\b",
+        normalized,
+    ):
+        return "browser"
+    return ""
+
+
 def _explicit_application(clause: str, node: SemanticActionNode) -> str:
+    norm = _normalized(clause)
+    if node.conditional_mode:
+        return ""
+    web_application = _explicit_web_application(clause)
+    if web_application:
+        return web_application
     if node.required_application:
         return node.required_application
-    norm = _normalized(clause)
+    context_only = re.fullmatch(
+        r"(?:in|inside|dans|sur)\s+([a-z0-9_.-]{1,80})",
+        norm,
+    )
+    if context_only and context_only.group(1) not in {
+        "a", "an", "browser", "desktop", "page", "site", "the", "web",
+    }:
+        return _bounded(_canonical_application(context_only.group(1)), 80)
+    leading = re.match(
+        r"^(?:in|inside|dans|sur)\s+"
+        r"([a-z0-9_.-]{1,80})(?:\s*[,;:]|\s+(?=(?:click|select|"
+        r"activate|type|send|search|clique|selectionne|active|saisis|"
+        r"envoie|cherche|read|observe|inspect|releve|lis)\b))",
+        norm,
+    )
+    if leading and leading.group(1) not in {
+        "a", "an", "browser", "desktop", "page", "site", "the", "web",
+    }:
+        return _bounded(_canonical_application(leading.group(1)), 80)
     if node.requested_action == "open":
         target = _normalized(node.target_object)
         target = re.sub(r"^(?:the|a|an|le|la|les|un|une)\s+", "", target)
-        return _bounded(_canonical_application(target), 80)
-    if node.requested_action in {"type", "send", "create"}:
-        match = re.search(
-            r"\b(?:in|into|inside|dans|sur)\s+([^,.;]{1,80})$", norm,
-        )
-        if match:
-            return _bounded(match.group(1).strip(), 80)
+        if target and not _looks_like_ui_surface_reference(target):
+            return _bounded(_canonical_application(target), 80)
+    if node.requested_action in {
+        "activate", "click", "create", "observe", "search", "select", "send", "type",
+    }:
+        matches = list(re.finditer(
+            r"(?=\b(?:in|into|inside|dans|on|sur)\s+([^,.;]{1,80})$)",
+            norm,
+        ))
+        if matches:
+            candidate = matches[-1].group(1).strip()
+            if (
+                candidate not in {
+                    "a", "an", "browser", "desktop", "page", "site", "the",
+                    "web",
+                }
+                and not _looks_like_ui_surface_reference(candidate)
+                and not _semantic_target_is_contextual(candidate)
+                and not _ABSOLUTE_PATH_RE.search(candidate)
+                and not re.search(
+                    r"\b(?:page|details?|result|resultat|entry|entree)\b",
+                    candidate,
+                )
+            ):
+                if not re.search(
+                    r"\b(?:if|si|otherwise|else|sinon)\b",
+                    candidate,
+                ):
+                    return _bounded(candidate, 80)
     return ""
+
+
+def _dependent_application_in_context(
+    clause: str,
+    node: SemanticActionNode,
+    *,
+    current_application: str,
+    current_surface: str,
+) -> bool:
+    """Keep content navigation inside an already established app/surface."""
+
+    if (
+        not current_application
+        or node.requested_action not in {"open", "navigate", "activate"}
+    ):
+        return False
+    normalized = _normalized(clause)
+    if _explicit_web_application(clause):
+        return False
+    if any(
+        re.search(rf"\b{re.escape(item)}\b", normalized)
+        for item in _KNOWN_APPLICATIONS
+    ):
+        return False
+    if current_surface:
+        return True
+    if node.required_surface and _targets_required_surface(node):
+        return True
+    return bool(re.search(
+        r"\b(?:page|details?|result|resultat|entry|entree)\b",
+        normalized,
+    ))
 
 
 def _open_list_targets(clause: str) -> tuple[str, ...]:
@@ -717,11 +1967,69 @@ def _node_with_identity(
 ) -> SemanticActionNode:
     if application:
         node.required_application = _canonical_application(application)
-        if node.requested_action == "open":
+        if (
+            node.requested_action == "open"
+            and not node.required_surface
+            and _normalized(node.target_object)
+            == _normalized(application)
+        ):
             node.target_object = _bounded(application, 160)
+    if node.requested_action == "type" and not node.requested_content:
+        typed_matches = list(re.finditer(
+            r"\b(?:type|enter|write|saisis|ecris|tape)\b\s+"
+            r"(.{1,320})$",
+            _normalized(clause),
+        ))
+        if typed_matches:
+            typed_content = re.split(
+                r"\b(?:and|et|then|puis|ensuite|apres)\b",
+                typed_matches[-1].group(1),
+                maxsplit=1,
+            )[0].strip(" .?!,;:")
+            node.requested_content = _bounded(typed_content, 320)
+    if (
+        node.required_application
+        and node.requested_action == "activate"
+        and "search field is visibly focused" in node.observable_success_postcondition
+    ):
+        node.observable_success_postcondition = _bounded(
+            f"{node.required_application} search field is visibly focused "
+            "and ready for typing",
+            320,
+        )
+        node.required_postconditions = (
+            node.observable_success_postcondition,
+        )
     if postcondition:
         node.observable_success_postcondition = _bounded(postcondition, 320)
         node.required_postconditions = (node.observable_success_postcondition,)
+    elif (
+        node.requested_action == "type"
+        and _looks_like_ui_surface_reference(clause)
+        and (node.requested_content or node.target_object)
+    ):
+        query = node.requested_content or node.target_object
+        node.observable_success_postcondition = _bounded(
+            f"{node.required_application or 'the target application'} visibly "
+            f"shows search results for {query}",
+            320,
+        )
+        node.required_postconditions = (
+            node.observable_success_postcondition,
+        )
+    elif (
+        node.requested_action == "activate"
+        and not node.conditional_mode
+        and re.search(r"\b(?:game|jeu|result|resultat)\b", _normalized(clause))
+    ):
+        node.observable_success_postcondition = _bounded(
+            f"{node.required_application or 'the target application'} visibly "
+            "shows the selected result details",
+            320,
+        )
+        node.required_postconditions = (
+            node.observable_success_postcondition,
+        )
     node.order = order
     node.source_clause = _bounded(clause, 500)
     node.node_id = "node_" + hashlib.sha256(
@@ -796,13 +2104,30 @@ def derive_semantic_mission(
     explicit_postconditions = tuple(
         _bounded(item, 320) for item in postconditions if _bounded(item, 320)
     )
-    clauses = [
+    initially_split = [
         item.strip(" ,") for item in _ACTION_SPLIT_PATTERN.split(source)
         if item.strip(" ,")
     ] or [source]
+    semantic_clauses: list[str] = []
+    for clause in initially_split:
+        surface_parts = _split_compound_surface_progression(clause)
+        if surface_parts is None:
+            semantic_clauses.append(clause)
+        else:
+            semantic_clauses.extend(surface_parts)
+    raw_clauses = _coalesce_verification_clauses(semantic_clauses)
+    clauses: list[str] = []
+    for clause in raw_clauses:
+        conditional_parts = _split_embedded_condition_clause(clause)
+        if conditional_parts is None:
+            clauses.append(clause)
+        else:
+            clauses.extend(conditional_parts)
     nodes: list[SemanticActionNode] = []
     current_application = ""
+    current_surface = ""
     current_action = ""
+    pending_scope_clause = ""
     for clause in clauses:
         verification = _verification_postcondition(
             clause,
@@ -822,7 +2147,8 @@ def derive_semantic_mission(
                 postcondition=verification,
             )
             continue
-        open_targets = _open_list_targets(clause)
+        conditional_branches = _conditional_branch_spec(clause)
+        open_targets = () if conditional_branches else _open_list_targets(clause)
         if open_targets:
             for target in open_targets:
                 node = _derive_semantic_node("Open " + target)
@@ -837,7 +2163,10 @@ def derive_semantic_mission(
                 current_action = "open"
             continue
 
-        node = _derive_semantic_node(clause)
+        node = (
+            _conditional_semantic_node(clause, conditional_branches)
+            if conditional_branches else _derive_semantic_node(clause)
+        )
         if (
             not node.requested_action
             and current_action == "open"
@@ -845,39 +2174,129 @@ def derive_semantic_mission(
         ):
             node = _derive_semantic_node("Open " + clause)
         explicit_application = _explicit_application(clause, node)
+        if _dependent_application_in_context(
+            clause,
+            node,
+            current_application=current_application,
+            current_surface=current_surface,
+        ):
+            explicit_application = ""
+            node.required_application = current_application
+        if (
+            not node.requested_action
+            and current_application
+            and _looks_like_ui_surface_reference(clause)
+        ):
+            pending_scope_clause = clause
+            continue
+        if (
+            not node.requested_action
+            and explicit_application
+            and re.fullmatch(
+                r"(?:in|inside|dans|sur)\s+[a-z0-9_.-]{1,80}",
+                _normalized(clause),
+            )
+        ):
+            if (
+                current_application
+                and _normalized(explicit_application)
+                != _normalized(current_application)
+            ):
+                current_surface = ""
+            current_application = explicit_application
+            pending_scope_clause = clause
+            continue
         if explicit_application:
+            if (
+                current_application
+                and _normalized(explicit_application)
+                != _normalized(current_application)
+            ):
+                current_surface = ""
             node.required_application = explicit_application
         elif current_application and node.requested_action:
             node.required_application = current_application
+        if (
+            not node.required_surface
+            and current_surface
+            and node.required_application == current_application
+            and node.requested_action
+        ):
+            node.required_surface = current_surface
+        page_target = _page_content_target(clause)
+        if page_target and node.requested_action == "open":
+            node.target_object = page_target
+        if _targets_required_surface(node):
+            node.target_object = node.required_surface
 
-        # Navigation/search/activation/typing with no new application is a
-        # dependent refinement of the preceding node, not a second effect.
+        scoped_clause = (
+            pending_scope_clause + ", " + clause
+            if pending_scope_clause else clause
+        )
+        pending_scope_clause = ""
+
+        if node.conditional_mode:
+            subject = _conditional_subject_node(
+                scoped_clause,
+                node.conditional_branches,
+                application=node.required_application or current_application,
+                surface=node.required_surface or current_surface,
+            )
+            if subject is not None and not any(
+                _normalized(item.target_object) == _normalized(subject.target_object)
+                for item in nodes
+            ):
+                subject = _node_with_identity(
+                    subject,
+                    order=len(nodes),
+                    clause=subject.source_clause,
+                )
+                nodes.append(subject)
+
+        # Dependent UI operations express one desired state. The active model
+        # chooses the necessary click/type/scroll recipe inside that state.
+        # Only a UI-state acquisition may absorb a dependent operation: merging
+        # into an independent creation/mutation deliverable would erase that
+        # deliverable's own required effect (e.g. creating a folder must stay
+        # a distinct outcome from writing files inside it).
         if (
             nodes
-            and node.requested_action in {"navigate", "search", "activate", "type"}
+            and not node.conditional_mode
+            and node.requested_action in {
+                "navigate", "search", "type", "activate", "open",
+            }
+            and nodes[-1].requested_action not in {
+                "create", "delete", "copy", "move", "download", "upload",
+            }
             and not explicit_application
             and nodes[-1].required_application == node.required_application
+            and not _targets_required_surface(nodes[-1])
         ):
-            combined = _derive_semantic_node(
-                nodes[-1].source_clause + " and " + clause,
+            combined = _merge_dependent_semantic_nodes(
+                nodes[-1],
+                node,
+                clause=scoped_clause,
+                current_application=current_application,
+                current_surface=current_surface,
             )
             nodes[-1] = _node_with_identity(
                 combined,
                 order=nodes[-1].order,
-                clause=nodes[-1].source_clause + " and " + clause,
-                application=current_application,
+                clause=nodes[-1].source_clause + " and " + scoped_clause,
             )
             continue
 
         node = _node_with_identity(
             node,
             order=len(nodes),
-            clause=clause,
+            clause=scoped_clause,
             application=explicit_application,
         )
         nodes.append(node)
         if node.required_application:
             current_application = node.required_application
+        if node.required_surface:
+            current_surface = node.required_surface
         if node.requested_action:
             current_action = node.requested_action
 
@@ -899,6 +2318,18 @@ def derive_semantic_mission(
                 nodes[index], order=index, clause=nodes[index].source_clause,
                 postcondition=value,
             )
+
+    # Fail closed for compound objectives: once any clause requires execution,
+    # an unclassified clause is required work too unless it positively asks for
+    # a text answer.  A plain provider answer can then never discharge an
+    # unrecognized action fragment of the same objective.
+    if any(node.requires_execution for node in nodes):
+        for node in nodes:
+            if node.requires_execution or node.requested_action:
+                continue
+            if _clause_is_informational_deliverable(node.source_clause):
+                continue
+            node.requires_execution = True
 
     payload = [node.public_dict() for node in nodes]
     fingerprint = hashlib.sha256(
@@ -974,6 +2405,8 @@ class StrategyAttempt:
     semantic_batch_effects: list[dict] = field(default_factory=list)
     semantic_checkpoint_count: int = 0
     semantic_batch_resume_from_index: int | None = None
+    state_refreshed_after_action_ids: list[str] = field(default_factory=list)
+    target_keys: tuple[str, ...] = ()
 
     def public_dict(self) -> dict:
         return asdict(self)
@@ -990,6 +2423,11 @@ class StrategyDecision:
 
 
 _TERMINAL_FOR_ESCALATION = frozenset({
+    # WOR-303: PROGRESSED retires non-desktop routes from *escalation order*
+    # only (an already-used route, like a fired deep link, is not re-selected
+    # ahead of a fresh exact observation).  It is NOT a progress score: the
+    # progressive desktop layers below are explicitly exempt, and there is no
+    # progress-count cap any more.
     AttemptStatus.PROGRESSED.value,
     AttemptStatus.SUCCEEDED.value,
     AttemptStatus.FAILED.value,
@@ -1002,9 +2440,6 @@ _TERMINAL_FOR_ESCALATION = frozenset({
 
 class ExecutionStrategy:
     """Bounded strategy state for one ordered semantic mission."""
-
-    _MAX_IDENTICAL_ACTION_ATTEMPTS = 2
-    _MAX_PROGRESS_ATTEMPTS_PER_DESKTOP_MECHANISM = 16
 
     def __init__(
         self,
@@ -1039,7 +2474,6 @@ class ExecutionStrategy:
         self._evidence_revision = 0
         self._evidence_tokens: set[str] = set()
         self._failed_signatures: dict[str, int] = {}
-        self._signature_attempt_counts: dict[str, int] = {}
         self._stale_mechanisms: dict[str, int] = {}
         self._retired_effect_mechanisms: dict[str, str] = {}
         self._completed_effects: list[dict[str, object]] = []
@@ -1051,9 +2485,16 @@ class ExecutionStrategy:
         self._retry_substeps: dict[str, dict] = {}
         self._latest_desktop_observation: dict[str, object] = {}
         self._goal_contract: dict = {}
+        self.execution_binding: dict = {}
+        self._semantic_goal_v2_runtime: dict[str, object] = {}
+        self._semantic_goal_v2_completion_authority: set[str] = set()
         self._frozen_node_id = ""
         self._frozen_mechanism_id = ""
         self._frozen_attempt_id = ""
+        self._effect_witnesses: dict[str, list[dict]] = {}
+        self._deliverable_artifacts: dict[str, list[dict]] = {}
+        self._mechanisms_by_node: dict[tuple[str, str], StrategyMechanism] = {}
+        self._effect_requirement_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         self.terminal_blocker = ""
         self._lock = threading.RLock()
         for mechanism in mechanisms:
@@ -1085,7 +2526,21 @@ class ExecutionStrategy:
     def require_execution(self) -> None:
         self.mission.execution_required_override = True
         if not any(node.requires_execution for node in self.mission.action_nodes):
-            self.mission.action_nodes[0].requires_execution = True
+            for index, node in enumerate(self.mission.action_nodes):
+                if index == 0 or (
+                    not node.requested_action
+                    and not _clause_is_informational_deliverable(
+                        node.source_clause
+                    )
+                ):
+                    # An unclassified required clause stays required work:
+                    # its effect can only be established by fresh bound
+                    # verification, never by an unrelated provider answer.
+                    node.requires_execution = True
+        with self._lock:
+            # The effect contract depends on requires_execution; a contract
+            # inspected before promotion must not stay cached afterwards.
+            self._effect_requirement_cache.clear()
 
     def bind_goal_contract(self, contract) -> None:
         """Bind one validated canonical authority for every later decision."""
@@ -1111,6 +2566,469 @@ class ExecutionStrategy:
 
     def goal_contract_dict(self) -> dict:
         return json.loads(json.dumps(self._goal_contract)) if self._goal_contract else {}
+
+    @property
+    def semantic_goal_v2_active(self) -> bool:
+        return bool(self._semantic_goal_v2_runtime)
+
+    def enable_semantic_goal_v2_runtime(self, contract) -> None:
+        """Bind evaluation-only V2 goal state without changing compilation."""
+
+        source = contract.to_dict() if hasattr(contract, "to_dict") else contract
+        if not isinstance(source, Mapping):
+            raise TypeError("semantic goal V2 contract is required")
+        raw_goals = source.get("goals")
+        if not isinstance(raw_goals, list) or not raw_goals:
+            raise ValueError("semantic goal V2 goals are required")
+        runtime_goals: dict[str, dict[str, object]] = {}
+        for raw in raw_goals:
+            if not isinstance(raw, Mapping):
+                raise ValueError("semantic goal V2 goal is invalid")
+            goal_id = _bounded(raw.get("goal_id"), 160)
+            node = self.node_by_id(goal_id)
+            postcondition = _bounded(
+                raw.get("observable_postcondition"), 512,
+            )
+            if (
+                not goal_id
+                or node is None
+                or postcondition not in node.required_postconditions
+            ):
+                raise ValueError("semantic goal V2 runtime binding mismatch")
+            branches = []
+            for branch in raw.get("branches") or []:
+                if not isinstance(branch, Mapping):
+                    continue
+                branches.append({
+                    "branch_id": _bounded(branch.get("branch_id"), 160),
+                    "desired_effect": _bounded(
+                        branch.get("desired_effect"), 320,
+                    ),
+                    "fallback": branch.get("fallback") is True,
+                    "priority": int(branch.get("priority") or 0),
+                })
+            runtime_goals[goal_id] = {
+                "goal_id": goal_id,
+                "semantic_target": _bounded(raw.get("semantic_target"), 320),
+                "required_application": _bounded(
+                    raw.get("required_application"), 160,
+                ),
+                "required_surface": _bounded(
+                    raw.get("required_surface"), 160,
+                ),
+                "required_account": _bounded(
+                    raw.get("required_account"), 160,
+                ),
+                "desired_state": _bounded(raw.get("desired_state"), 512),
+                "observable_postcondition": postcondition,
+                "side_effect_class": _bounded(
+                    raw.get("side_effect_class"), 80,
+                ),
+                "conditional_mode": _bounded(
+                    raw.get("conditional_mode"), 80,
+                ),
+                "branches": branches,
+                "status": "pending",
+                "method_attempts": {},
+                "action_effect_receipts": [],
+                "progress_receipts": [],
+                "completion_receipt": {},
+            }
+        self._semantic_goal_v2_runtime = {
+            "schema_version": 1,
+            "contract_fingerprint": _bounded(source.get("fingerprint"), 160),
+            "execution_binding": {
+                str(key): _bounded(value, 160)
+                for key, value in dict(
+                    source.get("execution_binding") or {}
+                ).items()
+            },
+            "active_goal_id": next(iter(runtime_goals)),
+            "goals": runtime_goals,
+        }
+
+    def semantic_goal_v2_runtime(self) -> dict[str, object]:
+        with self._lock:
+            return json.loads(json.dumps(self._semantic_goal_v2_runtime))
+
+    def semantic_goal_v2_current_state_refresh(self) -> dict[str, object]:
+        with self._lock:
+            receipt = self._semantic_goal_v2_runtime.get(
+                "current_state_refresh",
+            )
+            return dict(receipt) if isinstance(receipt, dict) else {}
+
+    def release_semantic_goal_v2_after_consumed_frame(
+        self,
+        *,
+        previous_strategy_attempt_id: str,
+        previous_tool_attempt_id: str,
+        previous_action_id: str,
+        unresolved_action_ids: Iterable[str],
+        provider_id: str,
+        model_id: str,
+    ) -> dict[str, object]:
+        """Release only the different-action gate from an exact fresh frame."""
+
+        with self._lock:
+            if not self._semantic_goal_v2_runtime:
+                return {}
+            attempt = self.attempt_by_id(previous_strategy_attempt_id)
+            if (
+                attempt is None
+                or attempt.status not in {
+                    AttemptStatus.SELECTED.value,
+                    AttemptStatus.AMBIGUOUS.value,
+                }
+                or (
+                    self.frozen_reason
+                    and attempt.attempt_id != self._frozen_attempt_id
+                )
+                or not previous_tool_attempt_id
+                or not previous_action_id
+            ):
+                return {}
+            history = self._latest_desktop_observation.get(
+                "visual_evidence_history",
+            )
+            history = history if isinstance(history, list) else []
+            frame = next((
+                item for item in reversed(history)
+                if isinstance(item, dict)
+                and item.get("image_input_sent") is True
+                and item.get("image_input_consumed") is True
+                and item.get("frame_id")
+            ), None)
+            if frame is None:
+                return {}
+            binding = self._semantic_goal_v2_runtime.get(
+                "execution_binding",
+            ) or {}
+            if any(
+                str(frame.get(key) or "") != str(binding.get(key) or "")
+                for key in ("conversation_id", "turn_id")
+            ) or any(
+                str(frame.get(key) or "") != str(expected or "")
+                for key, expected in (
+                    ("provider_id", provider_id),
+                    ("model_id", model_id),
+                )
+            ):
+                return {}
+            try:
+                captured_at = float(frame.get("captured_at") or 0.0)
+                expires_at = float(frame.get("expires_at") or 0.0)
+                dispatched_at = float(attempt.dispatched_at or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return {}
+            if (
+                captured_at <= dispatched_at
+                or dispatched_at <= 0.0
+                or expires_at < time.time()
+                or not frame.get("v4_loop_id")
+                or not frame.get("native_window_id")
+                or not frame.get("window_generation")
+            ):
+                return {}
+            receipt = {
+                "schema_version": 1,
+                "purpose": "current_state_refreshed_after_effect",
+                "conversation_id": _bounded(
+                    binding.get("conversation_id"), 160,
+                ),
+                "turn_id": _bounded(binding.get("turn_id"), 160),
+                "provider_id": _bounded(provider_id, 80),
+                "model_id": _bounded(model_id, 160),
+                "v4_loop_id": _bounded(frame.get("v4_loop_id"), 160),
+                "frame_id": _bounded(frame.get("frame_id"), 160),
+                "native_window_id": _bounded(
+                    frame.get("native_window_id"), 80,
+                ),
+                "window_generation": _bounded(
+                    frame.get("window_generation"), 160,
+                ),
+                "captured_at": captured_at,
+                "expires_at": expires_at,
+                "captured_after_dispatch": True,
+                "image_consumed_by_same_model": True,
+                "semantic_goal_id": attempt.node_id,
+                "previous_strategy_attempt_id": attempt.attempt_id,
+                "previous_tool_attempt_id": _bounded(
+                    previous_tool_attempt_id, 192,
+                ),
+                "previous_action_id": _bounded(previous_action_id, 192),
+                "refreshed_action_ids": list(dict.fromkeys(
+                    _bounded(item, 192)
+                    for item in (*tuple(unresolved_action_ids), previous_action_id)
+                    if _bounded(item, 192)
+                )),
+                "previous_effect_id": _bounded(
+                    attempt.attempted_effect, 512,
+                ),
+                "previous_mechanism_id": _bounded(
+                    attempt.mechanism_id, 192,
+                ),
+                "effect_verified": False,
+                "goal_satisfied": False,
+            }
+            self._semantic_goal_v2_runtime[
+                "current_state_refresh"
+            ] = receipt
+            self._latest_desktop_observation[
+                "v2_current_state_refresh"
+            ] = dict(receipt)
+            self._retired_effect_mechanisms[
+                self._effect_scope(attempt.mechanism_id, attempt.node_id)
+            ] = "outcome_unknown_state_refreshed"
+            node = self.node_by_id(attempt.node_id)
+            if node is not None:
+                node.status = "pending"
+            if attempt.attempt_id == self._frozen_attempt_id:
+                self.frozen_reason = ""
+                self._frozen_node_id = ""
+                self._frozen_mechanism_id = ""
+                self._frozen_attempt_id = ""
+            self._evidence_revision += 1
+            return dict(receipt)
+
+    def _semantic_goal_v2_record(self, goal_id: str = "") -> dict[str, object]:
+        runtime = self._semantic_goal_v2_runtime
+        goals = runtime.get("goals") if isinstance(runtime, dict) else None
+        if not isinstance(goals, dict):
+            return {}
+        active = _bounded(goal_id or runtime.get("active_goal_id"), 160)
+        record = goals.get(active)
+        return record if isinstance(record, dict) else {}
+
+    def _sync_semantic_goal_v2_active(self) -> None:
+        if not self._semantic_goal_v2_runtime:
+            return
+        goals = self._semantic_goal_v2_runtime.get("goals") or {}
+        next_goal = next((
+            node.node_id for node in self.mission.action_nodes
+            if isinstance(goals.get(node.node_id), dict)
+            and goals[node.node_id].get("status") != "satisfied"
+        ), "")
+        self._semantic_goal_v2_runtime["active_goal_id"] = next_goal
+
+    def bind_semantic_goal_v2_method_attempt(
+        self,
+        attempt_id: str,
+        *,
+        semantic_goal_candidate: bool,
+        branch_ids: Iterable[str] = (),
+    ) -> bool:
+        """Bind model-selected method metadata without completing its goal."""
+
+        with self._lock:
+            attempt = self.attempt_by_id(attempt_id)
+            goal = self._semantic_goal_v2_record(
+                attempt.node_id if attempt is not None else "",
+            )
+            if attempt is None or not goal:
+                return False
+            methods = goal.setdefault("method_attempts", {})
+            if not isinstance(methods, dict):
+                methods = {}
+                goal["method_attempts"] = methods
+            methods[attempt.attempt_id] = {
+                "attempt_id": attempt.attempt_id,
+                "goal_id": attempt.node_id,
+                "action_effect_postcondition": _bounded(
+                    attempt.primitive_postcondition, 512,
+                ),
+                "semantic_goal_candidate": bool(semantic_goal_candidate),
+                "branch_ids": list(dict.fromkeys(
+                    _bounded(item, 160) for item in branch_ids
+                    if _bounded(item, 160)
+                )),
+                "dispatched_at": float(attempt.dispatched_at or 0.0),
+                "effect_status": "pending",
+            }
+            return True
+
+    def record_semantic_goal_v2_action_effect(
+        self,
+        attempt_id: str,
+        *,
+        evidence: str,
+        observed_at: float,
+        evidence_kind: str,
+    ) -> bool:
+        """Record a verified method effect as progress, never completion."""
+
+        with self._lock:
+            attempt = self.attempt_by_id(attempt_id)
+            goal = self._semantic_goal_v2_record(
+                attempt.node_id if attempt is not None else "",
+            )
+            if attempt is None or not goal or not _bounded(evidence, 180):
+                return False
+            try:
+                observed_epoch = float(observed_at or 0.0)
+                dispatched_epoch = float(attempt.dispatched_at or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if dispatched_epoch <= 0.0 or observed_epoch < dispatched_epoch:
+                return False
+            methods = goal.get("method_attempts") or {}
+            method = methods.get(attempt.attempt_id) if isinstance(methods, dict) else None
+            if not isinstance(method, dict):
+                return False
+            method["effect_status"] = "verified"
+            method["effect_verified_at"] = observed_epoch
+            receipt = {
+                "goal_id": attempt.node_id,
+                "attempt_id": attempt.attempt_id,
+                "action_effect_postcondition": _bounded(
+                    attempt.primitive_postcondition, 512,
+                ),
+                "semantic_goal_candidate": (
+                    method.get("semantic_goal_candidate") is True
+                ),
+                "branch_ids": list(method.get("branch_ids") or []),
+                "evidence": _bounded(evidence, 180),
+                "evidence_kind": _bounded(evidence_kind, 80),
+                "dispatched_at": dispatched_epoch,
+                "observed_at": observed_epoch,
+            }
+            receipts = goal.setdefault("action_effect_receipts", [])
+            if not isinstance(receipts, list):
+                receipts = []
+                goal["action_effect_receipts"] = receipts
+            if not any(
+                isinstance(item, dict)
+                and item.get("attempt_id") == attempt.attempt_id
+                and item.get("evidence") == receipt["evidence"]
+                for item in receipts
+            ):
+                receipts.append(receipt)
+                goal["action_effect_receipts"] = receipts[-32:]
+            goal["status"] = "pending"
+            self._evidence_revision += 1
+            return True
+
+    def record_semantic_goal_v2_observation(
+        self,
+        *,
+        goal_id: str,
+        status: str,
+        evidence: str,
+        evidence_details: Mapping[str, object],
+    ) -> str:
+        """Record grounded V2 progress or authorize exact goal completion."""
+
+        with self._lock:
+            goal = self._semantic_goal_v2_record(goal_id)
+            details = dict(evidence_details)
+            normalized_status = _bounded(status, 32)
+            runtime = self._semantic_goal_v2_runtime
+            binding = runtime.get("execution_binding") or {}
+            exact_identity = bool(
+                goal
+                and goal_id == runtime.get("active_goal_id")
+                and details.get("evidence_purpose") == "semantic_goal"
+                and details.get("semantic_goal_id") == goal_id
+                and details.get("semantic_target") == goal.get("semantic_target")
+                and details.get("required_application")
+                == goal.get("required_application")
+                and details.get("required_surface") == goal.get("required_surface")
+                and details.get("postcondition")
+                == goal.get("observable_postcondition")
+                and all(
+                    str(details.get(key) or "") == str(binding.get(key) or "")
+                    for key in (
+                        "conversation_id", "turn_id", "provider_id", "model_id",
+                    )
+                )
+                and details.get("freshness") == "fresh"
+                and details.get("frame_id")
+                and details.get("v4_loop_id")
+                and details.get("native_window_id")
+                and details.get("window_generation")
+            )
+            try:
+                captured_at = float(details.get("captured_at") or 0.0)
+                expires_at = float(details.get("expires_at") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return "goal_evidence_invalid"
+            if (
+                not exact_identity
+                or captured_at <= 0.0
+                or expires_at < time.time()
+                or normalized_status not in {
+                    "satisfied", "not_satisfied", "inconclusive",
+                }
+            ):
+                return "goal_evidence_invalid"
+            phase = _bounded(details.get("evidence_phase"), 32)
+            receipt = {
+                "goal_id": goal_id,
+                "semantic_target": goal.get("semantic_target"),
+                "required_application": goal.get("required_application"),
+                "required_surface": goal.get("required_surface"),
+                "postcondition": goal.get("observable_postcondition"),
+                "status": normalized_status,
+                "evidence": _bounded(evidence, 180),
+                "evidence_phase": phase,
+                "frame_id": _bounded(details.get("frame_id"), 160),
+                "v4_loop_id": _bounded(details.get("v4_loop_id"), 160),
+                "native_window_id": _bounded(
+                    details.get("native_window_id"), 80,
+                ),
+                "window_generation": _bounded(
+                    details.get("window_generation"), 160,
+                ),
+                "captured_at": captured_at,
+            }
+            if normalized_status != "satisfied":
+                progress = goal.setdefault("progress_receipts", [])
+                if not isinstance(progress, list):
+                    progress = []
+                progress.append(receipt)
+                goal["progress_receipts"] = progress[-32:]
+                goal["status"] = "pending"
+                self._evidence_revision += 1
+                return "goal_pending"
+
+            effects = [
+                item for item in goal.get("action_effect_receipts") or []
+                if isinstance(item, dict)
+                and float(item.get("observed_at") or 0.0) <= captured_at
+            ]
+            mutation_requires_effect = goal.get("side_effect_class") != "read_only"
+            preexisting_authority = bool(
+                phase == "pre_dispatch"
+                and details.get("authoritative_postcondition_verified") is True
+            )
+            if mutation_requires_effect and not effects and not preexisting_authority:
+                return "goal_completion_missing_effect_witness"
+            if goal.get("conditional_mode") == "exactly_one_observed_branch":
+                executed = {
+                    branch_id
+                    for item in effects
+                    if item.get("semantic_goal_candidate") is True
+                    for branch_id in item.get("branch_ids") or []
+                    if branch_id
+                }
+                if len(executed) != 1:
+                    return "conditional_branch_effect_not_grounded"
+                receipt["executed_branch_id"] = next(iter(executed))
+            bounded = _bounded(evidence, 180)
+            self._semantic_goal_v2_completion_authority.add(bounded)
+            try:
+                completed = self.verify_postcondition(
+                    bounded,
+                    postcondition=str(goal.get("observable_postcondition") or ""),
+                )
+            finally:
+                self._semantic_goal_v2_completion_authority.discard(bounded)
+            if not completed:
+                return "goal_completion_not_authorized"
+            goal["status"] = "satisfied"
+            goal["completion_receipt"] = receipt
+            self._sync_semantic_goal_v2_active()
+            return "goal_satisfied"
 
     def pending_nodes(self) -> list[SemanticActionNode]:
         return [
@@ -1395,44 +3313,74 @@ class ExecutionStrategy:
             list(self.mission.action_nodes) if include_completed else self.pending_nodes()
         )
         candidates = [node for node in candidates if node.status != "blocked"]
-        executable = [node for node in candidates if node.requires_execution]
-        if executable:
-            candidates = executable
+        # A tool receipt may only discharge a node that requires execution.
+        # Informational nodes are answered by the final text, never proven by
+        # an unrelated tool outcome.
+        candidates = [node for node in candidates if node.requires_execution]
         if not candidates:
             return None
         tool_app = self._tool_application(tool_name, arguments)
         tool_action = self._tool_action(tool_name, arguments)
-        serialized = _normalized(json.dumps(arguments, sort_keys=True, default=str))
+        tool_actions = _tool_semantic_actions(tool_name, arguments)
+        tool_name_text = _normalized(str(tool_name or ""))
+        read_observation_tool = tool_name_text in _READ_FAMILY_OBSERVATION_TOOLS
+        arguments_text = _normalized(json.dumps(arguments, sort_keys=True, default=str))
         scored: list[tuple[int, int, SemanticActionNode]] = []
         for node in candidates:
+            if read_observation_tool:
+                if (
+                    node.requested_action != "observe"
+                    or not _observation_tool_matches_node(tool_name, node)
+                ):
+                    continue
             if (
                 tool_app
                 and node.required_application
                 and tool_app != _normalized(node.required_application)
             ):
                 continue
-            if (
-                tool_action
-                and node.requested_action
-                and tool_action != node.requested_action
-            ):
-                continue
+            node_action = node.requested_action
+            action_match = False
+            known_tool_actions = set(tool_actions)
+            if tool_action:
+                known_tool_actions.add(tool_action)
+            if read_observation_tool:
+                action_match = True
+            elif node_action and known_tool_actions:
+                action_match = bool(
+                    node_action in known_tool_actions
+                    or (
+                        node_action == "type"
+                        and known_tool_actions & {"write", "save"}
+                    )
+                )
+                if not action_match:
+                    continue
             score = 0
             if tool_app and tool_app == _normalized(node.required_application):
                 score += 20
-            if tool_action and tool_action == node.requested_action:
+            if action_match:
                 score += 8
             target_tokens = [
                 token for token in _normalized(node.target_object).split()
                 if len(token) >= 3
             ]
-            score += sum(1 for token in target_tokens[:6] if token in serialized)
+            score += 3 * sum(
+                1 for token in target_tokens[:6] if token in tool_name_text
+            )
+            score += sum(
+                1 for token in target_tokens[:6] if token in arguments_text
+            )
             if node.status in {"active", "unknown"}:
                 score += 4
             scored.append((score, -node.order, node))
         if not scored:
             return None
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        # An unbound tool must never fall through to an arbitrary pending node:
+        # zero semantic evidence is not a match.
+        if scored[0][0] <= 0:
+            return None
         return scored[0][2]
 
     def postcondition_for_tool(self, tool_name: str, arguments: dict | None = None) -> str:
@@ -1440,14 +3388,488 @@ class ExecutionStrategy:
         return node.observable_success_postcondition if node is not None else ""
 
     def prove_informational_nodes(self, evidence: str) -> tuple[str, ...]:
+        """Prove answer deliverables without waiving retained effect obligations.
+
+        The legacy classification cannot override an immutable effect contract
+        or evidence requirements already recorded for a node.
+        """
+
+        contract_nodes = {
+            str(item.get("node_id") or ""): item
+            for item in self._goal_contract.get("nodes", ())
+            if isinstance(item, dict)
+        }
         proven = []
         for node in self.pending_nodes():
-            if node.requires_execution:
+            contract = contract_nodes.get(node.node_id, {})
+            if (
+                node.requires_execution
+                or self.required_effect_keys(node)
+                or contract.get("mutation") is True
+                or contract.get("requires_observation_before_execution") is True
+                or node.requires_observation_before_execution
+            ):
                 continue
             for postcondition in node.required_postconditions:
                 if self.verify_postcondition(evidence, postcondition=postcondition):
                     proven.append(postcondition)
         return tuple(proven)
+
+    def mark_visual_input_sent(self) -> bool:
+        """Bind a prepared exact frame to the next successful same-model answer."""
+
+        with self._lock:
+            history = self._latest_desktop_observation.get(
+                "visual_evidence_history"
+            )
+            if not isinstance(history, list) or not history:
+                return False
+            latest = history[-1]
+            if not isinstance(latest, dict) or not latest.get("frame_id"):
+                return False
+            latest["image_input_sent"] = True
+            self._latest_desktop_observation["visual_image_input_sent"] = True
+            self._latest_desktop_observation["visual_frame_id"] = str(
+                latest.get("frame_id") or ""
+            )
+            return True
+
+    def mark_user_image_input_present(
+        self,
+        image_ids,
+        *,
+        provider: str,
+        model: str,
+    ) -> bool:
+        """Record a successful direct user-image provider continuation."""
+
+        identifiers = tuple(
+            _bounded(value, 160) for value in image_ids
+            if str(value or "").strip()
+        )
+        if not identifiers:
+            return False
+        with self._lock:
+            history = self._latest_desktop_observation.setdefault(
+                "visual_evidence_history", []
+            )
+            if not isinstance(history, list):
+                history = []
+                self._latest_desktop_observation[
+                    "visual_evidence_history"
+                ] = history
+            image_id = identifiers[-1]
+            item = next((
+                entry for entry in reversed(history)
+                if isinstance(entry, dict)
+                and entry.get("source_type") == "user_upload"
+                and entry.get("frame_id") == image_id
+            ), None)
+            if item is None:
+                item = {
+                    "frame_id": image_id,
+                    "image_ids": list(identifiers),
+                    "source_type": "user_upload",
+                    "provider_id": str(provider or ""),
+                    "model_id": str(model or ""),
+                }
+                history.append(item)
+            item.update({
+                "image_input_sent": True,
+                "image_input_consumed": True,
+                "visual_input_present": True,
+            })
+            self._latest_desktop_observation.update({
+                "visual_input_present": True,
+                "visual_image_input_sent": True,
+                "visual_image_input_consumed": True,
+                "visual_frame_id": image_id,
+            })
+            return True
+
+    def mark_visual_input_consumed(
+        self,
+        *,
+        provider: str = "",
+        model: str = "",
+        tool_call_id: str = "",
+        response_id: str = "",
+    ) -> bool:
+        """Bind a provider continuation to one exact previously sent frame."""
+
+        with self._lock:
+            history = self._latest_desktop_observation.get(
+                "visual_evidence_history"
+            )
+            if not isinstance(history, list):
+                return False
+            for item in reversed(history):
+                if not isinstance(item, dict) or not item.get("frame_id"):
+                    continue
+                if item.get("image_input_sent") is not True:
+                    continue
+                if (
+                    tool_call_id
+                    and item.get("tool_call_id")
+                    and str(item.get("tool_call_id")) != str(tool_call_id)
+                ):
+                    continue
+                if (
+                    provider
+                    and _normalized(item.get("provider_id"))
+                    != _normalized(provider)
+                ):
+                    continue
+                if model and str(item.get("model_id") or "") != str(model):
+                    continue
+                item["image_input_consumed"] = True
+                if tool_call_id:
+                    item["tool_call_id"] = _bounded(tool_call_id, 160)
+                if response_id:
+                    item["consumed_response_id"] = _bounded(response_id, 160)
+                try:
+                    from osia.desktop_scene import (
+                        acknowledge_visual_actuation_frame,
+                    )
+
+                    lease = acknowledge_visual_actuation_frame(
+                        str(item.get("frame_id") or ""),
+                        provider=(provider or str(item.get("provider_id") or "")),
+                        model=(model or str(item.get("model_id") or "")),
+                    )
+                except Exception:
+                    lease = {}
+                item["actuation_lease_state"] = _bounded(
+                    lease.get("lease_state"), 80,
+                )
+                try:
+                    item["actuation_lease_expires_at"] = float(
+                        lease.get("lease_expires_at") or 0.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item["actuation_lease_expires_at"] = 0.0
+                self._latest_desktop_observation.update({
+                    "visual_image_input_consumed": True,
+                    "visual_consumed_frame_id": _bounded(
+                        item.get("frame_id"), 160,
+                    ),
+                })
+                return True
+            return False
+
+    def stage_v4_grounded_observation(
+        self,
+        evidence: Mapping[str, Any],
+    ) -> bool:
+        """Stage one current-turn V4 frame interpretation for projection.
+
+        The model assertion is not completion authority here. Projection must
+        still prove provider consumption, exact turn/loop/window identity, and
+        the relevant postcondition against ActionTruth.
+        """
+
+        source = dict(evidence) if isinstance(evidence, Mapping) else {}
+        status = _bounded(source.get("status"), 32)
+        frame_id = _bounded(source.get("frame_id"), 160)
+        v4_loop_id = _bounded(source.get("v4_loop_id"), 160)
+        postcondition = _bounded(source.get("postcondition"), 512)
+        observed_state = _bounded(source.get("observed_state"), 512)
+        evidence_purpose = _bounded(source.get("evidence_purpose"), 32)
+        if (
+            status not in {"satisfied", "not_satisfied", "inconclusive"}
+            or not frame_id
+            or not v4_loop_id
+            or not postcondition
+            or not observed_state
+        ):
+            return False
+        binding = self.execution_binding or self.goal_contract_dict().get("execution_binding") or {}
+        if any(
+            str(source.get(key) or "") != str(binding.get(key) or "")
+            for key in (
+                "conversation_id", "turn_id", "provider_id", "model_id",
+            )
+        ):
+            return False
+        history = self._latest_desktop_observation.get(
+            "visual_evidence_history"
+        )
+        history = history if isinstance(history, list) else []
+        from osia.grounded_v4_claims import v4_observation_correlates
+        visual_input = next((
+            item for item in reversed(history)
+            if isinstance(item, dict) and v4_observation_correlates({**source, "frame_id": frame_id}, binding, item)
+        ), None)
+        if visual_input is None:
+            return False
+        node = (
+            self.node_by_id(self._frozen_node_id)
+            if self.frozen_reason else self.goal
+        )
+        attempt = (
+            self.attempt_by_id(self._frozen_attempt_id)
+            if self.frozen_reason else
+            next((
+                item for item in reversed(self.attempts)
+                if node is not None
+                and item.node_id == node.node_id
+                and item.primitive_postcondition
+                and item.status in {
+                    AttemptStatus.SELECTED.value,
+                }
+            ), None)
+        )
+        intermediate_action = bool(
+            attempt is not None
+            and attempt.primitive_postcondition == postcondition
+            and postcondition not in (
+                node.required_postconditions if node is not None else ()
+            )
+        )
+        if not evidence_purpose:
+            evidence_purpose = (
+                "action_effect" if intermediate_action else "semantic_goal"
+            )
+        if (
+            node is None
+            or evidence_purpose not in {"action_effect", "semantic_goal"}
+            or (
+                evidence_purpose == "action_effect"
+                and (
+                    attempt is None
+                    or attempt.primitive_postcondition != postcondition
+                )
+            )
+            or (
+                evidence_purpose == "semantic_goal"
+                and postcondition not in node.required_postconditions
+            )
+        ):
+            return False
+        runtime_goal = self._semantic_goal_v2_record(node.node_id)
+        required_application = _bounded(
+            runtime_goal.get("required_application")
+            if runtime_goal else node.required_application,
+            160,
+        )
+        if (
+            runtime_goal
+            and node.node_id
+            != self._semantic_goal_v2_runtime.get("active_goal_id")
+        ):
+            return False
+        if (
+            runtime_goal
+            and required_application
+            and _normalized(required_application)
+            not in {"not specified", "not_specified"}
+            and _normalized(visual_input.get("application"))
+            != _normalized(required_application)
+        ):
+            return False
+        prior_effects = (
+            runtime_goal.get("action_effect_receipts") or []
+            if runtime_goal else []
+        )
+        evidence_phase = "post_dispatch" if prior_effects else "pre_dispatch"
+        staged = {
+            "schema_version": 1,
+            "evidence_id": "v4evidence_" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "conversation_id": binding.get("conversation_id"),
+                        "turn_id": binding.get("turn_id"),
+                        "frame_id": frame_id,
+                        "postcondition": postcondition,
+                        "status": status,
+                        "observed_state": observed_state,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="replace")
+            ).hexdigest()[:32],
+            "conversation_id": _bounded(
+                binding.get("conversation_id"), 160,
+            ),
+            "request_id": _bounded(binding.get("request_id"), 160),
+            "turn_id": _bounded(binding.get("turn_id"), 160),
+            "provider_id": _bounded(binding.get("provider_id"), 80),
+            "model_id": _bounded(binding.get("model_id"), 160),
+            "v4_loop_id": v4_loop_id,
+            "frame_id": frame_id,
+            "surface_ref": _bounded(source.get("surface_ref"), 160),
+            "window_generation": _bounded(
+                source.get("window_generation"), 160,
+            ),
+            "native_window_id": _bounded(
+                source.get("native_window_id"), 80,
+            ),
+            "captured_at": float(source.get("captured_at") or 0.0),
+            "expires_at": float(source.get("expires_at") or 0.0),
+            "postcondition": postcondition,
+            "semantic_node_id": _bounded(node.node_id, 160),
+            "semantic_goal_id": _bounded(node.node_id, 160),
+            "semantic_target": _bounded(
+                runtime_goal.get("semantic_target")
+                if runtime_goal else node.target_object,
+                320,
+            ),
+            "required_application": _bounded(
+                required_application, 160,
+            ),
+            "required_surface": _bounded(
+                runtime_goal.get("required_surface")
+                if runtime_goal else node.required_surface,
+                160,
+            ),
+            "strategy_attempt_id": _bounded(
+                attempt.attempt_id if attempt is not None else "", 160,
+            ),
+            "intermediate_action": intermediate_action,
+            "evidence_purpose": evidence_purpose,
+            "evidence_phase": evidence_phase,
+            "authoritative_postcondition_verified": (
+                visual_input.get("authoritative_postcondition_verified") is True
+            ),
+            "status": status,
+            "observed_state_ref": "sha256:" + hashlib.sha256(
+                observed_state.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "projected": False,
+        }
+        with self._lock:
+            self._latest_desktop_observation[
+                "v4_grounded_observation"
+            ] = staged
+        return True
+
+    def v4_grounded_observation(self) -> dict[str, Any]:
+        with self._lock:
+            value = self._latest_desktop_observation.get(
+                "v4_grounded_observation"
+            )
+            return dict(value) if isinstance(value, dict) else {}
+
+    def mark_v4_grounded_observation_projected(self, evidence_id: str) -> bool:
+        with self._lock:
+            value = self._latest_desktop_observation.get(
+                "v4_grounded_observation"
+            )
+            if (
+                not isinstance(value, dict)
+                or str(value.get("evidence_id") or "")
+                != str(evidence_id or "")
+            ):
+                return False
+            value["projected"] = True
+            return True
+
+    def mark_visual_answer_ready(
+        self,
+        *,
+        evidence: str,
+        provider: str = "",
+        model: str = "",
+    ) -> tuple[str, ...]:
+        """Satisfy read-only VISUAL nodes from same-model image provenance.
+
+        Runtime authority ends at proving that exact pixels were attached to
+        the active provider/model continuation. Natural-language interpretation
+        is deliberately not compared with process names, UIA strings or other
+        semantic heuristics. A visual answer never proves an activation node;
+        its click/select effect must come from the correlated action authority.
+        """
+
+        pending = [
+            node for node in self.pending_nodes()
+            if (
+                _node_requires_visual_evidence(node)
+                and (
+                    not node.requires_execution
+                    or is_desktop_visual_read_node(node)
+                )
+                and node.requested_action not in {
+                    "activate", "click", "select",
+                }
+            )
+        ]
+        if not pending:
+            return ()
+        history = self._latest_desktop_observation.get(
+            "visual_evidence_history"
+        )
+        history = history if isinstance(history, list) else []
+        proven = []
+        matched_inputs = []
+        for node in pending:
+            visual_input = next((
+                item for item in reversed(history)
+                if isinstance(item, dict)
+                and item.get("image_input_sent") is True
+                and item.get("frame_id")
+                and (
+                    item.get("source_type") == "user_upload"
+                    or (
+                        item.get("exact_surface_pixels") is True
+                        and item.get("window_generation")
+                    )
+                )
+                and (
+                    _normalized(provider) != "chatgpt_account"
+                    or item.get("image_input_consumed") is True
+                )
+                and (
+                    not provider
+                    or _normalized(item.get("provider_id"))
+                    == _normalized(provider)
+                )
+                and (
+                    not model
+                    or str(item.get("model_id") or "") == str(model)
+                )
+                and _visual_observation_matches_node(item, node)
+            ), None)
+            if visual_input is None:
+                continue
+            visual_input["visual_answer_produced"] = True
+            matched_inputs.append(visual_input)
+            frame_id = _bounded(visual_input.get("frame_id"), 120)
+            proof = _bounded(f"{evidence}:visual_input:{frame_id}", 180)
+            for postcondition in node.required_postconditions:
+                if self.verify_postcondition(proof, postcondition=postcondition):
+                    proven.append(postcondition)
+        self._latest_desktop_observation.update({
+            "visual_input_present": bool(matched_inputs),
+            "visual_answer_produced": bool(matched_inputs),
+        })
+        if not matched_inputs:
+            return ()
+        if proven:
+            for visual_input in matched_inputs:
+                visual_input["final_visual_request_satisfied"] = True
+            self._latest_desktop_observation[
+                "final_visual_request_satisfied"
+            ] = True
+        return tuple(proven)
+
+    def prove_visual_answer(
+        self,
+        answer: str,
+        *,
+        evidence: str,
+        provider: str = "",
+        model: str = "",
+    ) -> tuple[str, ...]:
+        """Compatibility wrapper; answer text has no validation authority."""
+
+        if not str(answer or "").strip():
+            return ()
+        return self.mark_visual_answer_ready(
+            evidence=evidence,
+            provider=provider,
+            model=model,
+        )
 
     def record_external_event(
         self,
@@ -1481,6 +3903,24 @@ class ExecutionStrategy:
                 required_postconditions=(),
             )
         if normalized == "success_verified":
+            if _node_requires_visual_evidence(node):
+                # Tool completion proves observation/transport only. The
+                # correlated same-model continuation later proves only that
+                # visual input was present; answer wording is never re-scored.
+                return node
+            _, node_complete = self._apply_effect_witness(
+                node,
+                evidence=link or outcome,
+                attempt_id="external:" + _effect_key_digest(link or outcome),
+                target_keys=_tool_semantic_target_values(
+                    tool_name, arguments if isinstance(arguments, dict) else {},
+                ),
+            )
+            if not node_complete:
+                # One external receipt proves only the exact effect it
+                # establishes; multi-effect or unresolved requirements stay
+                # independently pending.
+                return node
             for postcondition in node.required_postconditions:
                 self.verify_postcondition(link or outcome, postcondition=postcondition)
             node.status = "succeeded"
@@ -1647,73 +4087,7 @@ class ExecutionStrategy:
         return ""
 
     def _exhausted(self, mechanism_id: str) -> bool:
-        matching = [
-            attempt for attempt in self.attempts
-            if attempt.mechanism_id == mechanism_id
-        ]
-        mechanism = self._mechanisms.get(mechanism_id)
-        if (
-            mechanism is not None
-            and mechanism.layer is StrategyLayer.NATIVE_ACCESSIBILITY
-        ):
-            if any(
-                attempt.status == AttemptStatus.INAPPLICABLE.value
-                and not attempt.target_surface
-                for attempt in matching
-            ):
-                return True
-            if any(
-                attempt.status == AttemptStatus.AMBIGUOUS.value
-                for attempt in matching
-            ):
-                return True
-            candidate_failures = [
-                attempt for attempt in matching
-                if attempt.target_surface
-                and attempt.substep_id
-                and attempt.status in {
-                    AttemptStatus.FAILED.value,
-                    AttemptStatus.STAGNATED.value,
-                    AttemptStatus.STALE.value,
-                    AttemptStatus.BLOCKED.value,
-                }
-            ]
-            if candidate_failures:
-                node = self.node_by_id(mechanism.node_id) or self.goal
-                return _structured_uia_frontier_state(
-                    self, node,
-                ) == "exhausted"
-            if any(
-                attempt.status in {
-                    AttemptStatus.FAILED.value,
-                    AttemptStatus.STAGNATED.value,
-                    AttemptStatus.STALE.value,
-                }
-                for attempt in matching
-            ):
-                return True
-        progressive_desktop = bool(
-            mechanism is not None
-            and mechanism.layer in {
-                StrategyLayer.NATIVE_ACCESSIBILITY,
-                StrategyLayer.KEYBOARD,
-            }
-        )
-        progress_count = sum(
-            attempt.status == AttemptStatus.PROGRESSED.value
-            for attempt in matching
-        )
-        for attempt in matching:
-            if attempt.status not in _TERMINAL_FOR_ESCALATION:
-                continue
-            if (
-                progressive_desktop
-                and attempt.status == AttemptStatus.PROGRESSED.value
-                and progress_count
-                < self._MAX_PROGRESS_ATTEMPTS_PER_DESKTOP_MECHANISM
-            ):
-                continue
-            return True
+        """Legacy history query; past attempts cannot retire a capability."""
         return False
 
     def remaining_mechanisms(self) -> list[StrategyMechanism]:
@@ -1726,15 +4100,6 @@ class ExecutionStrategy:
                     and not self._semantic_error(
                         mechanism, self._node_for_mechanism(mechanism),
                     )
-                    and not self._scope_retirement_reason(
-                        mechanism.mechanism_id,
-                        self._node_for_mechanism(mechanism).node_id,
-                    )
-                    and not self._scope_is_in_flight(
-                        mechanism.mechanism_id,
-                        self._node_for_mechanism(mechanism).node_id,
-                    )
-                    and not self._exhausted(mechanism.mechanism_id)
                 ),
                 key=lambda item: (int(item.layer), item.mechanism_id),
             )
@@ -1743,11 +4108,29 @@ class ExecutionStrategy:
         return [
             item for item in self.remaining_mechanisms()
             if int(item.layer) < int(layer)
+            and self._mechanism_runtime_available(item)
         ]
 
     @staticmethod
+    def _mechanism_runtime_available(item: StrategyMechanism) -> bool:
+        """WOR-301: a mechanism for a genuinely unavailable runtime tool must
+        not veto lower layers with ``higher_strategy_still_applicable``."""
+
+        mechanism_id = str(item.mechanism_id or "")
+        if mechanism_id.startswith("direct:computer_use_v4"):
+            try:
+                from osia.computer_use_v4_integration import (
+                    computer_use_v4_tools_available,
+                )
+
+                return bool(computer_use_v4_tools_available())
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
     def _effect_scope(mechanism_id: str, node_id: str) -> str:
-        """Return the durable replay scope for one mechanism on one goal node."""
+        """Return the factual history scope for one mechanism on one goal node."""
 
         return f"{_bounded(node_id, 96)}|{_bounded(mechanism_id, 120)}"
 
@@ -1760,10 +4143,8 @@ class ExecutionStrategy:
         )
 
     def _scope_retirement_reason(self, mechanism_id: str, node_id: str) -> str:
-        return self._retired_effect_mechanisms.get(
-            self._effect_scope(mechanism_id, node_id),
-            "",
-        )
+        """Legacy history query; past attempts cannot retire a capability."""
+        return ""
 
     @staticmethod
     def action_signature(mechanism_id: str, action: object) -> str:
@@ -1782,8 +4163,6 @@ class ExecutionStrategy:
         action: object | None = None,
     ) -> StrategyDecision:
         with self._lock:
-            if self.succeeded:
-                return StrategyDecision(False, "postcondition_already_satisfied")
             if any(
                 self._evidence_revision <= revision
                 for revision in self._stale_mechanisms.values()
@@ -1798,46 +4177,6 @@ class ExecutionStrategy:
                     False, semantic_error, node_id=(node.node_id if node else ""),
                 )
             node_id = node.node_id if node is not None else mechanism.node_id
-            if (
-                self.frozen_reason
-                and mechanism.mutation
-                and not (
-                    self.preparatory_effect_is_frozen()
-                    and mechanism.attempted_effect
-                    not in {
-                        "application_foreground", "window_focus",
-                        "surface_rebound",
-                    }
-                )
-            ):
-                return StrategyDecision(
-                    False,
-                    "ambiguous_effect_requires_reconciliation",
-                    node_id=node_id,
-                )
-            retirement = self._scope_retirement_reason(
-                mechanism.mechanism_id, node_id,
-            )
-            if retirement:
-                return StrategyDecision(
-                    False,
-                    "mechanism_retired_after_" + retirement,
-                    node_id=node_id,
-                )
-            if mechanism.mutation and self._scope_is_in_flight(
-                mechanism.mechanism_id, node_id,
-            ):
-                return StrategyDecision(
-                    False, "mechanism_dispatch_in_flight", node_id=node_id,
-                )
-            higher = self._higher_unexhausted(mechanism.layer)
-            if higher:
-                return StrategyDecision(
-                    False,
-                    "higher_strategy_still_applicable:" + ",".join(
-                        item.mechanism_id for item in higher[:8]
-                    ),
-                )
             return StrategyDecision(
                 True,
                 "strategy_selected",
@@ -1851,21 +4190,13 @@ class ExecutionStrategy:
             self.register(mechanism)
             signature = self.action_signature(mechanism.mechanism_id, action)
             preview = self.preview(mechanism, action)
+            if preview.node_id:
+                # One generic tool id may carry a distinct mechanism per node;
+                # the id alone must not resurrect another node's binding.
+                self._mechanisms_by_node[
+                    (mechanism.mechanism_id, preview.node_id)
+                ] = mechanism
             if not preview.allowed:
-                duplicate = next(
-                    (
-                        item for item in reversed(self.attempts)
-                        if item.action_signature == signature
-                        and item.status == AttemptStatus.BLOCKED.value
-                        and item.failure_or_stagnation_reason == preview.reason_code
-                    ),
-                    None,
-                )
-                if duplicate is not None:
-                    return StrategyDecision(
-                        False, preview.reason_code, duplicate.attempt_id,
-                        mechanism.mechanism_id,
-                    )
                 attempt = StrategyAttempt(
                     attempt_id=f"strategy_{len(self.attempts) + 1:03d}",
                     mechanism_id=mechanism.mechanism_id,
@@ -1888,17 +4219,9 @@ class ExecutionStrategy:
                     False, preview.reason_code, attempt.attempt_id,
                     mechanism.mechanism_id, preview.node_id,
                 )
-            if (
-                self._signature_attempt_counts.get(signature, 0)
-                >= self._MAX_IDENTICAL_ACTION_ATTEMPTS
-            ):
-                return StrategyDecision(False, "identical_action_retry_budget_exhausted")
             stale_revision = self._stale_mechanisms.get(mechanism.mechanism_id)
             if stale_revision is not None and self._evidence_revision <= stale_revision:
                 return StrategyDecision(False, "stale_target_requires_reresolution")
-            failed_revision = self._failed_signatures.get(signature)
-            if failed_revision is not None and self._evidence_revision <= failed_revision:
-                return StrategyDecision(False, "identical_failed_action_without_new_evidence")
             action_payload = action if isinstance(action, dict) else {}
             primitive_tool = str(action_payload.get("tool") or "")
             primitive_arguments = action_payload.get("arguments")
@@ -1919,17 +4242,6 @@ class ExecutionStrategy:
                 )
             )
             primitive_key = f"{preview.node_id}|{signature}"
-            if (
-                primitive_tool == "activate_desktop_surface"
-                and not preparatory_activation
-                and primitive_key in self._completed_primitive_signatures
-            ):
-                return StrategyDecision(
-                    False,
-                    "primitive_already_completed",
-                    mechanism_id=mechanism.mechanism_id,
-                    node_id=preview.node_id,
-                )
             observable_effect = {}
             if (
                 primitive_tool == "activate_desktop_surface"
@@ -1938,34 +4250,6 @@ class ExecutionStrategy:
                 observable_effect = normalize_desktop_observable_effect(
                     primitive_arguments.get("observable_effect")
                 )
-                completed_effects = [
-                    normalize_desktop_observable_effect(
-                        item.observable_effect,
-                    )
-                    for item in self.attempts
-                    if item.composite_id == preview.node_id
-                    and item.status in {
-                        AttemptStatus.PROGRESSED.value,
-                        AttemptStatus.SUCCEEDED.value,
-                    }
-                ]
-                same_surface_effects = [
-                    item for item in completed_effects
-                    if item
-                    and observable_effect
-                    and item["surface_ref"] == observable_effect["surface_ref"]
-                ]
-                if (
-                    len(same_surface_effects) >= 2
-                    and observable_effect != same_surface_effects[-1]
-                    and observable_effect in same_surface_effects[:-1]
-                ):
-                    return StrategyDecision(
-                        False,
-                        "primitive_observable_witness_regression",
-                        mechanism_id=mechanism.mechanism_id,
-                        node_id=preview.node_id,
-                    )
             retry_identity = self._retry_substeps.pop(primitive_key, None)
             pending_substep = _pending_uia_substep(self, preview.node_id)
             if (
@@ -2044,6 +4328,24 @@ class ExecutionStrategy:
                     target_surface_identity = (
                         _normalize_desktop_surface_identity(merged_identity)
                     )
+            refreshed_after_action_ids = []
+            state_refresh = self._semantic_goal_v2_runtime.get(
+                "current_state_refresh",
+            )
+            if (
+                isinstance(state_refresh, dict)
+                and state_refresh.get("semantic_goal_id") == preview.node_id
+                and state_refresh.get("previous_mechanism_id")
+                != mechanism.mechanism_id
+                and state_refresh.get("refreshed_action_ids")
+                and state_refresh.get("captured_after_dispatch") is True
+                and state_refresh.get("image_consumed_by_same_model") is True
+            ):
+                refreshed_after_action_ids = [
+                    str(item)
+                    for item in state_refresh.get("refreshed_action_ids") or []
+                    if str(item)
+                ]
             attempt = StrategyAttempt(
                 attempt_id=f"strategy_{len(self.attempts) + 1:03d}",
                 mechanism_id=mechanism.mechanism_id,
@@ -2077,11 +4379,19 @@ class ExecutionStrategy:
                 primitive_postcondition=primitive_postcondition,
                 observable_effect=observable_effect,
                 action_pattern=action_pattern,
+                state_refreshed_after_action_ids=(
+                    refreshed_after_action_ids
+                ),
+                target_keys=tuple(sorted(
+                    _tool_semantic_target_values(
+                        primitive_tool, primitive_arguments,
+                    )
+                )) if (
+                    primitive_tool
+                    and isinstance(primitive_arguments, dict)
+                ) else (),
             )
             self.attempts.append(attempt)
-            self._signature_attempt_counts[signature] = (
-                self._signature_attempt_counts.get(signature, 0) + 1
-            )
             self.current_mechanism = mechanism.mechanism_id
             self.current_layer = int(mechanism.layer)
             node = self.node_by_id(preview.node_id)
@@ -2103,6 +4413,415 @@ class ExecutionStrategy:
             if self.attempts:
                 self.attempts[-1].observations_gained.append(token)
 
+    def required_effect_keys(self, node: SemanticActionNode) -> tuple[str, ...]:
+        """Return the explicit effect contract of one node (cached)."""
+
+        key = str(node.node_id or "")
+        if not key:
+            return _explicit_effect_keys(node)
+        cache_key = (key, str(node.fingerprint or ""))
+        with self._lock:
+            cached = self._effect_requirement_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            computed = _explicit_effect_keys(node)
+            self._effect_requirement_cache[cache_key] = computed
+            return computed
+
+    def effect_witnesses(self, node: SemanticActionNode) -> tuple[dict, ...]:
+        with self._lock:
+            return tuple(
+                dict(item)
+                for item in self._effect_witnesses.get(str(node.node_id or ""), [])
+                if isinstance(item, dict)
+            )
+
+    def effect_progress(self, node: SemanticActionNode) -> tuple[int, int]:
+        keys = self.required_effect_keys(node)
+        if not keys:
+            return (1, 1)
+        with self._lock:
+            filled = {
+                str(item.get("key") or "")
+                for item in self._effect_witnesses.get(str(node.node_id or ""), [])
+                if isinstance(item, dict)
+            }
+        return (sum(1 for key in keys if key in filled), len(keys))
+
+    def open_verification_postconditions(self) -> tuple[str, ...]:
+        """Return pending postconditions whose only missing evidence is proof.
+
+        A node qualifies when it is still pending, every outstanding effect
+        key is an open-ended ``unresolved:``/``residual:`` requirement that no
+        primitive receipt can ever fill, and something exists for a read-only
+        observation to cover (a produced deliverable, or the explicitly named
+        target of a residual clause).  Concrete ``target:``/``unit:``
+        requirements keep a node out of this set: those still require genuine
+        productive work.  An empty result means the runtime must not claim a
+        verification path it cannot offer.
+        """
+
+        if not (self.available_tools & _VERIFICATION_OBSERVATION_TOOLS):
+            return ()
+        with self._lock:
+            pending: list[str] = []
+            for node in self.mission.action_nodes:
+                if not node.requires_execution or node.status == "succeeded":
+                    continue
+                keys = self.required_effect_keys(node)
+                if not keys:
+                    continue
+                filled = {
+                    str(item.get("key") or "")
+                    for item in self._effect_witnesses.get(
+                        node.node_id, (),
+                    )
+                    if isinstance(item, dict)
+                }
+                open_keys = [key for key in keys if key not in filled]
+                if not open_keys:
+                    continue
+                if any(
+                    key.startswith(("target:", "unit:")) for key in open_keys
+                ):
+                    continue
+                if not all(
+                    key.startswith(("unresolved:", "residual:"))
+                    for key in open_keys
+                ):
+                    continue
+                if any(
+                    key.startswith("unresolved:") for key in open_keys
+                ):
+                    verifiable = bool(
+                        self._deliverable_artifacts.get(node.node_id)
+                    )
+                else:
+                    verifiable = bool(
+                        _explicit_target_values(node.source_clause or "")
+                    ) or any(self._deliverable_artifacts.values())
+                if not verifiable:
+                    continue
+                pending.append(node.observable_success_postcondition)
+            return tuple(pending)
+
+    def _frontier_strategy_ids(self) -> list[str]:
+        """Return remaining mechanisms, read-only verification first.
+
+        When productive effects are complete and only the whole-objective proof
+        remains, a fresh bound read-only observation is the single safe next
+        step.  It must be represented in the terminality frontier so the turn
+        continues instead of accepting a premature ``blocked_verified``.
+        """
+
+        remaining = [
+            item.mechanism_id for item in self.remaining_mechanisms()
+            if self._mechanism_runtime_available(item)
+        ]
+        if not self.open_verification_postconditions():
+            return remaining
+        return [
+            VERIFICATION_STRATEGY_ID,
+            *(item for item in remaining if item != VERIFICATION_STRATEGY_ID),
+        ]
+
+    def _apply_effect_witness(
+        self,
+        node: SemanticActionNode | None,
+        *,
+        evidence: str,
+        attempt_id: str = "",
+        target_keys: Iterable[str] = (),
+        force: bool = False,
+        verification: bool = False,
+    ) -> tuple[str, bool]:
+        """Bind one witness to at most one outstanding required effect.
+
+        Returns ``(disposition, complete)`` where disposition is ``complete``
+        (nothing left to prove), ``filled``, ``partial``, ``duplicate`` or
+        ``unmatched``.  Primitive witnesses never fill ``unresolved:`` or
+        ``residual:`` keys; only explicit full-outcome verification or fresh
+        bound verification evidence can.
+        """
+
+        if node is None:
+            return "complete", True
+        with self._lock:
+            return self._apply_effect_witness_locked(
+                node,
+                evidence=evidence,
+                attempt_id=attempt_id,
+                target_keys=target_keys,
+                force=force,
+                verification=verification,
+            )
+
+    def _apply_effect_witness_locked(
+        self,
+        node: SemanticActionNode,
+        *,
+        evidence: str,
+        attempt_id: str = "",
+        target_keys: Iterable[str] = (),
+        force: bool = False,
+        verification: bool = False,
+    ) -> tuple[str, bool]:
+        keys = self.required_effect_keys(node)
+        receipt_targets = tuple(
+            str(item) for item in target_keys if str(item or "").strip()
+        )
+        if not keys:
+            soft_target = _single_effect_target(node.source_clause or "")
+            if (
+                soft_target
+                and receipt_targets
+                and not _effect_target_matches(soft_target, receipt_targets)
+            ):
+                # One action-compatible receipt for a different exact artifact
+                # does not establish the single named deliverable.
+                return "unmatched", False
+            return "complete", True
+        witness_list = self._effect_witnesses.setdefault(node.node_id, [])
+        filled = {
+            str(item.get("key") or "")
+            for item in witness_list
+            if isinstance(item, dict)
+        }
+        missing = [key for key in keys if key not in filled]
+        if not missing:
+            return "complete", True
+        used_targets = {
+            str(item.get("target") or "")
+            for item in witness_list
+            if isinstance(item, dict) and str(item.get("target") or "")
+        }
+        receipt_keys = {
+            _effect_slot_key(item) for item in receipt_targets
+            if _effect_slot_key(item)
+        }
+        if force:
+            chosen = list(missing)
+        else:
+            chosen = []
+            for key in missing:
+                if key.startswith("target:") and receipt_keys and (
+                    _effect_target_matches(key[len("target:"):], receipt_targets)
+                ):
+                    chosen.append(key)
+            if not chosen and verification:
+                chosen = [
+                    key for key in missing
+                    if key.startswith(("unresolved:", "residual:"))
+                ]
+            elif not chosen:
+                for key in missing:
+                    if key.startswith(("unresolved:", "residual:", "target:")):
+                        continue
+                    if receipt_keys and (receipt_keys & used_targets):
+                        continue
+                    chosen = [key]
+                    break
+        if not chosen:
+            if receipt_keys and (receipt_keys & used_targets):
+                return "duplicate", False
+            return "unmatched", False
+        primary_target = ""
+        if receipt_keys:
+            primary_target = sorted(receipt_keys)[0]
+        for key in chosen:
+            witness_list.append({
+                "key": key,
+                "evidence": _bounded(evidence, 180),
+                "attempt_id": _bounded(attempt_id, 192),
+                "target": primary_target,
+                "verification": bool(verification or force),
+            })
+        self._effect_witnesses[node.node_id] = witness_list[-32:]
+        self._evidence_revision += 1
+        complete = all(
+            any(
+                isinstance(item, dict) and item.get("key") == key
+                for item in witness_list
+            )
+            for key in keys
+        )
+        return ("complete" if complete else "filled" if force else "partial"), complete
+
+    def _finalize_node_success(
+        self,
+        node: SemanticActionNode,
+        evidence: str,
+    ) -> None:
+        """Record one node's whole required outcome as proven."""
+
+        if not node.required_postconditions:
+            return
+        for postcondition in node.required_postconditions:
+            self.proven_postconditions[postcondition] = evidence
+        node.status = "succeeded"
+        node.evidence_links = tuple((*node.evidence_links, evidence)[-16:])
+        self.succeeded = bool(self.required_postconditions) and all(
+            item in self.proven_postconditions
+            for item in self.required_postconditions
+        )
+
+    def deliverable_artifacts(self) -> tuple[dict, ...]:
+        """Return every artifact produced by verified mutation receipts."""
+
+        with self._lock:
+            return tuple(
+                dict(item)
+                for items in self._deliverable_artifacts.values()
+                for item in items
+                if isinstance(item, dict)
+            )
+
+    def _remember_deliverable_artifacts(
+        self,
+        node: SemanticActionNode,
+        attempt: StrategyAttempt,
+    ) -> None:
+        items = self._deliverable_artifacts.setdefault(node.node_id, [])
+        produced_at = time.time()
+        for target in attempt.target_keys:
+            key = _effect_slot_key(target)
+            if not key:
+                continue
+            if any(item.get("target_key") == key for item in items):
+                continue
+            items.append({
+                "target": _bounded(str(target), 240),
+                "target_key": key,
+                "attempt_id": _bounded(attempt.attempt_id, 192),
+                "produced_at": produced_at,
+            })
+        self._deliverable_artifacts[node.node_id] = items[-32:]
+
+    def verify_open_effects(
+        self,
+        node: SemanticActionNode | None,
+        *,
+        evidence: str,
+        observed_targets: Iterable[str] = (),
+        observed_text: str = "",
+    ) -> bool:
+        """Complete open-ended requirements with fresh bound verification.
+
+        ``unresolved:`` and ``residual:`` keys can never be filled by a
+        primitive mutation receipt.  A fresh read-only observation covering a
+        produced deliverable (or the explicitly named target of a residual
+        clause) is the minimum evidence that establishes the required
+        outcome.  Concrete ``target:``/``unit:`` requirements stay pending.
+        """
+
+        if node is None:
+            return False
+        with self._lock:
+            if not node.requires_execution:
+                return False
+            keys = self.required_effect_keys(node)
+            open_keys = [
+                key for key in keys
+                if key.startswith(("unresolved:", "residual:"))
+            ]
+            if not open_keys:
+                return False
+            observed = tuple(
+                str(item) for item in observed_targets
+                if str(item or "").strip()
+            )
+            explicit = _explicit_target_values(node.source_clause)
+            if all(key.startswith("residual:") for key in open_keys) and explicit:
+                if not any(
+                    _effect_target_matches(slot, observed) for slot in explicit
+                ):
+                    return False
+            else:
+                # An open-ended creation claim is verified only against the
+                # artifacts this node itself produced; residual verification
+                # clauses may cover the mission deliverable as a whole.
+                if any(key.startswith("unresolved:") for key in open_keys):
+                    produced = [
+                        item
+                        for item in self._deliverable_artifacts.get(
+                            node.node_id, (),
+                        )
+                        if isinstance(item, dict)
+                    ]
+                else:
+                    produced = [
+                        item for items in self._deliverable_artifacts.values()
+                        for item in items if isinstance(item, dict)
+                    ]
+                if not produced or not self._covered_artifact(
+                    produced, observed, observed_text,
+                ):
+                    return False
+            _, complete = self._apply_effect_witness_locked(
+                node,
+                evidence=evidence,
+                attempt_id="verify:" + _effect_key_digest(evidence),
+                target_keys=observed,
+                verification=True,
+            )
+            if not complete:
+                return False
+            self._finalize_node_success(node, evidence)
+            return True
+
+    @staticmethod
+    def _covered_artifact(
+        produced: list[dict],
+        observed: Iterable[str],
+        observed_text: str,
+    ) -> bool:
+        """Return whether one observation covers one produced artifact.
+
+        An exact artifact observation proves the deliverable directly.  A
+        parent-directory listing must also mention the artifact name: a path
+        that merely happens to be the parent is not evidence of its content.
+        """
+
+        text = _normalized(observed_text)
+        for item in produced:
+            artifact = item.get("target")
+            artifact_path = _artifact_path_key(artifact)
+            basename = artifact_path.rsplit("/", 1)[-1] if artifact_path else ""
+            for target in observed:
+                target_path = _artifact_path_key(target)
+                if not target_path:
+                    continue
+                if artifact_path == target_path:
+                    return True
+                if target_path.startswith(artifact_path + "/"):
+                    # Anything inside the produced deliverable/directory.
+                    return True
+                if (
+                    artifact_path.startswith(target_path + "/")
+                    and artifact_path.rsplit("/", 1)[0] == target_path
+                ):
+                    if basename and basename in text:
+                        return True
+        return False
+
+    def _force_effect_completion(
+        self,
+        node: SemanticActionNode | None,
+        *,
+        evidence: str,
+    ) -> bool:
+        """Explicit postcondition verification establishes the full outcome."""
+
+        if node is None:
+            return True
+        disposition, complete = self._apply_effect_witness(
+            node,
+            evidence=evidence,
+            attempt_id="verify:" + _effect_key_digest(evidence),
+            force=True,
+        )
+        return complete
+
     def record(
         self,
         decision: StrategyDecision,
@@ -2121,8 +4840,10 @@ class ExecutionStrategy:
             )
             if attempt is None or not decision.allowed:
                 return attempt
-            mechanism = self._mechanisms[attempt.mechanism_id]
             node = self.node_by_id(attempt.node_id) or self.goal
+            mechanism = self._mechanisms_by_node.get(
+                (attempt.mechanism_id, node.node_id),
+            ) or self._mechanisms[attempt.mechanism_id]
             normalized_outcome = _normalized(outcome).replace(" ", "_")
             if isinstance(primitive_receipt, dict):
                 attempt.primitive_receipt = json.loads(json.dumps(
@@ -2142,12 +4863,29 @@ class ExecutionStrategy:
                 self._retired_effect_mechanisms[
                     self._effect_scope(attempt.mechanism_id, node.node_id)
                 ] = "outcome_unknown"
-                if semantic_barrier:
+                state_refresh = self._semantic_goal_v2_runtime.get(
+                    "current_state_refresh",
+                )
+                already_refreshed = bool(
+                    isinstance(state_refresh, dict)
+                    and state_refresh.get("previous_strategy_attempt_id")
+                    == attempt.attempt_id
+                    and state_refresh.get("captured_after_dispatch") is True
+                    and state_refresh.get("image_consumed_by_same_model") is True
+                )
+                if semantic_barrier and not already_refreshed:
                     self.frozen_reason = attempt.failure_or_stagnation_reason
                     self._frozen_node_id = node.node_id
                     self._frozen_mechanism_id = attempt.mechanism_id
                     self._frozen_attempt_id = attempt.attempt_id
                     node.status = "unknown"
+                elif semantic_barrier:
+                    self._retired_effect_mechanisms[
+                        self._effect_scope(
+                            attempt.mechanism_id, node.node_id,
+                        )
+                    ] = "outcome_unknown_state_refreshed"
+                    node.status = "pending"
                 else:
                     # Preparatory activation/focus has its own effect identity.
                     # Its uncertainty retires only that exact preparatory
@@ -2190,39 +4928,81 @@ class ExecutionStrategy:
             elif normalized_outcome in {"progress", "progressed"}:
                 attempt.status = AttemptStatus.PROGRESSED.value
                 node.status = "pending"
-                if attempt.mechanism_id == "direct:run_command":
-                    self._retired_effect_mechanisms[
-                        self._effect_scope(attempt.mechanism_id, node.node_id)
-                    ] = "unverified_progress"
             elif normalized_outcome in {"succeeded", "success"}:
                 evidence = _bounded(postcondition_evidence, 180)
+                mechanism_covers_goal = bool(
+                    mechanism.covers_goal
+                    and (
+                        not mechanism.node_id
+                        or mechanism.node_id == node.node_id
+                    )
+                    and not _unclassified_requires_bound_verification(node)
+                )
                 if not evidence:
                     attempt.status = AttemptStatus.FAILED.value
                     attempt.failure_or_stagnation_reason = "postcondition_unverified"
                     self._failed_signatures[attempt.action_signature] = self._evidence_revision
-                elif mechanism.covers_goal:
-                    attempt.status = AttemptStatus.SUCCEEDED.value
-                    attempt.postcondition_evidence = evidence
-                    self.postcondition_evidence.append(evidence)
-                    for postcondition in node.required_postconditions:
-                        self.proven_postconditions[postcondition] = evidence
-                    node.status = "succeeded"
-                    node.evidence_links = tuple(
-                        (*node.evidence_links, evidence)[-16:]
+                elif mechanism_covers_goal:
+                    disposition, node_complete = self._apply_effect_witness(
+                        node,
+                        evidence=evidence,
+                        attempt_id=attempt.attempt_id,
+                        target_keys=tuple(attempt.target_keys),
                     )
-                    self.succeeded = all(
-                        item in self.proven_postconditions
-                        for item in self.required_postconditions
-                    )
+                    if node_complete:
+                        attempt.status = AttemptStatus.SUCCEEDED.value
+                        attempt.postcondition_evidence = evidence
+                        self.postcondition_evidence.append(evidence)
+                        self._finalize_node_success(node, evidence)
+                    elif disposition == "partial":
+                        # One exact independently required effect is proven;
+                        # the node stays pending until every effect is.
+                        attempt.status = AttemptStatus.PROGRESSED.value
+                        attempt.postcondition_evidence = evidence
+                        self.postcondition_evidence.append(evidence)
+                        node.status = "pending"
+                        node.evidence_links = tuple(
+                            (*node.evidence_links, evidence)[-16:]
+                        )
+                    elif disposition == "duplicate":
+                        attempt.status = AttemptStatus.FAILED.value
+                        attempt.failure_or_stagnation_reason = (
+                            "duplicate_effect_witness"
+                        )
+                        self._failed_signatures[
+                            attempt.action_signature
+                        ] = self._evidence_revision
+                        node.status = "pending"
+                    else:
+                        # The receipt is a real effect but not one of the
+                        # node's outstanding requirements: bounded progress,
+                        # never proof of the node.
+                        attempt.status = AttemptStatus.PROGRESSED.value
+                        attempt.postcondition_evidence = evidence
+                        self.postcondition_evidence.append(evidence)
+                        node.status = "pending"
+                        node.evidence_links = tuple(
+                            (*node.evidence_links, evidence)[-16:]
+                        )
                 else:
                     attempt.status = AttemptStatus.PROGRESSED.value
                     attempt.postcondition_evidence = evidence
                     self.postcondition_evidence.append(evidence)
                     node.status = "pending"
-                    if attempt.mechanism_id == "direct:run_command":
-                        self._retired_effect_mechanisms[
-                            self._effect_scope(attempt.mechanism_id, node.node_id)
-                        ] = "unverified_progress"
+                if (
+                    mechanism.mutation
+                    and attempt.target_keys
+                    and evidence
+                    and attempt.status in {
+                        AttemptStatus.PROGRESSED.value,
+                        AttemptStatus.SUCCEEDED.value,
+                    }
+                ):
+                    # A verified mutation receipt is progress evidence and the
+                    # concrete deliverable record that later read-only
+                    # verification can cover; it is never whole-goal proof by
+                    # itself.
+                    self._remember_deliverable_artifacts(node, attempt)
             else:
                 attempt.status = AttemptStatus.FAILED.value
                 attempt.failure_or_stagnation_reason = "invalid_strategy_outcome"
@@ -2441,7 +5221,7 @@ class ExecutionStrategy:
                             self.proven_postconditions[postcondition] = bounded
                         self.postcondition_evidence.append(bounded)
                         node.status = "succeeded"
-                        self.succeeded = all(
+                        self.succeeded = bool(self.required_postconditions) and all(
                             item in self.proven_postconditions
                             for item in self.required_postconditions
                         )
@@ -2505,15 +5285,44 @@ class ExecutionStrategy:
                 bounded = _bounded(evidence, 180)
                 self.postcondition_evidence.append(bounded)
                 if node is not None:
-                    for postcondition in node.required_postconditions:
-                        self.proven_postconditions[postcondition] = bounded
-                    node.status = "succeeded"
+                    exact_postcondition = str(details.get("postcondition") or "")
+                    exact_observation = bool(
+                        str(details.get("evidence_kind") or "")
+                        == "exact_independent_desktop_state"
+                    )
+                    # An explicit exact-state observation of the node's own
+                    # declared postcondition establishes its full outcome;
+                    # a primitive receipt still proves at most one effect.
+                    _, node_complete = self._apply_effect_witness(
+                        node,
+                        evidence=bounded,
+                        attempt_id=(
+                            attempt.attempt_id if attempt is not None else
+                            "reconcile:" + _effect_key_digest(bounded)
+                        ),
+                        target_keys=(
+                            tuple(attempt.target_keys)
+                            if attempt is not None else ()
+                        ),
+                        force=bool(
+                            exact_observation
+                            and exact_postcondition
+                            and exact_postcondition
+                            in node.required_postconditions
+                        ),
+                    )
+                    if node_complete:
+                        for postcondition in node.required_postconditions:
+                            self.proven_postconditions[postcondition] = bounded
+                        node.status = "succeeded"
+                        self.succeeded = bool(self.required_postconditions) and all(
+                            item in self.proven_postconditions
+                            for item in self.required_postconditions
+                        )
+                    else:
+                        node.status = "pending"
                     node.evidence_links = tuple(
                         (*node.evidence_links, bounded)[-16:]
-                    )
-                    self.succeeded = all(
-                        item in self.proven_postconditions
-                        for item in self.required_postconditions
                     )
                 if attempt is not None and attempt.substep_id:
                     attempt.status = AttemptStatus.SUCCEEDED.value
@@ -2745,10 +5554,22 @@ class ExecutionStrategy:
                 target = required[0]
             if target not in required:
                 return False
+            if (
+                self._semantic_goal_v2_runtime
+                and bounded not in self._semantic_goal_v2_completion_authority
+            ):
+                # In evaluation-only V2, a method receipt or generic provider
+                # success cannot authorize semantic goal completion. Only the
+                # exact grounded goal-observation path installs this token.
+                return False
             self.proven_postconditions[target] = bounded
-            self.succeeded = all(item in self.proven_postconditions for item in required)
+            self.succeeded = bool(self.required_postconditions) and all(item in self.proven_postconditions for item in required)
             for node in self.mission.action_nodes:
                 if target in node.required_postconditions:
+                    # Explicit postcondition verification establishes the
+                    # node's whole required outcome, including effects that a
+                    # primitive receipt could never fill on its own.
+                    self._force_effect_completion(node, evidence=bounded)
                     node.status = "succeeded" if all(
                         item in self.proven_postconditions
                         for item in node.required_postconditions
@@ -2763,13 +5584,13 @@ class ExecutionStrategy:
 
     def final_diagnostic(self) -> dict:
         with self._lock:
-            remaining = [item.mechanism_id for item in self.remaining_mechanisms()]
+            remaining = [
+                item.mechanism_id for item in self.remaining_mechanisms()
+                if self._mechanism_runtime_available(item)
+            ]
             if self.succeeded:
                 code = "postcondition_verified"
                 next_action = "complete"
-            elif self.frozen_reason:
-                code = "ambiguous_effect_requires_reconciliation"
-                next_action = "reconcile_existing_attempt"
             elif remaining:
                 code = "safe_strategies_remain"
                 next_action = "continue_with_next_strategy"
@@ -2797,6 +5618,7 @@ class ExecutionStrategy:
             return {
                 "mission": self.mission.public_dict(),
                 "goal_contract": self.goal_contract_dict(),
+                "execution_binding": dict(self.execution_binding),
                 # Kept for restoring pre-WOR-256 ledgers and focused callers.
                 "goal": self.goal.public_dict(),
                 "current_mechanism": self.current_mechanism,
@@ -2812,8 +5634,29 @@ class ExecutionStrategy:
                         key=lambda value: (int(value.layer), value.mechanism_id),
                     )
                 ],
-                "alternatives_still_applicable": [
-                    item.mechanism_id for item in self.remaining_mechanisms()
+                "mechanisms_by_node": [
+                    {
+                        **asdict(item),
+                        "layer": int(item.layer),
+                    }
+                    for item in sorted(
+                        self._mechanisms_by_node.values(),
+                        key=lambda value: (
+                            value.mechanism_id, value.node_id,
+                        ),
+                    )
+                ],
+                "alternatives_still_applicable": self._frontier_strategy_ids(),
+                # WOR-301: mechanisms backed by a genuinely available runtime
+                # capability.  A dormant/retired mechanism is never evidence
+                # that the engine still has a strategy to try.
+                "runtime_available_mechanisms": [
+                    item.mechanism_id
+                    for item in sorted(
+                        self._mechanisms.values(),
+                        key=lambda value: (int(value.layer), value.mechanism_id),
+                    )
+                    if self._mechanism_runtime_available(item)
                 ],
                 "postcondition_evidence": list(self.postcondition_evidence[-8:]),
                 "proven_postconditions": dict(self.proven_postconditions),
@@ -2822,7 +5665,6 @@ class ExecutionStrategy:
                 "evidence_revision": self._evidence_revision,
                 "evidence_tokens": sorted(self._evidence_tokens)[-64:],
                 "failed_signatures": dict(self._failed_signatures),
-                "signature_attempt_counts": dict(self._signature_attempt_counts),
                 "stale_mechanisms": dict(self._stale_mechanisms),
                 "retired_effect_mechanisms": dict(
                     self._retired_effect_mechanisms
@@ -2843,6 +5685,15 @@ class ExecutionStrategy:
                 "latest_desktop_observation": dict(
                     self._latest_desktop_observation
                 ),
+                "effect_witnesses": {
+                    str(node_id): [dict(item) for item in items[-32:]]
+                    for node_id, items in self._effect_witnesses.items()
+                },
+                "deliverable_artifacts": {
+                    str(node_id): [dict(item) for item in items[-32:]]
+                    for node_id, items in self._deliverable_artifacts.items()
+                },
+                "semantic_goal_v2_runtime": self.semantic_goal_v2_runtime(),
                 "available_tools": sorted(self.available_tools),
             }
 
@@ -2899,6 +5750,19 @@ class ExecutionStrategy:
             mechanisms,
             available_tools=snapshot.get("available_tools") or (),
         )
+        for raw in snapshot.get("mechanisms_by_node") or []:
+            if not isinstance(raw, dict):
+                continue
+            data = dict(raw)
+            try:
+                data["layer"] = StrategyLayer(int(data["layer"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            item = StrategyMechanism(**data)
+            strategy._mechanisms_by_node[
+                (item.mechanism_id, item.node_id)
+            ] = item
+        strategy.execution_binding = dict(snapshot.get("execution_binding") or {})
         serialized_goal_contract = snapshot.get("goal_contract")
         if isinstance(serialized_goal_contract, dict) and serialized_goal_contract:
             from osia.goal_contract import goal_contract_from_dict
@@ -2906,11 +5770,16 @@ class ExecutionStrategy:
             strategy.bind_goal_contract(
                 goal_contract_from_dict(serialized_goal_contract)
             )
-        strategy.attempts = [
-            StrategyAttempt(**dict(item))
-            for item in snapshot.get("attempts") or []
-            if isinstance(item, dict)
-        ]
+        restored_attempts: list[StrategyAttempt] = []
+        for item in snapshot.get("attempts") or []:
+            if not isinstance(item, dict):
+                continue
+            attempt_data = dict(item)
+            attempt_data["target_keys"] = tuple(
+                attempt_data.get("target_keys") or ()
+            )
+            restored_attempts.append(StrategyAttempt(**attempt_data))
+        strategy.attempts = restored_attempts
         strategy.current_mechanism = str(snapshot.get("current_mechanism") or "")
         layer = snapshot.get("current_layer")
         strategy.current_layer = int(layer) if layer is not None else None
@@ -2923,10 +5792,6 @@ class ExecutionStrategy:
         strategy._failed_signatures = {
             str(key): int(value)
             for key, value in (snapshot.get("failed_signatures") or {}).items()
-        }
-        strategy._signature_attempt_counts = {
-            str(key): int(value)
-            for key, value in (snapshot.get("signature_attempt_counts") or {}).items()
         }
         strategy._stale_mechanisms = {
             str(key): int(value)
@@ -2985,137 +5850,141 @@ class ExecutionStrategy:
         strategy._latest_desktop_observation = dict(
             snapshot.get("latest_desktop_observation") or {}
         )
+        strategy._effect_witnesses = {
+            str(node_id): [
+                dict(item) for item in items
+                if isinstance(item, dict)
+                and str(item.get("key") or "")
+            ][-32:]
+            for node_id, items in (
+                snapshot.get("effect_witnesses") or {}
+            ).items()
+            if isinstance(items, list)
+        }
+        strategy._deliverable_artifacts = {
+            str(node_id): [
+                dict(item) for item in items
+                if isinstance(item, dict)
+                and str(item.get("target") or "")
+            ][-32:]
+            for node_id, items in (
+                snapshot.get("deliverable_artifacts") or {}
+            ).items()
+            if isinstance(items, list)
+        }
+        semantic_goal_v2_runtime = snapshot.get("semantic_goal_v2_runtime")
+        if isinstance(semantic_goal_v2_runtime, dict):
+            strategy._semantic_goal_v2_runtime = json.loads(json.dumps(
+                semantic_goal_v2_runtime,
+                ensure_ascii=True,
+                sort_keys=True,
+            ))
         return strategy
 
     def model_instruction(self) -> str:
-        available = [
-            {
-                "id": item.mechanism_id,
-                "layer": int(item.layer),
-                "mechanism": item.label,
-                "reason": item.reason_selected,
+        """Expose factual execution state without choosing the model's tools."""
+        with self._lock:
+            contract = self.goal_contract_dict()
+            payload = {
+                "objective": self.mission.objective,
+                "unverified_outcomes": [
+                    item for item in self.required_postconditions
+                    if item not in self.proven_postconditions
+                ],
+                "verified_outcomes": dict(self.proven_postconditions),
+                "evidence_requirements": {
+                    str(item.get("node_id") or ""): item.get("evidence_requirement")
+                    for item in contract.get("nodes") or []
+                    if isinstance(item, dict) and item.get("evidence_requirement")
+                },
+                "completed_verified_effects": list(self.completed_effect_facts()),
+                "completed_verified_substeps": list(self._completed_substeps[-16:]),
+                "latest_desktop_observation": dict(self._latest_desktop_observation),
+                "unresolved_effect": self.frozen_reason,
             }
-            for item in self.remaining_mechanisms()
-        ]
-        goal_contract = self.goal_contract_dict()
-        if not goal_contract:
-            try:
-                from osia.goal_contract import goal_contract_from_semantic_mission
-
-                goal_contract = goal_contract_from_semantic_mission(
-                    self.mission
-                ).to_dict()
-            except (AttributeError, TypeError, ValueError):
-                goal_contract = {}
-        payload = {
-            "goal_contract": goal_contract,
-            "semantic_mission": self.mission.public_dict(),
-            "available_strategy_layers": available,
-            "completed_verified_effects": [
-                {
-                    key: fact.get(key)
-                    for key in (
-                        "attempted_effect", "target_application",
-                        "target_surface", "observed_at",
-                    )
-                }
-                for fact in self.completed_effect_facts()
-            ],
-            "completed_verified_substeps": list(self._completed_substeps[-16:]),
-            "latest_desktop_observation": dict(
-                self._latest_desktop_observation
-            ),
-            "uia_candidate_exhaustion": _uia_candidate_diagnostic(
-                self, self.goal,
-            ) if _semantic_domain(self.goal) == "desktop" else {},
-        }
         return (
-            "[Internal deterministic execution contract. Preserve every ordered "
-            "action node, its application/surface/account, requested content, and "
-            "observable postcondition across fallbacks. Never replay completed nodes "
-            "or merge unresolved work into another node. Inspect capabilities first "
-            "and use the earliest applicable "
-            "layer in this order: 0 exact direct provider/API/MCP/OSIA capability; "
-            "1 deep link or deterministic route; 2 DOM/Playwright; 3 native "
-            "accessibility; 4 keyboard with observable focus; 5 local/zoomed vision; "
-            "6 global coordinates. Do not replay a failed action "
-            "without new evidence; re-resolve stale targets; reconcile any possible "
-            "effect before another mutation. For a native Desktop composite, observe "
-            "the requested application surface first. Keep an unrelated foreground "
-            "separate from that target. If the exact target is background, activate "
-            "its opaque window ref and re-observe target focus before any control or "
-            "keyboard action. Then dispatch only one UIA primitive, observe, and "
-            "reconcile that exact primitive before choosing the next. For a stateless "
-            "Invoke control, declare its independent exact surface-text effect using "
-            "the observed effect surface ref and expected post-dispatch text; control "
-            "invocation itself is never proof. Repeated native literal controls in "
-            "one composite must keep the same previously verified text witness; if "
-            "a witness-family conflict is rejected, re-observe and use that proven "
-            "current witness. A failed-before-effect UIA candidate "
-            "retires only that exact identity/generation. Re-observe read-only and "
-            "exhaust the fresh candidate set for the same pending substep before "
-            "keyboard; a keyboard fallback may perform only that substep. Document tools "
-            "cannot execute or verify a Desktop node. Vision is eligible only after "
-            "structured UIA evidence proves it is necessary. Structured state: "
+            "[OSIA execution state. The original user objective is authoritative. "
+            "Choose tools and their order from the full available capability surface. "
+            "The engine enforces target freshness, effect truth, and "
+            "cancellation. Repeating actions is allowed, including after an unknown "
+            "outcome. Do not claim unverified outcomes. State: "
             + json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
             + "]"
         )
 
     def model_feedback(self) -> str:
-        payload = self.final_diagnostic()
-        payload["completed_verified_substeps"] = list(
-            self._completed_substeps[-16:]
-        )
-        return (
-            "[Internal execution_strategy: "
-            + json.dumps(
-                payload, sort_keys=True, ensure_ascii=True,
-                separators=(",", ":"),
-            )
-            + "]"
-        )
+        return self.model_instruction()
 
     def premature_final_instruction(self) -> str:
-        """Return one bounded correction for each unchanged strategy state."""
-
+        """Remind the model of unverified outcomes, without proposing a plan."""
         with self._lock:
             if not self.requires_execution or self.succeeded or self.frozen_reason:
                 return ""
-            remaining = self.remaining_mechanisms()
-            if not remaining:
+            # A completed observation already supplies the model's answer
+            # material. Leave whole-objective verification to the canonical
+            # controller; do not insert a duplicate inner synthesis round.
+            observed = {
+                postcondition
+                for node in self.pending_nodes()
+                if node.requested_action == "observe" and any(
+                    attempt.node_id == node.node_id
+                    and attempt.status in {
+                        AttemptStatus.PROGRESSED.value,
+                        AttemptStatus.SUCCEEDED.value,
+                    }
+                    for attempt in self.attempts
+                )
+                for postcondition in node.required_postconditions
+            }
+            pending = tuple(
+                item for item in self.required_postconditions
+                if item not in self.proven_postconditions and item not in observed
+            )
+            if not pending:
                 return ""
-            token = hashlib.sha256(
-                json.dumps(
-                    {
-                        "attempts": [
-                            (item.mechanism_id, item.status, item.failure_or_stagnation_reason)
-                            for item in self.attempts
-                        ],
-                        "remaining": [item.mechanism_id for item in remaining],
-                    },
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()[:20]
+            # Deduplicate a reminder only; this never ends or limits a turn.
+            token = repr((pending, self._evidence_revision))
             if token in self._terminal_prompt_tokens:
                 return ""
             self._terminal_prompt_tokens.add(token)
             return (
-                "The exact goal is not yet supported by postcondition evidence and "
-                "safe semantically equivalent strategies remain: "
-                + ", ".join(item.mechanism_id for item in remaining[:8])
-                + ". Continue with the earliest applicable strategy. Do not claim "
-                "success, change the required surface/account, or ask the user for "
-                "help yet."
+                "The requested outcomes are not yet supported by evidence: "
+                + "; ".join(pending)
+                + ". Continue using the available tools and factual results. "
+                "A successful substep does not prove the whole objective."
             )
 
 
 _OBSERVATION_TOOLS = frozenset({
     "take_screenshot", "inspect_desktop_surfaces", "request_visual_observation",
+    "computer_screenshot", "computer_zoom", "computer_observation",
     "is_running", "is_installed", "has_window",
     "steam_game_state", "web_state", "get_current_url", "read_page",
     "get_page_text", "get_browser_state", "inspect_browser_page", "inspect_form_fields",
     "list_browser_tabs", "get_browser_download", "read_file", "list_files",
     "search_files",
+})
+
+# A pending open-ended effect (``unresolved:``/``residual:``) can only be
+# completed by fresh bound read-only observation evidence.  When one of these
+# capabilities is available, the terminality frontier must keep offering the
+# verification continuation instead of accepting a block.
+VERIFICATION_STRATEGY_ID = "verify_open_effect_read_only"
+
+_VERIFICATION_OBSERVATION_TOOLS = frozenset({
+    "list_files", "read_file", "search_files",
+    "read_page", "get_page_text", "get_current_url", "get_browser_state",
+    "get_browser_download", "inspect_browser_page", "inspect_form_fields",
+    "list_browser_tabs", "web_state",
+})
+
+# Read/list observation tools may only discharge an explicit observation node
+# whose family they perform. They must never bind to a creation/mutation node
+# through generic target-token overlap.
+_READ_FAMILY_OBSERVATION_TOOLS = frozenset({
+    "read_file", "list_files", "read_page", "get_page_text",
+    "inspect_browser_page", "inspect_form_fields", "list_browser_tabs",
+    "get_browser_state", "get_current_url", "get_browser_download",
 })
 
 _DOM_ACTION_TOOLS = frozenset({
@@ -3130,7 +5999,381 @@ _DOM_ACTION_TOOLS = frozenset({
 
 _VISUAL_DESKTOP_TOOLS = frozenset({
     "take_screenshot", "request_visual_observation",
+    "computer_screenshot", "computer_zoom",
 })
+
+_DESKTOP_VISUAL_READ_TOOLS = frozenset({
+    "inspect_desktop_surfaces", "request_visual_observation",
+    "take_screenshot", "computer_screenshot", "computer_zoom",
+})
+
+_VISUAL_READ_INTENT = re.compile(
+    r"\b(?:inspect|observe|look\s+at|visually|visual|describe|report|"
+    r"regarde|inspecte|observe|visuellement|visuel|decris|decrire|"
+    r"tu\s+vois|vous\s+voyez|"
+    r"que\s+vois(?:\s*-\s*tu)?|what(?:\s+do)?\s+you\s+see)\b",
+)
+_VISUAL_READ_CONTEXTUAL_INTENT = re.compile(
+    r"\b(?:tell\s+me|dis\s+moi|rapporte)\b",
+)
+_VISUAL_READ_DESKTOP_CONTEXT = re.compile(
+    r"\b(?:desktop|screen|window|foreground|application|app|display|"
+    r"bureau|ecran|fenetre|premier\s+plan|affichage)\b",
+)
+_VISUAL_READ_ELLIPTICAL = re.compile(
+    r"^(?:et\s+)?(?:la|le|the)\s+"
+    r"(?:fenetre|window|app|application)\b[^.!?]{1,120}\??$",
+)
+_VISUAL_READ_MUTATION = re.compile(
+    r"\b(?:click|type|write|send|submit|activate|select|press|scroll|"
+    r"clique|tape|ecris|envoie|soumet|active|selectionne|appuie|"
+    r"defile)\b",
+)
+_VISUAL_APPEARANCE_INTENT = re.compile(
+    r"\b(?:background|theme|colour|color|shade|appearance|looks?\s+like|"
+    r"fond|theme|couleur|teinte|apparence|a\s+quoi\s+ressemble)\b",
+)
+
+
+def _without_negated_visual_read_actions(value: object) -> str:
+    """Remove explicit no-action clauses before classifying a visual read."""
+
+    text = _normalized(value)
+    text = re.sub(
+        r"\b(?:do\s+not|dont|without)\b[^.;!?]{0,200}",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:ne|n)\s*[' ]?[^.;!?]{0,100}\b(?:pas|rien)\b",
+        " ",
+        text,
+    )
+    return " ".join(text.split())
+
+
+def _desktop_visual_read_text(value: object, *, application: str = "") -> bool:
+    """Recognize one read-only desktop visual mission without app branches."""
+
+    normalized = _normalized(value)
+    has_desktop_context = bool(
+        _VISUAL_READ_DESKTOP_CONTEXT.search(normalized)
+    )
+    contextual_visual_intent = any(
+        _VISUAL_READ_CONTEXTUAL_INTENT.search(clause)
+        and _VISUAL_READ_DESKTOP_CONTEXT.search(clause)
+        for clause in _ACTION_SPLIT_PATTERN.split(normalized)
+    )
+    if (
+        not _VISUAL_READ_INTENT.search(normalized)
+        and not _VISUAL_APPEARANCE_INTENT.search(normalized)
+        and not contextual_visual_intent
+        and not _VISUAL_READ_ELLIPTICAL.fullmatch(normalized)
+    ):
+        return False
+    if not application and not has_desktop_context:
+        return False
+    return not _VISUAL_READ_MUTATION.search(
+        _without_negated_visual_read_actions(normalized),
+    )
+
+
+def is_desktop_visual_read_mission(strategy: "ExecutionStrategy") -> bool:
+    """Return whether the strategy is an exact read-only visual desktop route."""
+
+    if not isinstance(strategy, ExecutionStrategy):
+        return False
+    application = next((
+        str(node.required_application or "")
+        for node in strategy.mission.action_nodes
+        if node.required_application
+    ), "")
+    return _desktop_visual_read_text(
+        strategy.mission.objective,
+        application=application,
+    )
+
+
+def is_desktop_visual_read_node(node: SemanticActionNode) -> bool:
+    """Return whether one semantic node is a read-only desktop observation."""
+
+    if not isinstance(node, SemanticActionNode):
+        return False
+    return _desktop_visual_read_text(
+        node.source_clause,
+        application=str(node.required_application or ""),
+    )
+
+
+def _node_requires_visual_evidence(node: SemanticActionNode) -> bool:
+    """Read the canonical modality classifier without a module import cycle."""
+
+    try:
+        from osia.goal_contract import (
+            EvidenceRequirement,
+            evidence_requirement_for_node,
+        )
+
+        return evidence_requirement_for_node(node) in {
+            EvidenceRequirement.VISUAL,
+            EvidenceRequirement.MIXED,
+        }
+    except Exception:
+        return is_desktop_visual_read_node(node)
+
+
+def _fresh_exact_visual_target(
+    strategy: "ExecutionStrategy",
+    *,
+    surface_ref: str = "",
+) -> bool:
+    observation = strategy._latest_desktop_observation
+    if (
+        str(observation.get("target_resolution") or "")
+        not in {"exact_target", "current_foreground"}
+        or not observation.get("window_surface_ref")
+        or not observation.get("window_generation")
+        or observation.get("target_minimized") is True
+        or observation.get("target_conflict") is True
+    ):
+        return False
+    try:
+        observed_at = float(observation.get("observed_at") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (observed_at and -5.0 <= time.time() - observed_at <= 30.0):
+        return False
+    node = next((
+        item for item in strategy.pending_nodes()
+        if _node_requires_visual_evidence(item)
+    ), strategy.goal)
+    if not _visual_observation_matches_node(observation, node):
+        return False
+    requested_ref = str(surface_ref or "").strip()
+    expected_ref = str(observation.get("window_surface_ref") or "").strip()
+    if not requested_ref or requested_ref == expected_ref:
+        return True
+    try:
+        from osia.desktop_surface import DESKTOP_SURFACE_REGISTRY
+
+        requested = DESKTOP_SURFACE_REGISTRY.refresh_anchor(requested_ref)
+        expected = DESKTOP_SURFACE_REGISTRY.refresh_anchor(expected_ref)
+    except Exception:
+        return False
+    return bool(
+        requested.surface is not None
+        and expected.surface is not None
+        and requested.surface.process_ref == expected.surface.process_ref
+        and requested.surface.window_generation
+        == expected.surface.window_generation
+    )
+
+
+def visual_mouse_capability_applicable(
+    strategy: "ExecutionStrategy",
+) -> tuple[bool, str]:
+    """Expose guarded visual mouse actuation only for one exact click intent."""
+
+    if not isinstance(strategy, ExecutionStrategy):
+        return False, "execution_strategy_required"
+    node = strategy.match_action_node("desktop_click", {}) or strategy.goal
+    if (
+        not node.requires_execution
+        or _semantic_domain(node) != "desktop"
+        or is_desktop_visual_read_mission(strategy)
+    ):
+        return False, "visual_mouse_intent_not_applicable"
+    if node.requested_action != "activate":
+        if node.requested_action not in {"calculate", "type"}:
+            return False, "visual_mouse_intent_not_applicable"
+        if (
+            _structured_uia_frontier_state(strategy, node)
+            not in {"unavailable", "exhausted"}
+            or _structured_keyboard_frontier_state(strategy, node)
+            != "exhausted"
+        ):
+            return False, "visual_mouse_intent_not_applicable"
+    if (
+        "desktop_click" not in strategy.available_tools
+        or "request_visual_observation" not in strategy.available_tools
+    ):
+        return False, "visual_mouse_capability_unavailable"
+    if not _fresh_exact_visual_target(strategy):
+        return False, "fresh_exact_target_surface_required_before_visual_mouse"
+    observation = strategy._latest_desktop_observation
+    if observation.get("target_foreground") is not True:
+        return False, "visual_mouse_target_not_foreground"
+    if _target_correlated_uia_frontier_state(strategy, node) == "actionable":
+        return False, "stronger_exact_uia_frontier_available"
+    if _structured_keyboard_frontier_state(strategy, node) == "actionable":
+        return False, "stronger_exact_keyboard_frontier_available"
+    try:
+        from osia.desktop_scene import (
+            effective_model_route_is_bound,
+            effective_model_supports_vision,
+        )
+
+        vision_available = effective_model_supports_vision()
+        model_route_bound = effective_model_route_is_bound()
+    except Exception:
+        vision_available = False
+        model_route_bound = False
+    if not vision_available and model_route_bound:
+        return False, "effective_model_non_vision"
+    return True, ""
+
+
+def foreground_acquisition_capability_applicable(
+    strategy: "ExecutionStrategy",
+) -> tuple[bool, str]:
+    """Expose one exact Window focus transition only for a blocked mutation."""
+
+    if not isinstance(strategy, ExecutionStrategy):
+        return False, "execution_strategy_required"
+    node = strategy.match_action_node("activate_desktop_surface", {}) or strategy.goal
+    if (
+        _semantic_domain(node) != "desktop"
+        or not node.requires_execution
+        or node.requested_action != "activate"
+        or is_desktop_visual_read_mission(strategy)
+    ):
+        return False, "foreground_transition_intent_not_applicable"
+    if "activate_desktop_surface" not in strategy.available_tools:
+        return False, "foreground_transition_capability_unavailable"
+    observation = strategy._latest_desktop_observation
+    if (
+        observation.get("target_resolution") != "exact_target"
+        or not observation.get("window_surface_ref")
+        or not observation.get("window_generation")
+        or observation.get("target_minimized") is True
+        or observation.get("target_conflict") is True
+    ):
+        return False, "exact_background_target_required"
+    if not any(
+        name in strategy.available_tools
+        for name in ("desktop_click", "desktop_press", "desktop_type")
+    ):
+        return False, "foreground_dependent_actuator_unavailable"
+    contract = strategy.goal_contract_dict()
+    contract_nodes = contract.get("nodes") if isinstance(contract, dict) else []
+    bound_node = next((
+        item for item in contract_nodes or []
+        if isinstance(item, dict) and item.get("node_id") == node.node_id
+    ), None)
+    if isinstance(bound_node, dict) and (
+        bound_node.get("mutation") is not True
+        or str(bound_node.get("side_effect_class") or "")
+        != "reversible_local"
+    ):
+        return False, "foreground_transition_effect_policy_blocked"
+    return True, ""
+
+
+def _fresh_visual_mouse_action_binding(
+    strategy: "ExecutionStrategy",
+    arguments: dict,
+) -> bool:
+    """Bind one model bbox to its exact unexpired visual observation."""
+
+    applicable, _reason = visual_mouse_capability_applicable(strategy)
+    if not applicable:
+        return False
+    frame_id = _bounded(arguments.get("visual_frame_id"), 160)
+    bbox = arguments.get("visual_bbox")
+    if not frame_id or not isinstance(bbox, dict):
+        return False
+    try:
+        normalized = {
+            key: float(bbox[key])
+            for key in ("left", "top", "right", "bottom")
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if (
+        not all(math.isfinite(value) for value in normalized.values())
+        or not (
+            0.0 <= normalized["left"] < normalized["right"] <= 1.0
+            and 0.0 <= normalized["top"] < normalized["bottom"] <= 1.0
+        )
+    ):
+        return False
+    observation = strategy._latest_desktop_observation
+    history = observation.get("visual_evidence_history")
+    history = history if isinstance(history, list) else []
+    visual = next((
+        item for item in reversed(history)
+        if isinstance(item, dict) and item.get("frame_id") == frame_id
+    ), None)
+    if not isinstance(visual, dict) or visual.get("image_input_sent") is not True:
+        return False
+    try:
+        expires_at = float(
+            visual.get("actuation_lease_expires_at")
+            or visual.get("expires_at")
+            or 0.0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(expires_at) or expires_at <= time.time():
+        return False
+    expected_surface = _bounded(
+        observation.get("window_surface_ref"), 160,
+    )
+    observed_surface = _bounded(
+        visual.get("window_surface_ref") or visual.get("surface_ref"), 160,
+    )
+    if not expected_surface or observed_surface != expected_surface:
+        return False
+    if _bounded(visual.get("window_generation"), 160) != _bounded(
+        observation.get("window_generation"), 160,
+    ):
+        return False
+    node = strategy.match_action_node("desktop_click", arguments) or strategy.goal
+    visual_identity = {
+        "application": visual.get("application"),
+        "requested_application": visual.get("requested_application"),
+        "resolved_target_candidates": visual.get("resolved_target_candidates"),
+        "target_conflict": visual.get("target_conflict") is True,
+    }
+    if not _visual_observation_matches_node(visual_identity, node):
+        return False
+    description = _normalized(arguments.get("description"))
+    semantic_target = _normalized(node.target_object)
+    target_tokens = {
+        token for token in semantic_target.split() if len(token) >= 3
+    }
+    if target_tokens and not any(token in description for token in target_tokens):
+        return False
+    return True
+
+
+def _visual_observation_matches_node(
+    observation: dict,
+    node: SemanticActionNode,
+) -> bool:
+    """Bind visual proof to the exact node target resolved on one scene."""
+
+    if observation.get("target_conflict") is True:
+        return False
+    expected = _canonical_application(node.required_application)
+    if not expected:
+        return True
+    aliases = {
+        _canonical_application(value)
+        for value in (
+            observation.get("application"),
+            observation.get("requested_application"),
+        )
+        if _canonical_application(value)
+    }
+    aliases.update(
+        _canonical_application(item.get("value"))
+        for item in observation.get("resolved_target_candidates") or []
+        if isinstance(item, dict)
+        and _canonical_application(item.get("value"))
+    )
+    return expected in aliases
+
 
 # Exact reconciliation observers are selected from the semantic effect that is
 # already frozen, never from the mutating tool name.  The current tool registry
@@ -3270,7 +6513,7 @@ def _reconciliation_observer_relation(attempt: StrategyAttempt) -> str:
 def _semantic_domain(node: SemanticActionNode) -> str:
     if (
         _normalized(node.required_application)
-        in {"brave", "chrome", "firefox", "edge"}
+        in {"browser", "brave", "chrome", "firefox", "edge"}
         and node.requested_action in {
             "navigate", "search", "activate", "type", "send",
         }
@@ -3338,12 +6581,6 @@ def _effect_applicability(
             and application != _normalized(node.required_application)
         ):
             return False, "attempted_effect_target_mismatch"
-        if strategy.effect_is_completed(
-            effect,
-            target_application=application,
-            target_surface=target_surface,
-        ):
-            return False, "goal_effect_already_completed"
         return True, "goal_effect_pending"
     prerequisite = next((
         item for item in semantic_prerequisite_effects(node)
@@ -3359,12 +6596,6 @@ def _effect_applicability(
     ), None)
     if prerequisite is None:
         return False, "attempted_effect_not_applicable_to_semantic_node"
-    if strategy.effect_is_completed(
-        effect,
-        target_application=application,
-        target_surface=target_surface,
-    ):
-        return False, "prerequisite_effect_already_completed"
     return True, "prerequisite_effect_pending"
 
 
@@ -3981,6 +7212,98 @@ def _structured_uia_frontier_state(
     return "actionable"
 
 
+def _uia_candidate_semantically_matches_node(
+    candidate: dict,
+    node: SemanticActionNode,
+) -> bool:
+    """Require target-specific correspondence before UIA suppresses Vision."""
+
+    semantic_text = _normalized(" ".join((
+        node.target_object,
+        node.source_clause,
+        node.requested_content,
+        node.observable_success_postcondition,
+    )))
+    if not semantic_text:
+        return False
+    generic = {
+        "button", "control", "item", "window", "pane", "view",
+        "bouton", "controle", "element", "fenetre",
+    }
+    for value in (
+        candidate.get("label"),
+        candidate.get("automation_id"),
+    ):
+        label = _normalized(value)
+        if not label:
+            continue
+        tokens = [
+            token for token in label.split()
+            if len(token) >= 2 and token not in generic
+        ]
+        if not tokens:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", semantic_text):
+            return True
+        if all(
+            re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", semantic_text)
+            for token in tokens
+        ):
+            return True
+    return False
+
+
+def _target_correlated_uia_frontier_state(
+    strategy: ExecutionStrategy,
+    node: SemanticActionNode,
+    *,
+    semantic_target: str = "",
+) -> str:
+    """Return actionable only for UIA candidates matching this exact target."""
+
+    state = _structured_uia_frontier_state(strategy, node)
+    if state != "actionable":
+        return state
+    observation = strategy._latest_desktop_observation
+    frontier = _normalize_desktop_uia_frontier(
+        observation.get("uia_actionable_frontier"),
+    )
+    executable = [
+        item for item in frontier
+        if (
+            item["background_safe"]
+            or observation.get("target_foreground") is True
+        )
+        and (
+            _uia_candidate_semantically_matches_node(item, node)
+            or _uia_candidate_semantically_matches_text(
+                item, semantic_target,
+            )
+        )
+    ]
+    return "actionable" if executable else "unavailable"
+
+
+def _uia_candidate_semantically_matches_text(
+    candidate: dict,
+    semantic_target: object,
+) -> bool:
+    target = _normalized(semantic_target)
+    if not target:
+        return False
+    for value in (candidate.get("label"), candidate.get("automation_id")):
+        label = _normalized(value)
+        if label and (
+            label == target
+            or re.search(
+                rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])",
+                target,
+            )
+        ):
+            return True
+    return False
+
+
 def _structured_uia_surface(
     strategy: ExecutionStrategy,
     surface_ref: object,
@@ -4514,31 +7837,23 @@ def _tool_is_structurally_applicable(
     arguments: dict,
 ) -> tuple[bool, str]:
     matched_node = strategy.match_action_node(tool_name, arguments)
-    if strategy.frozen_reason and tool_name not in _OBSERVATION_TOOLS:
-        frozen_surface = _bounded(arguments.get("surface_ref"), 160)
-        frozen_attempt = strategy.attempt_by_id(
-            strategy._frozen_attempt_id
-        )
-        frozen_window = _bounded(
-            strategy._latest_desktop_observation.get("window_surface_ref")
-            or (
-                frozen_attempt.target_surface
-                if frozen_attempt is not None else ""
-            ),
-            160,
-        )
-        preparatory_bypass = bool(
-            strategy.preparatory_effect_is_frozen()
-            and tool_name == "activate_desktop_surface"
-            and frozen_surface
-            and frozen_surface != frozen_window
-        )
-        frozen_node = strategy.node_by_id(strategy._frozen_node_id)
-        independent_branch = _nodes_provably_independent(
-            frozen_node, matched_node,
-        )
-        if not preparatory_bypass and not independent_branch:
-            return False, "ambiguous_effect_requires_reconciliation"
+    if tool_name.startswith("computer_"):
+        try:
+            from osia.computer_use_v4_integration import (
+                COMPUTER_USE_V4_TOOL_NAMES,
+                computer_use_v4_tools_available,
+            )
+
+            if tool_name not in COMPUTER_USE_V4_TOOL_NAMES:
+                return False, "computer_use_v4_tool_unknown"
+            if not computer_use_v4_tools_available():
+                return False, "effective_model_non_vision"
+            # V4 owns its frame/window/stale/permission checks. Strategy keeps
+            # only the enclosing semantic mechanism and must not reconstruct a
+            # Vision frontier for each screenshot or pixel primitive.
+            return True, ""
+        except Exception:
+            return False, "computer_use_v4_context_unavailable"
     if matched_node is not None:
         pending_nodes = [
             item for item in strategy.pending_nodes() if item.requires_execution
@@ -4553,6 +7868,48 @@ def _tool_is_structurally_applicable(
             return False, "earlier_action_node_pending"
     node = matched_node or strategy.goal
     goal_domain = _semantic_domain(node)
+    if is_desktop_visual_read_node(node):
+        if tool_name not in _DESKTOP_VISUAL_READ_TOOLS:
+            return False, "read_only_visual_mission_tool_not_applicable"
+        if tool_name == "take_screenshot":
+            return False, "global_capture_hidden_for_exact_visual_read"
+        if tool_name == "request_visual_observation":
+            if not _fresh_exact_visual_target(
+                strategy,
+                surface_ref=str(arguments.get("surface_ref") or ""),
+            ):
+                return False, "fresh_exact_target_surface_required_before_vision"
+            if strategy._latest_desktop_observation.get(
+                "canonical_visual_verdict"
+            ):
+                return False, "canonical_visual_read_already_observed"
+            visual_failure = _bounded(
+                strategy._latest_desktop_observation.get(
+                    "visual_failure_reason"
+                ),
+                80,
+            ).upper()
+            if visual_failure in {
+                "CAPTURE_ACCESS_DENIED",
+                "CAPTURE_PROTECTED",
+                "CAPTURE_UNSUPPORTED",
+                "EFFECTIVE_MODEL_NON_VISION",
+                "IMAGE_INPUT_UNAVAILABLE",
+            }:
+                return False, "exact_bound_visual_observation_failed"
+            if "request_visual_observation" not in strategy.available_tools:
+                return False, "exact_visual_observation_tool_unavailable"
+            try:
+                from osia.desktop_scene import effective_model_supports_vision
+
+                vision_available = effective_model_supports_vision()
+            except Exception:
+                vision_available = False
+            if not vision_available:
+                return False, "effective_model_non_vision"
+            return True, ""
+        if tool_name == "inspect_desktop_surfaces":
+            return True, ""
     attempted_effect = _tool_attempted_effect(tool_name)
     if attempted_effect:
         target_application = strategy._tool_application(tool_name, arguments)
@@ -4573,73 +7930,16 @@ def _tool_is_structurally_applicable(
         if not applicable:
             return False, reason
     if tool_name == "run_command":
-        command = _normalized(arguments.get("command"))
-        explicit_command_goal = bool(re.search(
-            r"\b(command|command line|shell|terminal|powershell|bash|cmd)\b",
-            _normalized(" ".join((
-                strategy.mission.objective,
-                node.source_clause,
-                node.target_object,
-            ))),
-        ))
-        if not command and not (
-            explicit_command_goal and goal_domain not in {"document", "web"}
-        ):
-            return False, "generic_command_semantic_applicability_unknown"
-        if goal_domain == "desktop" and not (
-            strategy._tool_action(tool_name, arguments)
-            == node.requested_action
-            and strategy._tool_application(tool_name, arguments)
-            == _normalized(node.required_application)
-        ):
-            # Preserve the stronger anti-replay/in-flight decision for an
-            # already-bound direct effect.  A first generic command still
-            # fails closed before it can create a mutating attempt.
-            if not (
-                strategy._scope_retirement_reason(
-                    "direct:run_command", node.node_id,
-                )
-                or strategy._scope_is_in_flight(
-                    "direct:run_command", node.node_id,
-                )
-            ):
-                return False, (
-                    "mechanism_not_applicable"
-                    if node.requested_action == "calculate"
-                    else "generic_command_not_applicable_to_desktop_node"
-                )
-        if goal_domain in {"document", "web"}:
-            return False, "tool_capability_not_applicable_to_semantic_node"
-        if (
-            not goal_domain
-            and strategy.available_tools
-            and not explicit_command_goal
-        ):
-            return False, "generic_command_semantic_applicability_unknown"
+        # WOR-301: shell execution is technically valid on any mission; the
+        # remaining gates are destructive-command protection (action_policy),
+        # target freshness and attempt ownership, enforced at dispatch.
         return True, ""
     if (
         tool_name in _DOM_ACTION_TOOLS
         and goal_domain not in {"", "web"}
         and (goal_domain == "document" or not arguments)
     ):
-        return False, "tool_capability_not_applicable_to_semantic_node"
-    if tool_name == "open_uri" and node.requested_action not in {
-        "open", "navigate", "search",
-    }:
-        return False, "route_effect_not_applicable_to_semantic_node"
-    if (
-        tool_name == "activate_desktop_surface"
-        and bool(_bounded(arguments.get("surface_ref"), 160))
-        and _normalized(arguments.get("surface_ref")) == _normalized(
-            strategy._latest_desktop_observation.get("window_surface_ref")
-        )
-        and strategy.effect_is_completed(
-            "application_foreground",
-            target_application=node.required_application,
-            target_surface=str(arguments.get("surface_ref") or ""),
-        )
-    ):
-        return False, "prerequisite_effect_already_completed"
+        return True, ""
     if tool_name == "activate_desktop_surface":
         resume_effects: list[dict] = []
         resume_from_index: int | None = None
@@ -4680,10 +7980,6 @@ def _tool_is_structurally_applicable(
                 ]:
                     resume_from_index += len(later_effects)
             break
-        if resume_from_index is not None and resume_from_index >= len(
-            resume_effects
-        ):
-            return False, "semantic_batch_resume_already_completed"
         semantic_batch = arguments.get("semantic_batch")
         if semantic_batch is not None:
             try:
@@ -4770,10 +8066,6 @@ def _tool_is_structurally_applicable(
                     )
                 ):
                     return False, "semantic_batch_final_checkpoint_unobservable"
-                if _normalized(current_text_by_ref.get(effect_ref)) == _normalized(
-                    item["observable_effect"]["expected_text"]
-                ):
-                    return False, "semantic_batch_effect_already_observed"
                 if (
                     candidate.get("foreground_required") is True
                     and candidate.get("background_safe") is not True
@@ -4798,13 +8090,6 @@ def _tool_is_structurally_applicable(
             surface_ref == window_ref
             and _normalized(arguments.get("action_pattern")) in {"", "window"}
         )
-        if (
-            window_pattern
-            and strategy._latest_desktop_observation.get(
-                "target_foreground"
-            ) is True
-        ):
-            return False, "prerequisite_effect_already_completed"
         if (
             arguments.get("action_pattern")
             and not requested_pattern
@@ -4889,6 +8174,14 @@ def _tool_is_structurally_applicable(
             observation.get("target_resolution") != "exact_target"
             or not observation.get("window_surface_ref")
         ):
+            if tool_name == "desktop_click":
+                higher = strategy._higher_unexhausted(
+                    StrategyLayer.NATIVE_ACCESSIBILITY,
+                )
+                if higher:
+                    return False, "higher_strategy_still_applicable:" + ",".join(
+                        item.mechanism_id for item in higher[:8]
+                    )
             return False, "exact_desktop_target_observation_required"
         if observation.get("target_minimized") is True:
             return False, "exact_target_activation_required"
@@ -4901,7 +8194,12 @@ def _tool_is_structurally_applicable(
         if (
             tool_name == "desktop_click"
             and not _explicit_coordinate_goal(node)
-            and _structured_uia_frontier_state(strategy, node) == "actionable"
+            and _target_correlated_uia_frontier_state(
+                strategy,
+                node,
+                semantic_target=str(arguments.get("description") or ""),
+            )
+            == "actionable"
         ):
             return False, "stronger_exact_uia_frontier_available"
         if tool_name in {"desktop_press", "desktop_type"}:
@@ -4926,11 +8224,22 @@ def _tool_is_structurally_applicable(
             )
             if not preserves_substep:
                 return False, substep_reason
+        visual_binding = (
+            _fresh_visual_mouse_action_binding(strategy, arguments)
+            if tool_name == "desktop_click" else False
+        )
+        if (
+            tool_name == "desktop_click"
+            and not _explicit_coordinate_goal(node)
+            and not visual_binding
+        ):
+            return False, "fresh_authoritative_visual_target_required"
         if (
             tool_name == "desktop_click"
             and not _explicit_coordinate_goal(node)
             and _structured_keyboard_frontier_state(strategy, node)
-            != "exhausted"
+            == "actionable"
+            and not visual_binding
         ):
             return False, "stronger_exact_keyboard_frontier_available"
     if tool_name in {
@@ -4939,29 +8248,47 @@ def _tool_is_structurally_applicable(
         "desktop_scroll",
     } or tool_name in _DOM_ACTION_TOOLS:
         return True, ""
-    tool_domain = _tool_domain(tool_name)
-    if goal_domain and tool_domain != goal_domain:
-        return False, "tool_capability_not_applicable_to_semantic_node"
     if goal_domain == "desktop" and tool_name in _VISUAL_DESKTOP_TOOLS:
         observation = strategy._latest_desktop_observation
-        quality = str(observation.get("accessibility_quality") or "")
-        frontier_state = _structured_uia_frontier_state(strategy, node)
-        if not quality:
-            return False, "uia_observation_required_before_vision"
         if str(observation.get("target_resolution") or "") != "exact_target":
             return False, "exact_target_surface_required_before_vision"
-        if observation.get("target_foreground") is not True:
-            return False, "target_focus_verification_required_before_vision"
         if (
-            frontier_state in {"actionable", "refresh_required"}
-            or (
-                frontier_state == "unknown"
-                and quality == "rich_target_resolved"
-            )
+            tool_name != "request_visual_observation"
+            and observation.get("target_foreground") is not True
         ):
-            return False, "structured_uia_evidence_sufficient"
-        if _structured_keyboard_frontier_state(strategy, node) != "exhausted":
-            return False, "keyboard_frontier_not_exhausted"
+            return False, "target_focus_verification_required_before_vision"
+        try:
+            from osia.desktop_scene import (
+                effective_model_route_is_bound,
+                effective_model_supports_vision,
+            )
+
+            vision_available = effective_model_supports_vision()
+            model_route_bound = effective_model_route_is_bound()
+        except Exception:
+            vision_available = False
+            model_route_bound = False
+        if not vision_available:
+            if (
+                str(arguments.get("reason") or "") == "verification"
+                and not model_route_bound
+            ):
+                return True, ""
+            quality = str(observation.get("accessibility_quality") or "")
+            frontier_state = _structured_uia_frontier_state(strategy, node)
+            if (
+                frontier_state in {"actionable", "refresh_required"}
+                or (
+                    frontier_state == "unknown"
+                    and quality == "rich_target_resolved"
+                )
+            ):
+                return False, "structured_uia_evidence_sufficient"
+            if _structured_keyboard_frontier_state(strategy, node) != "exhausted":
+                return False, "keyboard_frontier_not_exhausted"
+            if not model_route_bound:
+                return True, ""
+            return False, "effective_model_non_vision"
     return True, ""
 
 
@@ -5560,6 +8887,44 @@ def normalize_execution_memory(value: object) -> dict:
         observed_at = float(observation.get("observed_at", 0.0) or 0.0)
     except (TypeError, ValueError, OverflowError):
         observed_at = 0.0
+    raw_visual_verdict = observation.get("canonical_visual_verdict")
+    raw_visual_verdict = (
+        raw_visual_verdict if isinstance(raw_visual_verdict, dict) else {}
+    )
+    visual_status = _bounded(raw_visual_verdict.get("status"), 32)
+    try:
+        visual_confidence = min(
+            1.0,
+            max(0.0, float(raw_visual_verdict.get("confidence") or 0.0)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        visual_confidence = 0.0
+    canonical_visual_verdict = (
+        {
+            "status": visual_status,
+            "expected_postcondition": _bounded(
+                raw_visual_verdict.get("expected_postcondition"), 320,
+            ),
+            "observed_state": _bounded(
+                raw_visual_verdict.get("observed_state"), 500,
+            ),
+            "confidence": visual_confidence,
+            "ambiguity": _bounded(
+                raw_visual_verdict.get("ambiguity"), 240,
+            ),
+        }
+        if visual_status in {
+            "match", "nonmatch", "ambiguous", "capture_invalid",
+            "target_not_visible", "stale",
+        }
+        else {}
+    )
+    try:
+        visual_observed_at = max(
+            0.0, float(observation.get("visual_observed_at") or 0.0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        visual_observed_at = 0.0
     desktop_observation = {
         "application": _bounded(observation.get("application"), 160),
         "requested_application": _bounded(
@@ -5602,6 +8967,23 @@ def normalize_execution_memory(value: object) -> dict:
             0, int(observation.get("evidence_revision") or 0),
         ) if str(observation.get("evidence_revision") or "0").isdigit() else 0,
         "observed_at": max(0.0, observed_at),
+        "canonical_visual_verdict": canonical_visual_verdict,
+        "visual_surface_ref": _bounded(
+            observation.get("visual_surface_ref"), 160,
+        ),
+        "visual_window_generation": _bounded(
+            observation.get("visual_window_generation"), 160,
+        ),
+        "visual_observation_id": _bounded(
+            observation.get("visual_observation_id"), 160,
+        ),
+        "visual_image_sha256": _bounded(
+            observation.get("visual_image_sha256"), 80,
+        ),
+        "visual_failure_reason": _bounded(
+            observation.get("visual_failure_reason"), 80,
+        ),
+        "visual_observed_at": visual_observed_at,
     }
     if not any(desktop_observation.values()):
         desktop_observation = {}
@@ -6037,7 +9419,7 @@ def rebind_execution_memory(
         strategy.mission.fingerprint = hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
         ).hexdigest()[:24]
-    strategy.succeeded = all(
+    strategy.succeeded = bool(strategy.required_postconditions) and all(
         postcondition in strategy.proven_postconditions
         for postcondition in strategy.required_postconditions
     )
@@ -6112,6 +9494,8 @@ def select_local_reconciliation_probe(
     available_tools: Iterable[str],
     *,
     user_request: str = "",
+    prefer_visual: bool = False,
+    action_target: dict | None = None,
 ) -> dict | None:
     """Select one canonical read-only observer for the exact frozen effect.
 
@@ -6175,19 +9559,87 @@ def select_local_reconciliation_probe(
             "primitive_postcondition": attempt.primitive_postcondition,
             "observable_effect": dict(attempt.observable_effect),
         }
+    durable_target = action_target if isinstance(action_target, dict) else {}
+    durable_visual_identity = bool(
+        str(durable_target.get("kind") or "") == "desktop"
+        and durable_target.get("application")
+        and (
+            durable_target.get("window_surface_ref")
+            or durable_target.get("surface_ref")
+        )
+        and durable_target.get("window_generation")
+        and durable_target.get("native_window_id")
+    )
+    target_application = str(
+        durable_target.get("application") or target_application
+    )
+    if prefer_visual and not semantic_effect:
+        semantic_effect = str(
+            node.observable_success_postcondition
+            or node.target_object
+            or node.requested_action
+            or ""
+        )
+        observer_relation = observer_relation or "desktop_visual_postcondition"
+    application_compatible = bool(
+        _normalized(target_application)
+        == _normalized(node.required_application)
+        or (
+            durable_visual_identity
+            and _visual_observation_matches_node(
+                strategy._latest_desktop_observation,
+                node,
+            )
+        )
+    )
     if (
         _semantic_domain(node) != "desktop"
         or not semantic_effect
         or not target_application
-        or _normalized(target_application)
-        != _normalized(node.required_application)
+        or not application_compatible
     ):
         return None
+    identity = (
+        attempt.target_surface_identity
+        if isinstance(attempt.target_surface_identity, dict) else {}
+    )
+    identity = {**identity, **{
+        key: value for key, value in durable_target.items()
+        if value not in (None, "", [], 0, 0.0)
+    }}
+    visual_surface = str(
+        identity.get("window_surface_ref")
+        or identity.get("surface_ref")
+        or target_surface
+        or ""
+    )
+    expected_postcondition = str(
+        attempt.primitive_postcondition
+        or node.observable_success_postcondition
+        or semantic_effect
+    )
     candidates = _RECONCILIATION_OBSERVERS.get(observer_relation, ())
+    if prefer_visual and durable_visual_identity and visual_surface:
+        candidates = tuple(candidates) + ("request_visual_observation",)
     for tool_name in candidates:
         if tool_name not in available:
             continue
-        arguments = {"target": target_application}
+        arguments = (
+            {
+                "surface_ref": visual_surface,
+                "reason": "verification",
+                "target": expected_postcondition,
+                "expected_application": target_application,
+                "expected_window_generation": str(
+                    identity.get("window_generation") or ""
+                ),
+                "expected_native_window_id": str(
+                    identity.get("native_window_id") or ""
+                ),
+            }
+            if tool_name == "request_visual_observation" else
+            {"target": target_application}
+        )
         try:
             from osia.tool_contracts import (
                 SideEffectClass,
@@ -6210,8 +9662,19 @@ def select_local_reconciliation_probe(
             or contract.side_effect is not SideEffectClass.READ_ONLY
         ):
             continue
-        applicable, _reason = _tool_is_structurally_applicable(
-            strategy, tool_name, arguments,
+        applicable, _reason = (
+            (True, "")
+            if (
+                tool_name == "request_visual_observation"
+                and prefer_visual
+                and bool(arguments.get("surface_ref"))
+                and bool(arguments.get("expected_application"))
+                and bool(arguments.get("expected_window_generation"))
+                and bool(arguments.get("expected_native_window_id"))
+            )
+            else _tool_is_structurally_applicable(
+                strategy, tool_name, arguments,
+            )
         )
         if not applicable or _tool_domain(tool_name) != "desktop":
             continue
@@ -6219,7 +9682,11 @@ def select_local_reconciliation_probe(
             "tool": tool_name,
             "arguments": arguments,
             "semantic_effect": semantic_effect,
-            "postcondition": semantic_effect,
+            "postcondition": (
+                expected_postcondition
+                if tool_name == "request_visual_observation" else
+                semantic_effect
+            ),
             "strategy_attempt_id": attempt.attempt_id,
             "semantic_node_id": node.node_id,
             "mechanism_id": attempt.mechanism_id,
@@ -6323,17 +9790,201 @@ def _single_application_hint(*values: object) -> str:
     return found[0] if len(found) == 1 else ""
 
 
+_SECOND_VISUAL_CLAUSE = re.compile(
+    r"(?:\b(?:and|et)\b\s+(?=(?:tell|describe|show|give|say|dis|dites|"
+    r"decris|décris|donne|donnez|montre|montrez)\b)|"
+    r"\b(?:tell|describe|show|give|say|dis|dites|decris|décris|donne|"
+    r"donnez|montre|montrez)\s+(?:me|moi|nous)\b|"
+    r"\b(?:tu|vous)\s+(?:vois|voyez)\b|"
+    r"\bwhat\s+(?:do\s+you\s+)?see\b)",
+    re.IGNORECASE,
+)
+
+
+def _target_hint_candidates(value: str) -> tuple[str, ...]:
+    """Return bounded noun-phrase prefixes without declaring one exact."""
+
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9_.-]+", value)
+    candidates = []
+    for width in range(min(len(tokens), 6), 0, -1):
+        candidate = _canonical_application(" ".join(tokens[:width]))
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates[:6])
+
+
+def _visual_read_target_hint(value: object) -> TargetHint:
+    """Extract a non-authoritative application noun phrase and provenance."""
+
+    source = " ".join(str(value or "").split())
+    if not source:
+        return TargetHint()
+    modifier = {
+        "a", "an", "app", "application", "au", "current", "currently",
+        "desktop", "exact", "exacte", "exactement", "foreground", "la",
+        "le", "native", "premier", "plan", "the", "window", "fenetre",
+    }
+    leading_command = {
+        "at", "can", "check", "could", "inspect", "look", "observe",
+        "open", "please", "regarde", "regarder", "show", "sur", "tu",
+        "veuillez", "voir", "vous", "what", "would", "you",
+    }
+    suffix_boundary = {
+        "active", "actif", "actifs", "actuelle", "actuel", "currently",
+        "dans", "de", "du", "en", "exact", "exacte", "foreground", "in",
+        "on", "open", "opened", "ouvert", "ouverte", "qui", "sur", "that",
+        "the", "visually", "visuellement", "which",
+    }
+
+    before = re.search(
+        r"([A-Za-zÀ-ÖØ-öø-ÿ0-9_. -]{1,100})\s+"
+        r"(?:window|app|application)\b",
+        source,
+        re.IGNORECASE,
+    )
+    if before is not None:
+        tokens = re.findall(
+            r"[A-Za-zÀ-ÖØ-öø-ÿ0-9_.-]+", before.group(1),
+        )
+        start = 0
+        while (
+            start < len(tokens)
+            and _normalized(tokens[start]) in modifier | leading_command
+        ):
+            start += 1
+        phrase_tokens = tokens[start:]
+        if phrase_tokens:
+            raw = " ".join(phrase_tokens[-6:])
+            normalized = _bounded(_canonical_application(raw), 160)
+            candidates = _target_hint_candidates(raw)
+            return TargetHint(
+                raw_text=raw,
+                normalized_value=normalized,
+                source="weak_natural_language_heuristic",
+                confidence=0.52,
+                ambiguity=len(candidates) > 1,
+                exactness=False,
+                span=(before.start(1), before.end(1)),
+                candidates=candidates or (normalized,),
+            )
+
+    quoted_after = re.search(
+        r"\b(?:window|fen[eê]tre|app|application)\b\s+"
+        r"[\"'\u201c\u201d\u00ab\u00bb]"
+        r"([^\"'\u201c\u201d\u00ab\u00bb]{1,160})"
+        r"[\"'\u201c\u201d\u00ab\u00bb]",
+        source,
+        re.IGNORECASE,
+    )
+    if quoted_after is not None:
+        raw = quoted_after.group(1).strip()
+        normalized = _bounded(_canonical_application(raw), 160)
+        return TargetHint(
+            raw_text=raw,
+            normalized_value=normalized,
+            source="explicit_quoted_application",
+            confidence=1.0,
+            ambiguity=False,
+            exactness=True,
+            span=(quoted_after.start(1), quoted_after.end(1)),
+            candidates=(normalized,),
+        )
+
+    after = re.search(
+        r"\b(?:window|fen[eê]tre|app|application)\b\s+"
+        r"([^\n,;:!?]{1,240})",
+        source,
+        re.IGNORECASE,
+    )
+    if after is not None:
+        raw_tail = after.group(1).strip()
+        boundary = _SECOND_VISUAL_CLAUSE.search(raw_tail)
+        raw_phrase = (
+            raw_tail[:boundary.start()].strip()
+            if boundary is not None else raw_tail
+        )
+        phrase_tokens = []
+        for token in re.findall(
+            r"[A-Za-zÀ-ÖØ-öø-ÿ0-9_.-]+", raw_phrase,
+        ):
+            normalized = _normalized(token)
+            if normalized in suffix_boundary:
+                break
+            if normalized not in modifier:
+                phrase_tokens.append(token)
+        if phrase_tokens:
+            raw = " ".join(phrase_tokens[:6])
+            normalized = _bounded(_canonical_application(raw), 160)
+            candidates = _target_hint_candidates(raw)
+            return TargetHint(
+                raw_text=raw,
+                normalized_value=normalized,
+                source="weak_natural_language_heuristic",
+                confidence=0.64 if boundary is not None else 0.38,
+                ambiguity=boundary is None and len(candidates) > 1,
+                exactness=False,
+                span=(after.start(1), after.start(1) + len(raw)),
+                candidates=candidates or (normalized,),
+            )
+    return TargetHint()
+
+
+def _visual_read_application_hint(value: object) -> str:
+    """Compatibility projection of the structured weak target hint."""
+
+    return _visual_read_target_hint(value).normalized_value
+
+
+def _request_target_hint(*values: object) -> TargetHint:
+    """Choose the strongest structured target evidence in trusted text."""
+
+    sources = [" ".join(str(value or "").split()) for value in values]
+    known = _single_application_hint(*sources)
+    if known:
+        joined = "\n".join(sources)
+        normalized_joined = _normalized(joined)
+        start = normalized_joined.find(_normalized(known))
+        return TargetHint(
+            raw_text=known,
+            normalized_value=known,
+            source="known_application_catalogue",
+            confidence=0.95,
+            ambiguity=False,
+            exactness=True,
+            span=(max(0, start), max(0, start) + len(known)),
+            candidates=(known,),
+        )
+    for value in sources:
+        hint = _visual_read_target_hint(value)
+        if hint.normalized_value:
+            return hint
+    return TargetHint()
+
+
 def _mission_with_application_hint(
     mission: SemanticMission,
     application: str,
+    *,
+    target_hint: TargetHint | None = None,
 ) -> SemanticMission:
     if not application or all(
         node.required_application for node in mission.action_nodes
     ):
         return mission
+    weak_hint = bool(
+        target_hint is not None
+        and target_hint.normalized_value
+        and not target_hint.exactness
+    )
     nodes = []
     for node in mission.action_nodes:
         if not node.required_application:
+            if weak_hint and node.requested_action in _EFFECT_ACTIONS:
+                # A weak noun phrase next to "app/application/window" is not
+                # evidence that a deliverable-producing action must target a
+                # desktop application.  Keep the clause free of that binding.
+                nodes.append(node)
+                continue
             node = _node_with_identity(
                 node,
                 order=node.order,
@@ -6342,6 +9993,13 @@ def _mission_with_application_hint(
             )
             if node.requested_action:
                 node.requires_execution = True
+        if (
+            target_hint is not None
+            and target_hint.normalized_value
+            and _normalized(node.required_application)
+            == _normalized(target_hint.normalized_value)
+        ):
+            node.target_hint = target_hint.public_dict()
         nodes.append(node)
     payload = [node.public_dict() for node in nodes]
     fingerprint = hashlib.sha256(
@@ -6366,6 +10024,33 @@ def _default_mechanisms_for_node(
     if deep_link is not None and "open_uri" in tools:
         mechanisms.append(StrategyMechanism(
             **{**asdict(deep_link), "node_id": node.node_id},
+        ))
+    if (
+        _normalized(node.required_application) != "browser"
+        and "computer_screenshot" in tools
+        and any(
+            name in tools
+            for name in (
+                "computer_click", "computer_double_click", "computer_type",
+                "computer_keypress", "computer_scroll", "computer_actions",
+            )
+        )
+    ):
+        suffix = ":" + node.node_id if multiple_nodes else ""
+        mechanisms.append(StrategyMechanism(
+            "direct:computer_use_v4" + suffix,
+            StrategyLayer.DIRECT_CAPABILITY,
+            (
+                "same active model may choose exact-window screenshots and "
+                "bounded computer actions; complementary to structured UIA"
+            ),
+            application=node.required_application,
+            surface=node.required_surface,
+            account=node.required_account,
+            covers_goal=True,
+            mutation=True,
+            node_id=node.node_id,
+            attempted_effect="computer_use_v4_semantic",
         ))
     if "desktop_click" in tools:
         suffix = ":" + node.node_id if multiple_nodes else ""
@@ -6408,40 +10093,65 @@ def build_execution_strategy(
     semantic_context: str = "",
 ) -> ExecutionStrategy:
     explicit_postconditions = tuple(postconditions)
-    # Autonomous supplies a trusted, labelled step contract inside a larger
-    # provider instruction. Only that structured objective/criterion is
-    # semantic work; the surrounding instructions are not action nodes.
-    objective_marker = "\nSTEP OBJECTIVE:\n"
-    criterion_marker = (
-        "\nSUCCESS CRITERION (you are done only when this is OBSERVABLY true):\n"
+    from osia.goal_contract_v2 import (
+        current_goal_contract_v2,
+        semantic_mission_from_goal_contract_v2,
     )
-    if (
-        "You are executing ONE step of a larger autonomous task." in request
-        and objective_marker in request
-        and criterion_marker in request
-    ):
-        before_criterion, criterion_tail = request.split(criterion_marker, 1)
-        _prefix, structured_objective = before_criterion.rsplit(
-            objective_marker, 1,
+
+    v2_contract = current_goal_contract_v2(request)
+    if v2_contract is not None:
+        mission = semantic_mission_from_goal_contract_v2(v2_contract)
+        target_hint = TargetHint()
+        application_hint = ""
+    else:
+        mission = derive_semantic_mission(
+            request,
+            postcondition=postcondition,
+            postconditions=explicit_postconditions,
         )
-        structured_objective = structured_objective.strip()
-        structured_criterion = criterion_tail.split("\n\n", 1)[0].strip()
-        if structured_objective and structured_criterion:
-            request = structured_objective
-            semantic_context = " ".join(
-                item for item in (semantic_context, structured_criterion) if item
-            )
-            if not postcondition and not explicit_postconditions:
-                postcondition = structured_criterion
-    mission = derive_semantic_mission(
-        request,
-        postcondition=postcondition,
-        postconditions=explicit_postconditions,
-    )
-    mission = _mission_with_application_hint(
-        mission,
-        _single_application_hint(request, semantic_context, postcondition),
-    )
+        target_hint = _request_target_hint(
+            request, semantic_context, postcondition,
+        )
+        application_hint = target_hint.normalized_value
+        mission = _mission_with_application_hint(
+            mission,
+            application_hint,
+            target_hint=target_hint,
+        )
+    if v2_contract is None and _desktop_visual_read_text(
+        request, application=application_hint,
+    ):
+        visual_node = _derive_semantic_node(
+            request,
+            postcondition=postcondition,
+            postconditions=explicit_postconditions,
+        )
+        visual_node.requested_action = ""
+        visual_node.requested_content = ""
+        visual_node.requires_execution = True
+        if application_hint:
+            visual_node.required_application = application_hint
+            visual_node.target_object = application_hint
+            visual_node.target_hint = target_hint.public_dict()
+        visual_node = _node_with_identity(
+            visual_node,
+            order=0,
+            clause=request,
+            application=visual_node.required_application,
+        )
+        visual_node.requires_execution = True
+        mission = SemanticMission(
+            objective=request,
+            action_nodes=(visual_node,),
+            fingerprint=hashlib.sha256(
+                json.dumps(
+                    visual_node.public_dict(),
+                    sort_keys=True,
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()[:24],
+            execution_required_override=True,
+        )
     tools = frozenset(str(item) for item in available_tools)
     mechanisms: list[StrategyMechanism] = []
     for node in mission.action_nodes:
@@ -6452,7 +10162,10 @@ def build_execution_strategy(
             tools,
             multiple_nodes=len(mission.action_nodes) > 1,
         ))
-    return ExecutionStrategy(mission, mechanisms, available_tools=tools)
+    strategy = ExecutionStrategy(mission, mechanisms, available_tools=tools)
+    if v2_contract is not None:
+        strategy.enable_semantic_goal_v2_runtime(v2_contract)
+    return strategy
 
 
 def mechanism_for_tool(
@@ -6589,17 +10302,26 @@ def mechanism_for_tool(
                 not desktop_goal
                 and
                 matched_goal is not None
+                and goal.requested_action
+                and not _unclassified_requires_bound_verification(goal)
                 and (not action or action == goal.requested_action)
             ),
             applicable=not desktop_calculation,
             mutation=True,
             node_id=node_id,
         )
+    # Bind completion only to the node this tool was semantically matched to.
+    # An unbound tool is at most progress, never proof of a pending node.
+    covers_goal = bool(
+        matched_goal is not None
+        and goal.requires_execution
+        and not _unclassified_requires_bound_verification(goal)
+    )
     return StrategyMechanism(
         f"direct:{_bounded(tool_name, 80)}", StrategyLayer.DIRECT_CAPABILITY,
         "provider/API/MCP/OSIA structured direct capability",
         application=goal.required_application, surface=goal.required_surface,
-        account=goal.required_account, covers_goal=True, mutation=True,
+        account=goal.required_account, covers_goal=covers_goal, mutation=True,
         node_id=node_id,
     )
 
@@ -6672,6 +10394,12 @@ def _tool_semantic_actions(tool_name: object, arguments: dict) -> frozenset[str]
         actions.add("write")
     if re.search(r"(?:^|_)(?:move|rename)(?:_|$)", name):
         actions.add("move")
+    if re.search(r"(?:^|_)(?:copy|duplicate)(?:_|$)", name):
+        actions.add("copy")
+    if re.search(r"(?:^|_)(?:download)(?:_|$)", name):
+        actions.add("download")
+    if re.search(r"(?:^|_)(?:upload)(?:_|$)", name):
+        actions.add("upload")
     if re.search(r"(?:^|_)(?:delete|remove)(?:_|$)", name) or name in {
         "kill_process", "close_browser_tab",
     }:
@@ -6738,79 +10466,236 @@ def _tool_semantic_target_values(tool_name: object, arguments: dict) -> tuple[st
     ))
 
 
-def _explicitly_forbidden_tool_action(
-    strategy: ExecutionStrategy,
-    tool_name: object,
+def _computer_action_branch_ids(
+    node: SemanticActionNode,
+    tool_name: str,
+    arguments: dict,
+) -> tuple[str, ...]:
+    """Return exact declared conditional effects named by one V4 action."""
+
+    action_items = arguments.get("actions")
+    action_items = action_items if isinstance(action_items, list) else []
+    if tool_name == "computer_actions" and action_items:
+        final_item = action_items[-1]
+        final_item = final_item if isinstance(final_item, dict) else {}
+        final_kind = str(final_item.get("kind") or "").strip().lower()
+        intent = _normalized(
+            final_item.get("effect_id") or final_item.get("intent")
+        )
+    else:
+        final_kind = tool_name.removeprefix("computer_").lower()
+        intent = _normalized(arguments.get("intent"))
+    if not node.conditional_mode or not intent:
+        return ()
+    return tuple(
+        str(branch.get("branch_id") or "")
+        for branch in node.conditional_branches
+        if str(branch.get("branch_id") or "")
+        and _normalized(branch.get("target"))
+        and _normalized(branch.get("target")) in intent
+    )
+
+
+def _computer_action_covers_node(
+    node: SemanticActionNode,
+    tool_name: str,
+    arguments: dict,
+) -> bool:
+    """Return whether one V4 action can itself reach the semantic outcome."""
+
+    action_items = arguments.get("actions")
+    action_items = action_items if isinstance(action_items, list) else []
+    if tool_name == "computer_actions" and action_items:
+        final_item = action_items[-1]
+        final_item = final_item if isinstance(final_item, dict) else {}
+        final_kind = str(final_item.get("kind") or "").strip().lower()
+        intent = _normalized(
+            final_item.get("effect_id") or final_item.get("intent")
+        )
+    else:
+        final_kind = tool_name.removeprefix("computer_").lower()
+        intent = _normalized(arguments.get("intent"))
+    if final_kind in {"type", "keypress", "scroll"} and (
+        node.requested_action not in {"type", "send"}
+    ):
+        return False
+    if node.conditional_mode:
+        return bool(_computer_action_branch_ids(node, tool_name, arguments))
+    if _targets_required_surface(node):
+        aliases = _SURFACE_ALIASES.get(node.required_surface, ())
+        return any(alias in intent for alias in aliases)
+    target_tokens = tuple(
+        token for token in _normalized(node.target_object).split()
+        if len(token) >= 2
+        and token not in {"details", "page", "result", "resultat"}
+    )
+    return bool(
+        intent
+        and target_tokens
+        and all(token in intent for token in target_tokens)
+        and node.requested_action in {"open", "navigate", "activate", "type"}
+    )
+
+
+def _computer_action_effect_postcondition(
+    tool_name: str,
     arguments: dict,
 ) -> str:
-    contract = strategy.goal_contract_dict()
-    constraints = (
-        contract.get("global_constraints")
-        if isinstance(contract, dict) else None
-    )
-    if not isinstance(constraints, list):
-        constraints = list(
-            explicit_negative_constraints(strategy.mission.objective)
-        )
-    forbidden = {
-        str(item.get("value") or "")
-        for item in constraints
-        if isinstance(item, dict) and item.get("name") == "forbidden_action"
-    }
-    tool_actions = _tool_semantic_actions(tool_name, arguments)
-    if any(
-        isinstance(item, dict)
-        and item.get("name") == "unresolved_negative_constraint"
-        for item in constraints
-    ):
-        mechanism = mechanism_for_tool(strategy, str(tool_name or ""), arguments)
-        if (
-            str(tool_name or "").strip().lower() not in _OBSERVATION_TOOLS
-            and (mechanism is None or mechanism.mutation)
-        ):
-            return "unresolved"
-    global_match = next(iter(sorted(
-        forbidden.intersection(tool_actions)
-    )), "")
-    if global_match:
-        return global_match
-    targeted = []
-    for item in constraints:
-        if not isinstance(item, dict) or item.get("name") != "forbidden_action_target":
-            continue
-        try:
-            value = json.loads(str(item.get("value") or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(value, dict):
-            continue
-        action = str((value or {}).get("action") or "")
-        target = str((value or {}).get("target") or "")
-        if action in tool_actions and _constraint_target_key(target):
-            targeted.append((action, target))
-    if not targeted:
-        return ""
-    candidate_keys = tuple(
-        _constraint_target_key(value)
-        for value in _tool_semantic_target_values(tool_name, arguments)
-        if _constraint_target_key(value)
-    )
-    if not candidate_keys:
-        # An opaque keyboard/ref action cannot prove that it excludes a
-        # specifically forbidden target, so explicit user intent wins.
-        return sorted(action for action, _target in targeted)[0]
-    for action, target in sorted(targeted):
-        target_key = _constraint_target_key(target)
-        if any(
-            target_key == candidate
-            or (
-                min(len(target_key), len(candidate)) >= 3
-                and (target_key in candidate or candidate in target_key)
+    """Describe the observable effect of one model-selected V4 sub-action."""
+
+    if tool_name == "computer_actions":
+        actions = arguments.get("actions")
+        actions = actions if isinstance(actions, list) else []
+        final = actions[-1] if actions and isinstance(actions[-1], dict) else {}
+        kind = str(final.get("kind") or "").strip().lower()
+        nested_tool = {
+            "click": "computer_click",
+            "double_click": "computer_double_click",
+            "type": "computer_type",
+            "keypress": "computer_keypress",
+            "scroll": "computer_scroll",
+        }.get(kind, "")
+        if nested_tool:
+            nested = dict(final)
+            nested["intent"] = final.get("effect_id") or final.get("intent") or ""
+            return _computer_action_effect_postcondition(nested_tool, nested)
+    if tool_name == "computer_type":
+        text = _bounded(arguments.get("text"), 160)
+        if text:
+            return _bounded(
+                f'the exact text "{text}" is visibly present in the intended field',
+                320,
             )
-            for candidate in candidate_keys
-        ):
-            return action
-    return ""
+    intent = _bounded(arguments.get("intent"), 160)
+    if tool_name in {"computer_click", "computer_double_click"}:
+        return _bounded(
+            "the intended control is visibly active after the click"
+            + (f" for {intent}" if intent else ""),
+            320,
+        )
+    if tool_name == "computer_keypress":
+        return _bounded(
+            f"the intended effect of key {arguments.get('key') or ''} is visible",
+            320,
+        )
+    if tool_name == "computer_scroll":
+        return "the intended scrolled content is visibly in view"
+    return _bounded(
+        intent or f"{tool_name} effect is visibly applied", 320,
+    )
+
+
+def _computer_action_method_identity(
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> str:
+    """Return a frame/prose-independent identity for one V4 method action."""
+
+    def normalized_item(kind: str, values: Mapping[str, object]) -> dict:
+        item = {"kind": kind}
+        if kind in {"click", "double_click"}:
+            for key in ("x", "y"):
+                try:
+                    # Raw visual coordinates have no stable element identity.
+                    # A coarse cell absorbs normal model click jitter without
+                    # interpreting labels, applications, or entity text.
+                    item[key + "_cell"] = int(
+                        float(values.get(key) or 0.0) // 64.0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    item[key + "_cell"] = 0
+        elif kind == "type":
+            item["text_sha256"] = hashlib.sha256(
+                str(values.get("text") or "").encode(
+                    "utf-8", errors="replace",
+                )
+            ).hexdigest()
+        elif kind == "keypress":
+            item["key"] = _normalized(values.get("key"))
+        elif kind == "scroll":
+            item["direction"] = _normalized(values.get("direction") or "down")
+            try:
+                item["amount"] = int(values.get("amount") or 3)
+            except (TypeError, ValueError, OverflowError):
+                item["amount"] = 3
+        return item
+
+    if tool_name == "computer_actions":
+        actions = arguments.get("actions")
+        actions = actions if isinstance(actions, list) else []
+        material = [
+            normalized_item(
+                str(item.get("kind") or "").strip().lower(), item,
+            )
+            for item in actions
+            if isinstance(item, Mapping)
+        ]
+    else:
+        material = [normalized_item(
+            tool_name.removeprefix("computer_").lower(), arguments,
+        )]
+    return hashlib.sha256(json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+# WOR-301 dispatch invariant: a technically available tool may be refused at
+# dispatch only for genuine technical unavailability or execution-integrity
+# reasons (stale target/frame freshness, cancellation, attempt ownership,
+# invalid arguments/state).  Relevance, plan-order, semantic domain,
+# GoalContract, mechanism preference and frontier position never block.
+_PREFLIGHT_BLOCKING_REASON_CODES = frozenset({
+    "semantic_batch_resume_frontier_mismatch",
+    "semantic_batch_stale_primitive",
+    "semantic_batch_structural_transition",
+    "semantic_batch_target_identity_invalid",
+    "semantic_batch_final_checkpoint_unobservable",
+    "semantic_batch_unresolved_focus_requirement",
+    "effective_model_non_vision",
+    "foreground_dependent_actuator_unavailable",
+    "foreground_transition_capability_unavailable",
+    "visual_mouse_capability_unavailable",
+    "target_focus_verification_required_before_vision",
+    # Composed-actuation state machine: each pending substep must be observed
+    # and completed before the next one, otherwise the typed/invoked effect
+    # cannot be correlated.  This is attempt/effect correlation and invalid
+    # actuation state, not relevance.
+    "keyboard_action_skips_pending_substep",
+    "keyboard_pending_substep_input_required",
+    "keyboard_substep_observation_required",
+    "uia_action_skips_pending_substep",
+    "uia_invoke_observable_effect_required",
+    "uia_action_pattern_unavailable",
+    "uia_action_pattern_unsupported",
+    "uia_candidate_conflicts_with_verified_text_delta",
+    "uia_literal_family_witness_conflict",
+})
+_PREFLIGHT_BLOCKING_REASON_PREFIXES = (
+    "fresh_",
+    "exact_",
+    "stale_",
+    "computer_use_v4_",
+)
+
+
+def preflight_refusal_is_dispatch_blocking(reason_code: object) -> bool:
+    """WOR-301: whether one preflight refusal may block an available tool.
+
+    Only genuine technical unavailability and execution-integrity invariants
+    block.  Everything else (relevance, semantic applicability, plan order,
+    mechanism preference, frontier ranking, GoalContract constraints) is
+    advisory and must let the dispatch proceed so the model decides.
+    """
+
+    code = str(reason_code or "").strip()
+    if not code:
+        return True
+    if code.startswith(_PREFLIGHT_BLOCKING_REASON_PREFIXES):
+        return True
+    return code in _PREFLIGHT_BLOCKING_REASON_CODES
 
 
 def tool_preflight(
@@ -6822,47 +10707,16 @@ def tool_preflight(
     strategy = strategy or current_execution_strategy()
     if strategy is None:
         return None
-    forbidden_action = _explicitly_forbidden_tool_action(
-        strategy, tool_name, arguments,
-    )
-    if forbidden_action:
-        return StrategyDecision(
-            False,
-            "explicit_negative_constraint_forbids_" + forbidden_action,
-            node_id=strategy.goal.node_id,
-        )
     applicable, reason_code = _tool_is_structurally_applicable(
         strategy, tool_name, arguments,
     )
     if not applicable:
-        if reason_code in {
-            "goal_effect_already_completed",
-            "prerequisite_effect_already_completed",
-        }:
-            mechanism = mechanism_for_tool(strategy, tool_name, arguments)
-            node = (
-                strategy.node_by_id(mechanism.node_id)
-                if mechanism is not None and mechanism.node_id else
-                strategy._node_for_mechanism(mechanism, {
-                    "tool": tool_name,
-                    "arguments": arguments,
-                })
-                if mechanism is not None else None
+        if preflight_refusal_is_dispatch_blocking(reason_code):
+            return StrategyDecision(
+                False,
+                reason_code,
+                node_id=strategy.goal.node_id,
             )
-            retirement = (
-                strategy._scope_retirement_reason(
-                    mechanism.mechanism_id,
-                    node.node_id,
-                )
-                if mechanism is not None and node is not None else ""
-            )
-            if retirement:
-                reason_code = "mechanism_retired_after_" + retirement
-        return StrategyDecision(
-            False,
-            reason_code,
-            node_id=strategy.goal.node_id,
-        )
     if tool_name in {"desktop_press", "desktop_type"}:
         node = strategy.goal
         if _structured_uia_frontier_state(strategy, node) == "unavailable":
@@ -6888,6 +10742,166 @@ def tool_preflight(
         spec = None
     if spec is not None and spec.side_effect is SideEffectClass.READ_ONLY:
         return None
+    if tool_name.startswith("computer_"):
+        try:
+            from osia.computer_use_v4_integration import (
+                COMPUTER_USE_V4_MUTATION_TOOLS,
+            )
+        except Exception:
+            COMPUTER_USE_V4_MUTATION_TOOLS = frozenset()
+        if tool_name in COMPUTER_USE_V4_MUTATION_TOOLS:
+            node = (
+                strategy.goal
+                if (
+                    tool_name == "computer_actions"
+                    and _requires_bounded_click_type_sequence(strategy.goal)
+                ) else
+                strategy.match_action_node(tool_name, arguments)
+                or strategy.goal
+            )
+            if _requires_bounded_click_type_sequence(node):
+                if tool_name != "computer_actions":
+                    return StrategyDecision(
+                        False,
+                        "computer_use_v4_bounded_click_type_required",
+                        node_id=node.node_id,
+                    )
+                actions = arguments.get("actions")
+                actions = actions if isinstance(actions, list) else []
+                kinds = [
+                    str(item.get("kind") or "").strip().lower()
+                    for item in actions
+                    if isinstance(item, dict)
+                ]
+                click_index = next((
+                    index for index, kind in enumerate(kinds)
+                    if kind in {"click", "double_click"}
+                ), -1)
+                type_index = next((
+                    index for index, kind in enumerate(kinds)
+                    if kind == "type"
+                ), -1)
+                if (
+                    click_index < 0
+                    or type_index <= click_index
+                    or any(
+                        isinstance(item, dict)
+                        and item.get("observe_after") is True
+                        for item in actions[click_index:type_index]
+                    )
+                ):
+                    return StrategyDecision(
+                        False,
+                        "computer_use_v4_bounded_click_type_incomplete",
+                        node_id=node.node_id,
+                    )
+            frame_id = str(arguments.get("frame_id") or "")
+            if tool_name == "computer_actions":
+                actions = arguments.get("actions")
+                first = actions[0] if isinstance(actions, list) and actions else {}
+                frame_id = str(
+                    first.get("frame_id") or ""
+                    if isinstance(first, dict) else ""
+                )
+            suffix = ":" + node.node_id if len(strategy.mission.action_nodes) > 1 else ""
+            base_mechanism_id = "direct:computer_use_v4" + suffix
+            stale_base = next((
+                item for item in reversed(strategy.attempts)
+                if item.mechanism_id == base_mechanism_id
+                and item.node_id == node.node_id
+                and item.status == AttemptStatus.STALE.value
+            ), None)
+            mechanism_id = (
+                base_mechanism_id
+                + ":refresh:"
+                + hashlib.sha256(
+                    frame_id.encode("utf-8", errors="replace")
+                ).hexdigest()[:12]
+                if stale_base is not None else base_mechanism_id
+            )
+            action_postcondition = _computer_action_effect_postcondition(
+                tool_name, arguments,
+            )
+            semantic_goal_candidate = _computer_action_covers_node(
+                node, tool_name, arguments,
+            )
+            branch_ids = _computer_action_branch_ids(
+                node, tool_name, arguments,
+            )
+            covers_goal = semantic_goal_candidate
+            if strategy.semantic_goal_v2_active:
+                # V2 method actions prove only their local effect. Semantic
+                # completion is a later, separately grounded observation.
+                covers_goal = False
+            action_postcondition = (
+                node.observable_success_postcondition
+                if covers_goal else
+                action_postcondition
+            )
+            if not covers_goal:
+                subaction_identity = (
+                    _computer_action_method_identity(tool_name, arguments)
+                    if strategy.semantic_goal_v2_active else
+                    hashlib.sha256(
+                        action_postcondition.encode("utf-8", errors="replace")
+                    ).hexdigest()[:12]
+                )
+                mechanism_id = (
+                    base_mechanism_id
+                    + ":subaction:"
+                    + subaction_identity
+                )
+            mechanism = StrategyMechanism(
+                mechanism_id,
+                StrategyLayer.DIRECT_CAPABILITY,
+                "same-model exact-window computer interaction",
+                application=node.required_application,
+                surface=node.required_surface,
+                account=node.required_account,
+                covers_goal=covers_goal,
+                mutation=True,
+                node_id=node.node_id,
+                attempted_effect="computer_use_v4_semantic",
+            )
+            strategy._mechanisms[mechanism_id] = mechanism
+            existing = next((
+                item for item in reversed(strategy.attempts)
+                if item.mechanism_id == mechanism.mechanism_id
+                and item.node_id == node.node_id
+                and item.status in {
+                    AttemptStatus.PROGRESSED.value,
+                    AttemptStatus.SELECTED.value,
+                }
+            ), None)
+            if existing is not None:
+                existing.primitive_postcondition = action_postcondition
+                existing.attempted_effect = action_postcondition
+                strategy.bind_semantic_goal_v2_method_attempt(
+                    existing.attempt_id,
+                    semantic_goal_candidate=semantic_goal_candidate,
+                    branch_ids=branch_ids,
+                )
+                return StrategyDecision(
+                    True,
+                    "computer_use_v4_inner_action",
+                    existing.attempt_id,
+                    existing.mechanism_id,
+                    existing.node_id,
+                    existing.attempted_effect,
+                )
+            selected = strategy.select(
+                mechanism, {"tool": tool_name, "arguments": arguments},
+            )
+            selected_attempt = strategy.attempt_by_id(selected.attempt_id)
+            if selected_attempt is not None:
+                selected_attempt.primitive_postcondition = action_postcondition
+                selected_attempt.attempted_effect = action_postcondition
+                strategy.bind_semantic_goal_v2_method_attempt(
+                    selected_attempt.attempt_id,
+                    semantic_goal_candidate=semantic_goal_candidate,
+                    branch_ids=branch_ids,
+                )
+            return selected
     if tool_name == "desktop_click":
         observation = strategy._latest_desktop_observation
         if (
@@ -6900,10 +10914,33 @@ def tool_preflight(
                 "exact_target_activation_required",
                 node_id=strategy.goal.node_id,
             )
+        visual_node = (
+            strategy.match_action_node(tool_name, arguments)
+            or strategy.goal
+        )
+        if _fresh_visual_mouse_action_binding(strategy, arguments):
+            visual_mouse = StrategyMechanism(
+                "direct:desktop_visual_activation:" + visual_node.node_id,
+                StrategyLayer.DIRECT_CAPABILITY,
+                "fresh exact visual target bound to guarded local mouse",
+                application=visual_node.required_application,
+                surface=str(
+                    observation.get("window_surface_ref") or ""
+                ),
+                account=visual_node.required_account,
+                covers_goal=False,
+                mutation=True,
+                node_id=visual_node.node_id,
+                attempted_effect="desktop_visual_activation",
+            )
+            return strategy.select(
+                visual_mouse,
+                {"tool": tool_name, "arguments": arguments},
+            )
         # Internal selection begins with DOM when applicable, then layer 3.
         preview = strategy.preview(StrategyMechanism(
             "native_accessibility", StrategyLayer.NATIVE_ACCESSIBILITY,
-            "desktop composite starts at the earliest applicable internal layer",
+            "exact structured actuator preferred when safely applicable",
             application=strategy.goal.required_application,
             surface=strategy.goal.required_surface,
             account=strategy.goal.required_account,
@@ -6918,6 +10955,15 @@ def tool_preflight(
     decision = strategy.select(
         mechanism, {"tool": tool_name, "arguments": arguments},
     )
+    if (
+        decision is not None
+        and not decision.allowed
+        and not preflight_refusal_is_dispatch_blocking(decision.reason_code)
+    ):
+        # WOR-301: relevance/plan-order/mechanism-preference refusals never
+        # block an available tool at dispatch.  The engine records the refused
+        # attempt; the model decides whether the capability is useful.
+        return None
     if (
         tool_name == "activate_desktop_surface"
         and arguments.get("semantic_batch") is not None
@@ -6949,15 +10995,291 @@ def tool_preflight(
     return decision
 
 
+_OBSERVATION_GENERIC_NOUNS = frozenset({
+    "content", "contents", "text", "body", "value", "values", "label",
+    "labels", "contenu", "contenus", "texte", "valeur", "valeurs", "libelle",
+    "libelles", "page", "pages",
+})
+_ARTIFACT_CONNECTOR_TOKENS = frozenset({
+    "called", "named", "entitled", "appele", "appeles", "appelee", "appelees",
+    "nomme", "nommee", "nommes", "nommees",
+})
+_FILE_EXTENSION_TOKENS = frozenset({
+    "txt", "md", "py", "js", "ts", "json", "csv", "html", "htm", "css",
+    "xml", "yaml", "yml", "pdf", "doc", "docx", "xls", "xlsx", "ppt",
+    "pptx", "png", "jpg", "jpeg", "gif", "svg", "zip", "tar", "gz", "exe",
+    "bat", "ps1", "sh", "log", "ini", "cfg", "toml",
+})
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![\w/\\])("
+    r"[A-Za-z]:[\\/][^\s,;:!?'\"<>|]{1,200}"
+    r"|~?[\\/][^\s,;:!?'\"<>|]{2,200}"
+    r")"
+)
+
+
+def _explicit_target_values(value: object) -> tuple[str, ...]:
+    """Return concrete artifact/surface targets explicitly named in a clause."""
+
+    text = str(value or "")
+    if not text:
+        return ()
+    predicate = _effect_predicate_source(text) or text
+    found: list[str] = list(_enumerated_effect_targets(predicate))
+    found.extend(_FILENAME_RE.findall(predicate))
+    found.extend(
+        item.strip() for item in _QUOTED_NAME_RE.findall(text)
+        if len(item.strip()) >= 2
+    )
+    found.extend(_ABSOLUTE_PATH_RE.findall(text))
+    named = _NAMED_TARGET_RE.search(_normalized(text))
+    if named is not None:
+        tail = re.split(r"[.!?]\s", named.group(1))[0].strip(" .?!,;:")
+        tail = _TAIL_BOUNDARY_RE.split(tail)[0].strip(" .?!,;:")
+        candidate = tail.split(",")[0].strip(" .?!,;:")
+        if (
+            candidate
+            and 2 <= len(candidate) <= 46
+            and not all(
+                token in _FUNCTION_HEAD_TOKENS
+                for token in candidate.split()
+            )
+        ):
+            found.append(candidate)
+    normalized = _normalized(text)
+    for match in _ARTIFACT_NOUN_RE.finditer(normalized):
+        remainder_raw = normalized[match.end():]
+        if remainder_raw.lstrip().startswith("."):
+            # "report.txt": the artifact noun is part of a filename.
+            continue
+        tokens = remainder_raw.strip(" .?!,;:").split()
+        while tokens and tokens[0] in _ARTIFACT_CONNECTOR_TOKENS:
+            tokens = tokens[1:]
+        if not tokens:
+            continue
+        first = tokens[0]
+        if (
+            first in _FUNCTION_HEAD_TOKENS
+            or first in _MEASURE_NOUNS
+            or first in _OBSERVATION_GENERIC_NOUNS
+            or first in _FILE_EXTENSION_TOKENS
+            or len(first) < 2
+        ):
+            continue
+        found.append(first)
+    unique = list(dict.fromkeys(found))
+    multi_token = [item for item in unique if " " in item]
+    return tuple(
+        item for item in unique
+        if " " in item
+        or not any(item in candidate.split() for candidate in multi_token)
+    )[:12]
+
+
+def _observation_argument_targets(
+    tool_name: object,
+    arguments: dict | None,
+) -> tuple[str, ...]:
+    if not isinstance(arguments, dict):
+        return ()
+    return _tool_semantic_target_values(tool_name, arguments)
+
+
+_RECEIPT_TARGET_KEYS = (
+    "path", "paths", "file", "files", "filename", "directory", "dir",
+    "folder", "target", "target_path", "uri", "url", "name",
+)
+
+
+def _observation_result_targets(
+    value: object,
+    *,
+    depth: int = 0,
+) -> tuple[str, ...]:
+    """Return target values carried by one read-only receipt payload."""
+
+    if depth > 3:
+        return ()
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key in _RECEIPT_TARGET_KEYS:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                found.append(item.strip())
+            elif isinstance(item, list):
+                found.extend(
+                    str(sub).strip() for sub in item[:16]
+                    if isinstance(sub, str) and str(sub).strip()
+                )
+        for key, item in value.items():
+            if key in _RECEIPT_TARGET_KEYS:
+                continue
+            if isinstance(item, (dict, list)):
+                found.extend(
+                    _observation_result_targets(item, depth=depth + 1)
+                )
+    elif isinstance(value, list):
+        for item in value[:16]:
+            found.extend(_observation_result_targets(item, depth=depth + 1))
+    return tuple(dict.fromkeys(found))[:24]
+
+
+def _observation_context_targets(
+    node: SemanticActionNode,
+    strategy: ExecutionStrategy,
+) -> tuple[str, ...]:
+    """Resolve a deictic observation ("the folder contents") from context."""
+
+    artifacts = strategy.deliverable_artifacts()
+    prior = sorted(
+        (
+            other for other in strategy.mission.action_nodes
+            if other.node_id != node.node_id and other.order < node.order
+        ),
+        key=lambda item: item.order,
+        reverse=True,
+    )
+    for other in prior:
+        explicit = _explicit_target_values(other.source_clause)
+        if not explicit:
+            continue
+        for slot in explicit:
+            slot_key = _effect_slot_key(slot)
+            if not slot_key:
+                continue
+            for item in artifacts:
+                artifact = str(item.get("target") or "")
+                if not artifact:
+                    continue
+                artifact_key = _effect_slot_key(artifact)
+                if artifact_key == slot_key or (
+                    artifact_key
+                    and artifact_key == _effect_slot_key(
+                        re.split(r"[/\\]", artifact)[-1],
+                    )
+                    and slot_key == _effect_slot_key(
+                        re.split(r"[/\\]", slot)[-1],
+                    )
+                ):
+                    # Prefer the concrete produced path over a bare name: a
+                    # same-named folder elsewhere is a different folder.
+                    return (artifact,)
+        return explicit[:1]
+    if artifacts:
+        return (str(artifacts[-1].get("target") or ""),)
+    return ()
+
+
+def _observation_required_targets(
+    node: SemanticActionNode,
+    strategy: ExecutionStrategy,
+) -> tuple[str, ...]:
+    explicit = _explicit_target_values(node.source_clause)
+    if explicit:
+        return explicit
+    return tuple(
+        item for item in _observation_context_targets(node, strategy) if item
+    )
+
+
+def _observation_target_ok(
+    node: SemanticActionNode,
+    strategy: ExecutionStrategy,
+    observed_targets: Iterable[str],
+    observed_text: str = "",
+) -> bool:
+    """Read-only receipts need the same exact target identity as mutations."""
+
+    required = _observation_required_targets(node, strategy)
+    if not required:
+        return True
+    observed = tuple(
+        str(item) for item in observed_targets if str(item or "").strip()
+    )
+    if not observed:
+        return False
+    produced = strategy.deliverable_artifacts()
+    for slot in required:
+        slot_text = str(slot)
+        slot_normalized = _normalized(slot_text)
+        structural = bool(
+            _ABSOLUTE_PATH_RE.fullmatch(slot_text.strip())
+        ) or "/" in slot_normalized or "\\" in slot_text
+        for value in observed:
+            if (
+                _artifact_path_key(value)
+                and _artifact_path_key(value) == _artifact_path_key(slot_text)
+            ):
+                return True
+        if structural:
+            if ExecutionStrategy._covered_artifact(
+                [{"target": item.get("target")} for item in produced],
+                observed,
+                observed_text,
+            ):
+                return True
+            continue
+        if _effect_target_matches(slot, observed):
+            return True
+    return False
+
+
+def _artifact_path_key(value: object) -> str:
+    text = _normalized(value).replace("\\", "/")
+    return re.sub(r"/+", "/", text).strip("/")
+
+
+def _observation_verb_families(value: object) -> frozenset[str]:
+    """Coarse observation families for read-only receipt binding."""
+
+    families: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", _normalized(value)):
+        if token in {
+            "list", "listing", "show", "display", "affiche", "montre",
+            "liste", "lister", "tabs", "tab",
+        }:
+            families.add("list")
+        elif token in {
+            "read", "lis", "lire", "releve", "relever", "get", "fetch",
+            "text", "contents", "content", "page", "file", "files",
+            "directory", "folder",
+        }:
+            families.add("read")
+        elif token in {
+            "inspect", "observe", "observation", "inspection", "examine",
+            "scan", "surface", "surfaces",
+        }:
+            families.add("inspect")
+    return frozenset(families)
+
+
+def _observation_tool_matches_node(tool_name: object, node) -> bool:
+    """A read-only receipt proves only the observation family it performs."""
+
+    tool_families = _observation_verb_families(tool_name)
+    if not tool_families:
+        return False
+    node_families = _observation_verb_families(
+        " ".join((
+            str(getattr(node, "source_clause", "") or ""),
+            str(getattr(node, "target_object", "") or ""),
+        ))
+    )
+    return bool(tool_families & node_families)
+
+
 def record_tool_observation(
     tool_name: str,
     result: object,
     *,
     is_error: bool,
     strategy: ExecutionStrategy | None = None,
+    arguments: dict | None = None,
 ) -> bool:
     strategy = strategy or current_execution_strategy()
-    if strategy is None or tool_name not in _OBSERVATION_TOOLS or is_error:
+    if strategy is None or tool_name not in _OBSERVATION_TOOLS:
+        return False
+    if is_error and tool_name != "request_visual_observation":
         return False
     receipt = result.get("receipt") if isinstance(result, dict) else None
     typed_app_open = bool(
@@ -6971,6 +11293,7 @@ def record_tool_observation(
     if (
         tool_name in {
             "inspect_desktop_surfaces", "request_visual_observation",
+            "computer_screenshot", "computer_zoom",
         }
         or typed_app_open
     ):
@@ -6978,7 +11301,38 @@ def record_tool_observation(
         receipt = receipt if isinstance(receipt, dict) else {}
         scene = result.get("scene") if isinstance(result, dict) else None
         scene = scene if isinstance(scene, dict) else {}
+        if tool_name in {
+            "request_visual_observation", "computer_screenshot",
+            "computer_zoom",
+        } and is_error:
+            reason = _bounded(
+                receipt.get("reason_code") or "visual_observation_failed",
+                80,
+            )
+            strategy._latest_desktop_observation[
+                "visual_failure_reason"
+            ] = reason
+            strategy.observe(
+                "exact bound visual observation failed before a verdict",
+                evidence_token=f"request_visual_observation:{reason}",
+            )
+            return False
         if tool_name == "inspect_desktop_surfaces" and scene:
+            prior_visual_failure = _bounded(
+                strategy._latest_desktop_observation.get(
+                    "visual_failure_reason"
+                ),
+                80,
+            )
+            prior_visual_history = (
+                strategy._latest_desktop_observation.get(
+                    "visual_evidence_history"
+                )
+            )
+            prior_visual_history = (
+                list(prior_visual_history)
+                if isinstance(prior_visual_history, list) else []
+            )
             strategy._latest_desktop_observation = {
                 "application": _bounded(scene.get("application"), 160),
                 "requested_application": _bounded(
@@ -7001,6 +11355,52 @@ def record_tool_observation(
                 "target_identity_evidence": _bounded(
                     scene.get("target_identity_evidence"), 240,
                 ),
+                "target_conflict": scene.get("target_conflict") is True,
+                "requested_target_candidates": [
+                    {
+                        "value": _bounded(item.get("value"), 160),
+                        "source": _bounded(item.get("source"), 80),
+                        "confidence": item.get("confidence"),
+                        "exactness": item.get("exactness") is True,
+                        "ambiguity": item.get("ambiguity") is not False,
+                    }
+                    for item in (
+                        scene.get("requested_target_candidates") or []
+                    )[:8]
+                    if isinstance(item, dict)
+                ],
+                "resolved_target_candidates": [
+                    {
+                        "value": _bounded(item.get("value"), 160),
+                        "source": _bounded(item.get("source"), 80),
+                        "confidence": item.get("confidence"),
+                        "exactness": item.get("exactness") is True,
+                        "ambiguity": item.get("ambiguity") is not False,
+                    }
+                    for item in (
+                        scene.get("resolved_target_candidates") or []
+                    )[:8]
+                    if isinstance(item, dict)
+                ],
+                "target_candidate_count": int(
+                    scene.get("target_candidate_count") or 0
+                ),
+                "top_level_surfaces": [
+                    {
+                        "application": _bounded(item.get("application"), 160),
+                        "title": _bounded(item.get("title"), 160),
+                        "window_class": _bounded(
+                            item.get("window_class"), 160,
+                        ),
+                        "foreground": item.get("foreground") is True,
+                    }
+                    for item in (scene.get("top_level_surfaces") or [])[:80]
+                    if isinstance(item, dict)
+                ],
+                "last_capability": "inspect_desktop_surfaces",
+                "last_typed_result": _bounded(
+                    receipt.get("reason_code"), 160,
+                ),
                 "foreground_application": _bounded(
                     scene.get("foreground_application"), 160,
                 ),
@@ -7008,9 +11408,11 @@ def record_tool_observation(
                 "focused_surface_ref": _bounded(
                     scene.get("focused_surface_ref"), 160,
                 ),
+                "visual_failure_reason": prior_visual_failure,
+                "visual_evidence_history": prior_visual_history[-3:],
                 "uia_frontier_observed": True,
-                "uia_actionable_frontier": (
-                    _desktop_uia_frontier_from_scene(scene)
+                "uia_actionable_frontier": _desktop_uia_frontier_from_scene(
+                    scene
                 ),
                 "uia_text_surfaces": _desktop_text_surfaces_from_scene(scene),
                 "observed_at": (
@@ -7054,6 +11456,200 @@ def record_tool_observation(
                     "application_open",
                     target_application=requested_application,
                 )
+        visual_verified = False
+        if tool_name in {
+            "request_visual_observation", "computer_screenshot",
+            "computer_zoom",
+        }:
+            visual_reason = _bounded(receipt.get("reason_code"), 80)
+            if visual_reason in {
+                "ACTIVE_MODEL_IMAGE_PART_BUILT", "IMAGE_INPUT_SENT",
+                "V4_ACTIVE_MODEL_IMAGE_PART_BUILT",
+                "V4_ACTIVE_MODEL_CROP_BUILT",
+            }:
+                dimensions = receipt.get("dimensions")
+                dimensions = dimensions if isinstance(dimensions, dict) else {}
+                def safe_int(value: object) -> int:
+                    try:
+                        return max(0, int(value or 0))
+                    except (TypeError, ValueError, OverflowError):
+                        return 0
+
+                def safe_time(value: object) -> float:
+                    try:
+                        parsed = float(value or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        return 0.0
+                    return parsed if math.isfinite(parsed) and parsed > 0 else 0.0
+
+                binding = (
+                    strategy.execution_binding or strategy.goal_contract_dict().get("execution_binding")
+                    or {}
+                )
+                visual_item = {
+                    "frame_id": _bounded(receipt.get("frame_id"), 160),
+                    "v4_loop_id": _bounded(
+                        receipt.get("v4_loop_id"), 160,
+                    ),
+                    "conversation_id": _bounded(
+                        binding.get("conversation_id"), 160,
+                    ),
+                    "turn_id": _bounded(binding.get("turn_id"), 160),
+                    "image_sha256": _bounded(
+                        receipt.get("image_sha256"), 80,
+                    ),
+                    "expires_at": safe_time(receipt.get("expires_at")),
+                    "surface_ref": _bounded(receipt.get("surface_ref"), 160),
+                    "window_surface_ref": _bounded(
+                        receipt.get("window_surface_ref"), 160,
+                    ),
+                    "application": _bounded(
+                        receipt.get("application"), 160,
+                    ),
+                    "requested_application": _bounded(
+                        receipt.get("requested_application")
+                        or scene.get("requested_application")
+                        or strategy._latest_desktop_observation.get(
+                            "requested_application"
+                        ),
+                        160,
+                    ),
+                    "resolved_target_candidates": [
+                        dict(item)
+                        for item in strategy._latest_desktop_observation.get(
+                            "resolved_target_candidates", []
+                        )[:8]
+                        if isinstance(item, dict)
+                    ],
+                    "target_conflict": (
+                        strategy._latest_desktop_observation.get(
+                            "target_conflict"
+                        ) is True
+                    ),
+                    "provider_id": _bounded(
+                        receipt.get("provider_id"), 80,
+                    ),
+                    "model_id": _bounded(receipt.get("model_id"), 160),
+                    "window_generation": _bounded(
+                        receipt.get("window_generation"), 160,
+                    ),
+                    "native_window_id": _bounded(
+                        receipt.get("native_window_id"), 80,
+                    ),
+                    "captured_at": safe_time(receipt.get("captured_at")),
+                    "content_coverage": _bounded(
+                        receipt.get("content_coverage"), 40,
+                    ),
+                    "exact_surface_pixels": (
+                        receipt.get("exact_surface_pixels") is True
+                    ),
+                    "authoritative_postcondition_verified": (
+                        receipt.get("authoritative_postcondition_verified") is True
+                    ),
+                    "image_input_sent": bool(
+                        visual_reason == "IMAGE_INPUT_SENT"
+                        or receipt.get("image_input_sent") is True
+                    ),
+                    "image_input_consumed": (
+                        receipt.get("image_input_consumed") is True
+                    ),
+                    "actuation_lease_state": _bounded(
+                        receipt.get("actuation_lease_state"), 80,
+                    ),
+                    "actuation_lease_expires_at": safe_time(
+                        receipt.get("actuation_lease_expires_at")
+                    ),
+                    "tool_call_id": _bounded(
+                        receipt.get("tool_call_id"), 160,
+                    ),
+                    "dimensions": {
+                        "width": safe_int(dimensions.get("width")),
+                        "height": safe_int(dimensions.get("height")),
+                    },
+                    "refine_count": safe_int(receipt.get("refine_count")),
+                    "source_frame_id": _bounded(
+                        receipt.get("source_frame_id"), 160,
+                    ),
+                }
+                history = strategy._latest_desktop_observation.get(
+                    "visual_evidence_history"
+                )
+                history = list(history) if isinstance(history, list) else []
+                history = [
+                    item for item in history
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("frame_id") == visual_item["frame_id"]
+                    )
+                ]
+                history.append(visual_item)
+                strategy._latest_desktop_observation[
+                    "visual_evidence_history"
+                ] = history[-3:]
+                strategy._latest_desktop_observation.update({
+                    "visual_frame_id": visual_item["frame_id"],
+                    "visual_content_coverage": visual_item[
+                        "content_coverage"
+                    ],
+                    "visual_image_input_sent": visual_item[
+                        "image_input_sent"
+                    ],
+                })
+            visual = result.get("visual") if isinstance(result, dict) else None
+            visual = visual if isinstance(visual, dict) else {}
+            verdict = visual.get("verdict")
+            verdict = verdict if isinstance(verdict, dict) else {}
+            status = _bounded(verdict.get("status"), 32)
+            if status in {
+                "match", "nonmatch", "ambiguous", "capture_invalid",
+                "target_not_visible", "stale",
+            }:
+                observation_payload = (
+                    result.get("observation")
+                    if isinstance(result, dict) else {}
+                )
+                observation_payload = (
+                    observation_payload
+                    if isinstance(observation_payload, dict) else {}
+                )
+                try:
+                    confidence = min(
+                        1.0, max(0.0, float(verdict.get("confidence") or 0.0)),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    confidence = 0.0
+                strategy._latest_desktop_observation.update({
+                    "canonical_visual_verdict": {
+                        "status": status,
+                        "expected_postcondition": _bounded(
+                            verdict.get("expected_postcondition"), 320,
+                        ),
+                        "observed_state": _bounded(
+                            verdict.get("observed_state"), 500,
+                        ),
+                        "confidence": confidence,
+                        "ambiguity": _bounded(verdict.get("ambiguity"), 240),
+                    },
+                    "visual_surface_ref": _bounded(
+                        receipt.get("surface_ref"), 160,
+                    ),
+                    "visual_window_generation": _bounded(
+                        receipt.get("window_generation"), 160,
+                    ),
+                    "visual_observation_id": _bounded(
+                        observation_payload.get("observation_id"),
+                        160,
+                    ),
+                    "visual_image_sha256": _bounded(
+                        receipt.get("image_sha256"), 80,
+                    ),
+                    "visual_observed_at": time.time(),
+                    "visual_failure_reason": "",
+                })
+                # A model verdict can guide bounded refinement/action, but it
+                # is not an independent semantic success authority for visual
+                # reads. Only delivered same-model pixels plus normal output
+                # may satisfy that postcondition.
         safe_reason = _bounded(receipt.get("reason_code"), 64)
         safe_outcome = _bounded(receipt.get("outcome"), 32)
         safe_surface = _bounded(
@@ -7081,6 +11677,13 @@ def record_tool_observation(
                 strategy._evidence_revision
             )
         exact_postcondition = _bounded(receipt.get("postcondition"), 320)
+        if (
+            tool_name == "inspect_desktop_surfaces"
+            and is_desktop_visual_read_mission(strategy)
+        ):
+            exact_postcondition = ""
+        if tool_name == "request_visual_observation":
+            return visual_verified
         if (
             tool_name == "inspect_desktop_surfaces"
             and safe_outcome == "confirmed_success"
@@ -7303,6 +11906,10 @@ def record_tool_observation(
         r"\b(no|false|unknown|unavailable|not found|not installed|cannot verify)\b",
         text,
     )
+    observed_targets = tuple(dict.fromkeys((
+        *_observation_argument_targets(tool_name, arguments),
+        *_observation_result_targets(result),
+    )))
     candidate_nodes = strategy.pending_nodes()
     goal = strategy.node_by_id(strategy._frozen_node_id) if strategy.frozen_reason else None
     if goal is None:
@@ -7315,6 +11922,21 @@ def record_tool_observation(
             ranked.append((sum(1 for token in tokens[:6] if token in text), -candidate.order, candidate))
         ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
         goal = ranked[0][2] if ranked else strategy.goal
+    # A fresh read-only receipt that covers a produced deliverable is the
+    # minimum evidence establishing an open-ended required outcome; it is
+    # recorded as a distinct verification witness, never as progress.
+    if (
+        not negative
+        and goal is not None
+        and goal.requires_execution
+        and strategy.verify_open_effects(
+            goal,
+            evidence=f"{tool_name}:{digest}",
+            observed_targets=observed_targets,
+            observed_text=_bounded(result, 2000),
+        )
+    ):
+        return True
     target_tokens = [
         token for token in _normalized(goal.target_object).split()
         if len(token) >= 3
@@ -7348,12 +11970,20 @@ def record_tool_observation(
         and affirmative
         and target_visible
     )
+    observe_proves_goal = (
+        goal.requested_action == "observe"
+        and goal.requires_execution
+        and tool_name in _OBSERVATION_TOOLS
+        and _observation_tool_matches_node(tool_name, goal)
+        and _observation_target_ok(goal, strategy, observed_targets, text)
+    )
     proves_goal = not negative and (
         page_proves_goal
         or file_search_proves_goal
         or app_state_proves_goal
         or steam_state_proves_goal
         or web_state_proves_goal
+        or observe_proves_goal
     )
     if strategy.frozen_reason:
         if proves_goal:
@@ -7387,6 +12017,206 @@ def record_tool_observation(
     return False
 
 
+def _project_verified_desktop_focus_outcome(
+    strategy: ExecutionStrategy,
+    result: object,
+    *,
+    outcome: str,
+    is_error: bool,
+    reason_code: str,
+    decision: StrategyDecision | None = None,
+) -> bool:
+    """Project one exact verified window-focus receipt into strategy state."""
+
+    normalized_outcome = _normalized(outcome).replace(" ", "_")
+    receipt = result.get("receipt") if isinstance(result, dict) else None
+    receipt = receipt if isinstance(receipt, dict) else {}
+    scene = result.get("scene") if isinstance(result, dict) else None
+    scene = scene if isinstance(scene, dict) else {}
+    primitive = receipt.get("primitive")
+    primitive = primitive if isinstance(primitive, dict) else {}
+    before = primitive.get("before")
+    before = before if isinstance(before, dict) else {}
+    after = primitive.get("after")
+    after = after if isinstance(after, dict) else {}
+    before_target = before.get("target")
+    before_target = before_target if isinstance(before_target, dict) else {}
+    after_target = after.get("target")
+    after_target = after_target if isinstance(after_target, dict) else {}
+    if (
+        is_error
+        or normalized_outcome != "success_verified"
+        or _bounded(reason_code, 120) != "desktop_target_focus_verified"
+        or receipt.get("dispatch_state") != "effect_confirmed"
+        or receipt.get("outcome") != "confirmed_success"
+        or receipt.get("reason_code") != "desktop_target_focus_verified"
+        or receipt.get("postcondition") != "application_foreground"
+        or receipt.get("target_foreground") is not True
+        or primitive.get("kind") != "desktop_window_focus"
+        or scene.get("target_resolution") != "exact_target"
+        or scene.get("target_foreground") is not True
+        or after.get("target_foreground") is not True
+    ):
+        return False
+
+    dispatched_surface_ref = _bounded(receipt.get("surface_ref"), 160)
+    foreground_surface_ref = _bounded(scene.get("window_surface_ref"), 160)
+    generation = _bounded(receipt.get("window_generation"), 160)
+    process_ref = _bounded(before_target.get("process_ref"), 160)
+    if (
+        not dispatched_surface_ref
+        or dispatched_surface_ref
+        != _bounded(before.get("window_surface_ref"), 160)
+        or not foreground_surface_ref
+        or foreground_surface_ref
+        != _bounded(after.get("window_surface_ref"), 160)
+        or not generation
+        or generation != _bounded(before.get("window_generation"), 160)
+        or generation != _bounded(scene.get("window_generation"), 160)
+        or generation != _bounded(after.get("window_generation"), 160)
+        or not process_ref
+        or process_ref != _bounded(after_target.get("process_ref"), 160)
+    ):
+        return False
+
+    if decision is not None:
+        attempt = strategy.attempt_by_id(decision.attempt_id)
+    else:
+        frozen_attempt = strategy.attempt_by_id(strategy._frozen_attempt_id)
+        candidates = (
+            [frozen_attempt]
+            if frozen_attempt is not None else
+            list(reversed(strategy.attempts))
+        )
+        attempt = next((
+            item for item in candidates
+            if item is not None
+            and item.attempted_effect == "application_foreground"
+            and item.target_surface == dispatched_surface_ref
+        ), None)
+    if (
+        attempt is None
+        or attempt.attempted_effect != "application_foreground"
+        or attempt.target_surface != dispatched_surface_ref
+    ):
+        return False
+
+    identity = (
+        attempt.target_surface_identity
+        if isinstance(attempt.target_surface_identity, dict) else {}
+    )
+    try:
+        observed_at = float(receipt.get("observed_at") or 0.0)
+        receipt_pid = int(receipt.get("pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    try:
+        from osia import desktop_scene as _desktop_scene
+
+        resolution = _desktop_scene.DESKTOP_SURFACE_REGISTRY.resolve(
+            foreground_surface_ref,
+        )
+        native = _desktop_scene.DESKTOP_SURFACE_REGISTRY.native_identity(
+            foreground_surface_ref,
+        )
+    except Exception:
+        return False
+    if (
+        resolution.surface is None
+        or native is None
+        or resolution.surface.ref_id != foreground_surface_ref
+        or resolution.surface.window_generation != generation
+        or resolution.surface.process_ref != process_ref
+        or _normalized(resolution.surface.application_id)
+        != _normalized(scene.get("application"))
+        or (
+            identity.get("process_ref")
+            and identity.get("process_ref") != process_ref
+        )
+        or (
+            identity.get("window_generation")
+            and identity.get("window_generation") != generation
+        )
+        or (
+            identity.get("native_window_id") not in (None, "")
+            and str(identity.get("native_window_id"))
+            != str(receipt.get("native_window_id") or "")
+        )
+        or str(native.native_window_id)
+        != str(receipt.get("native_window_id") or "")
+        or receipt_pid <= 0
+        or receipt_pid != int(native.pid or 0)
+        or observed_at < attempt.dispatched_at
+    ):
+        return False
+
+    record_tool_observation(
+        "inspect_desktop_surfaces",
+        result,
+        is_error=False,
+        strategy=strategy,
+    )
+    observation = strategy._latest_desktop_observation
+    observation["visual_evidence_history"] = []
+    for key in (
+        "visual_frame_id", "visual_consumed_frame_id",
+        "visual_surface_ref", "visual_window_generation",
+        "visual_observation_id", "visual_image_sha256",
+        "canonical_visual_verdict", "visual_observed_at",
+    ):
+        observation.pop(key, None)
+    attempt.attempted_effect = "application_foreground"
+    attempt.target_surface = foreground_surface_ref
+    evidence = "desktop_target_focus_verified"
+    if strategy.frozen_reason:
+        if strategy._frozen_attempt_id != attempt.attempt_id:
+            return False
+        return strategy.reconcile(
+            succeeded=True,
+            evidence=evidence,
+            evidence_details={
+                "evidence_kind": "exact_independent_desktop_state",
+                "evidence_source": "activate_desktop_surface",
+                "evidence_outcome": "confirmed_success",
+                "reason_code": evidence,
+                "postcondition": "application_foreground",
+                "observed_application": scene.get("application"),
+                "observed_surface": foreground_surface_ref,
+                "window_generation": generation,
+                "structural_epoch": scene.get("structural_epoch"),
+                "observed_at": observed_at,
+                "no_partial_effect": False,
+            },
+        )
+
+    focus_decision = decision or StrategyDecision(
+        True,
+        "verified_resumed_preparatory_focus",
+        attempt.attempt_id,
+        attempt.mechanism_id,
+        attempt.node_id,
+        attempt.attempted_effect,
+    )
+    strategy.record(
+        focus_decision,
+        "progress",
+        observation="exact target foreground verified and reinspected",
+        postcondition_evidence=evidence,
+        primitive_receipt=primitive,
+        semantic_barrier=False,
+    )
+    strategy.remember_completed_effect(
+        "application_foreground",
+        target_application=(
+            attempt.target_application or str(scene.get("application") or "")
+        ),
+        target_surface=foreground_surface_ref,
+        evidence=evidence,
+        observed_at=observed_at,
+    )
+    return True
+
+
 def record_resumed_tool_outcome(
     strategy: ExecutionStrategy,
     tool_name: str,
@@ -7400,6 +12230,16 @@ def record_resumed_tool_outcome(
     ).replace(" ", "_")
     is_error = bool(getattr(execution_record, "is_error", False))
     result = getattr(execution_record, "result", "")
+    if tool_name == "activate_desktop_surface" and (
+        _project_verified_desktop_focus_outcome(
+            strategy,
+            result,
+            outcome=outcome,
+            is_error=is_error,
+            reason_code=str(getattr(execution_record, "reason_code", "") or ""),
+        )
+    ):
+        return
     observation_proven = record_tool_observation(
         tool_name,
         result,
@@ -7448,12 +12288,14 @@ def record_tool_outcome(
     result: object,
     strategy: ExecutionStrategy | None = None,
     durable_attempt_id: str = "",
+    arguments: dict | None = None,
 ) -> None:
     strategy = strategy or current_execution_strategy()
     if strategy is None:
         return
     record_tool_observation(
         tool_name, result, is_error=is_error, strategy=strategy,
+        arguments=arguments,
     )
     if decision is None or not decision.allowed or not decision.attempt_id:
         if tool_name in _OBSERVATION_TOOLS:
@@ -7533,6 +12375,16 @@ def record_tool_outcome(
                         if (pattern := _canonical_uia_action_pattern(item))
                     ],
                 }
+        primitive_receipt = receipt.get("primitive")
+        if _project_verified_desktop_focus_outcome(
+            strategy,
+            result,
+            outcome=normalized_outcome,
+            is_error=is_error,
+            reason_code=reason_code,
+            decision=decision,
+        ):
+            return
     if normalized_outcome in {
         "pending", "outcome_unknown", "unknown_after_start",
     } or (
@@ -7704,7 +12556,14 @@ def record_tool_outcome(
             ),
         )
         return
-    if reason_code in {"stale_semantic_reference", "stale_reference"}:
+    if reason_code in {
+        "stale_semantic_reference", "stale_reference",
+        "window_pixels_changed", "frame_superseded", "frame_expired",
+        "window_geometry_changed", "capture_geometry_changed",
+        "target_structure_unavailable", "target_structure_moved",
+        "target_structure_changed", "action_window_mismatch",
+        "target_window_missing", "window_identity_changed",
+    }:
         strategy.record(decision, "stale", failure_reason=reason_code)
         return
     if is_error:
@@ -7718,6 +12577,35 @@ def record_tool_outcome(
             if node is not None:
                 node.status = "blocked"
             strategy.terminal_blocker = "permission_user_denied"
+        return
+    if tool_name.startswith("computer_") and normalized_outcome in {
+        "success_verified", "succeeded", "success",
+    }:
+        strategy.record(
+            decision,
+            "progress",
+            observation=(
+                "Computer Use V4 effect receipt recorded; a fresh same-model "
+                "observation is still required for semantic completion"
+            ),
+            postcondition_evidence="computer_use_v4_effect_receipt",
+        )
+        truth = receipt.get("action_truth")
+        truth = truth if isinstance(truth, dict) else {}
+        strategy.record_semantic_goal_v2_action_effect(
+            decision.attempt_id,
+            evidence=(
+                "actiontruth:"
+                + _bounded(
+                    truth.get("action_id")
+                    or receipt.get("action_id")
+                    or decision.attempt_id,
+                    160,
+                )
+            ),
+            observed_at=time.time(),
+            evidence_kind="actiontruth_verified_dispatch_result",
+        )
         return
     evidence = hashlib.sha256(
         _bounded(result, 4000).encode("utf-8", errors="replace")
@@ -7751,13 +12639,17 @@ def execution_strategy_scope(
     postcondition: str = "",
     postconditions: Iterable[str] = (),
     strategy: ExecutionStrategy | None = None,
+    enabled: bool = True,
 ):
-    active = strategy or build_execution_strategy(
-        request,
-        available_tools,
-        postcondition=postcondition,
-        postconditions=postconditions,
-    )
+    # Canonical Chat explicitly masks any ambient legacy strategy.
+    active = None
+    if enabled:
+        active = strategy or build_execution_strategy(
+            request,
+            available_tools,
+            postcondition=postcondition,
+            postconditions=postconditions,
+        )
     token = _ACTIVE_STRATEGY.set(active)
     try:
         yield active

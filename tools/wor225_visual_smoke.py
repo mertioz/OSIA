@@ -198,7 +198,6 @@ def _capture_settings(output: Path, prefix: str) -> list[dict[str, object]]:
     evidence: list[dict[str, object]] = []
     for category in (
         "settings.cat.general",
-        "settings.cat.permissions",
         "settings.cat.models",
         "settings.cat.voice",
         "settings.cat.wake",

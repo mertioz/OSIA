@@ -266,3 +266,156 @@ def reconnect_enabled_connectors(
         print(f"[MCP reconnect] {len(connected)}/{len(attempted)} connector(s) "
               f"reconnected, {len(results) - len(attempted)} skipped")
     return results
+
+
+def reconcile_to_enabled(
+    allow_oauth: bool = True,
+    oauth_margin_s: float = OAUTH_FRESH_MARGIN_S,
+) -> list:
+    """Reconcile THIS process's ``MCPManager`` to the shared
+    ``mcp_servers[].enabled`` flag — the direction-B (mobile→PC) core of the
+    desktop↔server MCP state mirror (WOR-44 Phase 2).
+
+    A single always-on desktop daemon (``osia.main``) calls this every few
+    seconds so an MCP connector the user connects/disconnects FROM THE MOBILE app
+    — which the server now persists as ``mcp_servers[].enabled`` (the Phase-2
+    server-side write) — is mirrored onto the desktop's OWN manager + GUI even
+    while the popup is CLOSED (the Settings ``QTimer`` stops then, and the desktop
+    has no HTTP listener, so neither can drive this). The convergence target is
+    the ``enabled`` flag, which connect/disconnect never mutate — so there is no
+    echo loop: the desktop reconciles to ``enabled``, the server (Phase 1)
+    reconciles to ``enabled``, both converge and neither oscillates.
+
+    For each saved connector it nudges the manager TOWARD ``enabled``:
+
+    * ``enabled`` and the manager is ``DISCONNECTED`` (incl. never-seen — the
+      genuine "should be up but isn't" delta) → CONNECT via the SAME strict-gated
+      headless path the boot sweep uses: ``_connectable`` + the boot OAuth
+      freshness gate (``_oauth_token_fresh`` with ``trust_present_token=False``),
+      then ``build_headless_connect_cfg`` + ``MCPManager.connect``. This
+      UNATTENDED daemon must NEVER pop a browser, so a connector whose stored
+      OAuth token is absent / expired / about to expire is SKIPPED silently — it
+      stays disconnected until the user re-auths ON THE PC (whose own connect,
+      Phase 1, then mirrors it). ``allow_oauth=False`` skips every OAuth connector
+      outright.
+    * not ``enabled`` and the manager is ``CONNECTED`` → DISCONNECT (the arm
+      ``reconnect_enabled_connectors`` lacks: that routine only ever connects).
+
+    DISCONNECTS run in a FIRST pass, CONNECTS in a SECOND: ``connect`` blocks this
+    thread up to the connect budget (45s, or up to ~7min for a fresh-OAuth
+    streamable-HTTP endpoint that is unreachable), so honouring every "bring it
+    down" before any (possibly slow) "bring it up" keeps a freshly-disabled
+    connector's disconnect from stalling behind a dead endpoint's connect in the
+    same tick.
+
+    A connector already in its target state — or in a terminal ``FAILED`` state,
+    or mid-``CONNECTING`` — is LEFT ALONE. Deliberately NOT retrying ``FAILED`` in
+    this tight loop keeps the daemon's "no work when nothing changed" contract
+    (a hard failure isn't a delta), avoids a blocking ``connect()`` retry every
+    tick starving the disconnect arm, and never hammers a down endpoint; a
+    genuinely-failed connector recovers when the user reconnects it on the PC
+    (mirrored by Phase 1) — the same one-shot semantics the boot sweep has.
+    So a steady state does ZERO manager work — only cheap per-server status
+    lookups plus one ``os.stat``-cached settings read.
+
+    Idempotent and lock-safe: ``MCPManager.connect`` (already-connecting/connected
+    id returns its existing status under the manager lock) and
+    ``disconnect`` (no-op when already gone) tolerate overlap with a boot
+    reconnect or a manual Connect — no double-connect, no oscillation. NEVER
+    raises. MUST run OFF the Qt main thread / server loop (connect/disconnect
+    block, bounded).
+
+    Returns a list of per-connector action dicts ``{"id", "status", "reason"}``
+    for the connectors it actually DROVE (connected/failed/disconnected) — an
+    empty list when nothing needed reconciling (gate-skipped OAuth connectors are
+    omitted, since no manager action was taken).
+    """
+    results: list = []
+    try:
+        from osia.config import get_setting
+        servers = get_setting("mcp_servers", []) or []
+    except Exception:
+        return results
+    if not isinstance(servers, list):
+        return results
+    try:
+        from osia.mcp_client import (
+            get_manager,
+            STATUS_CONNECTED,
+            STATUS_DISCONNECTED,
+        )
+        manager = get_manager()
+    except Exception:
+        return results
+
+    # Two ordered passes so the user's "bring it DOWN" intent is always honoured
+    # BEFORE any "bring it up": MCPManager.connect() BLOCKS this thread up to the
+    # connect budget (45s for stdio/streamable-HTTP, and up to ~7min for a fresh-
+    # OAuth streamable-HTTP endpoint that is unreachable), so a first-time connect
+    # of a dead endpoint in the same tick must not stall a freshly-disabled
+    # connector's disconnect. Disconnects (pass 1, typically fast) run first;
+    # connects (pass 2) follow. Both act ONLY on genuine deltas, so a steady state
+    # still does zero manager work — only the (cheap) per-server status lookups.
+
+    # ── PASS 1 — DISCONNECTS: bring every user-disabled connector down. Only act
+    #    on a real delta (still CONNECTED); a FAILED / already-down / CONNECTING
+    #    entry is left untouched (disconnect would be a no-op anyway). ──
+    for saved in servers:
+        if not isinstance(saved, dict):
+            continue
+        sid = str(saved.get("id") or "").strip()
+        if not sid or saved.get("enabled") is True:
+            continue
+        try:
+            current = manager.status(sid)
+        except Exception:
+            current = STATUS_DISCONNECTED
+        if current != STATUS_CONNECTED:
+            continue
+        try:
+            status = manager.disconnect(sid)
+        except Exception as e:  # noqa: BLE001 - disconnect shouldn't raise
+            status = "failed"
+            print(f"[MCP reconcile] {sid}: disconnect raised "
+                  f"{type(e).__name__}: {e}")
+        results.append({"id": sid, "status": status, "reason": "disabled"})
+
+    # ── PASS 2 — CONNECTS: connect every enabled connector the manager isn't
+    #    carrying yet (DISCONNECTED / never-seen). A CONNECTING (in-flight) or
+    #    FAILED (terminal) connector is skipped (see the no-tight-retry rationale
+    #    in the docstring). STRICT OAuth gate — never a browser. ──
+    for saved in servers:
+        if not isinstance(saved, dict):
+            continue
+        sid = str(saved.get("id") or "").strip()
+        if not sid or saved.get("enabled") is not True:
+            continue
+        try:
+            current = manager.status(sid)
+        except Exception:
+            current = STATUS_DISCONNECTED
+        if current != STATUS_DISCONNECTED:
+            continue
+        if not _connectable(saved):
+            continue
+        if str(saved.get("auth_type") or "").strip().lower() == "oauth":
+            if not allow_oauth:
+                continue
+            # STRICT gate (trust_present_token=False): never pop a browser on the
+            # unattended desktop daemon — a non-fresh OAuth token is skipped, and
+            # the connector stays disconnected until re-auth on the PC.
+            if not _oauth_token_fresh(sid, oauth_margin_s, trust_present_token=False):
+                continue
+        cfg = build_headless_connect_cfg(saved)
+        try:
+            status = manager.connect(cfg)
+        except Exception as e:  # noqa: BLE001 - connect() shouldn't raise, but be safe
+            status = "failed"
+            print(f"[MCP reconcile] {sid}: connect raised "
+                  f"{type(e).__name__}: {e}")
+        results.append({"id": sid, "status": status, "reason": "enabled"})
+
+    if results:
+        acted = ", ".join(f"{r['id']}={r['status']}" for r in results)
+        print(f"[MCP reconcile] reconciled {len(results)} connector(s): {acted}")
+    return results

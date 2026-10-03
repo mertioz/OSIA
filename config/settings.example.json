@@ -25,8 +25,6 @@
     "providers": {},
     "models": {}
   },
-  "vision_provider": "",
-  "vision_model": "",
   "liveapi_enabled": false,
   "liveapi_provider": "google",
   "liveapi_model": "gemini-3.1-flash-live",
@@ -64,8 +62,6 @@
   ],
   "skills_enabled": {},
   "mcp_servers": [],
-  "mcp_confirm_writes": true,
-  "mcp_allow_unattended_writes": false,
   "island_shape": "capsule",
   "island_dock_side": "right",
   "island_x": null,

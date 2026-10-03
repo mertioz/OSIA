@@ -39,7 +39,6 @@ class CoverageCategory:
 TARGET_COVERAGE_MATRIX = (
     CoverageCategory("direct_api_mcp", 24, "Direct, API, and MCP exact matches"),
     CoverageCategory("browser_dom", 24, "Browser and DOM stateful execution"),
-    CoverageCategory("personal_browser", 12, "Live authorized-tab/session binding"),
     CoverageCategory("desktop_uia", 24, "Rich and incomplete accessibility trees"),
     CoverageCategory("keyboard_deep_link", 12, "Observable keyboard and routes"),
     CoverageCategory("vision", 16, "Local/global Vision and non-Vision exclusion"),
@@ -446,18 +445,6 @@ def seed_scenarios() -> tuple[ScenarioSpec, ...]:
             terminal="blocked_verified",
             forbidden_transitions=(ForbiddenTransition(
                 "permission_required", "api:send", "confirmation_not_granted"
-            ),),
-            maximum_external_mutations=1,
-        ),
-        _seed(
-            "personal_browser_wrong_tab_rejected",
-            "Submit the form in my authorized Personal Browser tab",
-            ("personal_browser", "permissions_identity"),
-            (_capability("personal:submit", CapabilityFamily.PERSONAL_BROWSER, external, modalities=("personal_browser_live_authority",)),),
-            (),
-            terminal="blocked_verified",
-            forbidden_transitions=(ForbiddenTransition(
-                "wrong_tab_binding", "personal:submit", "authorization_revoked"
             ),),
             maximum_external_mutations=1,
         ),

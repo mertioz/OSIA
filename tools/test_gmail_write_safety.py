@@ -19,7 +19,6 @@ import osia.config as config
 from osia import oauth_relay
 from osia.integrations import google_oauth
 from osia.mcp_client import registry
-from osia.permission_outcome import PermissionOutcome
 from osia.tools import gmail
 
 
@@ -267,18 +266,6 @@ class GmailWriteSafetyTests(unittest.TestCase):
         self.assertEqual(len(send_calls), 1)
         self.assertIsInstance(result, str)
         self.assertTrue(result.startswith("ERROR:"))
-
-    def test_server_provider_without_live_target_reports_no_approver(self):
-        from osia.server import server as server_mod
-
-        token = server_mod._turn_target.set(None)
-        try:
-            result = server_mod._ws_confirm_provider(
-                "gmail", "gmail_create_draft", "safe summary"
-            )
-            self.assertEqual(result.outcome, PermissionOutcome.PRESENTATION_FAILED)
-        finally:
-            server_mod._turn_target.reset(token)
 
     def test_native_gmail_chat_tools_remain_in_pc_tool_map(self):
         from osia import agent

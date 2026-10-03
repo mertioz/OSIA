@@ -165,6 +165,66 @@ def test_no_real_event_keeps_thinking_empty_instead_of_inventing_progress(app):
         trace.deleteLater()
 
 
+def test_begin_turn_shows_minimal_thinking_before_detailed_activity(app):
+    chat = main_popup._ChatPage()
+    binding = _ledger(suffix="minimal").binding_dict()
+    try:
+        assert chat.begin_turn(binding)
+        traces = chat.findChildren(main_popup._ChatThinkingTrace)
+        assert len(traces) == 1
+        trace = traces[0]
+        assert trace._detail.toPlainText() == ""
+        assert trace._toggle.isEnabled() is False
+        assert trace._stop.isHidden() is False
+        assert trace._toggle.text().startswith(i18n.t("chat.thinking.title"))
+    finally:
+        chat.deleteLater()
+
+
+def test_only_fully_correlated_trace_events_contribute_thinking_detail(app):
+    ledger = _ledger(suffix="event_identity")
+    ledger.record_public_reasoning_summary("Current turn summary.")
+    payload = _payload(ledger)
+    payload["snapshot"][0].pop("request_id")
+    trace = main_popup._ChatThinkingTrace()
+    try:
+        assert trace.apply_trace(payload)
+        assert trace._detail.toPlainText() == ""
+    finally:
+        trace.deleteLater()
+
+
+def test_permission_waiting_is_projected_from_a_real_trace_event(app):
+    ledger = _ledger(suffix="permission_wait")
+    ledger.record(
+        kind="waiting_permission",
+        display_key="execution.permission.waiting",
+        permission_request_id="permission_wor265_wait",
+    )
+    trace = main_popup._ChatThinkingTrace()
+    try:
+        assert trace.apply_trace(_payload(ledger))
+        assert trace._detail.toPlainText() == i18n.t(
+            "chat.thinking.permission_waiting"
+        )
+    finally:
+        trace.deleteLater()
+
+
+def test_legacy_agent_activity_cannot_reach_the_chat_thinking_surface():
+    assert main_popup._ChatThinkingTrace._safe_payload({
+        "conversation_id": "conv_legacy",
+        "request_id": "request_legacy",
+        "turn_id": "turn_legacy",
+        "run_id": "run_legacy",
+        "status": "executing",
+        "tasks_done": 1,
+        "tasks_total": 3,
+    }) == {}
+    assert not hasattr(main_popup._ChatPage, "set_execution_activity")
+    assert not hasattr(main_popup.MainPopup, "restore_chat_execution_activity")
+
+
 def test_provider_public_summary_is_displayed_but_raw_reasoning_is_rejected(app):
     safe = _ledger(suffix="summary")
     assert safe.record_public_reasoning_summary(
@@ -303,6 +363,37 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         assert trace.isHidden()
     finally:
         popup._busy_conversation_ids.discard(binding["conversation_id"])
+
+
+def test_busy_clear_retires_exact_turn_before_delayed_activity_can_reactivate(
+    app, popup,
+):
+    first = _ledger(suffix="retired_first")
+    second = _ledger(suffix="retired_second")
+    conversation_id = first.conversation_id
+    second_binding = {
+        **second.binding_dict(),
+        "conversation_id": conversation_id,
+    }
+    first_payload = _payload(first)
+    popup.refresh_conversations(conversation_id)
+    try:
+        popup.set_conversation_busy(conversation_id, True)
+        assert popup.begin_chat_turn(first.binding_dict())
+        assert popup.update_chat_execution_activity(first_payload)
+
+        popup.set_conversation_busy(conversation_id, False)
+        first_key = main_popup._ChatPage._binding_key(first.binding_dict())
+        assert first_key in popup._retired_thinking_keys
+        assert not popup.begin_chat_turn(first.binding_dict())
+
+        assert popup.begin_chat_turn(second_binding)
+        assert not popup.update_chat_execution_activity(first_payload)
+        assert popup._active_thinking_key_by_conversation[conversation_id] == (
+            main_popup._ChatPage._binding_key(second_binding)
+        )
+    finally:
+        popup._busy_conversation_ids.discard(conversation_id)
 
 
 def test_historical_completed_trace_is_inspectable_but_never_active(app):
@@ -451,6 +542,47 @@ def test_reconnect_history_hydration_does_not_reanimate_completed_answer(app):
         assert rendered.count(old) == 1
         assert rendered.count(new) == 1
         assert rendered == ["question A", old, "question B", new]
+    finally:
+        chat.deleteLater()
+
+
+def test_markdown_code_and_unicode_final_drains_incrementally(app, monkeypatch):
+    chat = main_popup._ChatPage()
+    chat._stream._reduced_motion = lambda: False
+    binding = _ledger(suffix="markdown_code").binding_dict()
+    markdown_renders = []
+    original_set_source_text = main_popup._MessageText.set_source_text
+
+    def record_markdown_render(widget, text):
+        markdown_renders.append(text)
+        original_set_source_text(widget, text)
+
+    monkeypatch.setattr(
+        main_popup._MessageText, "set_source_text", record_markdown_render,
+    )
+    final = (
+        "## Résultat ✓\n\n"
+        "Une liste :\n- **premier**\n- `deuxième`\n\n"
+        "```python\nprint('café 🐈')\n```"
+    )
+    try:
+        assert chat.begin_turn(binding)
+        assert chat.append_assistant_stream_chunk(
+            "Provisional preview text.", binding,
+        )
+        chat._stream._on_tick()
+        assert chat.finalize_assistant_stream(final, binding)
+        _finish_progressive_stream(chat)
+        assistant = [
+            bubble for bubble in chat.findChildren(main_popup._Bubble)
+            if bubble.property("role") == "assistant"
+        ]
+        assert len(assistant) == 1
+        assert assistant[0].text() == final
+        assert "café 🐈" in assistant[0]._label.document().toPlainText()
+        assert markdown_renders == [final]
+        assert chat._stream.active is False
+        assert chat._stream.provider_complete is True
     finally:
         chat.deleteLater()
 

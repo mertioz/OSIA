@@ -23,8 +23,6 @@ datas = [
     (str(STAGE / "runtimes"), "runtimes"),
     (str(STAGE / "legal"), "legal"),
     (str(GENERATED / "app_metadata.json"), "."),
-    (str(GENERATED / "personal_browser_metadata.json"), "personal_browser"),
-    (str(ROOT / "packaging" / "native_messaging" / "space.osia.browser.json.in"), "personal_browser"),
     (str(ROOT / "packaging" / "windows" / "THIRD_PARTY_NOTICES.md"), "."),
 ]
 binaries = []

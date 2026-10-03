@@ -10,7 +10,7 @@ import queue
 import re
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from osia.config import get_setting, set_setting
@@ -31,24 +31,16 @@ _ACCOUNT_CHANGE_LISTENERS: set[Callable[[], None]] = set()
 
 _CONTAINMENT_INSTRUCTIONS = """
 
-CHATGPT ACCOUNT PROVIDER CONTAINMENT AND CAPABILITY FEDERATION:
-- Provider-hosted tools and listed OSIA calls are both available. OSIA calls are
-  optional additions, never required substitutes; choose the best valid path.
-- Request native local command/file approval normally. OSIA applies the same
-  permission broker used by OSIA tools and may pause before the effect.
-- This federation does NOT prohibit benign tasks or delegation; delegate through
-  OSIA when it is the best valid path.
-- Once any native or OSIA mutation is accepted or started, never repeat it through
-  an equivalent mechanism. Switch only after a proven no-effect outcome permits it.
-- Do not generically refuse benign tasks. Follow the base action policy and claim
-  actions only from observed results.
-- Do not mention or infer local paths unless the current request requires them.
+[ChatGPT account capability context: provider-hosted and listed OSIA
+capabilities are both available. The same permission, ActionTruth,
+and evidence rules apply to either path. A capability exposed as a native
+dynamic tool is invoked only through that native call, never duplicated as an
+XML/text tool call. Do not infer local paths unless needed.]
 """
 
 _DEVELOPER_INSTRUCTIONS = (
-    "Act as OSIA's provider. Follow base instructions and capability federation. "
-    "Native hosted tools and optional OSIA calls are available; choose one path "
-    "and report only observed outcomes."
+    "Act as OSIA's provider. Use any applicable hosted or OSIA capability and "
+    "report only observed outcomes."
 )
 
 _PLANNING_BASE_INSTRUCTIONS = (
@@ -62,7 +54,14 @@ _PLANNING_DEVELOPER_INSTRUCTIONS = (
     "desktop, or OSIA tools. Produce only the schema-constrained final JSON."
 )
 
-_LANGUAGE_MARKER = "\n\n[AUTHORITATIVE TURN LANGUAGE]\n"
+_LANGUAGE_MARKER = "\n\n[TURN RESPONSE LANGUAGE]\n"
+
+_DIRECT_VISUAL_TOOL_NAMES = frozenset({
+    "request_visual_observation", "desktop_click",
+    "computer_screenshot", "computer_zoom", "computer_observation",
+    "computer_click", "computer_double_click", "computer_type",
+    "computer_keypress", "computer_scroll", "computer_actions",
+})
 
 
 class AccountProviderError(RuntimeError):
@@ -96,6 +95,14 @@ class AccountProviderError(RuntimeError):
             getattr(error, "public_reasoning_summary", "") or ""
         )
         self.native_turn_id = getattr(error, "native_turn_id", None)
+        self.response_items = tuple(
+            dict(item)
+            for item in (getattr(error, "response_items", ()) or ())
+            if isinstance(item, dict)
+        )
+        self.final_output_item_id = str(
+            getattr(error, "final_output_item_id", "") or ""
+        )
         self.selected_model = str(selected_model) if selected_model else None
         self.reasoning_level = str(reasoning_level or "auto")
 
@@ -106,8 +113,33 @@ class _ConversationState:
     generation: int
     model: str
     system_fingerprint: str
+    tool_schema_fingerprint: str
+    runtime_client: AppServerClient
     expected_messages: list[dict]
     planning_only: bool = False
+    native_tool_names: tuple[str, ...] = ()
+    strategy_revision: int = 0
+    world_revision: int = 0
+
+
+def _with_native_frontier_receipt(
+    result,
+    state: _ConversationState,
+):
+    values = {
+        "native_tool_names": tuple(state.native_tool_names),
+        "native_tool_schema_fingerprint": state.tool_schema_fingerprint,
+        "strategy_revision": int(state.strategy_revision),
+        "world_revision": int(state.world_revision),
+    }
+    if isinstance(result, TurnResult):
+        return replace(result, **values)
+    for key, value in values.items():
+        try:
+            setattr(result, key, value)
+        except Exception:
+            pass
+    return result
 
 
 def _text_content(content) -> str:
@@ -161,6 +193,56 @@ def _same_messages(left: list[dict], right: list[dict]) -> bool:
     return all(_public_message(a) == _public_message(b) for a, b in zip(left, right))
 
 
+def _native_rebuild_history(messages: list[dict]) -> list[dict]:
+    """Replay only images relevant to the current turn on thread rebuild."""
+
+    non_system = [
+        dict(message) for message in messages
+        if message.get("role") != "system"
+    ]
+    latest_user_index = next((
+        index for index in range(len(non_system) - 1, -1, -1)
+        if non_system[index].get("role") == "user"
+    ), -1)
+    if latest_user_index < 0:
+        return non_system
+    latest_text = _text_content(non_system[latest_user_index].get("content"))
+    from osia.image_inputs import historical_image_reference_requested
+
+    replay_prior = historical_image_reference_requested(latest_text)
+    prior_image_index = next((
+        index for index in range(latest_user_index - 1, -1, -1)
+        if isinstance(non_system[index].get("content"), list)
+        and any(
+            isinstance(item, dict) and item.get("type") == "image_url"
+            for item in non_system[index]["content"]
+        )
+    ), -1)
+    selected = []
+    for index, message in enumerate(non_system):
+        content = message.get("content")
+        if not isinstance(content, list):
+            selected.append(message)
+            continue
+        keep_images = bool(
+            index == latest_user_index
+            or (replay_prior and index == prior_image_index)
+        )
+        parts = [
+            dict(item)
+            for item in content
+            if isinstance(item, dict)
+            and (
+                item.get("type") == "text"
+                or (keep_images and item.get("type") == "image_url")
+            )
+        ]
+        copied = dict(message)
+        copied["content"] = parts if parts else _text_content(content)
+        selected.append(copied)
+    return selected
+
+
 def _turn_input(messages: list[dict]) -> str | list[dict]:
     if len(messages) == 1 and messages[0].get("role") == "user":
         content = messages[0].get("content")
@@ -211,7 +293,7 @@ def _turn_input(messages: list[dict]) -> str | list[dict]:
 
 
 def _insert_before_turn_language(text: str, addition: str) -> str:
-    """Keep provider-owned additions below the authoritative turn contract."""
+    """Keep provider-owned additions above the current-turn preference."""
 
     block = str(addition or "").strip()
     if not block:
@@ -234,6 +316,11 @@ def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
     desktop_path = desktop_match.group(1) if desktop_match else None
     cleaned = re.sub(r"(?m)^\[DESKTOP PATH: .+?\]\s*$", "", system or "")
     cleaned = re.sub(r"(?m)^\[PROJECT ROOT: .+?\]\s*$", "", cleaned)
+    cleaned = re.sub(
+        r"(?m)^Your working directory is .+?\.?\s*$",
+        "",
+        cleaned,
+    )
     cleaned = cleaned.replace(
         'When the user says "desktop" or "bureau", use the exact path in the '
         '[DESKTOP PATH: ...] line.',
@@ -286,11 +373,38 @@ def _canonical_native_tool_text(error: AppServerError) -> str | None:
 
 
 class ChatGPTAccountProvider:
-    def __init__(self, client: AppServerClient | None = None):
+    def __init__(
+        self,
+        client: AppServerClient | None = None,
+        *,
+        direct_visual_client: AppServerClient | None = None,
+    ):
         self.client = client or AppServerClient()
+        self._direct_visual_client = (
+            direct_visual_client
+            if direct_visual_client is not None else
+            self.client
+            if client is not None else
+            AppServerClient(
+                base_dir=self.client.base_dir,
+                disable_code_mode_host=True,
+                runtime_partition="visual-direct",
+                compact_logs_on_startup=False,
+            )
+        )
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._models: list[dict] = []
         self._threads: dict[str, _ConversationState] = {}
+        self._conversation_locks: dict[str, threading.RLock] = {}
+
+    def _conversation_lock(self, conversation_id: str) -> threading.RLock:
+        identity = str(conversation_id or "")
+        with self._lock:
+            return self._conversation_locks.setdefault(
+                identity,
+                threading.RLock(),
+            )
 
     def status(self, *, refresh_models: bool = True) -> dict:
         try:
@@ -374,17 +488,29 @@ class ChatGPTAccountProvider:
         _notify_account_changed()
 
     def reset_login(self) -> None:
-        self.client.reset_login()
+        with self._lifecycle_lock:
+            with self._lock:
+                states = list(self._threads.values())
+            for state in states:
+                state.runtime_client.cancel_turn(thread_id=state.thread_id)
+            if self._direct_visual_client is not self.client:
+                self._direct_visual_client.shutdown()
+            self.client.reset_login()
+            with self._lock:
+                self._threads.clear()
 
     def logout(self) -> None:
-        with self._lock:
-            states = list(self._threads.values())
-        for state in states:
-            self.client.cancel_turn(thread_id=state.thread_id)
-        self.client.logout()
-        with self._lock:
-            self._models.clear()
-            self._threads.clear()
+        with self._lifecycle_lock:
+            with self._lock:
+                states = list(self._threads.values())
+            for state in states:
+                state.runtime_client.cancel_turn(thread_id=state.thread_id)
+            if self._direct_visual_client is not self.client:
+                self._direct_visual_client.shutdown()
+            self.client.logout()
+            with self._lock:
+                self._models.clear()
+                self._threads.clear()
         _notify_account_changed()
 
     def rate_limits(self) -> dict:
@@ -410,23 +536,68 @@ class ChatGPTAccountProvider:
             developer_instructions = _DEVELOPER_INSTRUCTIONS
         if planning_only:
             dynamic_tools = ()
+            strategy = None
         else:
             try:
                 from osia.execution_strategy import current_execution_strategy
 
-                dynamic_tools = tuple(_canonical_native_tools(
-                    current_execution_strategy(),
-                ))
+                strategy = current_execution_strategy()
+                dynamic_tools = tuple(_canonical_native_tools(strategy))
             except Exception:
                 dynamic_tools = ()
+                strategy = None
+        dynamic_tool_names = tuple(
+            str(item.get("name") or "")
+            for item in dynamic_tools
+            if isinstance(item, dict)
+        )
+        direct_visual_turn = bool(dynamic_tool_names) and all(
+            name in _DIRECT_VISUAL_TOOL_NAMES for name in dynamic_tool_names
+        )
+        runtime_client = (
+            self._direct_visual_client if direct_visual_turn else self.client
+        )
         frontier_names = [
             str(item.get("name") or "")
             for item in dynamic_tools
             if isinstance(item, dict)
         ]
+        tool_schema_fingerprint = hashlib.sha256(
+            json.dumps(
+                dynamic_tools,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        strategy_snapshot = (
+            strategy.snapshot() if strategy is not None else {}
+        )
+        try:
+            strategy_revision = max(
+                0, int(strategy_snapshot.get("evidence_revision") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            strategy_revision = 0
+        latest_observation = strategy_snapshot.get(
+            "latest_desktop_observation"
+        )
+        latest_observation = (
+            latest_observation
+            if isinstance(latest_observation, dict) else {}
+        )
+        try:
+            world_revision = max(
+                strategy_revision,
+                int(latest_observation.get("evidence_revision") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            world_revision = strategy_revision
         fingerprint_input = (
             f"{int(planning_only)}\0{system}\0"
             + json.dumps(frontier_names, separators=(",", ":"))
+            + "\0"
+            + tool_schema_fingerprint
         )
         system_fingerprint = hashlib.sha256(
             fingerprint_input.encode("utf-8"),
@@ -437,15 +608,20 @@ class ChatGPTAccountProvider:
             state = self._threads.get(conversation_id)
             reusable = bool(
                 state
-                and state.generation == self.client.generation
+                and state.runtime_client is runtime_client
+                and state.generation == runtime_client.generation
                 and state.model == model
                 and state.system_fingerprint == system_fingerprint
+                and state.tool_schema_fingerprint == tool_schema_fingerprint
                 and state.planning_only is planning_only
                 and _same_messages(state.expected_messages, public_non_system)
             )
-            delta = non_system[len(state.expected_messages):] if reusable and state else non_system
+            delta = (
+                non_system[len(state.expected_messages):]
+                if reusable and state else _native_rebuild_history(non_system)
+            )
         if not reusable:
-            thread_id = self.client.start_or_resume_conversation(
+            thread_id = runtime_client.start_or_resume_conversation(
                 thread_id=None,
                 model=model,
                 base_instructions=base_instructions,
@@ -454,13 +630,17 @@ class ChatGPTAccountProvider:
             )
             state = _ConversationState(
                 thread_id=thread_id,
-                generation=self.client.generation,
+                generation=runtime_client.generation,
                 model=model,
                 system_fingerprint=system_fingerprint,
+                tool_schema_fingerprint=tool_schema_fingerprint,
+                runtime_client=runtime_client,
                 expected_messages=[],
                 planning_only=planning_only,
+                native_tool_names=tuple(frontier_names),
+                strategy_revision=strategy_revision,
+                world_revision=world_revision,
             )
-            delta = non_system
             with self._lock:
                 self._threads[conversation_id] = state
         if not delta:
@@ -483,8 +663,50 @@ class ChatGPTAccountProvider:
         output_schema: dict | None = None,
         planning_only: bool = False,
     ) -> TurnResult:
+        with self._conversation_lock(conversation_id):
+            return self._complete_serialized(
+                conversation_id=conversation_id,
+                model=model,
+                messages=messages,
+                osia_turn_id=osia_turn_id,
+                client_request_id=client_request_id,
+                final_response_message_id=final_response_message_id,
+                effort=effort,
+                on_delta=on_delta,
+                on_reasoning_summary=on_reasoning_summary,
+                timeout=timeout,
+                output_schema=output_schema,
+                planning_only=planning_only,
+            )
+
+    def _complete_serialized(
+        self,
+        *,
+        conversation_id: str,
+        model: str,
+        messages: list[dict],
+        osia_turn_id: str | None = None,
+        client_request_id: str | None = None,
+        final_response_message_id: str | None = None,
+        effort: str | None = None,
+        on_delta=None,
+        on_reasoning_summary=None,
+        timeout: float = 300.0,
+        output_schema: dict | None = None,
+        planning_only: bool = False,
+    ) -> TurnResult:
         state = None
+        lifecycle_gate_held = False
+
+        def release_lifecycle_gate() -> None:
+            nonlocal lifecycle_gate_held
+            if lifecycle_gate_held:
+                self._lifecycle_lock.release()
+                lifecycle_gate_held = False
+
         try:
+            self._lifecycle_lock.acquire()
+            lifecycle_gate_held = True
             state, delta_messages = self._prepare(
                 conversation_id, model, messages,
                 planning_only=planning_only,
@@ -502,12 +724,17 @@ class ChatGPTAccountProvider:
                 on_reasoning_summary=on_reasoning_summary,
                 timeout=_bounded_turn_timeout(timeout),
                 output_schema=output_schema,
+                on_attempt_registered=release_lifecycle_gate,
             )
             if isinstance(turn_input, list):
                 run_kwargs["content"] = turn_input
             else:
                 run_kwargs["text"] = turn_input
-            result = self.client.run_turn(**run_kwargs)
+            try:
+                result = state.runtime_client.run_turn(**run_kwargs)
+                result = _with_native_frontier_receipt(result, state)
+            finally:
+                release_lifecycle_gate()
             with self._lock:
                 current = self._threads.get(conversation_id)
                 if current is state:
@@ -534,6 +761,16 @@ class ChatGPTAccountProvider:
                     public_reasoning_summary=str(
                         getattr(exc, "public_reasoning_summary", "") or ""
                     ),
+                    native_tool_names=tuple(state.native_tool_names),
+                    native_tool_schema_fingerprint=(
+                        state.tool_schema_fingerprint
+                    ),
+                    strategy_revision=int(state.strategy_revision),
+                    world_revision=int(state.world_revision),
+                    native_tool_call=(
+                        dict(exc.native_tool_call)
+                        if isinstance(exc.native_tool_call, dict) else None
+                    ),
                 )
                 if on_reasoning_summary is not None and result.public_reasoning_summary:
                     on_reasoning_summary(result.public_reasoning_summary)
@@ -557,18 +794,21 @@ class ChatGPTAccountProvider:
                         ]
             if exc.category in {"thread_failed", "request_rejected", "process_crash"}:
                 with self._lock:
-                    self._threads.pop(conversation_id, None)
+                    if self._threads.get(conversation_id) is state:
+                        self._threads.pop(conversation_id, None)
             raise AccountProviderError(
                 exc,
                 selected_model=model,
                 reasoning_level=effort,
             ) from exc
+        finally:
+            release_lifecycle_gate()
 
     def cancel_conversation(self, conversation_id: str) -> None:
         with self._lock:
             state = self._threads.get(conversation_id)
         if state:
-            self.client.cancel_turn(thread_id=state.thread_id)
+            state.runtime_client.cancel_turn(thread_id=state.thread_id)
 
     def release_ephemeral_conversation(self, conversation_id: str) -> None:
         """Forget local state for a completed one-shot observation turn."""
@@ -577,9 +817,12 @@ class ChatGPTAccountProvider:
             self._threads.pop(str(conversation_id or ""), None)
 
     def shutdown(self) -> None:
-        self.client.shutdown()
-        with self._lock:
-            self._threads.clear()
+        with self._lifecycle_lock:
+            if self._direct_visual_client is not self.client:
+                self._direct_visual_client.shutdown()
+            self.client.shutdown()
+            with self._lock:
+                self._threads.clear()
 
 
 class _AccountCompletions:
@@ -626,11 +869,40 @@ class _AccountCompletions:
             self._owner._set_capability_events(
                 getattr(result, "capability_events", ()),
             )
+            self._owner._set_native_tool_handoff(
+                getattr(result, "native_tool_call", None),
+            )
             self._owner._set_invocation_metadata({
                 "native_turn_id": getattr(result, "turn_id", None),
                 "native_thread_id": getattr(result, "thread_id", None),
                 "native_status": getattr(result, "status", ""),
                 "output_started": bool(getattr(result, "output_started", False)),
+                "response_items": tuple(
+                    dict(item)
+                    for item in (getattr(result, "response_items", ()) or ())
+                    if isinstance(item, dict)
+                ),
+                "final_output_item_id": str(
+                    getattr(result, "final_output_item_id", "") or ""
+                ),
+                "model_rerouted": bool(
+                    getattr(result, "model_rerouted", False)
+                ),
+                "effective_model_id": str(
+                    getattr(result, "effective_model_id", "") or model
+                ),
+                "native_tool_names": tuple(
+                    getattr(result, "native_tool_names", ()) or ()
+                ),
+                "native_tool_schema_fingerprint": str(
+                    getattr(result, "native_tool_schema_fingerprint", "") or ""
+                ),
+                "strategy_revision": int(
+                    getattr(result, "strategy_revision", 0) or 0
+                ),
+                "world_revision": int(
+                    getattr(result, "world_revision", 0) or 0
+                ),
             })
             message = SimpleNamespace(content=result.text, tool_calls=None)
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
@@ -664,11 +936,42 @@ class _AccountCompletions:
                 self._owner._set_capability_events(
                     getattr(result, "capability_events", ()),
                 )
+                self._owner._set_native_tool_handoff(
+                    getattr(result, "native_tool_call", None),
+                )
                 self._owner._set_invocation_metadata({
                     "native_turn_id": getattr(result, "turn_id", None),
                     "native_thread_id": getattr(result, "thread_id", None),
                     "native_status": getattr(result, "status", ""),
                     "output_started": bool(getattr(result, "output_started", False)),
+                    "response_items": tuple(
+                        dict(item)
+                        for item in (getattr(result, "response_items", ()) or ())
+                        if isinstance(item, dict)
+                    ),
+                    "final_output_item_id": str(
+                        getattr(result, "final_output_item_id", "") or ""
+                    ),
+                    "model_rerouted": bool(
+                        getattr(result, "model_rerouted", False)
+                    ),
+                    "effective_model_id": str(
+                        getattr(result, "effective_model_id", "") or model
+                    ),
+                    "native_tool_names": tuple(
+                        getattr(result, "native_tool_names", ()) or ()
+                    ),
+                    "native_tool_schema_fingerprint": str(
+                        getattr(
+                            result, "native_tool_schema_fingerprint", "",
+                        ) or ""
+                    ),
+                    "strategy_revision": int(
+                        getattr(result, "strategy_revision", 0) or 0
+                    ),
+                    "world_revision": int(
+                        getattr(result, "world_revision", 0) or 0
+                    ),
                 })
                 events.put(("done", None))
             except Exception as exc:
@@ -720,6 +1023,8 @@ class _AccountChatClient:
         self._invocation_metadata_lock = threading.Lock()
         self._public_reasoning_summary_callback = None
         self._public_reasoning_summary_lock = threading.Lock()
+        self._native_tool_handoff: dict = {}
+        self._native_tool_handoff_lock = threading.Lock()
         self.chat = SimpleNamespace(completions=_AccountCompletions(self))
 
     def _set_capability_events(self, events) -> None:
@@ -734,6 +1039,14 @@ class _AccountChatClient:
             "native_turn_id": getattr(exc, "native_turn_id", None),
             "native_status": "failed",
             "output_started": bool(getattr(exc, "output_started", False)),
+            "response_items": tuple(
+                dict(item)
+                for item in (getattr(exc, "response_items", ()) or ())
+                if isinstance(item, dict)
+            ),
+            "final_output_item_id": str(
+                getattr(exc, "final_output_item_id", "") or ""
+            ),
         })
 
     def consume_capability_events(self) -> tuple:
@@ -743,6 +1056,20 @@ class _AccountChatClient:
             events = self._capability_events
             self._capability_events = ()
         return events
+
+    def _set_native_tool_handoff(self, value) -> None:
+        with self._native_tool_handoff_lock:
+            self._native_tool_handoff = (
+                dict(value) if isinstance(value, Mapping) else {}
+            )
+
+    def consume_native_tool_handoff(self) -> dict:
+        """Return one exact out-of-band native call correlation mapping."""
+
+        with self._native_tool_handoff_lock:
+            value = dict(self._native_tool_handoff)
+            self._native_tool_handoff = {}
+        return value
 
     def _set_invocation_metadata(self, metadata) -> None:
         with self._invocation_metadata_lock:

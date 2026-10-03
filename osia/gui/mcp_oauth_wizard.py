@@ -19,11 +19,13 @@ Design (audited)
   exec()s this dialog.
 * INSTRUCTIONAL ONLY — the wizard never writes the ``client_id`` / ``client_secret``
   fields nor any connect/persist path. The user still pastes manually.
-* Mirrors ``osia.gui.mcp_confirm._MCPConfirmDialog`` exactly: frameless +
+* Uses the popup's protected frameless dialog chrome: frameless +
   ``dialogCard`` object name (inherits the popup's premium stylesheet),
   ``FramelessWindowHint | Dialog | WindowStaysOnTopHint`` (so the modal surfaces
   above the always-on-top popup on X11/Wayland), ``WA_TranslucentBackground``,
   ``setModal(True)`` and a ``showEvent`` that centres on the parent window.
+  OSIA is permanently full-access: no permission or confirmation prompt gates
+  setup.
 * Imports PyQt6 + ``osia.i18n`` (+ stdlib ``webbrowser``), and lazily imports
   ``google_oauth`` only to display the stable Mobile redirect. No GUI module is
   pulled back in, so the dependency remains acyclic.
@@ -75,9 +77,9 @@ _WIZARD_APIS = {
 _WIZARD_SCOPES = {
     "gmail-rest": (
         "Required: https://www.googleapis.com/auth/gmail.readonly\n"
-        "Optional for confirmed draft creation and draft sending: "
+        "Optional for draft creation and draft sending: "
         "https://www.googleapis.com/auth/gmail.compose\n"
-        "Optional for confirmed read/unread and label changes: "
+        "Optional for read/unread and label changes: "
         "https://www.googleapis.com/auth/gmail.modify"
     ),
     "gmail": "https://mail.google.com/",

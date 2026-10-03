@@ -1,38 +1,34 @@
+"""WOR-195/WOR-301 scheduled-task execution integrity.
+
+Scheduled tasks execute with permanent Full Access: no authorization request,
+no grant, no permit.  Retained here: canonical definition hashing, exact
+revision/occurrence binding, disabled/blocked preflight, OUTCOME_UNKNOWN
+durability, universal destruction barriers, sanitized mobile payloads.
+"""
+
 from __future__ import annotations
 
 import copy
 import json
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
 
-from osia import cron, scheduled_tasks
+from osia import action_policy, cron, scheduled_tasks
 from osia.action_policy import (
-    DecisionType,
     ExecutionType,
-    PermissionMode,
-    PermissionPolicy,
-    PermitError,
-    build_permission_request,
     execution_context_scope,
-    set_default_permission_policy,
-    trusted_deletion_classification,
 )
-from osia.permission_store import (
-    PermissionStore,
-    UnavailableSecureStorageBackend,
-    WindowsDPAPISecureStorageBackend,
+from osia.tool_contracts import (
+    ExecutionOutcome,
+    ToolExecutionRecord,
+    effective_contract,
+    get_tool_spec,
 )
-from osia.tool_contracts import ExecutionOutcome, ToolExecutionRecord
 
 
 @pytest.fixture
 def scheduled_runtime(tmp_path, monkeypatch):
-    backend = WindowsDPAPISecureStorageBackend()
-    if not backend.availability.available:
-        pytest.skip("protected recurring-grant persistence requires DPAPI")
     values = {"cron_jobs": []}
 
     def fake_get(key, default=None):
@@ -45,17 +41,7 @@ def scheduled_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduled_tasks.config, "set_setting", fake_set)
     monkeypatch.setattr(cron, "get_setting", fake_get)
     monkeypatch.setattr(cron, "set_setting", fake_set)
-    scheduled_tasks._PENDING_AUTHORIZATIONS.clear()
-    scheduled_tasks._RESPONDED_AUTHORIZATIONS.clear()
-    store = PermissionStore(tmp_path / "permissions.dat", backend=backend)
-    policy = PermissionPolicy(store)
-    set_default_permission_policy(policy)
-    try:
-        yield values, policy
-    finally:
-        scheduled_tasks._PENDING_AUTHORIZATIONS.clear()
-        scheduled_tasks._RESPONDED_AUTHORIZATIONS.clear()
-        set_default_permission_policy(None)
+    yield values
 
 
 def _create_sensitive(level: int = 25) -> dict:
@@ -71,20 +57,6 @@ def _create_sensitive(level: int = 25) -> dict:
     return result["job"]
 
 
-def _authorize(task_id: str, *, origin: str = "desktop", **kwargs) -> dict:
-    begun = scheduled_tasks.begin_scheduled_task_authorization(
-        task_id, origin_ref=origin, **kwargs,
-    )
-    assert begun["ok"] is True
-    request = dict(begun["request"])
-    request["action"] = "approve"
-    result = scheduled_tasks.respond_scheduled_task_authorization(
-        request, authenticated_origin=origin,
-    )
-    assert result["ok"] is True
-    return request
-
-
 def _execution(job: dict, occurrence: str) -> dict:
     return {
         "source": "scheduled_task",
@@ -92,7 +64,7 @@ def _execution(job: dict, occurrence: str) -> dict:
         "task_revision": job["task_revision"],
         "definition_hash": job["definition_hash"],
         "authorization_revision": job["authorization_revision"],
-        "policy_epoch": job["policy_epoch"],
+        "policy_epoch": job.get("policy_epoch", 0),
         "occurrence_id": occurrence,
     }
 
@@ -141,42 +113,32 @@ def test_canonical_definition_hash_excludes_cosmetic_and_volatile_fields():
         )
 
 
-def test_authorize_before_enable_exact_recurring_and_two_occurrences(
-    scheduled_runtime,
-):
-    _values, policy = scheduled_runtime
+def test_enabled_task_preflights_and_executes_without_grants(scheduled_runtime):
+    _values = scheduled_runtime
     created = _create_sensitive()
-    assert created["enabled"] is False
-    assert created["authorization_status"] == scheduled_tasks.AUTHORIZATION_REQUIRED
-    assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is False
+    assert created["enabled"] is True
+    assert created["desired_enabled"] is True
+    assert "grant_refs" not in created
+    assert "authorization_status" not in created
 
-    request = _authorize(created["id"])
     job = _current(created["id"])
-    assert job["enabled"] is True
-    assert job["authorization_status"] == scheduled_tasks.AUTHORIZED
-    assert job["grant_refs"]
-    assert request["definition_hash"] == job["definition_hash"]
+    assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is True
 
     for number in (1, 2):
         execution = _execution(job, f"occurrence:{number}")
         context = scheduled_tasks.execution_context_for_scheduled_occurrence(execution)
+        assert context.execution_type is ExecutionType.SCHEDULED
         with execution_context_scope(context):
-            permission_request = build_permission_request(
-                "set_volume", {"level": 25}, policy=policy,
-            )
-        decision = policy.evaluate(permission_request)
-        assert decision.decision_type == DecisionType.ALLOW
-        permit = policy.mint_permit(permission_request, decision)
-        assert permit is not None
-        assert policy.consume_permit(permit, permission_request).used is True
+            # WOR-301: no mode gate exists; the only barrier is integrity.
+            assert not hasattr(action_policy, "scheduled_permission_gate")
+            assert action_policy.guard_tool_call(
+                f"Set volume to 25", "set_volume", {"level": 25},
+            ) is None
 
 
-def test_edit_revision_invalidation_and_occurrence_id_is_not_permission(
-    scheduled_runtime,
-):
-    _values, _policy = scheduled_runtime
+def test_edit_bumps_revisions_and_stale_occurrence_is_rejected(scheduled_runtime):
+    _values = scheduled_runtime
     created = _create_sensitive()
-    _authorize(created["id"])
     before = _current(created["id"])
     stale = _execution(before, "occurrence:old")
     edited = scheduled_tasks.update_scheduled_task(
@@ -184,168 +146,49 @@ def test_edit_revision_invalidation_and_occurrence_id_is_not_permission(
     )["job"]
     assert edited["task_revision"] == before["task_revision"] + 1
     assert edited["definition_hash"] != before["definition_hash"]
-    assert edited["grant_refs"] == []
-    assert edited["authorization_status"] == scheduled_tasks.AUTHORIZATION_EDITED
-    assert edited["enabled"] is False
-    stale["occurrence_id"] = "occurrence:fresh-id-cannot-authorize"
+    assert edited["enabled"] is True
+
+    stale["occurrence_id"] = "occurrence:fresh-id-cannot-revive"
     with pytest.raises(scheduled_tasks.ScheduledTaskError):
         scheduled_tasks.execution_context_for_scheduled_occurrence(stale)
 
+    # The edited revision itself remains exactly executable.
+    fresh = _execution(edited, "occurrence:fresh")
+    scheduled_tasks.execution_context_for_scheduled_occurrence(fresh)
 
-def test_stale_duplicate_wrong_task_hash_and_origin_responses_are_rejected(
+
+def test_disable_stops_the_scheduler_without_consuming_the_schedule(
     scheduled_runtime,
 ):
-    _values, _policy = scheduled_runtime
-    first = _create_sensitive(25)
-    second = _create_sensitive(30)
-    begun = scheduled_tasks.begin_scheduled_task_authorization(
-        first["id"], origin_ref="mobile:fixture",
-    )
-    request = begun["request"]
-    for field, value in (
-        ("task_id", second["id"]),
-        ("task_revision", request["task_revision"] + 1),
-        ("definition_hash", "f" * 64),
-        ("origin_ref", "mobile:wrong"),
-    ):
-        response = {**request, field: value, "action": "approve"}
-        rejected = scheduled_tasks.respond_scheduled_task_authorization(
-            response, authenticated_origin="mobile:fixture",
-        )
-        assert rejected["ok"] is False
-        assert rejected["code"] == scheduled_tasks.ERROR_AUTHORIZATION_STALE
-
-    accepted = scheduled_tasks.respond_scheduled_task_authorization(
-        {**request, "action": "approve"},
-        authenticated_origin="mobile:fixture",
-    )
-    assert accepted["ok"] is True
-    duplicate = scheduled_tasks.respond_scheduled_task_authorization(
-        {**request, "action": "approve"},
-        authenticated_origin="mobile:fixture",
-    )
-    assert duplicate["ok"] is False
-    assert duplicate["code"] == scheduled_tasks.ERROR_AUTHORIZATION_STALE
-
-    third = _create_sensitive(40)
-    concurrent_request = scheduled_tasks.begin_scheduled_task_authorization(
-        third["id"], origin_ref="desktop:race",
-    )["request"]
-    response = {**concurrent_request, "action": "approve"}
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(
-            lambda _index: scheduled_tasks.respond_scheduled_task_authorization(
-                response, authenticated_origin="desktop:race",
-            ),
-            range(2),
-        ))
-    assert sorted(result["ok"] for result in results) == [False, True]
-
-
-def test_expiration_revocation_and_policy_epoch_invalidate_before_dispatch(
-    scheduled_runtime, monkeypatch,
-):
-    _values, policy = scheduled_runtime
+    values = scheduled_runtime
     created = _create_sensitive()
-    request = _authorize(created["id"], ttl_seconds=60)
-    job = _current(created["id"])
-    context = scheduled_tasks.execution_context_for_scheduled_occurrence(
-        _execution(job, "occurrence:permit"),
-    )
-    with execution_context_scope(context):
-        permission_request = build_permission_request(
-            "set_volume", {"level": 25}, policy=policy,
-        )
-    decision = policy.evaluate(permission_request)
-    permit = policy.mint_permit(permission_request, decision)
-    assert permit is not None
-    scheduled_tasks.update_scheduled_task(
-        task_id=created["id"], instruction="Set volume to 26", source="settings",
-    )
-    with pytest.raises(PermitError):
-        policy.consume_permit(permit, permission_request)
-    assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is False
+    disabled = scheduled_tasks.disable_scheduled_task(created["id"])
+    assert disabled["ok"] is True and disabled["changed"] is True
+    assert disabled["task"]["enabled"] is False
 
-    created = _create_sensitive(30)
-    request = _authorize(created["id"], ttl_seconds=60)
-    monkeypatch.setattr(time, "time", lambda: float(request["expiration"]) + 1.0)
-    expired = scheduled_tasks.preflight_scheduled_task(created["id"])
-    assert expired["ok"] is False
-    assert expired["authorization_status"] == scheduled_tasks.AUTHORIZATION_EXPIRED
+    blocked = scheduled_tasks.preflight_scheduled_task(created["id"])
+    assert blocked["ok"] is False
+    assert blocked["execution_state"] == scheduled_tasks.DISABLED
 
-
-def test_revocation_is_idempotent_and_scheduler_does_not_consume_retry(
-    scheduled_runtime,
-):
-    values, _policy = scheduled_runtime
-    created = _create_sensitive()
-    _authorize(created["id"])
-    authorized = _current(created["id"])
-    one = scheduled_tasks.revoke_scheduled_task_grant(
-        created["id"], authorized["grant_refs"][0],
-    )
-    assert one["ok"] is True and one["changed"] is True
-    assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is False
-
-    created = _create_sensitive(30)
-    _authorize(created["id"])
-    first = scheduled_tasks.revoke_scheduled_task_authorization(created["id"])
-    second = scheduled_tasks.revoke_scheduled_task_authorization(created["id"])
-    assert first["ok"] is True and first["changed"] is True
-    assert second["ok"] is True and second["changed"] is False
     timing = {"next_run": datetime(2026, 7, 27, 12, 5)}
     launched = cron.CronManager(lambda *_args, **_kwargs: None)._fire(
         "Set volume to 25", "every 5 minutes", timing,
         datetime(2026, 7, 27, 12, 5), task_id=created["id"], job_index=0,
     )
     assert launched is False
-    assert timing == {"next_run": datetime(2026, 7, 27, 12, 5)}
     stored = next(job for job in values["cron_jobs"] if job["id"] == created["id"])
     assert stored["last_status"] == "blocked_authorization"
 
-
-def test_session_authority_disappears_after_restart(tmp_path, monkeypatch):
-    values = {"cron_jobs": []}
-    monkeypatch.setattr(
-        scheduled_tasks.config, "get_setting",
-        lambda key, default=None: copy.deepcopy(values.get(key, default)),
-    )
-    monkeypatch.setattr(
-        scheduled_tasks.config, "set_setting",
-        lambda key, value: values.__setitem__(key, copy.deepcopy(value)),
-    )
-    scheduled_tasks._PENDING_AUTHORIZATIONS.clear()
-    scheduled_tasks._RESPONDED_AUTHORIZATIONS.clear()
-    first_store = PermissionStore(
-        tmp_path / "unavailable.dat", backend=UnavailableSecureStorageBackend(),
-    )
-    set_default_permission_policy(PermissionPolicy(first_store))
-    try:
-        created = _create_sensitive()
-        _authorize(created["id"])
-        assert first_store.path.exists() is False
-        assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is True
-
-        restarted_store = PermissionStore(
-            first_store.path, backend=UnavailableSecureStorageBackend(),
-        )
-        set_default_permission_policy(PermissionPolicy(restarted_store))
-        blocked = scheduled_tasks.preflight_scheduled_task(created["id"])
-        assert blocked["ok"] is False
-        assert blocked["authorization_status"] in {
-            scheduled_tasks.AUTHORIZATION_REQUIRED,
-            scheduled_tasks.AUTHORIZATION_REVOKED,
-        }
-    finally:
-        scheduled_tasks._PENDING_AUTHORIZATIONS.clear()
-        scheduled_tasks._RESPONDED_AUTHORIZATIONS.clear()
-        set_default_permission_policy(None)
+    # Re-enabling through an edit makes the exact new revision runnable again.
+    reenabled = scheduled_tasks.update_scheduled_task(
+        task_id=created["id"], enabled=True, source="settings",
+    )["job"]
+    assert reenabled["enabled"] is True
+    assert scheduled_tasks.preflight_scheduled_task(created["id"])["ok"] is True
 
 
-def test_legacy_read_only_and_sensitive_migration_and_unknown_schema_fail_closed(
-    scheduled_runtime,
-):
-    values, _policy = scheduled_runtime
+def test_legacy_migration_and_unknown_schema_fail_closed(scheduled_runtime):
+    values = scheduled_runtime
     values["cron_jobs"] = [
         {"id": "cron_legacy_read", "title": "Read", "task": "Return status",
          "schedule": "every 5 minutes", "enabled": True},
@@ -358,8 +201,11 @@ def test_legacy_read_only_and_sensitive_migration_and_unknown_schema_fail_closed
     ]
     jobs = {job["id"]: job for job in scheduled_tasks.scheduler_jobs_snapshot()}
     assert jobs["cron_legacy_read"]["enabled"] is True
-    assert jobs["cron_legacy_read"]["authorization_status"] == scheduled_tasks.AUTHORIZED
-    assert jobs["cron_legacy_write"]["enabled"] is False
+    assert jobs["cron_legacy_read"]["schema_version"] == (
+        scheduled_tasks.SCHEDULED_TASK_SCHEMA_VERSION
+    )
+    assert "grant_refs" not in jobs["cron_legacy_read"]
+    assert jobs["cron_legacy_write"]["enabled"] is True
     assert jobs["cron_legacy_write"]["task"] == "Set volume to 25"
     assert jobs["cron_unknown_schema"]["enabled"] is False
     assert jobs["cron_unknown_schema"]["schema_version"] == 999
@@ -370,34 +216,33 @@ def test_legacy_read_only_and_sensitive_migration_and_unknown_schema_fail_closed
 def test_outcome_unknown_is_durable_and_blocks_later_occurrence(
     scheduled_runtime,
 ):
-    _values, policy = scheduled_runtime
+    _values = scheduled_runtime
     created = _create_sensitive()
-    _authorize(created["id"])
     job = _current(created["id"])
     execution = _execution(job, "occurrence:unknown")
     context = scheduled_tasks.execution_context_for_scheduled_occurrence(execution)
-    with execution_context_scope(context):
-        request = build_permission_request("set_volume", {"level": 25}, policy=policy)
+    assert context.execution_type is ExecutionType.SCHEDULED
     record = ToolExecutionRecord(
         "ERROR: outcome unknown", True, ExecutionOutcome.OUTCOME_UNKNOWN,
-        1, True, True, request.effective_contract,
+        1, True, True,
+        effective_contract(get_tool_spec("set_volume"), {"level": 25}),
     )
     scheduled_tasks.record_scheduled_tool_execution(
         execution, "set_volume", {"level": 25}, record,
     )
     blocked = scheduled_tasks.preflight_scheduled_task(created["id"])
     assert blocked["ok"] is False
-    assert blocked["authorization_status"] == scheduled_tasks.BLOCKED_OUTCOME_UNKNOWN
+    assert blocked["execution_state"] == scheduled_tasks.BLOCKED_OUTCOME_UNKNOWN
+    assert scheduled_tasks.scheduled_execution_block_state(
+        execution,
+    ) == scheduled_tasks.BLOCKED_OUTCOME_UNKNOWN
     later = {**execution, "occurrence_id": "occurrence:later"}
     with pytest.raises(scheduled_tasks.ScheduledTaskError):
         scheduled_tasks.execution_context_for_scheduled_occurrence(later)
 
 
-def test_full_access_keeps_universal_destruction_barriers(
-    scheduled_runtime, tmp_path,
-):
-    _values, policy = scheduled_runtime
-    policy.store.set_permission_mode(PermissionMode.FULL_ACCESS)
+def test_universal_destruction_barrier_still_blocks(scheduled_runtime, tmp_path):
+    _values = scheduled_runtime
     target = tmp_path / "synthetic-delete-target"
     target.mkdir()
     created = scheduled_tasks.create_scheduled_task(
@@ -407,41 +252,27 @@ def test_full_access_keeps_universal_destruction_barriers(
         enabled=True,
         source="settings",
     )["job"]
-    assert created["enabled"] is True and created["grant_refs"] == []
+    assert created["enabled"] is True and "grant_refs" not in created
     context = scheduled_tasks.execution_context_for_scheduled_occurrence(
         _execution(created, "occurrence:barrier"),
     )
     with execution_context_scope(context):
-        ordinary = build_permission_request(
-            "delete_directory", {"path": str(target)}, policy=policy,
-        )
-    ordinary_decision = policy.evaluate(ordinary)
-    assert ordinary_decision.decision_type == DecisionType.ALLOW
-    pending_permit = policy.mint_permit(ordinary, ordinary_decision)
-    assert pending_permit is not None
-    for system, colossal, expected in (
-        (True, False, DecisionType.BLOCK_SYSTEM_DESTRUCTION),
-        (False, True, DecisionType.REQUIRE_COLOSSAL_DELETION_CONFIRMATION),
-    ):
-        with execution_context_scope(context):
-            request = build_permission_request(
-                "delete_directory", {"path": str(target)}, policy=policy,
-                deletion_classification=trusted_deletion_classification(
-                    system_destruction=system, colossal_deletion=colossal,
-                ),
-            )
-        assert policy.evaluate(request).decision_type == expected
-    scheduled_tasks.update_scheduled_task(
-        task_id=created["id"],
-        instruction=f"Delete directory {target} after review",
-        source="settings",
-    )
-    with pytest.raises(PermitError):
-        policy.consume_permit(pending_permit, ordinary)
+        # An ordinary non-system deletion dispatches with no authorization.
+        assert action_policy.guard_tool_call(
+            f"Delete directory {target}",
+            "delete_directory",
+            {"path": str(target)},
+        ) is None
+        # The absolute system-destruction barrier is the only refusal.
+        assert action_policy.system_mutation_barrier(
+            "run_command",
+            {"command": "Remove-Partition -DiskNumber 0 -PartitionNumber 1"},
+        ) == "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+        assert not hasattr(action_policy, "scheduled_permission_gate")
 
 
 def test_mobile_payload_and_notification_are_sanitized(scheduled_runtime):
-    _values, _policy = scheduled_runtime
+    _values = scheduled_runtime
     sentinel = "PRIVATE_FILENAME_RECIPIENT_URL"
     created = scheduled_tasks.create_scheduled_task(
         title=sentinel,
@@ -504,22 +335,3 @@ def test_windows_volume_success_is_verified(monkeypatch):
     )
     assert record.result == "Volume set to 31%"
     assert record.outcome is ExecutionOutcome.SUCCESS_VERIFIED
-
-
-def test_mobile_dynamic_target_requires_pc_local_review(scheduled_runtime):
-    created = scheduled_tasks.create_scheduled_task(
-        title="Private synthetic target",
-        instruction="Delete the private file named WOR195_PRIVATE.txt",
-        schedule={"type": "daily", "time": "12:00"},
-        enabled=True,
-        source="mobile_settings",
-    )["job"]
-
-    result = scheduled_tasks.begin_scheduled_task_authorization(
-        created["id"],
-        origin_ref="mobile_test",
-        mobile=True,
-    )
-    assert not result["ok"]
-    assert result["code"] == scheduled_tasks.ERROR_PC_REVIEW_REQUIRED
-    assert "request" not in result

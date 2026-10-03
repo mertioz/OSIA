@@ -86,7 +86,6 @@ _MUTATING_EFFECTS = frozenset({
 })
 _BLOCKING_UNRESOLVED_MARKERS = (
     "account_binding_unknown",
-    "personal_browser_authority_unknown",
     "vision_authority_unknown",
     "runtime_unknown",
     "surface_binding_unknown",
@@ -333,12 +332,17 @@ def _read_only_descriptor(
         if family == CapabilityFamily.VISION_OBSERVATION.value
         else (ModalityRequirement.ACCESSIBILITY.value,)
     )
+    is_vision = family == CapabilityFamily.VISION_OBSERVATION.value
     return replace(
         descriptor,
         semantic_effects=tuple(dict.fromkeys((
             node.objective,
             node.target,
-            "read-only state observation",
+            (
+                "visual observation and semantic verdict with optional target bbox"
+                if is_vision else
+                "structured accessibility state observation"
+            ),
         ))),
         supported_surfaces=(
             (node.required_surface,)
@@ -354,7 +358,13 @@ def _read_only_descriptor(
         reversibility=Reversibility.NOT_APPLICABLE.value,
         anti_replay_equivalence_class=goal_node_equivalence_class(node),
         deterministic_constraints=tuple(constraints),
-        description="read-only state observation for the current goal node",
+        description=(
+            "READ_ONLY approximate pixel evidence bound to one fresh local target; "
+            "requires a Vision-capable model, respects privacy/capture protection, "
+            "and may return an optional refinement bbox"
+            if is_vision else
+            "READ_ONLY structured accessibility evidence for the current goal node"
+        ),
     )
 
 
@@ -599,11 +609,6 @@ def _fallback_proposal(
         remaining_goal_node_ids=world.remaining_goal_node_ids,
         verified_postcondition_ids=world.verified_postconditions,
         unverified_postcondition_ids=verification.unsatisfied_postcondition_ids,
-        do_not_replay_capability_ids=tuple(sorted(dict.fromkeys(
-            item.capability_id for item in world.known_effect_states
-            if item.effect_state == EffectState.OUTCOME_UNKNOWN.value
-            and item.capability_id
-        ))),
         readiness_signals=tuple(item for item in dict.fromkeys((
             "unresolved_outcome_unknown"
             if verification.status == VerificationStatus.OUTCOME_UNKNOWN.value
@@ -699,13 +704,6 @@ def evaluate_adaptive_continuation(
             world_state, verification_result, "malformed_adaptive_plan"
         )
     if any(
-        step.goal_node_id in world_state.completed_goal_node_ids
-        for step in selected.ordered_steps
-    ):
-        return _fallback_proposal(
-            world_state, verification_result, "completed_node_replay_rejected"
-        )
-    if any(
         any(marker in item for marker in _BLOCKING_UNRESOLVED_MARKERS)
         for item in selected.unresolved_constraints
     ):
@@ -731,14 +729,6 @@ def evaluate_adaptive_continuation(
     ):
         return _fallback_proposal(
             world_state, verification_result, "selected_modality_unresolved"
-        )
-    if (
-        descriptor.side_effect_class in _MUTATING_EFFECTS
-        and descriptor.anti_replay_equivalence_class
-        in world_state.outcome_unknown_equivalence_classes
-    ):
-        return _fallback_proposal(
-            world_state, verification_result, "outcome_unknown_replay_rejected"
         )
     if (
         first.role == "act"
@@ -787,11 +777,6 @@ def evaluate_adaptive_continuation(
             *verification_result.satisfied_postcondition_ids,
         )))),
         unverified_postcondition_ids=verification_result.unsatisfied_postcondition_ids,
-        do_not_replay_capability_ids=tuple(sorted(dict.fromkeys(
-            item.capability_id for item in world_state.known_effect_states
-            if item.effect_state == EffectState.OUTCOME_UNKNOWN.value
-            and item.capability_id
-        ))),
         readiness_signals=tuple(readiness),
     )
 
@@ -905,14 +890,14 @@ def _compact_hint(
         "recommended_capability_id": proposal.selected_next_capability,
         "required_observation": proposal.required_observation,
         "hard_constraints": list(proposal.unresolved_constraints),
-        "do_not_replay": list(proposal.do_not_replay_capability_ids),
+        "do_not_replay": [],  # Legacy projection; no historical authority.
         "explanation_codes": list(proposal.explanation_codes),
         "world_revision": world.revision,
         "evidence_revision": world.evidence_revision,
     }
     return (
         "[Internal adaptive continuation hint. Advisory only: the existing "
-        "ExecutionStrategy, permission policy, dispatcher, anti-replay rules, "
+        "ExecutionStrategy, permission policy, dispatcher, target freshness, "
         "and TurnTerminalityController remain authoritative. Structured hint: "
         + json.dumps(
             payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")

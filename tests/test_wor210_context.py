@@ -77,7 +77,7 @@ def test_a_short_history_is_complete_ordered_and_origin_independent():
     mobile = build_context(
         copy.deepcopy(stored),
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model="deepseek-flash",
         conversation_id="conv-short",
         turn_id="turn-short",
     )
@@ -237,7 +237,7 @@ def test_d_model_change_recomputes_budget_and_provider_payload_is_equivalent():
     small_receipt = copy.deepcopy(agent.last_context_receipt)
 
     agent.provider = "deepseek"
-    agent.model = "deepseek-v4-flash"
+    agent.model = "deepseek-flash"
     large_wire = agent._wire_messages()
     large_receipt = copy.deepcopy(agent.last_context_receipt)
 
@@ -252,7 +252,7 @@ def test_d_model_change_recomputes_budget_and_provider_payload_is_equivalent():
         conversation_id="conv-long",
     )
     api = build_context(
-        copy.deepcopy(short), provider="deepseek", model="deepseek-v4-flash",
+        copy.deepcopy(short), provider="deepseek", model="deepseek-flash",
         conversation_id="conv-long",
     )
     assert account.messages == api.messages
@@ -436,7 +436,7 @@ def test_f_private_artifact_rehydrates_after_restart_without_source_reread(
         provider_results = []
         for provider, model in (
             ("chatgpt_account", "gpt-5.6-terra"),
-            ("deepseek", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-flash"),
         ):
             agent = OSIAAgent(model=model, lang="en")
             agent.provider = provider

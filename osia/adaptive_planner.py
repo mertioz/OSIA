@@ -123,7 +123,6 @@ class ShadowPlanResult:
 
 
 _BLOCKING_UNRESOLVED = frozenset({
-    "personal_browser_authority_unknown",
     "vision_authority_unknown",
 })
 _VERIFY_STRENGTH = {
@@ -415,29 +414,6 @@ def _node_plans(
             tuple(explanations),
         ))
 
-    if not plans and any(
-        item.outcome == "outcome_unknown"
-        for item in context.previous_attempt_effects
-    ):
-        reconciler = next(iter(_role_candidates(
-            result, StepRole.RECONCILE.value, include_unresolved=False
-        )), None)
-        if reconciler is not None:
-            descriptor = descriptors.get(reconciler.capability_id)
-            if descriptor is not None:
-                step = _step(
-                    node, reconciler, descriptor,
-                    StepRole.RECONCILE.value, 1, (),
-                )
-                plans.append(_make_plan(
-                    context,
-                    (step,),
-                    (f"{node.node_id}:mutation_reconsideration_requires_new_state",),
-                    (
-                        "outcome_unknown_replay_blocked",
-                        "reconcile_before_reconsidering_mutation",
-                    ),
-                ))
     return tuple(plans[:limits.max_candidate_plans])
 
 
@@ -583,8 +559,8 @@ def compare_legacy_snapshot(
         important = {
             "semantic_target_mismatch", "required_surface_mismatch",
             "application_mismatch", "account_mismatch",
-            "personal_browser_authority_mismatch", "permission_disallowed",
-            "outcome_unknown_replay_blocked", "modality_unavailable",
+            "permission_disallowed",
+            "modality_unavailable",
             "stale_ref_cannot_actuate", "required_postcondition_mismatch",
             "runtime_unavailable",
         }

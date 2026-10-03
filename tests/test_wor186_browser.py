@@ -19,14 +19,7 @@ import pytest
 from osia import tool_contracts
 from osia import action_policy
 from osia.tools import browser
-from osia.action_policy import (
-    PermissionPolicy, UsePolicy, build_permission_request, create_grant,
-)
-from osia.local_reauth import issue_full_access_activation_proof
 from osia.mcp_client import registry as mcp_registry
-from osia.permission_store import (
-    BackendAvailability, PermissionStore, SecureStorageBackend,
-)
 from osia.tools.browser_artifacts import (
     BrowserArtifactError,
     BrowserArtifactStore,
@@ -62,20 +55,6 @@ NEW_BROWSER_TOOLS = (
     "list_browser_dialogs", "handle_browser_dialog",
     "upload_browser_file", "download_browser_file",
 )
-
-
-class _HermeticProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor186_test", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W186" + bytes(value ^ 0x57 for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W186"):
-            raise ValueError("invalid_test_blob")
-        return bytes(value ^ 0x57 for value in protected[4:])
 
 
 def _free_port():
@@ -239,572 +218,61 @@ def test_all_browser_tools_have_complete_central_contracts():
         assert spec.permission_category != "", name
         assert spec.timeout_seconds > 0, name
         assert spec.redaction_policy, name
-        assert spec.chat_eligible is True, name
-        assert spec.scheduled_eligible is False, name
+        # WOR-301: the mode-eligibility vocabulary is gone entirely.
+        assert not hasattr(spec, "chat_eligible"), name
+        assert not hasattr(spec, "scheduled_eligible"), name
         assert spec.retry.value in {
             "not_started_only", "never_after_dispatch",
             "read_once_after_confirmed_failure",
         }
 
 
-def test_autonomous_browser_requires_authoritative_reference_tools():
-    legacy = {
-        "navigate", "click", "fill", "read_page", "get_current_url",
-        "scroll", "go_back", "go_forward", "open_new_tab",
-        "find_and_click", "wait_for_load", "get_page_text", "scroll_down",
-        "type_text", "press_key", "open_browser", "web_state",
-    }
-    for name in legacy:
-        assert tool_contracts.get_tool_spec(name).autonomous_eligible is False
-    for name in NEW_BROWSER_TOOLS:
-        assert tool_contracts.get_tool_spec(name).autonomous_eligible is True
-    assert tool_contracts.get_tool_spec(
-        "inspect_form_fields"
-    ).autonomous_eligible is True
-    assert tool_contracts.get_tool_spec("fill_form_field").autonomous_eligible is True
-
-    from osia.autonomous.orchestrator import Orchestrator
-
-    prompt = Orchestrator(SimpleNamespace())._compose({
-        "objective": "Inspect one controlled Web page",
-        "success_criterion": "The structured page state is observed",
-    }, "")
-    assert "navigate_browser" in prompt
-    assert "inspect_browser_page" in prompt
-    assert "Legacy selector-based browser tools" in prompt
 
 
-def test_autonomous_web_effective_surface_is_exact_and_chat_is_unchanged():
+def test_engine_surfaces_never_reduce_the_model_visible_inventory():
     from osia import agent as agent_module
-
-    expected = set(NEW_BROWSER_TOOLS) | {
-        "inspect_form_fields", "fill_form_field",
-    }
-    forbidden = {
-        "open_uri", "bash", "run_command", "navigate", "read_page",
-        "click", "fill", "find_and_click", "type_text", "press_key",
-        "desktop_click", "open_application", "take_screenshot",
-    }
-    with tool_contracts.effective_tool_surface_scope("autonomous_web"):
-        specs = tool_contracts.effective_static_tool_specs()
-        prompt = agent_module.get_system_prompt(
-            "en", model="deepseek-v4-pro", provider="deepseek",
-        )
-    assert {spec.name for spec in specs} == expected
-    assert all(spec.input_schema.get("type") == "object" for spec in specs)
-    assert all(spec.autonomous_eligible for spec in specs)
-    prompt_names = set(re.findall(r"^- ([a-z0-9_]+):", prompt, re.MULTILINE))
-    assert prompt_names == expected
-    assert not (forbidden & prompt_names)
 
     with tool_contracts.effective_tool_surface_scope(""):
         chat_names = {
             spec.name for spec in tool_contracts.effective_static_tool_specs()
         }
-    assert expected <= chat_names
-    assert {"open_uri", "navigate", "desktop_click", "bash"} <= chat_names
-
-    expected_verify = {
-        "inspect_form_fields", "get_browser_state", "inspect_browser_page",
-        "wait_for_browser_condition", "list_browser_tabs",
-        "list_browser_dialogs",
-    }
-    with tool_contracts.effective_tool_surface_scope(
-        "autonomous_web_verify"
-    ):
-        verify_specs = tool_contracts.effective_static_tool_specs()
-        verify_prompt = agent_module.get_system_prompt(
+        prompt = agent_module.get_system_prompt(
             "en", model="deepseek-v4-pro", provider="deepseek",
         )
-    assert {spec.name for spec in verify_specs} == expected_verify
+
+    # WOR-300/WOR-303: there is one canonical Chat surface; it gates dispatch,
+    # never the visible inventory.
+    assert all(spec.input_schema.get("type") == "object"
+               for spec in tool_contracts.effective_static_tool_specs())
+    prompt_names = set(re.findall(r"^- ([a-z0-9_]+)\(", prompt, re.MULTILINE))
+    assert prompt_names == chat_names
+    assert {"open_uri", "navigate", "bash", "navigate_browser"} <= prompt_names
+
+    with tool_contracts.effective_tool_surface_scope("scheduled"):
+        scheduled_specs = tool_contracts.effective_static_tool_specs()
+        scheduled_prompt = agent_module.get_system_prompt(
+            "en", model="deepseek-v4-pro", provider="deepseek",
+        )
+    assert {spec.name for spec in scheduled_specs} == chat_names
     assert set(re.findall(
-        r"^- ([a-z0-9_]+):", verify_prompt, re.MULTILINE,
-    )) == expected_verify
-    assert not ({
-        "navigate_browser", "search_web", "open_search_result",
-        "activate_browser_element", "fill_form_field", "paginate_browser",
-        "upload_browser_file", "download_browser_file",
-    } & expected_verify)
+        r"^- ([a-z0-9_]+)\(", scheduled_prompt, re.MULTILINE,
+    )) == chat_names
 
 
-def test_autonomous_web_bypass_tools_fail_before_dispatch():
-    context = action_policy.make_execution_context(
-        execution_type=action_policy.ExecutionType.AUTONOMOUS,
-        interactive=False,
-        run_id="wor186-surface-run",
-    )
-    forbidden = (
-        "open_uri", "navigate", "read_page", "click", "desktop_click",
-        "bash", "run_command",
-    )
-    with action_policy.execution_context_scope(context), \
-            tool_contracts.effective_tool_surface_scope("autonomous_web"):
-        for name in forbidden:
-            denied = action_policy.autonomous_permission_gate(name, {})
-            assert denied == "ERROR: tool is not eligible for Autonomous execution"
 
 
-def test_structured_browser_mutations_have_grantable_exact_call_authority(tmp_path):
-    tracker = BrowserStateTracker()
-    tracker.start_context(object())
-    state_ref = tracker.register_page(object()).to_dict()
-    policy = PermissionPolicy(PermissionStore(
-        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
-    ))
-    context = action_policy.make_execution_context(
-        execution_type=action_policy.ExecutionType.AUTONOMOUS,
-        interactive=False,
-        run_id="wor186-equivalence-run",
-        store=policy.store,
-    )
-    navigation = build_permission_request(
-        "navigate_browser",
-        {"url": "https://fixture.invalid/start", "state_ref": state_ref},
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    navigation_without_optional_state = build_permission_request(
-        "navigate_browser",
-        {"url": "https://fixture.invalid/start"},
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    download = build_permission_request(
-        "download_browser_file",
-        {"state_ref": state_ref, "element_ref": "el_" + "a" * 32},
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    target_binding = "b" * 64
-    activated = build_permission_request(
-        "activate_browser_element",
-        {
-            "state_ref": state_ref,
-            "element_ref": "el_" + "c" * 32,
-            "trusted_target_binding": target_binding,
-        },
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    moved_state = dict(state_ref)
-    moved_state["document_epoch"] += 1
-    activated_after_history = build_permission_request(
-        "activate_browser_element",
-        {
-            "state_ref": moved_state,
-            "element_ref": "el_" + "d" * 32,
-            "trusted_target_binding": target_binding,
-        },
-        execution_context=context,
-        force_sensitive=True,
-        policy=policy,
-    )
-    for request in (navigation, download):
-        assert request.private_scope.kind == "exact_call"
-        assert request.private_scope.grantable is True
-        assert request.private_scope.safe_category == "browser_action"
-    assert navigation.normalized_call_hash != (
-        navigation_without_optional_state.normalized_call_hash
-    )
-    assert navigation.autonomous_equivalence_hash == (
-        navigation_without_optional_state.autonomous_equivalence_hash
-    )
-    assert activated.normalized_call_hash != (
-        activated_after_history.normalized_call_hash
-    )
-    assert activated.autonomous_equivalence_hash == (
-        activated_after_history.autonomous_equivalence_hash
-    )
-
-    from osia.autonomous import state as autonomous_state
-
-    run = {"operation_records": [{
-        "operation_id": "op_verified",
-        "tool_identity": "navigate_browser",
-        "normalized_call_hash": navigation.normalized_call_hash,
-        "private_scope_hash": navigation.private_scope.scope_hash,
-        "autonomous_equivalence_hash": navigation.autonomous_equivalence_hash,
-        "status": "success_verified",
-    }]}
-    assert autonomous_state.equivalent_operation_record(
-        run,
-        tool_identity="navigate_browser",
-        normalized_call_hash=navigation_without_optional_state.normalized_call_hash,
-        private_scope_hash=(
-            navigation_without_optional_state.private_scope.scope_hash
-        ),
-        autonomous_equivalence_hash=(
-            navigation_without_optional_state.autonomous_equivalence_hash
-        ),
-        statuses={"success_verified"},
-    )["operation_id"] == "op_verified"
 
 
-def test_enumerated_planning_never_merges_requirements_and_blocks_subset_finish(
-    monkeypatch,
-):
-    from osia.autonomous import planner, state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    objective = (
-        "1. Verify the first controlled browser observation.\n"
-        "2. Verify the second controlled browser observation."
-    )
-
-    class FakeAgent:
-        def __init__(self, replies):
-            self.replies = iter(replies)
-            self.calls = 0
-
-        def reset(self):
-            return None
-
-        def run(self, *_args, **_kwargs):
-            self.calls += 1
-            return next(self.replies)
-
-    merged = json.dumps({
-        "phases": [{"name": "Merged", "tasks": [{
-            "requirement_id": "req_001",
-            "objective": "Verify both observations",
-            "success_criterion": "Both observations are visible",
-        }]}],
-    })
-    invalid_agent = FakeAgent([merged, merged])
-    assert planner.plan_objective(objective, invalid_agent) is None
-    assert invalid_agent.calls == 2
-
-    valid = json.dumps({
-        "phases": [{"name": "Separate", "tasks": [
-            {
-                "requirement_id": "req_001",
-                "objective": "Verify the first observation",
-                "success_criterion": "The first observation is visible",
-            },
-            {
-                "requirement_id": "req_002",
-                "objective": "Verify the second observation",
-                "success_criterion": "The second observation is visible",
-            },
-        ]}],
-    })
-    phases = planner.plan_objective(objective, FakeAgent([valid]))
-    assert [
-        task["requirement_id"]
-        for phase in phases for task in phase["tasks"]
-    ] == ["req_001", "req_002"]
-    assert [
-        task["success_criterion"]
-        for phase in phases for task in phase["tasks"]
-    ] == [
-        "Verify the first controlled browser observation.",
-        "Verify the second controlled browser observation.",
-    ]
-    run = autonomous_state.new_task_state(
-        objective, "deepseek", "deepseek-v4-pro", phases,
-    )
-    assert [item["status"] for item in run["checklist"]] == [
-        "pending", "pending",
-    ]
-    autonomous_state.set_task_status(run, 0, 0, "done")
-    assert [item["status"] for item in run["checklist"]] == [
-        "verified", "pending",
-    ]
-
-    run["cursor"] = {"phase": len(run["phases"]), "task": 0}
-    run["budgets"]["max_replans"] = 0
-    run["run_state"] = "running"
-    orchestrator = Orchestrator(SimpleNamespace())
-    orchestrator._state = run
-    monkeypatch.setattr(autonomous_state, "save_task_state", lambda _state: None)
-    assert orchestrator._step(run) is False
-    assert run["status"] == "failed"
-    assert run["run_state"] == "failed"
-    assert run["failure_diagnostic"]["reason_code"] == (
-        "verification_not_completed"
-    )
-    assert run["log"][-1]["note"] == "required_criteria_incomplete"
 
 
-def test_exact_scope_resume_continues_same_agent_conversation(monkeypatch):
-    from osia.autonomous import state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    phases = [{
-        "name": "Controlled",
-        "tasks": [{
-            "id": "0.0",
-            "requirement_id": "req_001",
-            "objective": "Perform one controlled operation",
-            "success_criterion": "The controlled operation is verified",
-        }],
-    }]
-    run = autonomous_state.new_task_state(
-        "1. Perform one controlled operation", "deepseek", "model", phases,
-    )
-    task = run["phases"][0]["tasks"][0]
-    task["last_error"] = "scope_extension_required"
-    run["run_state"] = "running"
-
-    class FakeAgent:
-        def __init__(self):
-            self.messages = [
-                {"role": "system", "content": "bounded"},
-                {
-                    "role": "assistant",
-                    "content": "requested exact call",
-                    "_autonomous_resume_call": {
-                        "tool": "paginate_browser",
-                        "state_ref": {"document_epoch": 4},
-                        "next_ref": "E2",
-                    },
-                },
-            ]
-            self.reset_calls = 0
-            self.run_messages = []
-            self.exact_resume_calls = []
-
-        def reset(self):
-            self.reset_calls += 1
-
-        def run(self, message):
-            self.run_messages.append(message)
-            self.exact_resume_calls.append(
-                getattr(self, "_autonomous_resume_exact_call", None)
-            )
-            return "The exact approved operation completed."
-
-    agent = FakeAgent()
-    orchestrator = Orchestrator(agent)
-    orchestrator._state = run
-    orchestrator._resume_scope_extension = True
-    orchestrator._resume_scope_tool = "paginate_browser"
-    monkeypatch.setattr(autonomous_state, "save_task_state", lambda _state: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "_verify_outcome",
-        lambda _task, _result: SimpleNamespace(
-            ok=True, reason_code="verification_completed", category=None,
-        ),
-    )
-    assert orchestrator._step(run) is True
-    assert agent.reset_calls == 0
-    assert len(agent.run_messages) == 1
-    continuation = agent.run_messages[0]
-    assert "immediately preceding assistant message" in continuation
-    assert "approved operation is paginate_browser" in continuation
-    assert "ignore all of them" in continuation
-    assert "same arguments as your sole next tool call" in continuation
-    assert "do not inspect, refresh, navigate" in continuation
-    assert agent.exact_resume_calls == [{
-        "tool": "paginate_browser",
-        "state_ref": {"document_epoch": 4},
-        "next_ref": "E2",
-    }]
-    assert agent._autonomous_resume_exact_call is None
-    assert task["status"] == "done"
 
 
-def test_suspended_batch_history_keeps_only_the_attempted_exact_call():
-    from osia import agent as agent_module
-
-    messages = [
-        {"role": "system", "content": "bounded"},
-        {
-            "role": "assistant",
-            "_provisional": True,
-            "content": (
-                '<tool_call>{"tool":"browser_back","state_ref":{}}</tool_call>'
-                '<tool_call>{"tool":"navigate_browser","url":"private"}</tool_call>'
-            ),
-        },
-    ]
-    assert agent_module._retain_only_attempted_provisional_call(
-        messages,
-        "browser_back",
-        {"state_ref": {"document_epoch": 9}},
-    )
-    retained = messages[-1]["content"]
-    assert retained.count("<tool_call>") == 1
-    assert '"tool": "browser_back"' in retained
-    assert '"document_epoch": 9' in retained
-    assert "navigate_browser" not in retained
-    assert messages[-1]["_autonomous_resume_call"] == {
-        "tool": "browser_back",
-        "state_ref": {"document_epoch": 9},
-    }
 
 
-def test_approved_scope_resume_executes_only_retained_exact_call():
-    from osia import agent as agent_module
-
-    owner = SimpleNamespace(_autonomous_resume_exact_call={
-        "tool": "browser_forward",
-        "state_ref": {"document_epoch": 11},
-    })
-    selected = agent_module._apply_exact_autonomous_resume_call(owner, [
-        {
-            "tool": "browser_back",
-            "state_ref": {"document_epoch": 9},
-        },
-        {"tool": "navigate_browser", "url": "private"},
-    ])
-    assert selected == [{
-        "tool": "browser_forward",
-        "state_ref": {"document_epoch": 11},
-    }]
-    assert owner._autonomous_resume_exact_call is None
 
 
-def test_retained_exact_resume_metadata_is_internal_only():
-    from osia import agent as agent_module
-
-    owner = agent_module.OSIAAgent(lang="en")
-    owner.messages = [
-        {"role": "system", "content": "bounded"},
-        {
-            "role": "assistant",
-            "content": "<tool_call>{}</tool_call>",
-            "_provisional": True,
-            "_autonomous_resume_call": {
-                "tool": "upload_browser_file",
-                "local_path": "private-value",
-            },
-        },
-    ]
-    wire = owner._wire_messages()
-    assert "_provisional" not in wire[-1]
-    assert "_autonomous_resume_call" not in wire[-1]
-    assert agent_module._sanitize_persisted_history_message(
-        owner.messages[-1]
-    ) is None
 
 
-def test_replan_reuses_verified_operations_by_stable_requirement(monkeypatch):
-    from osia.autonomous import state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    run = autonomous_state.new_task_state(
-        "1. Paginate the controlled fixture.",
-        "deepseek",
-        "model",
-        [{"name": "Recovery", "tasks": [{
-            "id": "replan.0",
-            "requirement_id": "req_001",
-            "objective": "Recover the verified pagination requirement.",
-            "success_criterion": (
-                "Use navigate_browser then paginate_browser and verify the "
-                "next page."
-            ),
-        }]}],
-    )
-    run["capability_summary"] = [{"tool_category": "browser"}]
-    run["operation_records"] = [
-        {
-            "operation_id": "op_old_navigation",
-            "task_id": "task:old.4",
-            "requirement_id": "req_001",
-            "tool_identity": "navigate_browser",
-            "status": "success_verified",
-        },
-        {
-            "operation_id": "op_old_pagination",
-            "task_id": "task:old.4",
-            "requirement_id": "req_001",
-            "tool_identity": "paginate_browser",
-            "status": "success_verified",
-            "browser_evidence": {
-                "receipt": {
-                    "dispatch_state": "effect_confirmed",
-                    "outcome": "confirmed_success",
-                    "evidence": [{"pagination_step": 1}],
-                },
-                "data": {"pages_advanced": 1},
-            },
-        },
-        {
-            "operation_id": "op_unrelated",
-            "task_id": "task:old.5",
-            "requirement_id": "req_002",
-            "tool_identity": "search_web",
-            "status": "success_verified",
-        },
-    ]
-    task = run["phases"][0]["tasks"][0]
-    orchestrator = Orchestrator(SimpleNamespace())
-    orchestrator._state = run
-    orchestrator._active_task = task
-    monkeypatch.setattr(
-        orchestrator,
-        "_llm_judge_outcome",
-        lambda _criterion, _evidence="": SimpleNamespace(
-            ok=True, reason_code="verification_completed", category=None,
-        ),
-    )
-
-    assert orchestrator._verified_operations_for_active_task() == [
-        "navigate_browser", "paginate_browser",
-    ]
-    assert orchestrator._verify_outcome(task, "verified receipt evidence").ok
-    verification_context = json.loads(
-        orchestrator._browser_verification_context()
-    )
-    assert verification_context[
-        "verified_operation_receipts_for_current_task"
-    ][0]["operation"] == "paginate_browser"
-    assert verification_context[
-        "verified_operation_receipts_for_current_task"
-    ][0]["typed_evidence"]["data"] == {"pages_advanced": 1}
-    monkeypatch.setattr(autonomous_state, "save_task_state", lambda _state: None)
-    assert orchestrator._step(run) is True
-    assert task["status"] == "done"
-    assert run["log"][-1]["event"] == "salvaged"
-    assert run["log"][-1]["note"] == "verified_operation_receipt_reuse"
-
-
-def test_named_structured_operation_cannot_be_verified_from_prose(monkeypatch):
-    from osia.autonomous import state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    run = autonomous_state.new_task_state(
-        "1. Use search_web for the controlled query.",
-        "deepseek",
-        "model",
-        [{"name": "Search", "tasks": [{
-            "id": "0.0",
-            "requirement_id": "req_001",
-            "objective": "Search",
-            "success_criterion": "Use search_web for the controlled query.",
-        }]}],
-    )
-    run["capability_summary"] = [{"tool_category": "browser"}]
-    task = run["phases"][0]["tasks"][0]
-    orchestrator = Orchestrator(SimpleNamespace())
-    orchestrator._state = run
-    orchestrator._active_task = task
-    missing = orchestrator._verify_outcome(
-        task, "I claim the search completed.",
-    )
-    assert missing.ok is False
-    assert missing.reason_code == "required_browser_operation_missing"
-
-    run["operation_records"].append({
-        "task_id": "task:0.0",
-        "tool_identity": "search_web",
-        "status": "success_verified",
-    })
-    monkeypatch.setattr(
-        orchestrator,
-        "_llm_judge_outcome",
-        lambda _criterion, _evidence="": SimpleNamespace(
-            ok=True, reason_code="verification_completed", category=None,
-        ),
-    )
-    assert orchestrator._verify_outcome(task, "Verified search result.").ok is True
 
 
 def test_artifact_limits_identity_classification_and_privacy(tmp_path):
@@ -915,224 +383,10 @@ def test_legacy_browser_errors_withhold_selectors_values_urls_and_exceptions(mon
     assert "#fragment" not in serialized
 
 
-def test_server_progress_projection_is_sanitized_and_terminal_is_canonical(monkeypatch):
-    from osia.autonomous import state as autonomous_state
-    from osia.server import server as server_module
-
-    run = autonomous_state.new_task_state("private objective", "provider", "model", [])
-    run["run_id"] = "wor186-terminal-run"
-    run["browser_checkpoint"] = {
-        "last_action_receipt": {
-            "schema_version": 1,
-            "operation_id": "operation_ref",
-            "tool_call_id": "tool_call_ref",
-            "before_state": None,
-            "after_state": None,
-            "dispatch_state": "effect_confirmed",
-            "outcome": "confirmed_success",
-            "evidence": [{
-                "safe_url_after": (
-                    "https://example.test/safe?token=QUERY_SENTINEL#fragment"
-                ),
-            }],
-            "started_at": 1,
-            "completed_at": 2,
-        },
-    }
-    with server_module._AUTONOMOUS_PROTOCOL_LOCK:
-        server_module._AUTONOMOUS_PROTOCOL_STATE["sequences"].pop(run["run_id"], None)
-        server_module._AUTONOMOUS_PROTOCOL_STATE["terminals"].pop(run["run_id"], None)
-    running = server_module._autonomous_frame({"event": "running"}, run)
-    assert running["safe_site_display"] == "https://example.test"
-    assert "private objective" not in json.dumps(running)
-    unknown = server_module._autonomous_frame(
-        {"event": "WOR186_PRIVATE_EVENT"}, run,
-    )
-    assert unknown["event"] == "state_updated"
-    assert "WOR186_PRIVATE_EVENT" not in json.dumps(unknown)
-    run["status"] = "done"
-    run["run_state"] = "completed"
-    terminal = server_module._autonomous_frame({"event": "done"}, run)
-    repeated_terminal = server_module._autonomous_frame({"event": "failed"}, run)
-    late = server_module._autonomous_frame({"event": "running"}, run)
-    assert terminal["terminal"] is True
-    assert repeated_terminal == terminal
-    assert late == {"_drop_after_terminal": True, "run_id": run["run_id"]}
-
-    monkeypatch.setattr(
-        browser,
-        "_browser_owner_snapshot",
-        lambda: {
-            "activeUrl": "https://example.test/path?token=QUERY_SENTINEL#fragment",
-            "browserState": {"browser_session_id": "browser_safe_ref"},
-        },
-    )
-    browser_frame = server_module._browser_progress_frame({"phase": "downloading"})
-    assert browser_frame["safe_site_display"] == "https://example.test"
-    assert "QUERY_SENTINEL" not in json.dumps(browser_frame)
 
 
-def test_autonomous_browser_checkpoint_resume_and_suspension_rules(monkeypatch):
-    from osia.autonomous import state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    tracker = BrowserStateTracker()
-    tracker.start_context(object())
-    state_ref = tracker.register_page(object())
-    popup_ref = tracker.register_page(object(), popup=True)
-    receipt = make_receipt(
-        before_state=state_ref,
-        after_state=state_ref,
-        dispatch_state=DispatchState.EFFECT_CONFIRMED,
-        outcome=ReceiptOutcome.CONFIRMED_SUCCESS,
-        evidence=[{"download_finalized": True}],
-    )
-    run = autonomous_state.new_task_state("fixture", "provider", "model", [])
-    autonomous_state.record_browser_execution(
-        run,
-        "download_browser_file",
-        action_result(
-            ok=True,
-            receipt=receipt,
-            data={
-                "artifact": {
-                    "artifact_id": "web_" + "a" * 32,
-                    "size": 12,
-                    "mime_type": "text/plain",
-                    "classification": "opaque_content",
-                },
-            },
-        ),
-    )
-    checkpoint = autonomous_state.normalize_browser_checkpoint(
-        run["browser_checkpoint"]
-    )
-    checkpoint["active_popup_state"] = popup_ref.to_dict()
-    run["browser_checkpoint"] = checkpoint
-    assert checkpoint["browser_state"] == state_ref.to_dict()
-    assert checkpoint["last_verified_state"] == state_ref.to_dict()
-    assert checkpoint["last_artifact_summary"] == {
-        "artifact_id": "web_" + "a" * 32,
-        "size": 12,
-        "mime_type": "text/plain",
-        "classification": "opaque_content",
-        "private": True,
-    }
-
-    orchestrator = Orchestrator(SimpleNamespace())
-    monkeypatch.setattr(
-        browser, "get_browser_state",
-        lambda: {"ok": True, "data": {"state": state_ref.to_dict()}},
-    )
-    assert orchestrator._validate_browser_resume(run) is None
-    autonomous_state.mark_pending_browser_operation(run, "download_ref", "download")
-    assert orchestrator._validate_browser_resume(run) == "download_attention_required"
-    run["browser_checkpoint"]["pending_operation"] = None
-    monkeypatch.setattr(
-        browser, "get_browser_state",
-        lambda: {"ok": True, "data": {"state": popup_ref.to_dict()}},
-    )
-    assert orchestrator._validate_browser_resume(run) == "browser_state_stale"
-    for reason in (
-        "manual_login_required", "captcha_required", "two_factor_required",
-    ):
-        autonomous_state.suspend_browser(run, reason)
-        assert run["run_state"] == "suspended_browser_intervention"
-        assert run["browser_checkpoint"]["manual_intervention"] == reason
 
 
-def test_current_document_opaque_references_survive_task_reset_only_until_stale():
-    from osia.autonomous import state as autonomous_state
-    from osia.autonomous.orchestrator import Orchestrator
-
-    tracker = BrowserStateTracker()
-    tracker.start_context(object())
-    page = object()
-    before = tracker.register_page(page)
-    search_state = tracker.note_navigation(page)
-    result_ref = "el_" + "a" * 32
-    run = autonomous_state.new_task_state(
-        "1. Search.\n2. Open the result.",
-        "deepseek",
-        "model",
-        [{"name": "Web", "tasks": [{
-            "id": "0.0",
-            "requirement_id": "req_001",
-            "objective": "Search",
-            "success_criterion": "One result exists",
-        }, {
-            "id": "0.1",
-            "requirement_id": "req_002",
-            "objective": "Open the result",
-            "success_criterion": "The result opens",
-        }]}],
-    )
-    autonomous_state.record_browser_execution(
-        run,
-        "search_web",
-        action_result(
-            ok=True,
-            receipt=make_receipt(
-                before_state=before,
-                after_state=search_state,
-                dispatch_state=DispatchState.EFFECT_CONFIRMED,
-                outcome=ReceiptOutcome.CONFIRMED_SUCCESS,
-            ),
-            data={
-                "state": search_state.to_dict(),
-                "results": [{
-                    "result_ref": result_ref,
-                    "title": "WOR186_PRIVATE_PAGE_SENTINEL",
-                    "safe_destination": "https://fixture.invalid/private",
-                }],
-            },
-        ),
-    )
-    # A later read-only inspection on the same document must not erase the
-    # opaque result reference needed by the next independently planned task.
-    autonomous_state.record_browser_execution(
-        run,
-        "inspect_browser_page",
-        action_result(
-            ok=True,
-            receipt=make_receipt(
-                before_state=search_state,
-                after_state=search_state,
-                dispatch_state=DispatchState.EFFECT_CONFIRMED,
-                outcome=ReceiptOutcome.CONFIRMED_SUCCESS,
-            ),
-            data={"state": search_state.to_dict(), "title": "private title"},
-        ),
-    )
-    handoffs = run["browser_checkpoint"]["reference_handoffs"]
-    assert handoffs == [{
-        "operation": "search_web",
-        "state": search_state.to_dict(),
-        "references": [{"field": "result_ref", "ref": result_ref}],
-    }]
-    orchestrator = Orchestrator(SimpleNamespace())
-    orchestrator._state = run
-    prompt = orchestrator._compose(run["phases"][0]["tasks"][1], "")
-    assert result_ref in prompt
-    assert "WOR186_PRIVATE_PAGE_SENTINEL" not in prompt
-    assert "private title" not in prompt
-
-    next_state = tracker.note_navigation(page)
-    autonomous_state.record_browser_execution(
-        run,
-        "navigate_browser",
-        action_result(
-            ok=True,
-            receipt=make_receipt(
-                before_state=search_state,
-                after_state=next_state,
-                dispatch_state=DispatchState.EFFECT_CONFIRMED,
-                outcome=ReceiptOutcome.CONFIRMED_SUCCESS,
-            ),
-            data={"state": next_state.to_dict()},
-        ),
-    )
-    assert run["browser_checkpoint"]["reference_handoffs"] == []
 
 
 def test_agent_model_feedback_includes_typed_browser_data_only_inside_turn():
@@ -1600,7 +854,7 @@ def test_real_search_pagination_history_tabs_and_infinite_scroll(controlled_brow
     assert scrolled["status"] in {"reached_end", "no_progress", "max_steps"}
 
 
-def test_real_upload_authority_ask_exact_grant_and_full_access(
+def test_real_upload_exact_binding_without_authorization(
     controlled_browser, tmp_path,
 ):
     web = controlled_browser.web
@@ -1618,51 +872,15 @@ def test_real_upload_authority_ask_exact_grant_and_full_access(
     assert prepared == browser.prepare_upload_authorization(dict(base_arguments))
     assert str(web.upload_file) not in json.dumps(prepared)
 
-    policy = PermissionPolicy(PermissionStore(
-        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
-    ))
+    # WOR-301: the upload dispatches without any user authorization provider.
     previous_provider = mcp_registry.get_confirmation_provider()
-    action_policy.set_default_permission_policy(policy)
-    approvals = []
+    mcp_registry.set_confirmation_provider(None)
     try:
-        mcp_registry.set_confirmation_provider(
-            lambda *_args: approvals.append("ask") or True
-        )
-        ask_arguments = dict(base_arguments)
-        assert action_policy.guard_tool_call(
-            "Upload this exact synthetic file to the controlled form.",
-            "upload_browser_file", ask_arguments,
-        ) is None
-        assert approvals == ["ask"]
-        action_policy.clear_pending_execution_permit()
-
-        request = build_permission_request(
-            "upload_browser_file", {**base_arguments, **prepared},
-            force_sensitive=True, policy=policy,
-        )
-        policy.store.add_grant(create_grant(
-            request, use_policy=UsePolicy.BOUNDED, max_uses=1,
-        ))
-        mcp_registry.set_confirmation_provider(
-            lambda *_args: pytest.fail("exact upload grant must avoid ASK")
-        )
-        assert action_policy.guard_tool_call(
-            "Upload this exact synthetic file to the controlled form.",
-            "upload_browser_file", dict(base_arguments),
-        ) is None
-        action_policy.clear_pending_execution_permit()
-
-        policy.store.revoke_all_grants()
-        policy.store.activate_full_access(
-            activation_proof=issue_full_access_activation_proof(),
-        )
         assert action_policy.guard_tool_call(
             "Upload this exact synthetic file to the controlled form.",
             "upload_browser_file", dict(base_arguments),
         ) is None
     finally:
-        action_policy.clear_pending_execution_permit()
-        action_policy.set_default_permission_policy(None)
         mcp_registry.set_confirmation_provider(previous_provider)
 
     original_upload = web.upload_file.read_bytes()

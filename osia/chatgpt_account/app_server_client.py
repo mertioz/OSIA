@@ -1,14 +1,15 @@
 """Small fail-closed client for the stable Codex App Server JSONL protocol.
 
 The process is deliberately isolated from the normal Codex installation and
-from OSIA's repository/configuration.  Turn-scoped local images are input-only.
-Provider-hosted read capabilities remain native, observable local command/file
-effects use OSIA's canonical permission broker, and exact OSIA dynamic tools
-remain a compatibility path.
+from OSIA's repository/configuration. Turn-scoped local images are input-only.
+Provider-hosted read capabilities and validated image views remain native;
+physical local effects are handled only by OSIA's canonical dynamic-tool path.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 from copy import deepcopy
 import hashlib
 import json
@@ -41,10 +42,16 @@ from .rate_limits import (
 
 SUPPORTED_MIN_VERSION = (0, 144, 1)
 SUPPORTED_MAX_VERSION = (0, 145, 0)
+_DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE = ((0, 144, 1), (0, 145, 0))
+# The original interval remains pinned for the 0.144 dynamic-image bridge.
+# Codex 0.156.1 is separately supported after checking its generated App Server
+# contract; unreviewed releases stay fail-closed.
+_ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1)})
 CLIENT_VERSION = "1.0.0"
 _MAX_PUBLIC_REASONING_SUMMARY_PARTS = 32
 _MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS = 8_192
 _PUBLIC_REASONING_SUMMARY_EMIT_STEP = 160
+_IMAGE_LOG_REDACTION_POLL_SECONDS = 0.5
 
 _SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
 check_for_update_on_startup = false
@@ -84,7 +91,7 @@ inherit = "none"
 
 _SAFE_ITEM_TYPES = frozenset({
     "agentMessage", "userMessage", "reasoning", "plan",
-    "contextCompaction", "webSearch",
+    "contextCompaction", "webSearch", "imageView",
 })
 _FORBIDDEN_ITEM_TYPES = frozenset(
     {
@@ -92,7 +99,6 @@ _FORBIDDEN_ITEM_TYPES = frozenset(
         "dynamicToolCall",
         "hookPrompt",
         "imageGeneration",
-        "imageView",
         "mcpToolCall",
         "sleep",
         "subAgentActivity",
@@ -133,18 +139,61 @@ _SAFE_NOTIFICATIONS = frozenset(
 )
 
 _CANONICAL_NATIVE_TOOL_NAMES = (
+    "declare_outcomes",
     "read_file",
+    "run_command",
     "write_file",
     "navigate",
     "open_browser",
     "navigate_browser",
     "read_document",
     "query_document",
+    "inspect_desktop_surfaces",
+    "activate_desktop_surface",
+    "computer_screenshot",
+    "computer_zoom",
+    "computer_observation",
+    "computer_click",
+    "computer_double_click",
+    "computer_type",
+    "computer_keypress",
+    "computer_scroll",
+    "computer_actions",
 )
+
+_DIRECT_READ_ONLY_NATIVE_TOOLS = frozenset({
+    "inspect_desktop_surfaces",
+    "request_visual_observation",
+    "computer_screenshot",
+    "computer_zoom",
+    "computer_observation",
+})
+
+_DIRECT_IMAGE_NATIVE_TOOLS = frozenset({
+    "request_visual_observation", "computer_screenshot", "computer_zoom",
+})
+
+
+def _normalized_model_id(value: Any) -> str:
+    """Normalize harmless surrounding whitespace; model IDs stay exact otherwise."""
+
+    return str(value or "").strip()
 
 
 def _canonical_native_tools(execution_strategy=None) -> list[dict]:
-    """Expose only exact OSIA identities backed by authoritative schemas."""
+    """Expose every available native capability for this provider.
+
+    WOR-300: the native frontier is composed from genuine runtime availability
+    alone — canonical wire schemas this app-server can host, membership in the
+    complete OSIA inventory, and win32/V4/vision capability for ``computer_*``.
+    Request wording, GoalContract/ExecutionStrategy state, frozen effects,
+    target conflicts and frontier progress never change it; those remain
+    execution-time guards (``tool_preflight``, V4 capture/action gates) that
+    can still refuse a visible call.
+    """
+
+    del execution_strategy  # kept for call compatibility; never consulted
+    import sys
 
     from osia.capability_federation import federated_capabilities
     from osia.tool_contracts import get_static_registry
@@ -157,28 +206,49 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     }
     tools = []
     for name in _CANONICAL_NATIVE_TOOL_NAMES:
+        if name.startswith("computer_"):
+            if sys.platform != "win32":
+                # V4 exact-window capture/actuation is win32-only.
+                continue
+            try:
+                from osia.computer_use_v4_integration import (
+                    COMPUTER_USE_V4_TOOL_NAMES,
+                    computer_use_v4_tools_available,
+                )
+            except Exception:
+                continue
+            if (
+                name not in COMPUTER_USE_V4_TOOL_NAMES
+                or not computer_use_v4_tools_available()
+            ):
+                continue
         if name not in available_osia:
             continue
         spec = registry.get(name)
-        if spec is None or not spec.chat_eligible:
+        if spec is None:
             continue
-        if execution_strategy is not None:
-            try:
-                from osia.execution_strategy import tool_applicability
-
-                applicable, _reason = tool_applicability(
-                    execution_strategy, name, {},
-                )
-            except Exception:
-                applicable = False
-            if not applicable:
-                continue
+        input_schema = deepcopy(spec.input_schema)
+        if name == "activate_desktop_surface":
+            properties = input_schema.get("properties") or {}
+            input_schema["properties"] = {
+                key: deepcopy(properties[key])
+                for key in ("surface_ref", "objective", "action_pattern")
+                if key in properties
+            }
+            input_schema["properties"]["action_pattern"] = {
+                "type": "string",
+                "const": "Window",
+            }
+            input_schema["required"] = [
+                "surface_ref", "objective", "action_pattern",
+            ]
+            input_schema["additionalProperties"] = False
         tools.append(
             {
                 "type": "function",
                 "name": spec.name,
                 "description": spec.capability,
-                "inputSchema": deepcopy(spec.input_schema),
+                "inputSchema": input_schema,
             }
         )
     return tools
@@ -277,12 +347,18 @@ def _latest_user_text(turn_content: str | list[dict]) -> str:
 def _native_action_refusal(turn_content: str | list[dict]) -> str:
     """Return the user-language refusal for blocked native actions."""
     from osia import i18n
-    from osia.turn_context import resolve_turn_context
+    from osia.turn_context import normalize_locale, resolve_turn_context
 
+    saved_language = normalize_locale(i18n.get_language())
     language = resolve_turn_context(
         _latest_user_text(turn_content),
-        saved_language=i18n.get_language(),
-    ).language
+        saved_language=saved_language,
+    )
+    language = (
+        saved_language
+        if language.source == "natural_model" and saved_language else
+        language.language
+    )
     translations = i18n.TRANSLATIONS.get(_NATIVE_ACTION_REFUSAL_KEY, {})
     return translations.get(language) or i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
 
@@ -299,6 +375,8 @@ class CapabilityEvent:
     arguments: dict | None = None
     semantic_node_id: str = ""
     semantic_postcondition: str = ""
+    reason_code: str = ""
+    process_facts: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -310,27 +388,21 @@ class TurnResult:
     output_started: bool = False
     capability_events: tuple[CapabilityEvent, ...] = ()
     public_reasoning_summary: str = ""
+    response_items: tuple[dict, ...] = ()
+    final_output_item_id: str = ""
+    model_rerouted: bool = False
+    effective_model_id: str = ""
+    image_input_present: bool = False
+    native_tool_names: tuple[str, ...] = ()
+    native_tool_schema_fingerprint: str = ""
+    strategy_revision: int = 0
+    world_revision: int = 0
+    native_tool_call: dict | None = None
 
 
 @dataclass
 class _PendingRequest:
     response: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
-
-
-@dataclass
-class _NativeDispatch:
-    item_id: str
-    tool_name: str
-    arguments: dict
-    side_effect: str
-    idempotence: str
-    retry_policy: str
-    equivalence_fingerprint: str = ""
-    tool_attempt_id: str = ""
-    started: bool = False
-    terminal: bool = False
-    strategy_decision: Any = None
-    semantic_postcondition: str = ""
 
 
 @dataclass
@@ -351,10 +423,8 @@ class _TurnAttempt:
     unsafe_category: str | None = None
     interrupt_sent: bool = False
     capability_events: list[CapabilityEvent] = field(default_factory=list)
-    native_items: dict[str, dict] = field(default_factory=dict)
-    native_dispatches: dict[str, _NativeDispatch] = field(default_factory=dict)
+    native_image_views: dict[str, dict] = field(default_factory=dict)
     terminal_native_items: set[str] = field(default_factory=set)
-    frozen_equivalences: set[str] = field(default_factory=set)
     native_effect_started: bool = False
     outcome_unknown: bool = False
     terminal_permission_outcome: str = ""
@@ -363,6 +433,45 @@ class _TurnAttempt:
     public_reasoning_summary_order: list[str] = field(default_factory=list)
     public_reasoning_summary: str = ""
     public_reasoning_summary_emitted: str = ""
+    dynamic_items: dict[str, dict] = field(default_factory=dict)
+    dynamic_tool_responses: dict[str, dict] = field(default_factory=dict)
+    dynamic_response_lock: Any = field(
+        default_factory=threading.RLock,
+        repr=False,
+    )
+    dynamic_response_sent: bool = False
+    first_causal_failure: str = ""
+    visual_frame_calls: dict[str, dict] = field(default_factory=dict)
+    visual_consumed_calls: set[str] = field(default_factory=set)
+    post_visual_agent_items: set[str] = field(default_factory=set)
+    local_image_delivery_ids: set[str] = field(default_factory=set)
+    bridged_visual_delivery_ids: set[str] = field(default_factory=set)
+    bridged_visual_paths: list[Path] = field(default_factory=list)
+    visual_delivery_frozen: bool = False
+    visual_bridge_failure_state: str = ""
+    visual_delivery_required_failed: bool = False
+    model_successor_observed: bool = False
+    agent_delta_sequence: int = 0
+    pending_turn_notifications: list[tuple[str, dict]] = field(default_factory=list)
+    pending_server_requests: list[dict] = field(default_factory=list)
+    model_rerouted: bool = False
+    effective_model_id: str = ""
+    model_identity_changed: bool = False
+    image_input_present: bool = False
+    agent_message_items: dict[str, dict] = field(default_factory=dict)
+    pending_agent_message_items: set[str] = field(default_factory=set)
+    response_item_diagnostics: list[dict] = field(default_factory=list)
+    deferred_done: dict | None = None
+    final_output_item_id: str = ""
+
+
+def _selected_model_identity_changed(attempt: _TurnAttempt) -> bool:
+    effective_model_id = attempt.effective_model_id or attempt.model_id
+    return bool(
+        attempt.model_identity_changed
+        or _normalized_model_id(effective_model_id)
+        != _normalized_model_id(attempt.model_id)
+    )
 
 
 def _runtime_base_dir() -> Path:
@@ -375,11 +484,53 @@ def _runtime_base_dir() -> Path:
     return root / "OSIA" / "Codex"
 
 
+_DATA_IMAGE_PATTERN = re.compile(
+    r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)",
+    re.IGNORECASE,
+)
+_RAW_IMAGE_LOG_SQL_WHERE = "(" + " OR ".join(
+    f"instr(lower(feedback_log_body), 'data:image/{mime};base64,') > 0"
+    for mime in ("png", "jpeg", "webp", "gif")
+) + ")"
+
+
+def redact_app_server_log_body(value: object) -> str:
+    """Replace private pixels with bounded mechanical delivery metadata."""
+
+    body = str(value or "")
+
+    def replace(match: re.Match) -> str:
+        mime = str(match.group(1) or "image/unknown").lower()
+        encoded = str(match.group(2) or "")
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+            byte_count = len(image_bytes)
+            digest = hashlib.sha256(image_bytes).hexdigest()[:16]
+        except (ValueError, TypeError, binascii.Error):
+            byte_count = 0
+            digest = "invalid"
+        return (
+            "osia:image_redacted:"
+            f"mime={mime};bytes={byte_count};sha256={digest}"
+        )
+
+    return _DATA_IMAGE_PATTERN.sub(replace, body)
+
+
 def _version_tuple(raw: str) -> tuple[int, int, int] | None:
     match = re.search(r"(?:codex-cli\s+)?(\d+)\.(\d+)\.(\d+)", raw or "")
     if not match:
         return None
     return tuple(int(part) for part in match.groups())
+
+
+def _is_supported_runtime_version(version: tuple[int, int, int] | None) -> bool:
+    if version is None:
+        return False
+    return (
+        SUPPORTED_MIN_VERSION <= version < SUPPORTED_MAX_VERSION
+        or version in _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS
+    )
 
 
 def _managed_runtime_candidates(base_dir: Path | None = None) -> list[Path]:
@@ -459,17 +610,26 @@ class AppServerClient:
         process_factory: Callable | None = None,
         runtime_executable: Path | None = None,
         runtime_version_override: str | None = None,
+        disable_code_mode_host: bool = False,
+        runtime_partition: str = "",
+        compact_logs_on_startup: bool = True,
         startup_timeout: float = 15.0,
         request_timeout: float = 30.0,
         tool_attempt_store=None,
     ):
         self.base_dir = Path(base_dir) if base_dir else _runtime_base_dir()
+        partition = str(runtime_partition or "").strip().lower()
+        if partition and not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", partition):
+            raise ValueError("invalid_app_server_runtime_partition")
+        directory_suffix = f"-{partition}" if partition else ""
         self.home_dir = self.base_dir / "home"
-        self.workspace_dir = self.base_dir / "workspace"
-        self.temp_dir = self.base_dir / "temp"
+        self.workspace_dir = self.base_dir / f"workspace{directory_suffix}"
+        self.temp_dir = self.base_dir / f"temp{directory_suffix}"
         self._process_factory = process_factory or subprocess.Popen
         self._runtime_executable = Path(runtime_executable) if runtime_executable else None
         self._runtime_version_override = runtime_version_override
+        self._disable_code_mode_host = bool(disable_code_mode_host)
+        self._compact_logs_on_startup = bool(compact_logs_on_startup)
         self.startup_timeout = startup_timeout
         self.request_timeout = request_timeout
         self._tool_attempt_store = tool_attempt_store
@@ -491,6 +651,11 @@ class AppServerClient:
         self._rate_limits_refresh_lock = threading.Lock()
         self._rate_limits_cache: dict | None = None
         self._rate_limits_pending_update: dict = {}
+        self._image_log_redaction_pending = False
+        self._image_log_checkpoint_pending = False
+        self._log_redaction_lock = threading.Lock()
+        self._log_redaction_stop = threading.Event()
+        self._log_redaction_thread: threading.Thread | None = None
 
         self._login_lock = threading.Lock()
         self._active_login: dict | None = None
@@ -523,7 +688,7 @@ class AppServerClient:
                     category="runtime_missing",
                 )
             parsed = _version_tuple(version)
-            if parsed is None or not (SUPPORTED_MIN_VERSION <= parsed < SUPPORTED_MAX_VERSION):
+            if not _is_supported_runtime_version(parsed):
                 raise RuntimeUnavailableError(
                     "ERROR: the installed Codex runtime is incompatible with ChatGPT account support.",
                     category="runtime_incompatible",
@@ -536,7 +701,7 @@ class AppServerClient:
             if not version:
                 continue
             parsed = _version_tuple(version)
-            if parsed and SUPPORTED_MIN_VERSION <= parsed < SUPPORTED_MAX_VERSION:
+            if _is_supported_runtime_version(parsed):
                 self._runtime_executable = candidate
                 self._runtime_version_override = version
                 return candidate, version
@@ -580,7 +745,8 @@ class AppServerClient:
             if system_skills.exists():
                 allowed_system = {
                     ".codex-system-skills.marker", "imagegen", "openai-docs",
-                    "plugin-creator", "skill-creator", "skill-installer",
+                    "plugin-creator", "review-agent", "skill-creator",
+                    "skill-installer",
                 }
                 unexpected = [
                     path for path in system_skills.iterdir()
@@ -610,6 +776,214 @@ class AppServerClient:
                 ) from exc
         else:
             config.write_text(_SAFE_CONFIG, encoding="utf-8", newline="\n")
+        from osia.image_inputs import (
+            cleanup_media_store,
+            cleanup_owned_temp_images,
+        )
+
+        cleanup_media_store()
+        cleanup_owned_temp_images(directories=(self.temp_dir,))
+        log_cleanup_proven = self._drain_operational_image_logs(
+            compact=self._compact_logs_on_startup,
+        )
+        if self._compact_logs_on_startup and not log_cleanup_proven:
+            raise RuntimeUnavailableError(
+                "ERROR: OSIA could not prove private image log cleanup.",
+                category="isolation_failed",
+            )
+
+    def _app_server_command(self, executable: Path) -> list[str]:
+        command = [
+            str(executable), "app-server", "--stdio", "--strict-config",
+        ]
+        # `unified_exec` selects the PTY-backed implementation; `shell_tool`
+        # is the separate feature gate that registers the native command tool.
+        command.extend((
+            "--enable", "code_mode",
+            "--enable", "code_mode_host",
+            "--disable", "code_mode_only",
+            "--disable", "shell_tool",
+            "--disable", "unified_exec",
+            "--disable", "browser_use",
+            "--disable", "browser_use_external",
+            "--disable", "browser_use_full_cdp_access",
+            "--disable", "computer_use",
+            "--disable", "apps",
+            "--disable", "plugins",
+            "--disable", "standalone_web_search",
+            "--disable", "in_app_browser",
+            "--disable", "in_app_local_automation",
+            "--config", 'web_search="disabled"',
+            "--config", "tools.web_search=false",
+        ))
+        if self._disable_code_mode_host:
+            # Keep ordinary code-mode-only account turns unchanged.  This
+            # alternate client is selected only for a turn whose exact
+            # frontier contains the correlated visual dynamic tool.
+            command.extend(("--disable", "code_mode_host"))
+        return command
+
+    def redact_operational_image_logs(
+        self,
+        *,
+        limit: int = 64,
+        compact: bool = False,
+    ) -> int:
+        """Schema-aware bounded redaction of the isolated App Server log DB."""
+
+        database = self.home_dir / "logs_2.sqlite"
+        if not database.is_file() or database.is_symlink():
+            return 0
+        try:
+            import sqlite3
+
+            connection = sqlite3.connect(str(database), timeout=0.25)
+            try:
+                connection.execute("PRAGMA secure_delete = ON")
+                columns = {
+                    str(row[1]) for row in connection.execute(
+                        "PRAGMA table_info(logs)"
+                    ).fetchall()
+                }
+                if not {"id", "feedback_log_body", "estimated_bytes"}.issubset(
+                    columns
+                ):
+                    return -1
+                remaining = max(1, min(int(limit), 16_384))
+                changed = 0
+                while remaining > 0:
+                    rows = connection.execute(
+                        "SELECT id, feedback_log_body FROM logs "
+                        f"WHERE {_RAW_IMAGE_LOG_SQL_WHERE} "
+                        "ORDER BY id ASC LIMIT ?",
+                        (min(64, remaining),),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    batch_changed = 0
+                    for row_id, body in rows:
+                        redacted = redact_app_server_log_body(body)
+                        if redacted == str(body or ""):
+                            continue
+                        connection.execute(
+                            "UPDATE logs SET feedback_log_body = ?, "
+                            "estimated_bytes = ? WHERE id = ?",
+                            (redacted, len(redacted.encode("utf-8")), int(row_id)),
+                        )
+                        batch_changed += 1
+                    connection.commit()
+                    changed += batch_changed
+                    remaining -= len(rows)
+                    if batch_changed == 0:
+                        break
+                # VACUUM rebuilds the database even when a previous pass already
+                # removed every logical match, purging old cells/freelist pages.
+                if compact:
+                    connection.execute("VACUUM")
+                if compact or changed or self._image_log_checkpoint_pending:
+                    self._image_log_checkpoint_pending = True
+                    checkpoint = connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    checkpoint_busy = bool(
+                        checkpoint and int(checkpoint[0] or 0) != 0
+                    )
+                    self._image_log_checkpoint_pending = checkpoint_busy
+                    if compact and checkpoint_busy:
+                        return -1
+                return changed
+            finally:
+                connection.close()
+        except Exception:
+            return -1
+
+    def _drain_operational_image_logs(self, *, compact: bool) -> bool:
+        """Drain every logical match, then physically rebuild and verify."""
+
+        residual = self.operational_image_log_residual_count()
+        while residual > 0:
+            changed = self.redact_operational_image_logs(
+                limit=min(residual, 16_384),
+                compact=False,
+            )
+            current = self.operational_image_log_residual_count()
+            if changed <= 0 or current < 0 or current >= residual:
+                return False
+            residual = current
+        if residual < 0:
+            return False
+        if compact and self.redact_operational_image_logs(
+            limit=1,
+            compact=True,
+        ) < 0:
+            return False
+        return self.operational_image_log_residual_count() == 0
+
+    def operational_image_log_residual_count(self) -> int:
+        """Return 0 only when the canonical log schema proves no raw image row."""
+
+        database = self.home_dir / "logs_2.sqlite"
+        if not database.is_file() or database.is_symlink():
+            return 0
+        try:
+            import sqlite3
+
+            connection = sqlite3.connect(str(database), timeout=0.25)
+            try:
+                columns = {
+                    str(row[1]) for row in connection.execute(
+                        "PRAGMA table_info(logs)"
+                    ).fetchall()
+                }
+                if not {"id", "feedback_log_body"}.issubset(columns):
+                    return -1
+                row = connection.execute(
+                    "SELECT count(*) FROM logs WHERE "
+                    + _RAW_IMAGE_LOG_SQL_WHERE
+                ).fetchone()
+                return int(row[0]) if row else -1
+            finally:
+                connection.close()
+        except Exception:
+            return -1
+
+    def _schedule_operational_log_redaction(self) -> None:
+        if not self._image_log_redaction_pending:
+            return
+        if self._log_redaction_stop.is_set():
+            return
+        if not self._log_redaction_lock.acquire(blocking=False):
+            return
+
+        def redact() -> None:
+            try:
+                # The native SQLite logger batches asynchronously. Keep polling
+                # after an initially empty pass so a delayed insert is scrubbed.
+                while (
+                    self._image_log_redaction_pending
+                    and not self._log_redaction_stop.is_set()
+                ):
+                    self.redact_operational_image_logs(limit=1024)
+                    self._log_redaction_stop.wait(
+                        _IMAGE_LOG_REDACTION_POLL_SECONDS
+                    )
+            finally:
+                self._log_redaction_thread = None
+                self._log_redaction_lock.release()
+
+        worker = threading.Thread(
+            target=redact,
+            name="osia-app-server-log-redaction",
+            daemon=True,
+        )
+        self._log_redaction_thread = worker
+        worker.start()
+
+    def _stop_operational_log_redaction(self) -> None:
+        self._log_redaction_stop.set()
+        worker = self._log_redaction_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2.0)
 
     def isolated_environment(self) -> dict[str, str]:
         """Return the exact secret-minimized child environment (testable)."""
@@ -646,6 +1020,9 @@ class AppServerClient:
                 "TMP": str(self.temp_dir),
                 "APPDATA": str(self.home_dir / "appdata"),
                 "LOCALAPPDATA": str(self.home_dir / "localappdata"),
+                # Reduce ordinary stderr body logging. The independent SQLite
+                # sink is still scrubbed and physically compacted by OSIA.
+                "RUST_LOG": "warn,codex_core::session::handlers=off",
             }
         )
         return env
@@ -654,6 +1031,7 @@ class AppServerClient:
         with self._start_lock:
             if self._process is not None and self._process.poll() is None:
                 return
+            self._log_redaction_stop.clear()
             now = time.monotonic()
             self._crash_times = [stamp for stamp in self._crash_times if now - stamp < 60.0]
             if len(self._crash_times) >= 2:
@@ -666,7 +1044,7 @@ class AppServerClient:
             env = self.isolated_environment()
             Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
             Path(env["LOCALAPPDATA"]).mkdir(parents=True, exist_ok=True)
-            command = [str(executable), "app-server", "--stdio", "--strict-config"]
+            command = self._app_server_command(executable)
             kwargs = {
                 "cwd": str(self.workspace_dir),
                 "env": env,
@@ -745,6 +1123,7 @@ class AppServerClient:
 
     def _send(self, message: dict) -> None:
         raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+        contains_private_image = "data:image" in raw
         with self._write_lock:
             process = self._process
             if process is None or process.poll() is not None or process.stdin is None:
@@ -760,6 +1139,9 @@ class AppServerClient:
                     "ERROR: the Codex App Server connection closed.",
                     category="process_crash",
                 ) from exc
+        if contains_private_image:
+            self._image_log_redaction_pending = True
+            self._schedule_operational_log_redaction()
 
     def _request(
         self,
@@ -821,6 +1203,8 @@ class AppServerClient:
         if process is None or process.stdout is None:
             return
         for line in process.stdout:
+            if self._image_log_redaction_pending:
+                self._schedule_operational_log_redaction()
             try:
                 message = json.loads(line)
             except (TypeError, ValueError):
@@ -906,6 +1290,32 @@ class AppServerClient:
             if len(self._attempts) == 1:
                 return next(iter(self._attempts.values()))
         return None
+
+    def _turn_attempt_for(self, params: dict) -> _TurnAttempt | None:
+        """Return only the exact native thread+turn for streamed output."""
+
+        thread_id = self._thread_id(params)
+        if not thread_id:
+            return None
+        native_turn_id = str(
+            params.get("turnId")
+            or (
+                (params.get("turn") or {}).get("id")
+                if isinstance(params.get("turn"), dict) else ""
+            )
+            or ""
+        )
+        if not native_turn_id:
+            return None
+        with self._state_lock:
+            attempt = self._attempts.get(thread_id)
+            if attempt is None:
+                return None
+            if not attempt.turn_id:
+                return None
+            if str(attempt.turn_id) != native_turn_id:
+                return None
+            return attempt
 
     def _reasoning_attempt_for(self, params: dict) -> _TurnAttempt | None:
         """Return only an explicitly thread-bound matching public-summary turn."""
@@ -1101,6 +1511,242 @@ class AppServerClient:
         return str(params.get("itemId") or params.get("item_id") or "")
 
     @staticmethod
+    def _agent_message_text(item: Mapping[str, Any]) -> str:
+        """Extract only public assistant text from stable App Server item shapes."""
+
+        direct = item.get("text")
+        if isinstance(direct, str):
+            return direct
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        parts = []
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type not in {
+                "outputText", "output_text", "text", "messageText",
+            }:
+                continue
+            value = part.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+        return "".join(parts)
+
+    @staticmethod
+    def _native_image_view_metadata(path_value: str) -> dict:
+        """Validate a native image read with OSIA's existing image bounds."""
+        from osia.image_inputs import (
+            ImageInputError,
+            MAX_SOURCE_IMAGE_BYTES,
+            _magic_mime,
+            _validated_image_geometry,
+        )
+
+        path = Path(path_value)
+        if not path.is_absolute():
+            raise ValueError("image_view_path_not_absolute")
+        path = path.resolve(strict=True)
+        if not path.is_file() or path.stat().st_size > MAX_SOURCE_IMAGE_BYTES:
+            raise ValueError("image_view_path_unavailable")
+        data = path.read_bytes()
+        mime = _magic_mime(data)
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            raise ValueError("image_view_format_invalid")
+        try:
+            width, height = _validated_image_geometry(data, mime)
+        except ImageInputError as exc:
+            raise ValueError("image_view_image_invalid") from exc
+        return {
+            "path": str(path),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "byte_size": len(data),
+            "mime": mime,
+            "width": width,
+            "height": height,
+        }
+
+    @staticmethod
+    def _record_response_item(
+        attempt: _TurnAttempt,
+        *,
+        item_id: str,
+        item_type: str,
+        phase: str,
+        status: str = "",
+        text_chars: int = 0,
+    ) -> None:
+        attempt.response_item_diagnostics.append({
+            "item_id": str(item_id or "")[:160],
+            "item_type": str(item_type or "unknown")[:80],
+            "phase": str(phase or "")[:40],
+            "status": str(status or "")[:40],
+            "text_present": bool(text_chars),
+            "text_chars": max(0, min(int(text_chars or 0), 1_000_000)),
+        })
+        del attempt.response_item_diagnostics[:-64]
+
+    @staticmethod
+    def _append_agent_text(
+        attempt: _TurnAttempt,
+        text: str,
+        *,
+        item_id: str = "",
+    ) -> bool:
+        if not isinstance(text, str) or not text:
+            return False
+        state = attempt.agent_message_items.setdefault(
+            str(item_id or ""), {
+                "delta_chars": 0,
+                "delta_text": "",
+                "completed": False,
+            },
+        )
+        state["delta_chars"] = int(state.get("delta_chars") or 0) + len(text)
+        state["delta_text"] = str(state.get("delta_text") or "") + text
+        attempt.output_started = True
+        attempt.text_parts.append(text)
+        if item_id:
+            attempt.final_output_item_id = str(item_id)[:160]
+        attempt.events.put(("delta", text))
+        return True
+
+    def _mark_visual_input_consumed(
+        self,
+        attempt: _TurnAttempt,
+        *,
+        successor_item_id: str = "",
+    ) -> bool:
+        """Record one exact post-image continuation without exposing pixels."""
+
+        successor = str(successor_item_id or "")
+        if not successor:
+            return False
+        correlated_successor = False
+        with attempt.dynamic_response_lock:
+            for entry in tuple(attempt.visual_frame_calls.values()):
+                call_id = str(entry.get("call_id") or "")
+                if (
+                    not call_id
+                    or not entry.get("transport_started")
+                    or successor == call_id
+                    or successor in set(entry.get("prior_item_ids") or ())
+                ):
+                    continue
+                if not entry.get("response_committed"):
+                    pending = entry.setdefault("pending_successor_item_ids", [])
+                    if successor not in pending:
+                        pending.append(successor)
+                        del pending[:-16]
+                    continue
+                correlated_successor = True
+                if call_id in attempt.visual_consumed_calls:
+                    continue
+                attempt.visual_consumed_calls.add(call_id)
+                delivery_id = str(entry.get("delivery_id") or "")
+                if delivery_id:
+                    try:
+                        from osia.image_inputs import acknowledge_media_delivery
+
+                        delivery = acknowledge_media_delivery(delivery_id)
+                        if delivery is not None:
+                            entry["delivery_state"] = delivery.state
+                    except Exception:
+                        pass
+                if delivery_id and entry.get("delivery_state") != "ACKNOWLEDGED":
+                    entry["successor_observed"] = True
+                self._acknowledge_bridged_visual_deliveries(attempt)
+                if entry.get("tool_name") == "request_visual_observation":
+                    try:
+                        from osia.desktop_scene import (
+                            acknowledge_visual_actuation_frame,
+                        )
+
+                        lease = acknowledge_visual_actuation_frame(
+                            str(entry.get("frame_id") or ""),
+                            provider=attempt.model_id and "chatgpt_account" or "",
+                            model=attempt.model_id,
+                            owner_id=attempt.conversation_id,
+                            turn_id=attempt.osia_turn_id,
+                        )
+                        entry["actuation_lease_state"] = str(
+                            lease.get("lease_state") or ""
+                        )
+                        entry["actuation_lease_expires_at"] = float(
+                            lease.get("lease_expires_at") or 0.0
+                        )
+                    except Exception:
+                        entry["actuation_lease_state"] = "unavailable"
+                        entry["actuation_lease_expires_at"] = 0.0
+                else:
+                    entry["actuation_lease_state"] = "not_required_v4"
+                    entry["actuation_lease_expires_at"] = 0.0
+                self._append_capability_event(
+                    attempt,
+                    source="provider_dynamic",
+                    identity="imageInput",
+                    phase="continued",
+                    outcome="success_verified",
+                    item_id=call_id,
+                    tool_attempt_id=str(
+                        entry.get("tool_attempt_id") or call_id
+                    ),
+                    tool_name=str(entry.get("tool_name") or ""),
+                    arguments=entry.get("arguments"),
+                    reason_code="IMAGE_INPUT_CONSUMED",
+                )
+        return correlated_successor
+
+    @staticmethod
+    def _acknowledge_local_image_deliveries(
+        attempt: _TurnAttempt,
+    ) -> None:
+        if not attempt.local_image_delivery_ids:
+            return
+        from osia.image_inputs import acknowledge_media_delivery
+
+        remaining = set()
+        for delivery_id in attempt.local_image_delivery_ids:
+            try:
+                delivery = acknowledge_media_delivery(delivery_id)
+            except Exception:
+                delivery = None
+            if delivery is None or delivery.state != "ACKNOWLEDGED":
+                remaining.add(delivery_id)
+        attempt.local_image_delivery_ids = remaining
+
+    @staticmethod
+    def _acknowledge_bridged_visual_deliveries(
+        attempt: _TurnAttempt,
+    ) -> None:
+        if not attempt.bridged_visual_delivery_ids:
+            return
+        from osia.image_inputs import acknowledge_media_delivery
+
+        remaining = set()
+        for delivery_id in attempt.bridged_visual_delivery_ids:
+            try:
+                delivery = acknowledge_media_delivery(delivery_id)
+            except Exception:
+                delivery = None
+            if delivery is None or delivery.state != "ACKNOWLEDGED":
+                remaining.add(delivery_id)
+        attempt.bridged_visual_delivery_ids = remaining
+
+    @staticmethod
+    def _release_deferred_done(attempt: _TurnAttempt) -> None:
+        if (
+            attempt.deferred_done is not None
+            and not attempt.pending_agent_message_items
+        ):
+            payload = attempt.deferred_done
+            attempt.deferred_done = None
+            attempt.events.put(("done", payload))
+
+    @staticmethod
     def _append_capability_event(
         attempt: _TurnAttempt,
         *,
@@ -1114,7 +1760,11 @@ class AppServerClient:
         arguments: Mapping[str, Any] | None = None,
         semantic_node_id: str = "",
         semantic_postcondition: str = "",
+        reason_code: str = "",
+        process_facts: Mapping[str, Any] | None = None,
     ) -> None:
+        from osia.tool_contracts import normalize_process_facts
+
         attempt.capability_events.append(CapabilityEvent(
             source=source,
             identity=identity,
@@ -1126,97 +1776,9 @@ class AppServerClient:
             arguments=dict(arguments) if isinstance(arguments, Mapping) else None,
             semantic_node_id=str(semantic_node_id or "")[:128],
             semantic_postcondition=str(semantic_postcondition or "")[:512],
+            reason_code=str(reason_code or "")[:160],
+            process_facts=normalize_process_facts(process_facts),
         ))
-
-    def _file_change_broker_call(
-        self, attempt: _TurnAttempt, item_id: str,
-    ) -> tuple[str, dict] | None:
-        item = attempt.native_items.get(item_id)
-        changes = item.get("changes") if isinstance(item, dict) else None
-        if not isinstance(changes, list) or len(changes) != 1:
-            return None
-        change = changes[0] if isinstance(changes[0], dict) else {}
-        kind = change.get("kind")
-        kind_name = str(kind.get("type") or "") if isinstance(kind, dict) else str(kind or "")
-        if kind_name not in {"add", "update"}:
-            return None
-        if kind_name == "update" and isinstance(kind, dict) and kind.get("move_path"):
-            return None
-        path_value = str(change.get("path") or "").strip()
-        diff = change.get("diff")
-        if not path_value or not isinstance(diff, str) or len(diff) > 2_000_000:
-            return None
-        path = Path(path_value)
-        if not path.is_absolute():
-            path = self.workspace_dir / path
-        return "write_file", {
-            "path": str(path.resolve(strict=False)),
-            # This is the exact proposed patch body used only for policy and
-            # receipt binding; OSIA does not execute it as write_file content.
-            "content": diff,
-        }
-
-    def _native_broker_call(
-        self, attempt: _TurnAttempt, method: str, params: dict,
-    ) -> tuple[str, dict] | None:
-        item_id = self._native_item_id(params)
-        if not item_id:
-            return None
-        if method == "item/fileChange/requestApproval":
-            return self._file_change_broker_call(attempt, item_id)
-        if method != "item/commandExecution/requestApproval":
-            return None
-        if any(
-            params.get(field)
-            for field in (
-                "additionalPermissions",
-                "networkApprovalContext",
-            )
-        ):
-            # These expand authority beyond the exact local command contract;
-            # the canonical broker has no sealed permit for that extra scope.
-            return None
-        command = params.get("command")
-        if not isinstance(command, str) or not command or len(command) > 32_768:
-            return None
-        available_decisions = params.get("availableDecisions")
-        if isinstance(available_decisions, list) and "accept" not in {
-            str(item) for item in available_decisions
-        }:
-            return None
-        cwd = params.get("cwd")
-        try:
-            resolved_cwd = Path(
-                str(cwd) if cwd else self.workspace_dir,
-            ).resolve(strict=False)
-        except (OSError, ValueError):
-            return None
-        started_item = attempt.native_items.get(item_id)
-        if (
-            not isinstance(started_item, dict)
-            or started_item.get("type") != "commandExecution"
-            or started_item.get("command") != command
-        ):
-            return None
-        try:
-            started_cwd = Path(
-                str(started_item.get("cwd") or self.workspace_dir),
-            ).resolve(strict=False)
-        except (OSError, ValueError):
-            return None
-        if started_cwd != resolved_cwd:
-            return None
-        arguments = {"command": command, "cwd": str(resolved_cwd)}
-        try:
-            from osia.deletion_plan import DeletionPreflightKind, prepare_deletion_call
-
-            deletion = prepare_deletion_call("run_command", arguments)
-            if deletion.kind is not DeletionPreflightKind.NOT_DELETION:
-                return None
-        except Exception:
-            # Native deletion cannot consume OSIA's sealed deletion plan.
-            return None
-        return "run_command", arguments
 
     def _deny_native_approval(
         self, attempt: _TurnAttempt, request_id: Any, method: str, item_id: str,
@@ -1225,6 +1787,7 @@ class AppServerClient:
         arguments: Mapping[str, Any] | None = None,
         semantic_node_id: str = "",
         semantic_postcondition: str = "",
+        reason_code: str = "",
     ) -> None:
         try:
             self._send({"id": request_id, "result": {"decision": "decline"}})
@@ -1244,6 +1807,7 @@ class AppServerClient:
             arguments=arguments,
             semantic_node_id=semantic_node_id,
             semantic_postcondition=semantic_postcondition,
+            reason_code=reason_code,
         )
         if outcome in {
             "permission_user_denied",
@@ -1258,535 +1822,1542 @@ class AppServerClient:
     def _resolve_native_approval(
         self, attempt: _TurnAttempt, payload: dict,
     ) -> None:
+        """Decline provider-native physical execution; OSIA dynamic tools own effects."""
+
         method = str(payload.get("method") or "")
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
-        request_id = payload.get("request_id")
-        item_id = self._native_item_id(params)
-        if attempt.terminal_permission_outcome:
-            try:
-                self._send({
-                    "id": request_id,
-                    "result": {"decision": "decline"},
-                })
-            except AppServerError:
-                pass
-            return
-        broker_call = self._native_broker_call(attempt, method, params)
-        if broker_call is None:
-            self._deny_native_approval(attempt, request_id, method, item_id)
-            return
-        tool_name, arguments = broker_call
-        strategy_decision = None
-        semantic_postcondition = ""
-        try:
-            from osia.action_policy import (
-                consume_pending_execution_permit,
-                guard_tool_call,
-                pending_execution_permit_matches,
-            )
-            from osia.capability_federation import mutation_equivalence_arguments
-            from osia.tool_contracts import (
-                ConfirmationPolicy,
-                SideEffectClass,
-                effective_contract,
-                get_tool_spec,
-            )
-
-            spec = get_tool_spec(tool_name)
-            if spec is None:
-                raise ValueError("native_broker_tool_unavailable")
-            contract = effective_contract(spec, arguments, attempt.user_request)
-            effectful = contract.side_effect is not SideEffectClass.READ_ONLY
-            if effectful:
-                try:
-                    from osia.execution_strategy import tool_preflight
-
-                    strategy_decision = tool_preflight(
-                        tool_name,
-                        arguments,
-                        strategy=attempt.execution_strategy,
-                    )
-                except Exception:
-                    if attempt.execution_strategy is not None:
-                        self._deny_native_approval(
-                            attempt,
-                            request_id,
-                            method,
-                            item_id,
-                            outcome="semantic_preflight_unavailable",
-                            tool_name=tool_name,
-                            arguments=arguments,
-                        )
-                        return
-                    strategy_decision = None
-                if strategy_decision is not None:
-                    node = (
-                        attempt.execution_strategy.node_by_id(
-                            strategy_decision.node_id,
-                        )
-                        if attempt.execution_strategy is not None else None
-                    )
-                    semantic_postcondition = (
-                        node.observable_success_postcondition
-                        if node is not None else ""
-                    )
-                    if not strategy_decision.allowed:
-                        self._deny_native_approval(
-                            attempt,
-                            request_id,
-                            method,
-                            item_id,
-                            outcome=(
-                                "semantic_" + strategy_decision.reason_code
-                            ),
-                            tool_name=tool_name,
-                            arguments=arguments,
-                            semantic_node_id=strategy_decision.node_id,
-                            semantic_postcondition=semantic_postcondition,
-                        )
-                        return
-            store = None
-            fingerprint = ""
-            equivalence_fingerprint = ""
-            if effectful:
-                store = self._attempt_store()
-                fingerprint = store.fingerprint_arguments(arguments)
-                equivalence = mutation_equivalence_arguments(tool_name, arguments)
-                if equivalence is not None:
-                    equivalence_fingerprint = store.fingerprint_arguments(
-                        equivalence,
-                    )
-                if store.has_dispatch_barrier(
-                    conversation_id=self._safe_receipt_ref(
-                        attempt.conversation_id or attempt.thread_id,
-                        "conversation",
-                    ),
-                    turn_id=self._safe_receipt_ref(
-                        attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
-                        "turn",
-                    ),
-                    tool_name=tool_name,
-                    argument_fingerprint=fingerprint,
-                    equivalence_fingerprint=equivalence_fingerprint,
-                ):
-                    self._deny_native_approval(
-                        attempt,
-                        request_id,
-                        method,
-                        item_id,
-                        outcome="duplicate_or_unknown_frozen",
-                    )
-                    return
-            blocked = guard_tool_call(attempt.user_request, tool_name, arguments)
-            if blocked is not None:
-                from osia.permission_outcome import permission_outcome_from_text
-
-                permission_outcome = permission_outcome_from_text(blocked)
-                self._deny_native_approval(
-                    attempt,
-                    request_id,
-                    method,
-                    item_id,
-                    outcome=(
-                        f"permission_{permission_outcome.value}"
-                        if permission_outcome is not None
-                        else "rejected_before_execution"
-                    ),
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    semantic_node_id=(
-                        strategy_decision.node_id if strategy_decision else ""
-                    ),
-                    semantic_postcondition=semantic_postcondition,
-                )
-                if strategy_decision is not None:
-                    from osia.execution_strategy import record_tool_outcome
-
-                    record_tool_outcome(
-                        tool_name,
-                        strategy_decision,
-                        outcome="failed_before_effect",
-                        is_error=True,
-                        reason_code=(
-                            f"permission_{permission_outcome.value}"
-                            if permission_outcome is not None
-                            else "rejected_before_execution"
-                        ),
-                        result=blocked,
-                        strategy=attempt.execution_strategy,
-                    )
-                return
-            requires_permit = contract.confirmation in {
-                ConfirmationPolicy.CONFIRMATION_REQUIRED,
-                ConfirmationPolicy.FINAL_COMMIT_CONFIRMATION,
-            }
-            has_permit = pending_execution_permit_matches(tool_name, arguments)
-            if requires_permit and not has_permit:
-                self._deny_native_approval(
-                    attempt, request_id, method, item_id,
-                    outcome="permission_internal_failure",
-                    tool_name=tool_name,
-                    arguments=arguments,
-                )
-                return
-            if has_permit and not consume_pending_execution_permit(tool_name, arguments):
-                self._deny_native_approval(
-                    attempt, request_id, method, item_id,
-                    outcome="permission_internal_failure",
-                    tool_name=tool_name,
-                    arguments=arguments,
-                )
-                return
-
-            dispatch = _NativeDispatch(
-                item_id=item_id,
-                tool_name=tool_name,
-                arguments=dict(arguments),
-                side_effect=contract.side_effect.value,
-                idempotence=contract.idempotency.value,
-                retry_policy=contract.retry.value,
-                strategy_decision=strategy_decision,
-                semantic_postcondition=semantic_postcondition,
-            )
-            if effectful:
-                dispatch.equivalence_fingerprint = equivalence_fingerprint
-                receipt = store.create_attempt(
-                    conversation_id=self._safe_receipt_ref(
-                        attempt.conversation_id or attempt.thread_id, "conversation",
-                    ),
-                    turn_id=self._safe_receipt_ref(
-                        attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
-                        "turn",
-                    ),
-                    request_id=self._safe_receipt_ref(
-                        attempt.client_request_id or request_id,
-                        "request",
-                    ),
-                    tool_call_id=self._safe_receipt_ref(item_id, "native_item"),
-                    tool_name=tool_name,
-                    provider_id="chatgpt_account",
-                    model_id=attempt.model_id or "unknown",
-                    turn_context={},
-                    argument_fingerprint=fingerprint,
-                    equivalence_fingerprint=dispatch.equivalence_fingerprint,
-                    side_effect=contract.side_effect.value,
-                    idempotence=contract.idempotency.value,
-                    retry_policy=contract.retry.value,
-                    postcondition_type="provider_typed_item_status",
-                    final_response_message_id=attempt.final_response_message_id,
-                    persistence_contract={
-                        "family": "system" if tool_name == "run_command" else "file",
-                        "release_after_seconds": 2.0,
-                        "inactivity_timeout_seconds": 30.0,
-                        "hard_timeout_seconds": 300.0,
-                        "check_delays_seconds": [2.0, 5.0],
-                        "safe_alternatives": [],
-                        "restart_reconciliation": True,
-                    },
-                    provider_references={
-                        "provider_request_id": str(request_id or ""),
-                        "thread_id": str(attempt.thread_id or ""),
-                        "turn_id": str(attempt.turn_id or ""),
-                        "item_id": item_id,
-                        "tool_call_id": item_id,
-                    },
-                )
-                dispatch.tool_attempt_id = str(receipt["tool_attempt_id"])
-                store.mark_accepted(dispatch.tool_attempt_id)
-                store.arm_owner_dispatch_boundary(dispatch.tool_attempt_id)
-                store.mark_running(dispatch.tool_attempt_id)
-                _dispatch_record, dispatch_claimed = store.claim_owner_dispatch(
-                    dispatch.tool_attempt_id,
-                )
-                if not dispatch_claimed:
-                    raise RuntimeError("native_dispatch_boundary_unavailable")
-                dispatch.started = True
-                attempt.native_effect_started = True
-                if dispatch.equivalence_fingerprint:
-                    attempt.frozen_equivalences.add(
-                        dispatch.equivalence_fingerprint,
-                    )
-            attempt.native_dispatches[item_id] = dispatch
-            self._send({"id": request_id, "result": {"decision": "accept"}})
-            self._append_capability_event(
-                attempt,
-                source="provider_native",
-                identity=(
-                    "commandExecution"
-                    if tool_name == "run_command" else "fileChange"
-                ),
-                phase="accepted",
-                outcome="dispatch_started" if effectful else "read_only",
-                item_id=item_id,
-                tool_attempt_id=dispatch.tool_attempt_id,
-                tool_name=tool_name,
-                arguments=arguments,
-                semantic_node_id=(
-                    strategy_decision.node_id if strategy_decision else ""
-                ),
-                semantic_postcondition=semantic_postcondition,
-            )
-        except Exception:
-            dispatch = attempt.native_dispatches.get(item_id)
-            if dispatch is not None and dispatch.tool_attempt_id:
-                try:
-                    from osia.tool_attempts import ToolAttemptStatus
-
-                    self._attempt_store().record_terminal_result(
-                        dispatch.tool_attempt_id,
-                        status=ToolAttemptStatus.UNKNOWN_AFTER_START,
-                        terminal_outcome="outcome_unknown",
-                        dispatch_state="dispatch_started",
-                        reason_code="native_approval_transport_failed",
-                    )
-                except Exception:
-                    pass
-                attempt.outcome_unknown = True
-                attempt.native_effect_started = True
-            self._deny_native_approval(
-                attempt, request_id, method, item_id,
-                outcome=(
-                    "outcome_unknown" if attempt.outcome_unknown
-                    else "rejected_before_execution"
-                ),
-            )
-
-    def _native_dynamic_call_is_frozen(
-        self, attempt: _TurnAttempt, native_tool_call: dict,
-    ) -> bool:
-        try:
-            from osia.capability_federation import mutation_equivalence_arguments
-            from osia.tool_contracts import SideEffectClass, effective_contract, get_tool_spec
-
-            tool_name = str(native_tool_call.get("tool") or "")
-            arguments = native_tool_call.get("arguments")
-            arguments = arguments if isinstance(arguments, dict) else {}
-            spec = get_tool_spec(tool_name)
-            if spec is None:
-                return True
-            contract = effective_contract(spec, arguments, attempt.user_request)
-            if contract.side_effect is SideEffectClass.READ_ONLY:
-                return False
-            if attempt.outcome_unknown:
-                return True
-            equivalence = mutation_equivalence_arguments(tool_name, arguments)
-            if equivalence is None:
-                return False
-            fingerprint = self._attempt_store().fingerprint_arguments(equivalence)
-            return fingerprint in attempt.frozen_equivalences
-        except Exception:
-            return bool(attempt.native_effect_started)
+        self._deny_native_approval(
+            attempt,
+            payload.get("request_id"),
+            method,
+            self._native_item_id(params),
+            reason_code="CANONICAL_OSIA_TOOL_REQUIRED",
+        )
 
     def _complete_native_item(self, attempt: _TurnAttempt, item: dict) -> None:
+        """Record an unexpected provider-native physical item without adoption."""
+
         item_id = str(item.get("id") or "")
         item_type = str(item.get("type") or "")
         status = str(item.get("status") or "")
-        if status != "inProgress":
-            if item_id in attempt.terminal_native_items:
-                return
-            attempt.terminal_native_items.add(item_id)
-        dispatch = attempt.native_dispatches.get(item_id)
-        if dispatch is None:
-            if status in {"declined", "failed"}:
-                self._append_capability_event(
-                    attempt,
-                    source="provider_native",
-                    identity=item_type,
-                    phase="completed",
-                    outcome=(
-                        "cancelled_proven" if status == "declined"
-                        else "failed_before_effect"
-                    ),
-                    item_id=item_id,
-                )
-                return
-            if item_type == "commandExecution" and status == "completed":
-                try:
-                    from osia.tool_contracts import SideEffectClass, effective_contract, get_tool_spec
-
-                    spec = get_tool_spec("run_command")
-                    contract = effective_contract(
-                        spec, {"command": str(item.get("command") or "")},
-                        attempt.user_request,
-                    )
-                    if (
-                        contract.side_effect is SideEffectClass.READ_ONLY
-                        and isinstance(item.get("exitCode"), int)
-                        and not isinstance(item.get("exitCode"), bool)
-                        and item.get("exitCode") == 0
-                    ):
-                        self._append_capability_event(
-                            attempt,
-                            source="provider_native",
-                            identity=item_type,
-                            phase="completed",
-                            outcome="success_verified",
-                            item_id=item_id,
-                        )
-                        return
-                except Exception:
-                    pass
-            attempt.outcome_unknown = True
-            attempt.native_effect_started = True
-            self._mark_unsafe(
-                {"threadId": attempt.thread_id, "turnId": attempt.turn_id},
-                f"unbrokered_native_item:{item_type or 'unknown'}",
+        if item_type not in {"commandExecution", "fileChange"}:
+            return
+        if status == "inProgress":
+            return
+        if item_id in attempt.terminal_native_items:
+            return
+        attempt.terminal_native_items.add(item_id)
+        if status == "declined":
+            self._append_capability_event(
+                attempt,
+                source="provider_native",
+                identity=item_type,
+                phase="completed",
+                outcome="cancelled_proven",
+                item_id=item_id,
+                reason_code="PROVIDER_NATIVE_EXECUTION_DECLINED",
             )
             return
-        if dispatch.terminal or status == "inProgress":
-            return
-        dispatch.terminal = True
-        lifecycle_matches = True
-        if dispatch.tool_name == "run_command":
-            try:
-                completed_cwd = Path(
-                    str(item.get("cwd") or self.workspace_dir),
-                ).resolve(strict=False)
-            except (OSError, ValueError):
-                lifecycle_matches = False
-            else:
-                lifecycle_matches = bool(
-                    item.get("command") == dispatch.arguments.get("command")
-                    and str(completed_cwd) == dispatch.arguments.get("cwd")
-                )
-        elif dispatch.tool_name == "write_file":
-            completed_call = self._file_change_broker_call(attempt, item_id)
-            lifecycle_matches = bool(
-                completed_call is not None
-                and completed_call[0] == dispatch.tool_name
-                and completed_call[1] == dispatch.arguments
-            )
-        if not lifecycle_matches:
-            status = "lifecycleMismatch"
-        if status == "completed" and (
-            dispatch.tool_name != "run_command"
-            or (
-                isinstance(item.get("exitCode"), int)
-                and not isinstance(item.get("exitCode"), bool)
-                and item.get("exitCode") == 0
-            )
-        ):
-            terminal_status = "succeeded"
-            outcome = "success_verified"
-            dispatch_state = "effect_applied"
-            reason = "provider_typed_completion"
-        elif (
-            status == "completed"
-            and isinstance(item.get("exitCode"), int)
-            and not isinstance(item.get("exitCode"), bool)
-        ):
-            terminal_status = "failed_after_effect"
-            outcome = "failed_after_effect"
-            dispatch_state = "effect_applied"
-            reason = "provider_nonzero_exit"
-        elif status == "declined":
-            terminal_status = "cancelled_proven"
-            outcome = "cancelled_proven"
-            dispatch_state = "cancelled_before_effect"
-            reason = "provider_declined_before_effect"
-        else:
-            terminal_status = "unknown_after_start"
-            outcome = "outcome_unknown"
-            dispatch_state = "dispatch_started"
-            reason = "provider_failed_after_start"
-            attempt.outcome_unknown = True
-        if dispatch.tool_attempt_id:
-            try:
-                from osia.tool_attempts import ToolAttemptStatus
 
-                attempt_store = self._attempt_store()
-                durable_attempt = (
-                    attempt_store.get_attempt(dispatch.tool_attempt_id)
-                    if hasattr(attempt_store, "get_attempt") else None
-                )
-                if isinstance(durable_attempt, dict) and hasattr(
-                    attempt_store, "apply_provider_callback",
-                ):
-                    callback_outcome = (
-                        "completed_with_receipt"
-                        if outcome == "success_verified" else
-                        "explicit_not_applied"
-                        if outcome == "cancelled_proven" else
-                        "reconciliation_required"
-                    )
-                    callback_identity = hashlib.sha256(
-                        json.dumps(
-                            {
-                                "item_id": item_id,
-                                "status": status,
-                                "exit_code": item.get("exitCode"),
-                                "outcome": callback_outcome,
-                            },
-                            ensure_ascii=True,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest()[:32]
-                    attempt_store.apply_provider_callback(
-                        dispatch.tool_attempt_id,
-                        callback_id=f"native_callback_{callback_identity}",
-                        execution_epoch=str(
-                            durable_attempt.get("execution_epoch") or ""
-                        ),
-                        outcome=callback_outcome,
-                        provider_references={
-                            "thread_id": str(attempt.thread_id or ""),
-                            "turn_id": str(attempt.turn_id or ""),
-                            "item_id": item_id,
-                            "tool_call_id": item_id,
-                        },
-                        reason_code=reason,
-                        evidence_ref=(
-                            f"provider_native_item:{item_id}"
-                            if callback_outcome == "completed_with_receipt"
-                            else ""
-                        ),
-                    )
-                attempt_store.record_terminal_result(
-                    dispatch.tool_attempt_id,
-                    status=ToolAttemptStatus(terminal_status),
-                    terminal_outcome=outcome,
-                    dispatch_state=dispatch_state,
-                    reason_code=reason,
-                )
-            except Exception:
-                attempt.outcome_unknown = True
-                outcome = "outcome_unknown"
-        if dispatch.strategy_decision is not None:
-            try:
-                from osia.execution_strategy import record_tool_outcome
-
-                record_tool_outcome(
-                    dispatch.tool_name,
-                    dispatch.strategy_decision,
-                    outcome=outcome,
-                    is_error=(outcome != "success_verified"),
-                    reason_code=reason,
-                    result={
-                        "provider_native_item": item_id,
-                        "status": status,
-                        "outcome": outcome,
-                    },
-                    strategy=attempt.execution_strategy,
-                )
-            except Exception:
-                pass
+        # A provider completion is only an observation. It does not establish
+        # OSIA dispatch, policy approval, or a canonical ActionTruth receipt.
+        attempt.outcome_unknown = True
+        attempt.native_effect_started = True
         self._append_capability_event(
             attempt,
             source="provider_native",
             identity=item_type,
             phase="completed",
-            outcome=outcome,
+            outcome="outcome_unknown",
             item_id=item_id,
-            tool_attempt_id=dispatch.tool_attempt_id,
-            tool_name=dispatch.tool_name,
-            arguments=dispatch.arguments,
-            semantic_node_id=(
-                dispatch.strategy_decision.node_id
-                if dispatch.strategy_decision is not None else ""
-            ),
-            semantic_postcondition=dispatch.semantic_postcondition,
+            reason_code="UNEXPECTED_PROVIDER_NATIVE_PHYSICAL_EFFECT",
         )
+        self._mark_unsafe(
+            {"threadId": attempt.thread_id, "turnId": attempt.turn_id},
+            f"unbrokered_native_item:{item_type}",
+        )
+
+    @staticmethod
+    def _dynamic_call_from_params(params: Mapping[str, Any]) -> tuple[dict | None, str]:
+        """Parse one provider dynamic call without treating unknown tools as holes."""
+
+        namespace = params.get("namespace")
+        tool = params.get("tool")
+        arguments = params.get("arguments")
+        call_id = params.get("callId") or params.get("call_id")
+        if namespace not in {None, ""}:
+            return None, "CAPABILITY_UNAVAILABLE"
+        if not isinstance(tool, str) or not tool or len(tool) > 128:
+            return None, "CAPABILITY_UNAVAILABLE"
+        if not isinstance(arguments, dict) or "tool" in arguments:
+            return None, "INVALID_TOOL_ARGUMENTS"
+        if not isinstance(call_id, str) or not call_id or len(call_id) > 256:
+            return None, "TOOL_RESPONSE_ID_MISMATCH"
+        return {
+            "tool": tool,
+            "arguments": deepcopy(arguments),
+            "call_id": call_id,
+        }, ""
+
+    @staticmethod
+    def _dynamic_call_signature(call: Mapping[str, Any]) -> str:
+        encoded = json.dumps(
+            {
+                "tool": str(call.get("tool") or ""),
+                "arguments": (
+                    call.get("arguments")
+                    if isinstance(call.get("arguments"), dict) else {}
+                ),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda _value: "<unsupported>",
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _visual_provider_result(
+        result: Any,
+        *,
+        attached_now: bool = True,
+        reconciliation_postcondition: str = "",
+    ) -> Any:
+        """Expose pixels plus mechanical metadata, not a duplicate UIA scene."""
+
+        if not isinstance(result, dict):
+            return result
+        observation = result.get("observation")
+        observation = observation if isinstance(observation, dict) else {}
+        receipt = result.get("receipt")
+        receipt = receipt if isinstance(receipt, dict) else {}
+        allowed_receipt = {
+            "schema_version", "dispatch_state", "outcome", "reason_code",
+            "surface_ref", "window_surface_ref", "application",
+            "requested_application", "resolved_target_candidates",
+            "target_conflict", "window_generation", "structural_epoch",
+            "observed_at", "captured_at", "expires_at", "image_sha256", "image_id",
+            "image_mime", "image_width", "image_height",
+            "native_window_token", "native_window_id", "capture_method",
+            "capture_driver", "capture_attempts", "fallback_used",
+            "exact_surface_pixels", "target_foreground", "frame_id",
+            "surface_generation", "provider_id", "model_id",
+            "v4_loop_id",
+            "image_part_count", "image_input_sent", "image_input_resent",
+            "dimensions", "image_part_dimensions", "source_dimensions",
+            "mime", "crop_rectangle", "source_frame_id", "refine_count",
+            "crop_chain", "target_identity", "source_bounds",
+            "content_coverage", "source_pixel_format",
+            "pixel_format_conversion", "alpha_handling",
+            "source_color_space", "color_space_conversion",
+        }
+        mechanical_receipt = {
+            key: deepcopy(value)
+            for key, value in receipt.items()
+            if key in allowed_receipt
+        }
+        reconciliation_instruction = (
+            " This frame is exclusively for read-only reconciliation of this "
+            "intermediate postcondition: "
+            + str(reconciliation_postcondition)[:512]
+            + ". Inspect the pixels, then call computer_observation exactly "
+            "once with this frame_id and status satisfied, not_satisfied, or "
+            "inconclusive. Do not advance to a later mutation, and do not "
+            "substitute provider prose for the typed observation."
+            if reconciliation_postcondition else ""
+        )
+        text = json.dumps({
+            "contract": (
+                "Exact read-only pixels from the reported target are attached "
+                "to this tool result. Use the image for visible appearance; "
+                if attached_now else
+                "The same exact pixels were attached to an earlier correlated "
+                "tool result in this model turn; they are not duplicated here. "
+            ) + (
+                "mechanical metadata below is not a semantic description. "
+                "If desktop_click is independently applicable and chosen, "
+                "copy visual_frame_id exactly and supply the normalized bbox "
+                "derived from these pixels. When computer_observation is "
+                "available, use it after inspecting the image to ground any "
+                "already-satisfied or post-action visual claim; prose alone "
+                "is not verification evidence."
+            ) + reconciliation_instruction,
+            "visual_frame_id": mechanical_receipt.get("frame_id", ""),
+            "observation": observation,
+            "target_identity": mechanical_receipt.get("target_identity", {}),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "text": text,
+            "visual_frame_id": mechanical_receipt.get("frame_id", ""),
+            "observation": deepcopy(observation),
+            "receipt": mechanical_receipt,
+        }
+
+    @staticmethod
+    def _dynamic_result_envelope(
+        call: Mapping[str, Any] | None,
+        *,
+        success: bool,
+        reason_code: str,
+        status: str = "",
+        result: Any = None,
+        detail_reason_code: str = "",
+        image_data_url: str = "",
+    ) -> dict:
+        tool = str((call or {}).get("tool") or "")
+        call_id = str((call or {}).get("call_id") or "")
+        payload = {
+            "schema_version": 1,
+            "call_id": call_id,
+            "tool": tool,
+            "status": str(status or (
+                "success_verified" if success else "failed_before_effect"
+            ))[:80],
+            "reason_code": str(reason_code or "")[:160],
+            "result": result,
+        }
+        if detail_reason_code:
+            payload["detail_reason_code"] = str(detail_reason_code)[:160]
+        content_items = [{
+            "type": "inputText",
+            "text": json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=lambda _value: "<unsupported>",
+            ),
+        }]
+        if image_data_url:
+            repeat_instruction = (
+                "request_visual_observation again for this same frame."
+                if tool == "request_visual_observation" else
+                "request this same computer frame again."
+            )
+            content_items.append({
+                "type": "inputText",
+                "text": (
+                    "The next content item is the exact fresh target image. "
+                    "Inspect those pixels now and answer the current visual "
+                    "request from them. Do not " + repeat_instruction
+                ),
+            })
+            content_items.append({
+                "type": "inputImage",
+                "imageUrl": image_data_url,
+            })
+        return {"contentItems": content_items, "success": bool(success)}
+
+    def _bridge_dynamic_visual_image_for_runtime(
+        self,
+        attempt: _TurnAttempt,
+        *,
+        call_id: str,
+        request_id: Any,
+        image_reference: dict,
+        image_artifact,
+        owner_id: str,
+        tool_name: str = "request_visual_observation",
+        frame_id: str = "",
+    ) -> bool:
+        """Bridge Codex 0.144 dynamic-image visibility on the same native turn.
+
+        The pinned App Server correctly transports ``inputImage`` in the
+        correlated tool response, but the controlled Terra probe proves that
+        its current model backend does not expose those pixels for reasoning.
+        Until the supported runtime range advances past 0.144, queue the same
+        canonical artifact as ``localImage`` before releasing the dynamic
+        response.  The duplicate is explicit, version-bounded compatibility
+        transport—not a secondary model or semantic image helper.
+        """
+
+        if (
+            SUPPORTED_MIN_VERSION,
+            SUPPORTED_MAX_VERSION,
+        ) != _DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE:
+            attempt.visual_bridge_failure_state = "RUNTIME_RANGE_UNREVIEWED"
+            attempt.visual_delivery_frozen = True
+            return False
+
+        from osia.image_inputs import (
+            MediaEnvelopeType,
+            acknowledge_media_delivery,
+            begin_media_delivery,
+            commit_media_delivery,
+            fail_media_delivery,
+            mark_media_delivery_commit_unknown,
+            prepare_media_delivery,
+        )
+
+        suffix = {
+            "image/gif": ".gif",
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+        }.get(str(image_artifact.mime_type or ""))
+        if not suffix or not attempt.turn_id:
+            attempt.visual_bridge_failure_state = "FAILED"
+            return False
+        delivery = prepare_media_delivery(
+            image_reference,
+            owner_id=owner_id,
+            provider="chatgpt_account",
+            model=attempt.model_id,
+            conversation_id=attempt.conversation_id,
+            request_id=(attempt.client_request_id or attempt.thread_id),
+            turn_id=(attempt.osia_turn_id or attempt.turn_id),
+            tool_call_id=call_id,
+            rpc_id=f"turn-steer:{request_id}",
+            transport_id=(
+                f"generation:{self.generation}:thread:{attempt.thread_id}:"
+                "codex-0.144-dynamic-image-bridge"
+            ),
+            envelope_type=MediaEnvelopeType.TURN_STEER_IMAGE,
+        )
+
+        def remember_failure_state() -> None:
+            try:
+                from osia.image_inputs import media_delivery_record
+
+                current = media_delivery_record(delivery.delivery_id)
+                state = str(current.state if current is not None else "UNKNOWN")
+            except Exception:
+                state = "UNKNOWN"
+            attempt.visual_bridge_failure_state = state
+            if state in {"DISPATCHING", "COMMIT_UNKNOWN", "UNKNOWN"}:
+                attempt.visual_delivery_frozen = True
+
+        if delivery.state == "ACKNOWLEDGED":
+            attempt.visual_bridge_failure_state = ""
+            return True
+        if delivery.state == "COMMITTED":
+            attempt.bridged_visual_delivery_ids.add(delivery.delivery_id)
+            attempt.visual_bridge_failure_state = ""
+            return True
+        if not delivery.send_authorized:
+            remember_failure_state()
+            return False
+
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        path = None
+        transport_started = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix="vision-bridge-",
+                suffix=suffix,
+                dir=self.temp_dir,
+                delete=False,
+            ) as handle:
+                handle.write(image_artifact.image_bytes)
+                path = Path(handle.name)
+            dispatching = begin_media_delivery(delivery.delivery_id)
+            if dispatching is None or dispatching.state != "DISPATCHING":
+                raise RuntimeError(
+                    "image_bridge_dispatch_state_unavailable"
+                )
+            transport_started = True
+            self._request(
+                "turn/steer",
+                {
+                    "threadId": attempt.thread_id,
+                    "expectedTurnId": str(attempt.turn_id),
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Codex 0.144 compatibility image for the exact "
+                                "correlated visual tool result. Inspect these "
+                                "pixels and answer the current visual request "
+                                "without requesting this frame again."
+                                + (
+                                    " The required Computer Use frame_id is "
+                                    + str(frame_id)[:160]
+                                    + "; copy that exact frame_id into any "
+                                    "computer action. The local image filename "
+                                    "is transport-only and is not a frame_id."
+                                    if tool_name.startswith("computer_")
+                                    and frame_id else ""
+                                )
+                            ),
+                        },
+                        {
+                            "type": "localImage",
+                            "path": str(path),
+                            "detail": "high",
+                        },
+                    ],
+                },
+                timeout=min(15.0, self.request_timeout),
+            )
+            committed = commit_media_delivery(delivery.delivery_id)
+            if committed is None or committed.state not in {
+                "COMMITTED", "ACKNOWLEDGED",
+            }:
+                committed = mark_media_delivery_commit_unknown(
+                    delivery.delivery_id,
+                    reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                )
+            if committed is None or committed.state not in {
+                "COMMITTED", "ACKNOWLEDGED",
+            }:
+                remember_failure_state()
+                return False
+            attempt.bridged_visual_paths.append(path)
+            path = None
+            if committed.state == "COMMITTED":
+                attempt.bridged_visual_delivery_ids.add(delivery.delivery_id)
+            else:
+                acknowledge_media_delivery(delivery.delivery_id)
+            attempt.visual_bridge_failure_state = ""
+            self._append_capability_event(
+                attempt,
+                source="provider_dynamic",
+                identity="codex0144DynamicImageBridge",
+                phase="committed",
+                outcome="success_verified",
+                item_id=call_id,
+                tool_attempt_id=call_id,
+                tool_name=tool_name,
+                reason_code="DYNAMIC_IMAGE_COMPATIBILITY_BRIDGED",
+            )
+            return True
+        except AppServerError as exc:
+            try:
+                if exc.category in {"request_rejected", "process_stopped"}:
+                    fail_media_delivery(
+                        delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_FAILED_BEFORE_COMMIT",
+                    )
+                else:
+                    mark_media_delivery_commit_unknown(
+                        delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                    )
+            except Exception:
+                pass
+            remember_failure_state()
+            return False
+        except Exception:
+            try:
+                if transport_started:
+                    mark_media_delivery_commit_unknown(
+                        delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                    )
+                else:
+                    fail_media_delivery(
+                        delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_FAILED_BEFORE_COMMIT",
+                    )
+            except Exception:
+                pass
+            remember_failure_state()
+            return False
+        finally:
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _send_dynamic_failure(
+        self,
+        request_id: Any,
+        call: Mapping[str, Any] | None,
+        reason_code: str,
+        *,
+        detail_reason_code: str = "",
+    ) -> None:
+        result = self._dynamic_result_envelope(
+            call,
+            success=False,
+            reason_code=reason_code,
+            result={
+                "available": False,
+                "retryable_in_same_model_turn": True,
+            },
+            detail_reason_code=detail_reason_code,
+        )
+        self._send({"id": request_id, "result": result})
+
+    def _send_uncached_dynamic_failure(
+        self,
+        attempt: _TurnAttempt,
+        request_id: Any,
+        call: Mapping[str, Any] | None,
+        reason_code: str,
+    ) -> None:
+        try:
+            self._send_dynamic_failure(request_id, call, reason_code)
+        except AppServerError as exc:
+            if not attempt.first_causal_failure:
+                attempt.first_causal_failure = "TOOL_RESPONSE_MISSING"
+            raise AppServerError(
+                "ERROR: TOOL_RESPONSE_MISSING",
+                allow_fallback=False,
+                category="TOOL_RESPONSE_MISSING",
+            ) from exc
+
+    def _reject_dynamic_after_model_change(
+        self,
+        attempt: _TurnAttempt,
+        request_id: Any,
+        call: Mapping[str, Any] | None,
+    ) -> None:
+        call = call if isinstance(call, Mapping) else {}
+        call_id = str(call.get("call_id") or "")
+        tool_name = str(call.get("tool") or "")
+        arguments = call.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        self._append_capability_event(
+            attempt,
+            source="provider_dynamic",
+            identity="dynamicToolCall",
+            phase="completed",
+            outcome="failed_before_effect",
+            item_id=call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            reason_code="MODEL_IDENTITY_CHANGED",
+        )
+        if not attempt.first_causal_failure:
+            attempt.first_causal_failure = "MODEL_IDENTITY_CHANGED"
+        try:
+            self._send_dynamic_failure(
+                request_id, call or None, "MODEL_IDENTITY_CHANGED",
+            )
+        except AppServerError:
+            attempt.events.put((
+                "error",
+                AppServerError(
+                    "ERROR: TOOL_RESPONSE_MISSING",
+                    allow_fallback=False,
+                    category="TOOL_RESPONSE_MISSING",
+                ),
+            ))
+            return
+        attempt.events.put((
+            "error",
+            AppServerError(
+                "ERROR: MODEL_IDENTITY_CHANGED",
+                allow_fallback=False,
+                category="MODEL_IDENTITY_CHANGED",
+            ),
+        ))
+
+    def _commit_dynamic_response(
+        self,
+        attempt: _TurnAttempt,
+        *,
+        request_id: Any,
+        call_id: str,
+        signature: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        pending_successors: list[str] = []
+        with attempt.dynamic_response_lock:
+            visual_entry = next((
+                entry for entry in attempt.visual_frame_calls.values()
+                if str(entry.get("call_id") or "") == str(call_id or "")
+            ), None)
+            if isinstance(visual_entry, dict):
+                visual_entry["transport_started"] = True
+            try:
+                self._send({"id": request_id, "result": dict(result)})
+            except AppServerError as exc:
+                if isinstance(visual_entry, dict):
+                    visual_entry["transport_started"] = False
+                    visual_entry["pending_successor_item_ids"] = []
+                if not attempt.first_causal_failure:
+                    attempt.first_causal_failure = "TOOL_RESPONSE_MISSING"
+                raise AppServerError(
+                    "ERROR: TOOL_RESPONSE_MISSING",
+                    allow_fallback=False,
+                    category="TOOL_RESPONSE_MISSING",
+                ) from exc
+            if isinstance(visual_entry, dict):
+                visual_entry["response_committed"] = True
+                pending_successors = list(
+                    visual_entry.pop("pending_successor_item_ids", ()) or ()
+                )
+            attempt.dynamic_tool_responses[call_id] = {
+                "signature": signature,
+                "result": deepcopy(dict(result)),
+            }
+            attempt.dynamic_response_sent = True
+        for successor_item_id in pending_successors:
+            correlated = self._mark_visual_input_consumed(
+                attempt,
+                successor_item_id=successor_item_id,
+            )
+            if correlated and successor_item_id in attempt.agent_message_items:
+                attempt.post_visual_agent_items.add(successor_item_id)
+
+    def _close_dynamic_failure(
+        self,
+        attempt: _TurnAttempt,
+        *,
+        request_id: Any,
+        call: Mapping[str, Any],
+        reason_code: str,
+        result: Any,
+        arguments: Mapping[str, Any] | None = None,
+        detail_reason_code: str = "",
+        semantic_node_id: str = "",
+    ) -> None:
+        call_id = str(call.get("call_id") or "")
+        tool_name = str(call.get("tool") or "")
+        clean_arguments = (
+            dict(arguments)
+            if isinstance(arguments, Mapping) else
+            dict(call.get("arguments") or {})
+        )
+        response = self._dynamic_result_envelope(
+            call,
+            success=False,
+            reason_code=reason_code,
+            result=result,
+            detail_reason_code=detail_reason_code,
+        )
+        self._commit_dynamic_response(
+            attempt,
+            request_id=request_id,
+            call_id=call_id,
+            signature=self._dynamic_call_signature(call),
+            result=response,
+        )
+        if not attempt.first_causal_failure:
+            attempt.first_causal_failure = reason_code
+        self._append_capability_event(
+            attempt,
+            source="provider_dynamic",
+            identity="dynamicToolCall",
+            phase="completed",
+            outcome="failed_before_effect",
+            item_id=call_id,
+            tool_attempt_id=call_id,
+            tool_name=tool_name,
+            arguments=clean_arguments,
+            semantic_node_id=semantic_node_id,
+            reason_code=reason_code,
+        )
+
+    @staticmethod
+    def _dynamic_lifecycle_mismatch(
+        attempt: _TurnAttempt,
+        call: Mapping[str, Any],
+        params: Mapping[str, Any],
+    ) -> bool:
+        call_id = str(call.get("call_id") or "")
+        item_id = str(params.get("itemId") or params.get("item_id") or "")
+        if item_id and item_id != call_id:
+            return True
+        if not attempt.dynamic_items:
+            return False
+        signature = AppServerClient._dynamic_call_signature(call)
+        known = attempt.dynamic_items.get(call_id)
+        if known is not None:
+            return AppServerClient._dynamic_call_signature(known) != signature
+        # A new App Server call ID is a new request even when its tool and
+        # arguments match a prior dynamic call. Only a conflict for this exact
+        # call ID (or an explicit itemId mismatch) is a transport mismatch.
+        return False
+
+    def _resolve_dynamic_tool_call(
+        self,
+        attempt: _TurnAttempt,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Close one read-only App Server call on its original model turn."""
+
+        request_id = payload.get("request_id")
+        params = payload.get("params")
+        params = params if isinstance(params, dict) else {}
+        call = payload.get("call")
+        call = call if isinstance(call, dict) else None
+        parse_failure = str(payload.get("parse_failure") or "")
+        if call is None:
+            reason_code = parse_failure or "TOOL_RESPONSE_ID_MISMATCH"
+            self._send_uncached_dynamic_failure(
+                attempt, request_id, None, reason_code,
+            )
+            if not attempt.first_causal_failure:
+                attempt.first_causal_failure = reason_code
+            self._append_capability_event(
+                attempt,
+                source="provider_dynamic",
+                identity="dynamicToolCall",
+                phase="completed",
+                outcome="failed_before_effect",
+                item_id="",
+                reason_code=reason_code,
+            )
+            return
+
+        call_id = str(call.get("call_id") or "")
+        tool_name = str(call.get("tool") or "")
+        arguments = call.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        signature = self._dynamic_call_signature(call)
+        cached = attempt.dynamic_tool_responses.get(call_id)
+        if cached is not None:
+            if cached.get("signature") != signature:
+                self._send_uncached_dynamic_failure(
+                    attempt, request_id, call, "TOOL_RESPONSE_ID_MISMATCH",
+                )
+                if not attempt.first_causal_failure:
+                    attempt.first_causal_failure = "TOOL_RESPONSE_ID_MISMATCH"
+                self._append_capability_event(
+                    attempt,
+                    source="provider_dynamic",
+                    identity="dynamicToolCall",
+                    phase="completed",
+                    outcome="failed_before_effect",
+                    item_id=call_id,
+                    tool_attempt_id=call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    reason_code="TOOL_RESPONSE_ID_MISMATCH",
+                )
+                return
+            try:
+                self._send({
+                    "id": request_id,
+                    "result": deepcopy(cached["result"]),
+                })
+            except AppServerError as exc:
+                if not attempt.first_causal_failure:
+                    attempt.first_causal_failure = "TOOL_RESPONSE_MISSING"
+                raise AppServerError(
+                    "ERROR: TOOL_RESPONSE_MISSING",
+                    allow_fallback=False,
+                    category="TOOL_RESPONSE_MISSING",
+                ) from exc
+            return
+
+        if _selected_model_identity_changed(attempt):
+            self._reject_dynamic_after_model_change(
+                attempt, request_id, call,
+            )
+            return
+
+        if self._dynamic_lifecycle_mismatch(attempt, call, params):
+            self._send_uncached_dynamic_failure(
+                attempt, request_id, call, "TOOL_RESPONSE_ID_MISMATCH",
+            )
+            if not attempt.first_causal_failure:
+                attempt.first_causal_failure = "TOOL_RESPONSE_ID_MISMATCH"
+            self._append_capability_event(
+                attempt,
+                source="provider_dynamic",
+                identity="dynamicToolCall",
+                phase="completed",
+                outcome="failed_before_effect",
+                item_id=call_id,
+                tool_attempt_id=call_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                reason_code="TOOL_RESPONSE_ID_MISMATCH",
+            )
+            return
+
+        if tool_name not in _DIRECT_READ_ONLY_NATIVE_TOOLS:
+            from osia.tool_contracts import tool_is_runtime_available
+
+            self._close_dynamic_failure(
+                attempt,
+                request_id=request_id,
+                call=call,
+                reason_code="CAPABILITY_UNAVAILABLE",
+                result={
+                    "available": False,
+                    "requested_capability": tool_name,
+                    "available_capabilities": sorted(
+                        name for name in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                        if tool_is_runtime_available(name)
+                    ),
+                    "retryable_in_same_model_turn": True,
+                },
+                arguments=arguments,
+            )
+            return
+
+        try:
+            from osia.execution_strategy import (
+                record_tool_outcome,
+                tool_preflight,
+            )
+            from osia.tool_contracts import (
+                SideEffectClass,
+                ToolValidationError,
+                get_tool_spec,
+                validate_tool_arguments,
+            )
+        except ImportError:
+            self._close_dynamic_failure(
+                attempt,
+                request_id=request_id,
+                call=call,
+                reason_code="CAPABILITY_UNAVAILABLE",
+                result={"available": False, "executed": False},
+                arguments=arguments,
+            )
+            return
+        try:
+            spec = get_tool_spec(tool_name)
+            if (
+                spec is None
+                or spec.side_effect is not SideEffectClass.READ_ONLY
+                or not callable(spec.dispatcher)
+            ):
+                raise LookupError("canonical_read_only_dispatcher_unavailable")
+            clean_arguments = validate_tool_arguments(spec, arguments)
+        except ToolValidationError:
+            self._close_dynamic_failure(
+                attempt,
+                request_id=request_id,
+                call=call,
+                reason_code="INVALID_TOOL_ARGUMENTS",
+                result={"available": True, "executed": False},
+                arguments=arguments,
+            )
+            return
+        except LookupError:
+            self._close_dynamic_failure(
+                attempt,
+                request_id=request_id,
+                call=call,
+                reason_code="CAPABILITY_UNAVAILABLE",
+                result={"available": False, "executed": False},
+                arguments=arguments,
+            )
+            return
+
+        decision = None
+        preflight_error = None
+        preflight_reason_code = ""
+        try:
+            decision = tool_preflight(
+                tool_name,
+                clean_arguments,
+                strategy=attempt.execution_strategy,
+            ) if attempt.execution_strategy is not None else None
+        except Exception:
+            preflight_error = (
+                "ERROR: read-only capability preflight failed safely"
+            )
+            preflight_reason_code = "CAPABILITY_PREFLIGHT_UNAVAILABLE"
+        if decision is not None and not decision.allowed:
+            preflight_error = "ERROR: capability rejected before execution"
+            preflight_reason_code = str(
+                decision.reason_code or "CAPABILITY_PREFLIGHT_REJECTED"
+            )[:160]
+        if (
+            tool_name in _DIRECT_IMAGE_NATIVE_TOOLS
+            and attempt.visual_delivery_frozen
+        ):
+            preflight_error = "ERROR: image delivery state is unresolved"
+            preflight_reason_code = "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+
+        from osia.agent import _execute_tool_with_policy
+        from osia.tool_contracts import ExecutionOutcome
+
+        durable_turn_id = str(attempt.osia_turn_id or attempt.turn_id or "")
+        provider_request_id = str(request_id or "")
+
+        def _capability_outcome(record) -> str:
+            value = str(
+                getattr(getattr(record, "outcome", None), "value", "")
+                or getattr(record, "outcome", "")
+            )
+            return {
+                ExecutionOutcome.SUCCESS_VERIFIED.value: "success_verified",
+                ExecutionOutcome.SUCCESS_UNVERIFIED.value: "success_unverified",
+                ExecutionOutcome.PENDING.value: "pending",
+                ExecutionOutcome.NOT_STARTED.value: "failed_before_effect",
+                ExecutionOutcome.REJECTED_BEFORE_EXECUTION.value:
+                    "rejected_before_execution",
+                ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT.value:
+                    "confirmed_failure_before_effect",
+                ExecutionOutcome.FAILED_AFTER_EFFECT.value: "failed_after_effect",
+                ExecutionOutcome.OUTCOME_UNKNOWN.value: "outcome_unknown",
+                ExecutionOutcome.CANCELLED_PROVEN.value: "cancelled_proven",
+            }.get(value, "outcome_unknown")
+
+        def _record_capability_event(
+            phase,
+            outcome,
+            tool_attempt_id,
+            reason="",
+            semantic_postcondition="",
+        ):
+            self._append_capability_event(
+                attempt,
+                source="provider_dynamic",
+                identity="dynamicToolCall",
+                phase=phase,
+                outcome=outcome,
+                item_id=call_id,
+                tool_attempt_id=tool_attempt_id,
+                tool_name=tool_name,
+                arguments=clean_arguments,
+                semantic_node_id=str(
+                    decision.node_id if decision is not None else ""
+                ),
+                semantic_postcondition=semantic_postcondition,
+                reason_code=reason,
+            )
+
+        def _status_callback(status, tool_attempt_id):
+            if status == "action_starting":
+                _record_capability_event(
+                    "accepted", "read_only", tool_attempt_id,
+                )
+            elif status == "action_in_progress":
+                _record_capability_event(
+                    "started", "dispatch_started", tool_attempt_id,
+                )
+
+        def _terminal_callback(tool_attempt_id, record):
+            outcome = _capability_outcome(record)
+            if outcome != "pending":
+                _record_capability_event(
+                    "completed", outcome, tool_attempt_id,
+                    str(getattr(record, "reason_code", "") or ""),
+                )
+
+        attempt_context = {
+            "enabled": True,
+            "store": self._attempt_store(),
+            "conversation_id": str(attempt.conversation_id or attempt.thread_id),
+            "turn_id": durable_turn_id,
+            "request_id": str(attempt.client_request_id or provider_request_id),
+            "tool_call_id": call_id,
+            "provider_id": "chatgpt_account",
+            "model_id": str(attempt.model_id or "unknown"),
+            "owner_scope": "chat",
+            "provider_references": {
+                "tool_call_id": call_id,
+                "provider_native_call_id": call_id,
+                "provider_request_id": provider_request_id,
+                "native_turn_id": str(attempt.turn_id or ""),
+                "native_thread_id": str(attempt.thread_id or ""),
+            },
+            "status_callback": _status_callback,
+            "terminal_callback": _terminal_callback,
+        }
+        execution_record = _execute_tool_with_policy(
+            tool_name,
+            clean_arguments,
+            allow_retry=False,
+            lang="en",
+            attempt_context=attempt_context,
+            preflight_error=preflight_error,
+            preflight_reason_code=preflight_reason_code,
+        )
+        durable_attempt_id = str(
+            getattr(execution_record, "tool_attempt_id", "")
+            or attempt_context.get("tool_attempt_id")
+            or ""
+        )
+        execution_outcome = _capability_outcome(execution_record)
+        model_result = getattr(execution_record, "result", None)
+        text_result = (
+            str(model_result.get("text") or "")
+            if isinstance(model_result, dict) else str(model_result or "")
+        )
+        receipt = (
+            model_result.get("receipt")
+            if isinstance(model_result, dict) else {}
+        )
+        receipt = receipt if isinstance(receipt, dict) else {}
+        receipt_outcome = str(receipt.get("outcome") or "")
+        is_pending = execution_outcome == "pending"
+        is_error = bool(
+            getattr(execution_record, "is_error", False)
+            or is_pending
+            or text_result.lstrip().startswith("ERROR:")
+            or receipt_outcome in {
+                "confirmed_failure_before_effect",
+                "failed_before_effect",
+                "rejected_before_execution",
+            }
+        )
+        reason_code = str(
+            getattr(execution_record, "reason_code", "")
+            or receipt.get("reason_code")
+            or (
+                "READ_ONLY_OBSERVATION_COMPLETED"
+                if not is_error else "CAPABILITY_EXECUTION_FAILED"
+            )
+        )[:160]
+        if is_pending:
+            reason_code = "TOOL_RESULT_PENDING"
+            model_result = {
+                "text": "PENDING: the read-only observation is still running.",
+                "receipt": {
+                    "schema_version": 1,
+                    "dispatch_state": "worker_may_be_active",
+                    "outcome": "pending",
+                    "reason_code": reason_code,
+                },
+            }
+        image_data_url = ""
+        image_artifact = None
+        media_delivery = None
+        image_reference = (
+            model_result.get("image_ref")
+            if isinstance(model_result, dict) else None
+        )
+        if isinstance(model_result, dict):
+            model_result = deepcopy(model_result)
+            model_result.pop("screenshot", None)
+            model_result.pop("image_ref", None)
+        if not is_error and isinstance(image_reference, dict):
+            try:
+                from osia.image_inputs import (
+                    artifact_data_url,
+                    ImageInputError,
+                    resolve_image_reference,
+                    turn_scoped_media_owner,
+                )
+
+                media_owner_id = turn_scoped_media_owner(
+                    attempt.conversation_id,
+                    attempt.osia_turn_id or attempt.turn_id or attempt.thread_id,
+                )
+                image_artifact = resolve_image_reference(
+                    image_reference,
+                    owner_id=media_owner_id,
+                )
+                receipt_expectations = {
+                    "image_id": image_artifact.image_id,
+                    "image_sha256": image_artifact.content_hash,
+                    "image_mime": image_artifact.mime_type,
+                    "image_width": image_artifact.width,
+                    "image_height": image_artifact.height,
+                }
+                required_receipt_fields = {
+                    "image_id", "image_sha256", "image_mime",
+                    "image_width", "image_height", "surface_ref",
+                    "window_generation", "application", "frame_id",
+                }
+                if any(
+                    receipt.get(key) in (None, "")
+                    for key in required_receipt_fields
+                ) or any(
+                    receipt.get(key) != expected
+                    for key, expected in receipt_expectations.items()
+                ) or (
+                    str(receipt.get("surface_ref"))
+                    != str(image_artifact.surface_id)
+                    or str(receipt.get("window_generation"))
+                    != str(image_artifact.generation)
+                    or str(receipt.get("application"))
+                    != str(image_artifact.application_identity)
+                ):
+                    raise ImageInputError(
+                        "ERROR: the visual receipt does not match its exact "
+                        "image artifact.",
+                        reason_code="IMAGE_REF_METADATA_MISMATCH",
+                    )
+                image_data_url = artifact_data_url(
+                    image_artifact, "chatgpt_account",
+                )
+            except Exception as exc:
+                is_error = True
+                reason_code = str(
+                    getattr(exc, "reason_code", "IMAGE_INPUT_UNAVAILABLE")
+                    or "IMAGE_INPUT_UNAVAILABLE"
+                )[:160]
+                model_result = {
+                    "text": "ERROR: the prepared image input was unavailable.",
+                    "receipt": {
+                        "schema_version": 1,
+                        "dispatch_state": "not_dispatched",
+                        "outcome": "confirmed_failure_before_effect",
+                        "reason_code": reason_code,
+                    },
+                }
+        if (
+            tool_name in _DIRECT_IMAGE_NATIVE_TOOLS
+            and not is_error
+            and reason_code in {
+                "ACTIVE_MODEL_IMAGE_PART_BUILT",
+                "V4_ACTIVE_MODEL_IMAGE_PART_BUILT",
+                "V4_ACTIVE_MODEL_CROP_BUILT",
+            }
+            and not image_data_url
+        ):
+            is_error = True
+            reason_code = "IMAGE_INPUT_UNAVAILABLE"
+            model_result = {
+                "text": "ERROR: the active-model image input was unavailable.",
+                "receipt": {
+                    "schema_version": 1,
+                    "dispatch_state": "not_dispatched",
+                    "outcome": "confirmed_failure_before_effect",
+                    "reason_code": reason_code,
+                },
+            }
+        frame_key = ""
+        prior_visual_call = None
+        if image_data_url and isinstance(model_result, dict):
+            sent_receipt = model_result.get("receipt")
+            if isinstance(sent_receipt, dict):
+                frame_id = str(sent_receipt.get("frame_id") or "")
+                image_sha256 = str(sent_receipt.get("image_sha256") or "")
+                target_identity = sent_receipt.get("target_identity")
+                target_identity = (
+                    target_identity if isinstance(target_identity, dict) else {}
+                )
+                frame_key = hashlib.sha256(json.dumps(
+                    {
+                        "image_sha256": image_sha256,
+                        "frame_id": frame_id,
+                        "application": sent_receipt.get("application"),
+                        "surface_ref": sent_receipt.get("surface_ref"),
+                        "window_generation": sent_receipt.get(
+                            "window_generation"
+                        ),
+                        "target_identity": target_identity,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                prior_visual_call = (
+                    attempt.visual_frame_calls.get(frame_key)
+                    if frame_key else None
+                )
+                if (
+                    prior_visual_call is not None
+                    and prior_visual_call.get("delivery_state")
+                    not in {"COMMITTED", "ACKNOWLEDGED"}
+                ):
+                    prior_visual_call = None
+                sent_receipt["tool_call_id"] = call_id
+                if prior_visual_call is not None:
+                    # The first response already placed these exact pixels in
+                    # this same native model turn. Close the repeated call once,
+                    # but do not duplicate the image content item.
+                    image_data_url = ""
+                    reason_code = "IMAGE_INPUT_ALREADY_SENT"
+                    sent_receipt["reason_code"] = reason_code
+                    sent_receipt["image_input_sent"] = True
+                    sent_receipt["image_input_resent"] = False
+                    sent_receipt["original_tool_call_id"] = str(
+                        prior_visual_call.get("call_id") or ""
+                    )[:160]
+                else:
+                    sent_receipt["reason_code"] = "IMAGE_INPUT_SENT"
+                    sent_receipt["image_input_sent"] = True
+            diagnostics = model_result.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                diagnostics["image_input_sent"] = True
+                diagnostics["image_input_resent"] = prior_visual_call is None
+            if prior_visual_call is None:
+                reason_code = "IMAGE_INPUT_SENT"
+
+        success = not is_error
+        reconciliation_postcondition = ""
+        strategy = attempt.execution_strategy
+        if strategy is not None and bool(
+            getattr(strategy, "frozen_reason", "")
+        ):
+            frozen_node = strategy.node_by_id(
+                str(getattr(strategy, "_frozen_node_id", "") or "")
+            )
+            if frozen_node is not None:
+                reconciliation_postcondition = str(
+                    frozen_node.observable_success_postcondition or ""
+                )
+        provider_model_result = (
+            self._visual_provider_result(
+                model_result,
+                attached_now=bool(image_data_url),
+                reconciliation_postcondition=reconciliation_postcondition,
+            )
+            if (
+                tool_name in _DIRECT_IMAGE_NATIVE_TOOLS
+                and success
+                and bool(image_data_url or prior_visual_call is not None)
+            ) else model_result
+        )
+        try:
+            result = self._dynamic_result_envelope(
+                call,
+                success=success,
+                reason_code=reason_code,
+                status="pending" if is_pending else "",
+                result=provider_model_result,
+                image_data_url=image_data_url,
+            )
+        except (TypeError, ValueError, RecursionError):
+            success = False
+            reason_code = "CAPABILITY_EXECUTION_FAILED"
+            image_data_url = ""
+            model_result = {
+                "text": "ERROR: the capability result was not serializable.",
+                "receipt": {
+                    "schema_version": 1,
+                    "dispatch_state": "not_dispatched",
+                    "outcome": "confirmed_failure_before_effect",
+                    "reason_code": reason_code,
+                },
+            }
+            provider_model_result = model_result
+            result = self._dynamic_result_envelope(
+                call,
+                success=False,
+                reason_code=reason_code,
+                result=model_result,
+            )
+        if (
+            success
+            and frame_key
+            and prior_visual_call is None
+            and reason_code == "IMAGE_INPUT_SENT"
+            and isinstance(image_reference, dict)
+            and image_artifact is not None
+        ):
+            try:
+                from osia.image_inputs import (
+                    MediaEnvelopeType,
+                    prepare_media_delivery,
+                )
+
+                media_delivery = prepare_media_delivery(
+                    image_reference,
+                    owner_id=media_owner_id,
+                    provider="chatgpt_account",
+                    model=attempt.model_id,
+                    conversation_id=attempt.conversation_id,
+                    request_id=(attempt.client_request_id or attempt.thread_id),
+                    turn_id=(attempt.osia_turn_id or attempt.thread_id),
+                    tool_call_id=call_id,
+                    rpc_id=str(request_id or ""),
+                    transport_id=(
+                        f"generation:{self.generation}:"
+                        f"thread:{attempt.thread_id}"
+                    ),
+                    envelope_type=MediaEnvelopeType.INPUT_IMAGE,
+                )
+                if media_delivery.state in {"COMMITTED", "ACKNOWLEDGED"}:
+                    image_data_url = ""
+                    reason_code = "IMAGE_INPUT_ALREADY_SENT"
+                    result = self._dynamic_result_envelope(
+                        call,
+                        success=True,
+                        reason_code=reason_code,
+                        result=provider_model_result,
+                    )
+                    media_delivery = None
+                elif not media_delivery.send_authorized:
+                    success = False
+                    image_data_url = ""
+                    reason_code = (
+                        "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+                        if media_delivery.state == "COMMIT_UNKNOWN" else
+                        "IMAGE_DELIVERY_IN_PROGRESS"
+                    )
+                    model_result = {
+                        "text": "ERROR: the exact image delivery is already claimed.",
+                        "receipt": {
+                            "schema_version": 1,
+                            "dispatch_state": "not_dispatched",
+                            "outcome": "confirmed_failure_before_effect",
+                            "reason_code": reason_code,
+                            "image_input_sent": False,
+                        },
+                    }
+                    result = self._dynamic_result_envelope(
+                        call,
+                        success=False,
+                        reason_code=reason_code,
+                        result=model_result,
+                    )
+                    media_delivery = None
+                else:
+                    attempt.visual_frame_calls[frame_key] = {
+                        "call_id": call_id,
+                        "tool_attempt_id": durable_attempt_id,
+                        "tool_name": tool_name,
+                        "frame_id": str(receipt.get("frame_id") or "")[:160],
+                        "provider_id": str(receipt.get("provider_id") or "")[:80],
+                        "model_id": str(receipt.get("model_id") or "")[:160],
+                        "arguments": dict(clean_arguments),
+                        "delivery_id": media_delivery.delivery_id,
+                        "delivery_state": "PREPARED",
+                        "transport_started": False,
+                        "response_committed": False,
+                        "pending_successor_item_ids": [],
+                        "prior_item_ids": sorted({
+                            str(item.get("item_id") or "")
+                            for item in attempt.response_item_diagnostics
+                            if isinstance(item, dict) and item.get("item_id")
+                        } | set(attempt.dynamic_items) | set(
+                            attempt.agent_message_items
+                        )),
+                    }
+                    attempt.image_input_present = True
+            except Exception:
+                success = False
+                reason_code = "IMAGE_DELIVERY_FAILED"
+                image_data_url = ""
+                model_result = {
+                    "text": "ERROR: the image delivery could not be prepared.",
+                    "receipt": {
+                        "schema_version": 1,
+                        "dispatch_state": "not_dispatched",
+                        "outcome": "confirmed_failure_before_effect",
+                        "reason_code": reason_code,
+                        "image_input_sent": False,
+                    },
+                }
+                result = self._dynamic_result_envelope(
+                    call,
+                    success=False,
+                    reason_code=reason_code,
+                    result=model_result,
+                )
+        if media_delivery is not None:
+            bridge_committed = self._bridge_dynamic_visual_image_for_runtime(
+                attempt,
+                call_id=call_id,
+                request_id=request_id,
+                image_reference=image_reference,
+                image_artifact=image_artifact,
+                owner_id=media_owner_id,
+                tool_name=tool_name,
+                frame_id=str(receipt.get("frame_id") or ""),
+            )
+            if not bridge_committed:
+                self._append_capability_event(
+                    attempt,
+                    source="provider_dynamic",
+                    identity="codex0144DynamicImageBridge",
+                    phase="completed",
+                    outcome="failed_before_effect",
+                    item_id=call_id,
+                    tool_attempt_id=call_id,
+                    tool_name=tool_name,
+                    reason_code="DYNAMIC_IMAGE_COMPATIBILITY_BRIDGE_FAILED",
+                )
+                try:
+                    from osia.image_inputs import fail_media_delivery
+
+                    fail_media_delivery(
+                        media_delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_FAILED_BEFORE_COMMIT",
+                    )
+                except Exception:
+                    pass
+                attempt.visual_frame_calls.pop(frame_key, None)
+                media_delivery = None
+                success = False
+                attempt.visual_delivery_required_failed = True
+                image_data_url = ""
+                reason_code = "IMAGE_DELIVERY_FAILED"
+                if not attempt.first_causal_failure:
+                    attempt.first_causal_failure = reason_code
+                model_result = {
+                    "text": (
+                        "ERROR: the pinned App Server image compatibility "
+                        "delivery failed before visual continuation."
+                    ),
+                    "receipt": {
+                        "schema_version": 1,
+                        "dispatch_state": "not_dispatched",
+                        "outcome": "confirmed_failure_before_effect",
+                        "reason_code": reason_code,
+                        "detail_reason_code": (
+                            "DYNAMIC_IMAGE_COMPATIBILITY_BRIDGE_FAILED"
+                        ),
+                        "image_input_sent": False,
+                    },
+                }
+                result = self._dynamic_result_envelope(
+                    call,
+                    success=False,
+                    reason_code=reason_code,
+                    result=model_result,
+                    detail_reason_code=(
+                        "DYNAMIC_IMAGE_COMPATIBILITY_BRIDGE_FAILED"
+                    ),
+                )
+            else:
+                try:
+                    from osia.image_inputs import (
+                        begin_media_delivery,
+                        fail_media_delivery,
+                    )
+
+                    dispatching = begin_media_delivery(
+                        media_delivery.delivery_id
+                    )
+                    if (
+                        dispatching is None
+                        or dispatching.state != "DISPATCHING"
+                    ):
+                        raise RuntimeError(
+                            "image_delivery_dispatch_state_unavailable"
+                        )
+                except Exception:
+                    try:
+                        fail_media_delivery(
+                            media_delivery.delivery_id,
+                            reason_code="IMAGE_DELIVERY_FAILED_BEFORE_COMMIT",
+                        )
+                    except Exception:
+                        pass
+                    attempt.visual_frame_calls.pop(frame_key, None)
+                    media_delivery = None
+                    success = False
+                    attempt.visual_delivery_required_failed = True
+                    image_data_url = ""
+                    reason_code = "IMAGE_DELIVERY_FAILED"
+                    model_result = {
+                        "text": "ERROR: the image delivery could not be started.",
+                        "receipt": {
+                            "schema_version": 1,
+                            "dispatch_state": "not_dispatched",
+                            "outcome": "confirmed_failure_before_effect",
+                            "reason_code": reason_code,
+                            "image_input_sent": False,
+                        },
+                    }
+                    result = self._dynamic_result_envelope(
+                        call,
+                        success=False,
+                        reason_code=reason_code,
+                        result=model_result,
+                    )
+        semantic_postcondition = ""
+        if (
+            tool_name in {"computer_screenshot", "computer_zoom"}
+            and receipt.get("authoritative_postcondition_verified") is True
+            and attempt.execution_strategy is not None
+        ):
+            node = attempt.execution_strategy.goal
+            semantic_postcondition = str(
+                getattr(node, "observable_success_postcondition", "") or ""
+            )[:512]
+        if execution_outcome != "pending":
+            _record_capability_event(
+                "completed",
+                execution_outcome,
+                durable_attempt_id,
+                str(getattr(execution_record, "reason_code", "") or ""),
+                semantic_postcondition,
+            )
+        try:
+            self._commit_dynamic_response(
+                attempt,
+                request_id=request_id,
+                call_id=call_id,
+                signature=signature,
+                result=result,
+            )
+        except AppServerError:
+            if media_delivery is not None:
+                try:
+                    from osia.image_inputs import (
+                        mark_media_delivery_commit_unknown,
+                    )
+
+                    mark_media_delivery_commit_unknown(
+                        media_delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                    )
+                except Exception:
+                    pass
+                attempt.visual_frame_calls.pop(frame_key, None)
+            raise
+        if media_delivery is not None:
+            registered = attempt.visual_frame_calls.get(frame_key)
+            try:
+                from osia.image_inputs import (
+                    acknowledge_media_delivery,
+                    commit_media_delivery,
+                    mark_media_delivery_commit_unknown,
+                )
+
+                committed = commit_media_delivery(media_delivery.delivery_id)
+                if committed is None or committed.state not in {
+                    "COMMITTED", "ACKNOWLEDGED",
+                }:
+                    committed = mark_media_delivery_commit_unknown(
+                        media_delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                    )
+                    if not attempt.first_causal_failure:
+                        attempt.first_causal_failure = (
+                            "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+                        )
+                if isinstance(registered, dict):
+                    registered["delivery_state"] = (
+                        committed.state if committed is not None else
+                        "COMMIT_UNKNOWN"
+                    )
+                if call_id in attempt.visual_consumed_calls:
+                    acknowledged = acknowledge_media_delivery(
+                        media_delivery.delivery_id
+                    )
+                    if isinstance(registered, dict):
+                        registered["delivery_state"] = (
+                            acknowledged.state if acknowledged is not None else
+                            registered.get("delivery_state", "COMMIT_UNKNOWN")
+                        )
+            except Exception:
+                # The provider response is already committed. Completion-time
+                # repair can acknowledge it from the correlated successor.
+                try:
+                    from osia.image_inputs import (
+                        mark_media_delivery_commit_unknown,
+                    )
+
+                    mark_media_delivery_commit_unknown(
+                        media_delivery.delivery_id,
+                        reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                    )
+                except Exception:
+                    pass
+                if isinstance(registered, dict):
+                    registered["delivery_state"] = "COMMIT_UNKNOWN"
+                if not attempt.first_causal_failure:
+                    attempt.first_causal_failure = (
+                        "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+                    )
+        if not success and not attempt.first_causal_failure:
+            attempt.first_causal_failure = reason_code
+        if attempt.execution_strategy is not None:
+            try:
+                record_tool_outcome(
+                    tool_name,
+                    decision,
+                    outcome=(
+                        "success_verified" if success else "failed_before_effect"
+                    ),
+                    is_error=not success,
+                    reason_code=reason_code,
+                    result=model_result,
+                    strategy=attempt.execution_strategy,
+                )
+            except Exception:
+                pass
+        # Image transport is mechanical modality evidence only. The terminal
+        # turn requires this consumed same-model frame, but never re-scores the
+        # provider's natural-language interpretation.
+        if semantic_postcondition and attempt.execution_strategy is not None:
+            try:
+                attempt.execution_strategy.verify_postcondition(
+                    "computer_use_v4_authoritative_post_action_observation",
+                    postcondition=semantic_postcondition,
+                )
+            except Exception:
+                semantic_postcondition = ""
 
     def _handle_server_request(self, message: dict) -> None:
         method = str(message.get("method") or "")
@@ -1803,11 +3374,11 @@ class AppServerClient:
                 except AppServerError:
                     pass
                 return
-            attempt.events.put(("native_approval", {
+            self._resolve_native_approval(attempt, {
                 "method": method,
                 "params": deepcopy(params),
                 "request_id": request_id,
-            }))
+            })
             return
         elif method in {"execCommandApproval", "applyPatchApproval"}:
             result = {"decision": "abort"}
@@ -1816,22 +3387,148 @@ class AppServerClient:
         elif method == "mcpServer/elicitation/request":
             result = {"action": "cancel", "content": None}
         elif method == "item/tool/call":
-            native_tool_call = _exact_canonical_native_call(params)
+            dynamic_call, parse_failure = self._dynamic_call_from_params(params)
             attempt = self._attempt_for(params)
-            frozen = bool(
-                native_tool_call is not None
-                and attempt is not None
-                and self._native_dynamic_call_is_frozen(
-                    attempt, native_tool_call,
-                )
+            thread_id = str(params.get("threadId") or "")
+            turn_id = str(params.get("turnId") or "")
+            if (
+                attempt is not None
+                and thread_id == attempt.thread_id
+                and turn_id
+                and not attempt.turn_id
+            ):
+                attempt.pending_server_requests.append(deepcopy(message))
+                del attempt.pending_server_requests[:-32]
+                return
+            exact_attempt = bool(
+                attempt is not None
+                and thread_id
+                and thread_id == attempt.thread_id
+                and turn_id
+                and attempt.turn_id
+                and turn_id == str(attempt.turn_id)
             )
+            if not exact_attempt:
+                try:
+                    self._send_dynamic_failure(
+                        request_id,
+                        dynamic_call,
+                        "TOOL_RESPONSE_ID_MISMATCH",
+                    )
+                except AppServerError:
+                    pass
+                return
+            if _selected_model_identity_changed(attempt):
+                self._reject_dynamic_after_model_change(
+                    attempt, request_id, dynamic_call,
+                )
+                return
+            if dynamic_call is None:
+                attempt.events.put(("dynamic_tool_call", {
+                    "call": None,
+                    "parse_failure": parse_failure,
+                    "params": deepcopy(params),
+                    "request_id": request_id,
+                }))
+                return
+            self._mark_visual_input_consumed(
+                attempt,
+                successor_item_id=str(dynamic_call.get("call_id") or ""),
+            )
+            if dynamic_call["tool"] == "desktop_click":
+                click_arguments = dynamic_call.get("arguments")
+                click_arguments = (
+                    click_arguments
+                    if isinstance(click_arguments, dict) else {}
+                )
+                frame_entries = [
+                    entry
+                    for entry in attempt.visual_frame_calls.values()
+                    if isinstance(entry, dict)
+                    and entry.get("frame_id")
+                    and entry.get("delivery_state") in {
+                        "COMMITTED", "ACKNOWLEDGED",
+                    }
+                ]
+                valid_frame_ids = {
+                    str(entry.get("frame_id") or "")
+                    for entry in frame_entries
+                }
+                expected_frame_id = (
+                    str(frame_entries[-1].get("frame_id") or "")
+                    if frame_entries else ""
+                )
+                supplied_frame_id = str(
+                    click_arguments.get("visual_frame_id") or ""
+                )
+                bbox = click_arguments.get("visual_bbox")
+                bbox = bbox if isinstance(bbox, dict) else {}
+                normalized_bbox = {}
+                for key in ("left", "top", "right", "bottom"):
+                    value = bbox.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not 0.0 <= float(value) <= 1.0
+                    ):
+                        normalized_bbox = {}
+                        break
+                    normalized_bbox[key] = float(value)
+                bbox_valid = bool(
+                    len(normalized_bbox) == 4
+                    and normalized_bbox["left"] < normalized_bbox["right"]
+                    and normalized_bbox["top"] < normalized_bbox["bottom"]
+                )
+                missing = []
+                if not str(click_arguments.get("description") or "").strip():
+                    missing.append("description")
+                if not supplied_frame_id or supplied_frame_id not in valid_frame_ids:
+                    missing.append("visual_frame_id")
+                if not bbox_valid:
+                    missing.append("visual_bbox")
+                if missing:
+                    self._close_dynamic_failure(
+                        attempt,
+                        request_id=request_id,
+                        call=dynamic_call,
+                        reason_code="INVALID_ARGUMENTS",
+                        result={
+                            "available": True,
+                            "executed": False,
+                            "retryable_in_same_model_turn": True,
+                            "missing_or_invalid_fields": missing,
+                            "required_visual_frame_id": expected_frame_id,
+                            "visual_frame_id": expected_frame_id,
+                            "visual_bbox_contract": (
+                                "left, top, right, bottom must be normalized "
+                                "numbers in [0,1] with left < right and top < bottom"
+                            ),
+                            "instruction": (
+                                "Call desktop_click again with visual_frame_id "
+                                "copied exactly and one normalized visual_bbox."
+                                if expected_frame_id else
+                                "Call request_visual_observation before desktop_click."
+                            ),
+                        },
+                        arguments=click_arguments,
+                    )
+                    return
+            if (
+                dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                or dynamic_call["tool"] not in _CANONICAL_NATIVE_TOOL_NAMES
+            ):
+                attempt.events.put(("dynamic_tool_call", {
+                    "call": dynamic_call,
+                    "parse_failure": "",
+                    "params": deepcopy(params),
+                    "request_id": request_id,
+                }))
+                return
+            native_tool_call = _exact_canonical_native_call(params)
             result = {
                 "contentItems": [{
                     "type": "inputText",
                     "text": (
-                        "The equivalent action is already committed and must "
-                        "not be repeated."
-                        if frozen else
                         "The request was not executed by Codex. OSIA will "
                         "evaluate it through its canonical tool pipeline."
                     ),
@@ -1856,7 +3553,19 @@ class AppServerClient:
             self._send({"id": request_id, "result": result})
         except AppServerError:
             pass
-        if method == "item/tool/call" and native_tool_call is not None and not frozen:
+        if method == "item/tool/call" and native_tool_call is not None:
+            if str(native_tool_call.get("tool") or "").startswith("computer_"):
+                try:
+                    from osia.computer_use_v4_integration import (
+                        prepare_controlled_computer_use_v4_handoff,
+                    )
+
+                    prepare_controlled_computer_use_v4_handoff(
+                        str(native_tool_call.get("tool") or ""),
+                        native_tool_call.get("arguments") or {},
+                    )
+                except Exception:
+                    pass
             self._mark_unsafe(
                 params,
                 f"canonical_tool:{native_tool_call['tool']}",
@@ -1912,20 +3621,158 @@ class AppServerClient:
                 )
             return
 
-        attempt = self._attempt_for(params)
+        thread_id = self._thread_id(params)
+        if thread_id:
+            pending_turn_id = str(
+                params.get("turnId")
+                or (
+                    (params.get("turn") or {}).get("id")
+                    if isinstance(params.get("turn"), dict) else ""
+                )
+                or ""
+            )
+            with self._state_lock:
+                pending_attempt = self._attempts.get(thread_id)
+                if (
+                    pending_attempt is not None
+                    and not pending_attempt.turn_id
+                    and pending_turn_id
+                ):
+                    pending_attempt.pending_turn_notifications.append((
+                        str(method), deepcopy(params),
+                    ))
+                    del pending_attempt.pending_turn_notifications[:-64]
+                    return
+
+        attempt = self._turn_attempt_for(params)
+        if method == "model/rerouted":
+            if attempt is not None:
+                attempt.model_rerouted = True
+                attempt.effective_model_id = str(
+                    params.get("model")
+                    or params.get("toModel")
+                    or params.get("modelId")
+                    or ""
+                )[:160]
+                if (
+                    _normalized_model_id(attempt.effective_model_id)
+                    != _normalized_model_id(attempt.model_id)
+                ):
+                    attempt.model_identity_changed = True
+            return
         if method == "item/agentMessage/delta":
             if attempt is not None and not attempt.native_action:
                 delta = params.get("delta")
                 if isinstance(delta, str) and delta:
-                    attempt.output_started = True
-                    attempt.text_parts.append(delta)
-                    attempt.events.put(("delta", delta))
+                    attempt.model_successor_observed = True
+                    self._acknowledge_local_image_deliveries(attempt)
+                    item_id = self._native_item_id(params)
+                    if (
+                        not item_id
+                        and len(attempt.pending_agent_message_items) == 1
+                    ):
+                        item_id = next(iter(
+                            attempt.pending_agent_message_items
+                        ))
+                    if not item_id:
+                        attempt.agent_delta_sequence += 1
+                        item_id = (
+                            f"agent-delta:{attempt.turn_id}:"
+                            f"{attempt.agent_delta_sequence}"
+                        )[:160]
+                    correlated_visual = self._mark_visual_input_consumed(
+                        attempt,
+                        successor_item_id=item_id,
+                    )
+                    if correlated_visual and item_id:
+                        attempt.post_visual_agent_items.add(item_id)
+                    self._append_agent_text(
+                        attempt, delta, item_id=item_id,
+                    )
             return
 
         if method in {"item/started", "item/completed"}:
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             item_type = str(item.get("type") or "")
             item_id = str(item.get("id") or "")
+            if (
+                attempt is not None
+                and item_type
+                and item_type != "userMessage"
+            ):
+                attempt.model_successor_observed = True
+                self._acknowledge_local_image_deliveries(attempt)
+            if attempt is not None:
+                self._record_response_item(
+                    attempt,
+                    item_id=item_id,
+                    item_type=item_type,
+                    phase=(
+                        "started" if method == "item/started" else "completed"
+                    ),
+                    status=str(item.get("status") or ""),
+                    text_chars=(
+                        len(self._agent_message_text(item))
+                        if item_type == "agentMessage" else 0
+                    ),
+                )
+            correlated_visual = False
+            if (
+                attempt is not None
+                and item_type in {"agentMessage", "dynamicToolCall"}
+                and item_id
+            ):
+                correlated_visual = self._mark_visual_input_consumed(
+                    attempt,
+                    successor_item_id=item_id,
+                )
+            if item_type == "agentMessage":
+                if attempt is not None:
+                    state = attempt.agent_message_items.setdefault(
+                        item_id, {
+                            "delta_chars": 0,
+                            "delta_text": "",
+                            "completed": False,
+                        },
+                    )
+                    if method == "item/started":
+                        if item_id:
+                            attempt.pending_agent_message_items.add(item_id)
+                    else:
+                        completed_text = self._agent_message_text(item)
+                        if correlated_visual and completed_text:
+                            attempt.post_visual_agent_items.add(item_id)
+                        assembled_text = "".join(attempt.text_parts)
+                        streamed_text = str(state.get("delta_text") or "")
+                        missing_text = ""
+                        if completed_text and completed_text not in assembled_text:
+                            if (
+                                streamed_text
+                                and completed_text.startswith(streamed_text)
+                            ):
+                                missing_text = completed_text[len(streamed_text):]
+                            elif not streamed_text:
+                                overlap = min(
+                                    len(assembled_text), len(completed_text),
+                                )
+                                while (
+                                    overlap
+                                    and not assembled_text.endswith(
+                                        completed_text[:overlap]
+                                    )
+                                ):
+                                    overlap -= 1
+                                missing_text = completed_text[overlap:]
+                        if missing_text:
+                            self._append_agent_text(
+                                attempt, missing_text, item_id=item_id,
+                            )
+                        state["completed"] = True
+                        if item_id:
+                            attempt.pending_agent_message_items.discard(item_id)
+                            attempt.final_output_item_id = item_id[:160]
+                    self._release_deferred_done(attempt)
+                return
             if item_type == "webSearch":
                 if attempt is not None:
                     self._append_capability_event(
@@ -1940,8 +3787,55 @@ class AppServerClient:
                         item_id=item_id,
                     )
                 return
+            if item_type == "imageView":
+                if attempt is None or self._turn_attempt_for(params) is not attempt:
+                    return
+                path_value = item.get("path")
+                valid_shape = bool(
+                    set(item) == {"type", "id", "path"}
+                    and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", item_id)
+                    and isinstance(path_value, str)
+                    and path_value
+                )
+                if not valid_shape:
+                    self._mark_unsafe(params, "invalid_native_item:imageView")
+                    return
+                try:
+                    metadata = self._native_image_view_metadata(path_value)
+                except (OSError, ValueError, TypeError):
+                    self._mark_unsafe(params, "invalid_native_item:imageView")
+                    return
+                if method == "item/started":
+                    if item_id in attempt.native_image_views:
+                        self._mark_unsafe(params, "invalid_native_item:imageView")
+                        return
+                    attempt.native_image_views[item_id] = {
+                        "original_path": path_value, "metadata": metadata,
+                    }
+                    self._append_capability_event(
+                        attempt, source="provider_native", identity="imageView",
+                        phase="selected", outcome="running_read_only",
+                        item_id=item_id, arguments=metadata,
+                    )
+                else:
+                    selected = attempt.native_image_views.pop(item_id, None)
+                    if (
+                        not isinstance(selected, dict)
+                        or selected.get("original_path") != path_value
+                        or selected.get("metadata") != metadata
+                    ):
+                        self._mark_unsafe(params, "invalid_native_item:imageView")
+                        return
+                    self._append_capability_event(
+                        attempt, source="provider_native", identity="imageView",
+                        phase="completed", outcome="success_verified",
+                        item_id=item_id, arguments=metadata,
+                    )
+                return
             if item_type in {"commandExecution", "fileChange"}:
                 if attempt is not None and item_id:
+                    if self._turn_attempt_for(params) is not attempt:
+                        return
                     valid_item = bool(
                         item.get("status") in {
                             "inProgress", "completed", "failed", "declined",
@@ -1963,37 +3857,21 @@ class AppServerClient:
                             params, f"invalid_native_item:{item_type}",
                         )
                         return
-                    attempt.native_items[item_id] = deepcopy(item)
                     if method == "item/started":
-                        selection_outcome = "pending_approval"
-                        if item_type == "commandExecution":
-                            try:
-                                from osia.tool_contracts import (
-                                    SideEffectClass,
-                                    effective_contract,
-                                    get_tool_spec,
-                                )
-
-                                command_spec = get_tool_spec("run_command")
-                                command_contract = effective_contract(
-                                    command_spec,
-                                    {"command": str(item.get("command") or "")},
-                                    attempt.user_request,
-                                )
-                                if (
-                                    command_contract.side_effect
-                                    is SideEffectClass.READ_ONLY
-                                ):
-                                    selection_outcome = "running_read_only"
-                            except Exception:
-                                pass
                         self._append_capability_event(
                             attempt,
                             source="provider_native",
                             identity=item_type,
-                            phase="selected",
-                            outcome=selection_outcome,
+                            phase="started",
+                            outcome="outcome_unknown",
                             item_id=item_id,
+                            reason_code="UNEXPECTED_PROVIDER_NATIVE_PHYSICAL_EFFECT",
+                        )
+                        attempt.outcome_unknown = True
+                        attempt.native_effect_started = True
+                        self._mark_unsafe(
+                            params,
+                            f"unbrokered_native_item:{item_type}",
                         )
                     else:
                         self._complete_native_item(attempt, item)
@@ -2002,6 +3880,23 @@ class AppServerClient:
                 lifecycle_params = {**params, **item}
                 if not lifecycle_params.get("callId") and isinstance(item.get("id"), str):
                     lifecycle_params["callId"] = item["id"]
+                dynamic_call, _parse_failure = self._dynamic_call_from_params(
+                    lifecycle_params,
+                )
+                if dynamic_call is not None and attempt is not None:
+                    call_id = str(dynamic_call.get("call_id") or "")
+                    if method == "item/started":
+                        attempt.dynamic_items[call_id] = deepcopy(dynamic_call)
+                    if (
+                        dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                        or dynamic_call["tool"] not in _CANONICAL_NATIVE_TOOL_NAMES
+                    ):
+                        return
+                    if call_id in attempt.dynamic_tool_responses:
+                        # A pre-handoff typed rejection already closed this
+                        # exact item. Its later lifecycle notification must not
+                        # resurrect it as an effectful compatibility handoff.
+                        return
                 native_tool_call = _exact_canonical_native_call(lifecycle_params)
                 if native_tool_call is not None:
                     if method == "item/completed":
@@ -2025,16 +3920,17 @@ class AppServerClient:
         if method == "turn/completed":
             if attempt is not None:
                 turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
-                attempt.events.put(
-                    (
-                        "done",
-                        {
-                            "status": str(turn.get("status") or "failed"),
-                            "turnId": str(turn.get("id")) if turn.get("id") else attempt.turn_id,
-                            "errorCategory": self._turn_error_category(turn),
-                        },
-                    )
-                )
+                completion = {
+                    "status": str(turn.get("status") or "failed"),
+                    "turnId": (
+                        str(turn.get("id")) if turn.get("id") else attempt.turn_id
+                    ),
+                    "errorCategory": self._turn_error_category(turn),
+                }
+                if attempt.pending_agent_message_items:
+                    attempt.deferred_done = completion
+                else:
+                    attempt.events.put(("done", completion))
             return
 
         if method == "error":
@@ -2365,6 +4261,7 @@ class AppServerClient:
         effort: str | None = None,
         on_delta: Callable[[str], None] | None = None,
         on_reasoning_summary: Callable[[dict], None] | None = None,
+        on_attempt_registered: Callable[[], None] | None = None,
         timeout: float = 300.0,
         output_schema: dict | None = None,
     ) -> TurnResult:
@@ -2375,6 +4272,7 @@ class AppServerClient:
                 category="empty_input",
             )
         staged_images: list[Path] = []
+        staged_deliveries: list[str] = []
         attempt = _TurnAttempt(
             thread_id=thread_id,
             conversation_id=str(conversation_id or thread_id),
@@ -2382,6 +4280,7 @@ class AppServerClient:
             client_request_id=str(client_request_id or ""),
             final_response_message_id=str(final_response_message_id or ""),
             model_id=str(model or "unknown"),
+            effective_model_id=str(model or "unknown"),
             user_request=_latest_user_text(turn_content),
         )
         try:
@@ -2399,7 +4298,13 @@ class AppServerClient:
                 )
             self._attempts[thread_id] = attempt
         try:
-            app_input, staged_images = self._stage_turn_input(turn_content)
+            app_input, staged_images, staged_deliveries = self._stage_turn_input(
+                turn_content,
+                attempt,
+            )
+            attempt.local_image_delivery_ids.update(staged_deliveries)
+            if staged_deliveries:
+                attempt.image_input_present = True
             params = {
                 "threadId": thread_id,
                 "input": app_input,
@@ -2418,10 +4323,126 @@ class AppServerClient:
                         category="invalid_input",
                     )
                 params["outputSchema"] = deepcopy(output_schema)
-            response = self._request("turn/start", params)
+            if staged_deliveries:
+                from osia.image_inputs import (
+                    begin_media_delivery,
+                    fail_media_delivery,
+                )
+
+                try:
+                    for delivery_id in staged_deliveries:
+                        dispatching = begin_media_delivery(delivery_id)
+                        if (
+                            dispatching is None
+                            or dispatching.state != "DISPATCHING"
+                        ):
+                            raise RuntimeError(
+                                "image_delivery_dispatch_state_unavailable"
+                            )
+                except Exception as exc:
+                    for delivery_id in staged_deliveries:
+                        try:
+                            fail_media_delivery(
+                                delivery_id,
+                                reason_code="IMAGE_DELIVERY_FAILED_BEFORE_COMMIT",
+                            )
+                        except Exception:
+                            pass
+                    raise AppServerError(
+                        "ERROR: IMAGE_DELIVERY_FAILED",
+                        allow_fallback=False,
+                        category="IMAGE_DELIVERY_FAILED",
+                    ) from exc
+            try:
+                response = self._request("turn/start", params)
+            except Exception as exc:
+                from osia.image_inputs import (
+                    fail_media_delivery,
+                    mark_media_delivery_commit_unknown,
+                )
+
+                for delivery_id in staged_deliveries:
+                    if (
+                        isinstance(exc, AppServerError)
+                        and exc.category in {
+                            "request_rejected", "process_stopped",
+                        }
+                    ):
+                        fail_media_delivery(
+                            delivery_id,
+                            reason_code=(
+                                "PROVIDER_REQUEST_REJECTED"
+                                if exc.category == "request_rejected" else
+                                "IMAGE_DELIVERY_FAILED_BEFORE_COMMIT"
+                            ),
+                        )
+                    else:
+                        mark_media_delivery_commit_unknown(
+                            delivery_id,
+                            reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                        )
+                raise
+            if staged_deliveries:
+                from osia.image_inputs import (
+                    commit_media_delivery,
+                    mark_media_delivery_commit_unknown,
+                )
+
+                for delivery_id in staged_deliveries:
+                    try:
+                        committed = commit_media_delivery(delivery_id)
+                    except Exception:
+                        committed = None
+                    if committed is None or committed.state not in {
+                        "COMMITTED", "ACKNOWLEDGED",
+                    }:
+                        try:
+                            committed = mark_media_delivery_commit_unknown(
+                                delivery_id,
+                                reason_code="IMAGE_DELIVERY_COMMIT_UNKNOWN",
+                            )
+                        except Exception:
+                            committed = None
+                        if not attempt.first_causal_failure:
+                            attempt.first_causal_failure = (
+                                "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+                            )
             turn = response.get("turn") if isinstance(response.get("turn"), dict) else {}
             if turn.get("id"):
-                attempt.turn_id = str(turn["id"])
+                response_turn_id = str(turn["id"])
+                if attempt.turn_id and attempt.turn_id != response_turn_id:
+                    raise AppServerError(
+                        "ERROR: the App Server returned a mismatched turn identity.",
+                        allow_fallback=False,
+                        category="TOOL_RESPONSE_ID_MISMATCH",
+                )
+                attempt.turn_id = response_turn_id
+                if on_attempt_registered is not None:
+                    on_attempt_registered()
+                pending_notifications = list(
+                    attempt.pending_turn_notifications
+                )
+                attempt.pending_turn_notifications.clear()
+                pending_requests = list(attempt.pending_server_requests)
+                attempt.pending_server_requests.clear()
+                for pending_request in pending_requests:
+                    self._handle_server_request(pending_request)
+                for pending_method, pending_params in pending_notifications:
+                    pending_turn_id = str(
+                        pending_params.get("turnId")
+                        or (
+                            (pending_params.get("turn") or {}).get("id")
+                            if isinstance(pending_params.get("turn"), dict)
+                            else ""
+                        )
+                        or ""
+                    )
+                    if pending_turn_id == response_turn_id:
+                        self._dispatch_notification(
+                            pending_method, pending_params,
+                        )
+            if staged_deliveries and attempt.model_successor_observed:
+                self._acknowledge_local_image_deliveries(attempt)
 
             deadline = time.monotonic() + timeout
             provider_error = None
@@ -2429,15 +4450,26 @@ class AppServerClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.cancel_turn(thread_id=thread_id, turn_id=attempt.turn_id)
+                    output_waiting = bool(
+                        attempt.deferred_done is not None
+                        and attempt.pending_agent_message_items
+                    )
                     raise AppServerError(
-                        "ERROR: the ChatGPT account turn timed out.",
+                        (
+                            "ERROR: OUTPUT_AVAILABILITY_TIMEOUT"
+                            if output_waiting else
+                            "ERROR: the ChatGPT account turn timed out."
+                        ),
                         output_started=attempt.output_started,
                         native_action=attempt.native_effect_started,
                         allow_fallback=(
                             not attempt.output_started
                             and not attempt.native_effect_started
                         ),
-                        category="turn_timeout",
+                        category=(
+                            "OUTPUT_AVAILABILITY_TIMEOUT"
+                            if output_waiting else "turn_timeout"
+                        ),
                     )
                 try:
                     kind, payload = attempt.events.get(timeout=min(remaining, 1.0))
@@ -2463,17 +4495,18 @@ class AppServerClient:
                         on_reasoning_summary(payload)
                 elif kind == "provider_error":
                     provider_error = str(payload)
-                elif kind == "native_approval" and isinstance(payload, dict):
-                    approval_started = time.monotonic()
-                    self._resolve_native_approval(attempt, payload)
-                    deadline += max(0.0, time.monotonic() - approval_started)
+                elif kind == "dynamic_tool_call" and isinstance(payload, dict):
+                    tool_started = time.monotonic()
+                    self._resolve_dynamic_tool_call(attempt, payload)
+                    deadline += max(0.0, time.monotonic() - tool_started)
                 elif kind == "error" and isinstance(payload, AppServerError):
                     payload.output_started = attempt.output_started
                     payload.native_action = (
                         payload.native_action or attempt.native_effect_started
                     )
                     payload.allow_fallback = bool(
-                        not attempt.output_started
+                        payload.category != "MODEL_IDENTITY_CHANGED"
+                        and not attempt.output_started
                         and not attempt.native_effect_started
                     )
                     raise payload
@@ -2510,17 +4543,6 @@ class AppServerClient:
                                     attempt, public_summary,
                                 )
                             )
-                    for dispatch in tuple(attempt.native_dispatches.values()):
-                        if dispatch.started and not dispatch.terminal:
-                            self._complete_native_item(attempt, {
-                                "id": dispatch.item_id,
-                                "type": (
-                                    "commandExecution"
-                                    if dispatch.tool_name == "run_command"
-                                    else "fileChange"
-                                ),
-                                "status": "failed",
-                            })
                     if attempt.native_action:
                         native_tool_call = attempt.native_tool_call
                         raise AppServerError(
@@ -2546,20 +4568,115 @@ class AppServerClient:
                             allow_fallback=False,
                             category="native_outcome_unknown",
                         )
+                    if (
+                        _selected_model_identity_changed(attempt)
+                        or (
+                            attempt.image_input_present
+                            and attempt.model_rerouted
+                        )
+                    ):
+                        raise AppServerError(
+                            "ERROR: MODEL_IDENTITY_CHANGED",
+                            output_started=attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category="MODEL_IDENTITY_CHANGED",
+                        )
                     if status != "completed":
                         cancelled = status == "interrupted"
+                        causal_failure = str(
+                            attempt.first_causal_failure
+                            or (
+                                "PROVIDER_CONTINUATION_REJECTED"
+                                if attempt.dynamic_response_sent else ""
+                            )
+                        )
                         raise AppServerError(
-                            "ERROR: the ChatGPT account turn was cancelled."
-                            if cancelled
-                            else "ERROR: the ChatGPT account turn failed before completion.",
+                            (
+                                "ERROR: " + causal_failure
+                                if causal_failure else
+                                "ERROR: the ChatGPT account turn was cancelled."
+                                if cancelled else
+                                "ERROR: the ChatGPT account turn failed before completion."
+                            ),
                             output_started=attempt.output_started,
                             native_action=attempt.native_effect_started,
                             allow_fallback=(
+                                False
+                                if causal_failure else
                                 not attempt.output_started
                                 and not cancelled
                                 and not attempt.native_effect_started
                             ),
-                            category=provider_error or str(payload.get("errorCategory") or status),
+                            category=(
+                                causal_failure
+                                or provider_error
+                                or str(payload.get("errorCategory") or status)
+                            ),
+                        )
+                    if attempt.visual_delivery_required_failed:
+                        raise AppServerError(
+                            "ERROR: IMAGE_DELIVERY_FAILED",
+                            output_started=attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category=(
+                                attempt.first_causal_failure
+                                or "IMAGE_DELIVERY_FAILED"
+                            ),
+                        )
+                    committed_visual = any(
+                        entry.get("delivery_state") in {
+                            "COMMITTED", "ACKNOWLEDGED",
+                        }
+                        for entry in attempt.visual_frame_calls.values()
+                    )
+                    unresolved_visual_delivery = any(
+                        entry.get("delivery_state") in {
+                            "PREPARED", "DISPATCHING", "COMMIT_UNKNOWN",
+                        }
+                        for entry in attempt.visual_frame_calls.values()
+                    )
+                    if unresolved_visual_delivery:
+                        raise AppServerError(
+                            "ERROR: IMAGE_DELIVERY_FAILED",
+                            output_started=attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category=(
+                                attempt.first_causal_failure
+                                or "IMAGE_DELIVERY_FAILED"
+                            ),
+                        )
+                    if attempt.local_image_delivery_ids:
+                        raise AppServerError(
+                            "ERROR: MODEL_OUTPUT_MISSING",
+                            output_started=attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category=(
+                                attempt.first_causal_failure
+                                or "MODEL_OUTPUT_MISSING"
+                            ),
+                        )
+                    if committed_visual and not attempt.post_visual_agent_items:
+                        raise AppServerError(
+                            "ERROR: MODEL_VISUAL_OUTPUT_MISSING",
+                            output_started=attempt.output_started,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category="MODEL_VISUAL_OUTPUT_MISSING",
+                        )
+                    if (
+                        not attempt.text_parts
+                        and attempt.visual_consumed_calls
+                    ):
+                        raise AppServerError(
+                            "ERROR: MODEL_VISUAL_OUTPUT_MISSING",
+                            output_started=False,
+                            native_action=attempt.native_effect_started,
+                            allow_fallback=False,
+                            category="MODEL_VISUAL_OUTPUT_MISSING",
                         )
                     result = TurnResult(
                         text="".join(attempt.text_parts),
@@ -2569,17 +4686,28 @@ class AppServerClient:
                         output_started=attempt.output_started,
                         capability_events=tuple(attempt.capability_events),
                         public_reasoning_summary=public_summary,
+                        response_items=tuple(
+                            dict(item)
+                            for item in attempt.response_item_diagnostics
+                        ),
+                        final_output_item_id=attempt.final_output_item_id,
+                        model_rerouted=attempt.model_rerouted,
+                        effective_model_id=attempt.effective_model_id,
                     )
                     return result
         except AppServerError as exc:
             exc.capability_events = tuple(attempt.capability_events)
             exc.native_turn_id = attempt.turn_id
             exc.public_reasoning_summary = self._public_reasoning_summary(attempt)
+            exc.response_items = tuple(
+                dict(item) for item in attempt.response_item_diagnostics
+            )
+            exc.final_output_item_id = attempt.final_output_item_id
             raise
         finally:
             with self._state_lock:
                 self._attempts.pop(thread_id, None)
-            for path in staged_images:
+            for path in [*staged_images, *attempt.bridged_visual_paths]:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
@@ -2588,11 +4716,12 @@ class AppServerClient:
     def _stage_turn_input(
         self,
         content: str | list[dict],
-    ) -> tuple[list[dict], list[Path]]:
+        attempt: _TurnAttempt,
+    ) -> tuple[list[dict], list[Path], list[str]]:
         """Convert verified inline images to native, turn-scoped localImage items."""
 
         if isinstance(content, str):
-            return [{"type": "text", "text": content}], []
+            return [{"type": "text", "text": content}], [], []
         if not isinstance(content, list):
             raise AppServerError(
                 "ERROR: the ChatGPT account turn input is invalid.",
@@ -2600,10 +4729,22 @@ class AppServerClient:
             )
 
         from osia.attachments import MAX_ATTACHMENT_BYTES
-        from osia.image_inputs import ImageInputError, decode_image_data_url
+        from osia.image_inputs import (
+            ImageInputError,
+            ImageSourceType,
+            MediaEnvelopeType,
+            content_with_images,
+            create_image_artifact,
+            decode_image_data_url,
+            fail_media_delivery,
+            prepare_media_delivery,
+            reference_owner_id,
+            resolve_image_reference,
+        )
 
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         staged: list[Path] = []
+        deliveries: list[str] = []
         items: list[dict] = []
         suffixes = {
             "image/gif": ".gif",
@@ -2633,14 +4774,80 @@ class AppServerClient:
                     )
                 except ImageInputError as exc:
                     raise AppServerError(str(exc), category="invalid_image") from exc
+                media_reference = part.get("_osia_media")
+                if not isinstance(media_reference, dict):
+                    artifact = create_image_artifact(
+                        decoded.data,
+                        decoded.mime,
+                        ImageSourceType.USER_UPLOAD,
+                    )
+                    media_reference = content_with_images(
+                        "",
+                        (artifact,),
+                        owner_id=attempt.conversation_id,
+                    )[0]
+                else:
+                    media_owner_id = reference_owner_id(
+                        media_reference,
+                        conversation_id=attempt.conversation_id,
+                        turn_id=attempt.osia_turn_id,
+                    )
+                    artifact = resolve_image_reference(
+                        media_reference,
+                        owner_id=media_owner_id,
+                    )
+                    if (
+                        decoded.mime != artifact.mime_type
+                        or decoded.content_hash != artifact.content_hash
+                        or (decoded.width, decoded.height)
+                        != (artifact.width, artifact.height)
+                    ):
+                        raise AppServerError(
+                            "ERROR: canonical image metadata does not match the "
+                            "provider payload.",
+                            category="IMAGE_REF_METADATA_MISMATCH",
+                        )
+                delivery = prepare_media_delivery(
+                    media_reference,
+                    owner_id=(
+                        reference_owner_id(
+                            media_reference,
+                            conversation_id=attempt.conversation_id,
+                            turn_id=attempt.osia_turn_id,
+                        )
+                    ),
+                    provider="chatgpt_account",
+                    model=attempt.model_id,
+                    conversation_id=attempt.conversation_id,
+                    request_id=(attempt.client_request_id or attempt.thread_id),
+                    turn_id=(attempt.osia_turn_id or attempt.thread_id),
+                    envelope_type=MediaEnvelopeType.LOCAL_IMAGE,
+                    transport_id=(
+                        f"generation:{self.generation}:"
+                        f"thread:{attempt.thread_id}"
+                    ),
+                )
+                if delivery.state in {"COMMITTED", "ACKNOWLEDGED"}:
+                    continue
+                if not delivery.send_authorized:
+                    raise AppServerError(
+                        "ERROR: an identical image delivery is already in "
+                        "progress or has an unknown commit outcome.",
+                        category=(
+                            "IMAGE_DELIVERY_COMMIT_UNKNOWN"
+                            if delivery.state == "COMMIT_UNKNOWN" else
+                            "IMAGE_DELIVERY_IN_PROGRESS"
+                        ),
+                    )
+                deliveries.append(delivery.delivery_id)
                 with tempfile.NamedTemporaryFile(
                     mode="wb",
                     prefix="vision-",
-                    suffix=suffixes[decoded.mime],
+                    suffix=suffixes[artifact.mime_type],
                     dir=self.temp_dir,
                     delete=False,
                 ) as handle:
-                    handle.write(decoded.data)
+                    handle.write(artifact.image_bytes)
                     path = Path(handle.name)
                 staged.append(path)
                 items.append({"type": "localImage", "path": str(path)})
@@ -2649,8 +4856,16 @@ class AppServerClient:
                     "ERROR: the ChatGPT account turn input is empty.",
                     category="empty_input",
                 )
-            return items, staged
+            return items, staged, deliveries
         except Exception:
+            for delivery_id in deliveries:
+                try:
+                    fail_media_delivery(
+                        delivery_id,
+                        reason_code="IMAGE_DELIVERY_FAILED",
+                    )
+                except Exception:
+                    pass
             for path in staged:
                 try:
                     path.unlink(missing_ok=True)
@@ -2673,8 +4888,22 @@ class AppServerClient:
 
     def shutdown(self) -> None:
         with self._start_lock:
+            self._stop_operational_log_redaction()
             process = self._process
             if process is None:
+                cleaned = self._drain_operational_image_logs(compact=True)
+                self._image_log_redaction_pending = not cleaned
+                if not cleaned:
+                    print("[ERROR] private App Server image log cleanup failed")
+                try:
+                    from osia.image_inputs import cleanup_owned_temp_images
+
+                    cleanup_owned_temp_images(
+                        directories=(self.temp_dir,),
+                        minimum_age_seconds=0,
+                    )
+                except Exception:
+                    pass
                 return
             with self._state_lock:
                 self._intentional_processes.add(id(process))
@@ -2694,3 +4923,16 @@ class AppServerClient:
                 except Exception:
                     pass
             self._fail_all("shutdown")
+            cleaned = self._drain_operational_image_logs(compact=True)
+            self._image_log_redaction_pending = not cleaned
+            if not cleaned:
+                print("[ERROR] private App Server image log cleanup failed")
+            try:
+                from osia.image_inputs import cleanup_owned_temp_images
+
+                cleanup_owned_temp_images(
+                    directories=(self.temp_dir,),
+                    minimum_age_seconds=0,
+                )
+            except Exception:
+                pass

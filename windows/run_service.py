@@ -35,11 +35,14 @@ import os
 import sys
 import time
 import socket
+import json
 import tempfile
 import subprocess
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 _SOURCE_ROOT = Path(__file__).resolve().parent.parent
 if (_SOURCE_ROOT / "osia").is_dir() and str(_SOURCE_ROOT) not in sys.path:
@@ -52,6 +55,7 @@ from osia.runtime import (
     cmdline_has_mode,
     is_frozen,
     resource_root,
+    source_tree_fingerprint,
 )
 from osia.utils.subprocess_policy import ProcessMode, process_kwargs
 
@@ -62,7 +66,7 @@ _RUN_SERVER = _REPO / "osia" / "server" / "run_server.py"
 _RESTART_SEC = 3.0      # delay before relaunching a crashed child (systemd RestartSec)
 _POLL_SEC = 2.0         # cadence for re-checking a live child / an external owner
 _STARTUP_GRACE = 2.0    # head start before re-checking a freshly launched child
-_HANG_TIMEOUT = 75.0    # max time a server child may be alive-but-not-listening on
+_HANG_TIMEOUT = 270.0   # bounded grace for canonical startup recovery before relaunch
                         # 8765 before we treat it as HUNG and relaunch (WOR-47)
 _CHILD_STOP_TIMEOUT = 8.0
 _LIFECYCLE_MUTEX_TIMEOUT = 5.0
@@ -352,7 +356,7 @@ def _other_owner_running(kind: str, exclude_pid: int) -> bool:
             raw_cmdline = proc.info.get("cmdline") or []
             cmdline = " ".join(raw_cmdline)
             if _cmdline_has_path(cmdline, _RUN_SERVER) or (
-                is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)
+                cmdline_has_mode(raw_cmdline, SERVER_MODE)
             ):
                 return True
         except Exception:
@@ -400,6 +404,39 @@ def _port_listening(port: int) -> bool:
         return False
 
 
+def _server_health_ready() -> bool:
+    """Accept only the health response for this supervisor's runtime source."""
+    try:
+        with urlopen("http://127.0.0.1:8765/health", timeout=1.5) as response:
+            if int(response.status) != 200:
+                return False
+            payload = json.loads(response.read(32_768).decode("utf-8"))
+    except (HTTPError, OSError, ValueError, TimeoutError):
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "healthy":
+        return False
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        return False
+    expected_mode = "frozen" if is_frozen() else "source"
+    expected_root = str(application_dir().resolve()).casefold()
+    matches = bool(
+        runtime.get("source_mode") == expected_mode
+        and str(runtime.get("checkout_root") or "").casefold() == expected_root
+        and str(runtime.get("source_fingerprint") or "")
+        == source_tree_fingerprint()
+    )
+    if expected_mode == "source":
+        expected_entrypoint = str(
+            (_REPO / "osia" / "server" / "server.py").resolve()
+        ).casefold()
+        matches = matches and (
+            str(runtime.get("entrypoint") or "").casefold()
+            == expected_entrypoint
+        )
+    return matches
+
+
 def _stop_child(child) -> None:
     """Stop and reap one supervised child without allowing a relaunch."""
     if child is None:
@@ -434,9 +471,9 @@ def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
                 rc = my_child.poll()
                 if rc is None:
                     if kind == "server" and not healthy:
-                        if _port_listening(8765):
+                        if _server_health_ready():
                             healthy = True
-                            _say(f"child pid={my_child.pid} is serving on 8765 "
+                            _say(f"child pid={my_child.pid} passed canonical /health on 8765 "
                                  f"({time.time() - launched_at:.1f}s after launch)")
                         elif time.time() - launched_at > _HANG_TIMEOUT:
                             _say(f"child pid={my_child.pid} alive but 8765 not "
@@ -464,6 +501,14 @@ def _supervise(kind: str, cmd, cwd: str, child_log, child_log_path: Path,
                 if not deferring:
                     _say(f"another {kind} owner already running (pid!={dead_pid}); "
                          f"deferring instead of racing for the port")
+                    deferring = True
+                if shutdown.wait(_POLL_SEC):
+                    break
+                continue
+            if kind == "server" and _port_listening(8765):
+                if not deferring:
+                    _say("port 8765 is occupied by an unattributed listener; "
+                         "deferring without starting or terminating it")
                     deferring = True
                 if shutdown.wait(_POLL_SEC):
                     break

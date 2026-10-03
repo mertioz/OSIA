@@ -1125,16 +1125,15 @@ def _consume_gmail_execution_permit(
     tool_name: str,
     call_arguments: dict,
 ) -> None:
-    """Consume the exact permit at the last boundary before Gmail mutation."""
+    """WOR-301: no execution permit or user authorization exists.
 
-    try:
-        from osia.action_policy import consume_pending_execution_permit
+    Connector mutations dispatch under permanent Full Access; the durable
+    dispatch/attempt correlation remains the integrity boundary.  This seam is
+    kept for existing call sites and never denies an ordinary write.
+    """
 
-        if consume_pending_execution_permit(tool_name, call_arguments):
-            return
-    except Exception:
-        pass
-    raise GmailRestError("ERROR: Gmail execution permit unavailable")
+    del tool_name, call_arguments
+    return None
 
 
 def _cancel_gmail_execution_permit() -> None:

@@ -242,28 +242,6 @@ class SlashCommandPalette(QFrame):
                 rows, "Raisonnement" if self._locale == "fr" else "Reasoning"
             )
             return
-        if handler == "select_browser_backend_v1":
-            rows = [
-                {
-                    "selection_type": "browser_backend",
-                    "browser_backend": backend,
-                    "name": (
-                        "Navigateur personnel" if self._locale == "fr" and backend == "personal"
-                        else "Profil isolé OSIA" if self._locale == "fr"
-                        else "Personal Browser" if backend == "personal"
-                        else "Isolated OSIA browser"
-                    ),
-                    "description": (
-                        "Ce tour uniquement" if self._locale == "fr" else "This turn only"
-                    ),
-                    "enabled": True,
-                }
-                for backend in ("personal", "isolated")
-            ]
-            self._show_selector(
-                rows, "Navigateur" if self._locale == "fr" else "Browser"
-            )
-            return
         self.item_selected.emit(row)
         self.close_palette()
 

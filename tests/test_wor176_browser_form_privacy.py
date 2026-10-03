@@ -198,24 +198,6 @@ def test_wor175_artifact_tail_maps_field_by_field_without_persistence(
         document_artifacts.set_store_for_testing(previous)
 
 
-def test_failed_or_command_accepted_only_results_never_count_as_progress():
-    accepted_only = json.dumps({
-        "ok": True,
-        "field_ref": FIELD_REF,
-        "operation": "fill",
-        "verified": False,
-        "changed": True,
-        "state_token": "b" * 32,
-    })
-    failed = 'ERROR: {"category":"postcondition_mismatch","ok":false}'
-    assert agent_module._semantic_form_progress_fingerprint(
-        "fill_form_field", accepted_only,
-    ) is None
-    assert agent_module._semantic_form_progress_fingerprint(
-        "fill_form_field", failed,
-    ) is None
-
-
 def test_safe_metadata_shape_contains_no_value_or_screenshot_payload():
     result = json.loads(_safe_fill_result())
     assert result["verified"] is True

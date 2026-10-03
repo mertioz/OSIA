@@ -355,6 +355,60 @@ def test_every_category_resets_only_right_detail_without_recreation(settings_pan
         assert window.geometry() == geometry
 
 
+def test_short_category_uses_its_own_content_bounds(settings_panel, qt_app):
+    panel = settings_panel
+    long_row = next(
+        row for row, (key, _sections) in enumerate(panel._settings_pages)
+        if key == "settings.cat.models"
+    )
+    short_row = next(
+        row for row, (key, _sections) in enumerate(panel._settings_pages)
+        if key == "settings.cat.wake"
+    )
+    bar = panel._settings_scroll.verticalScrollBar()
+
+    panel._settings_nav.setCurrentRow(long_row)
+    qt_app.processEvents()
+    assert bar.maximum() > 0
+    bar.setValue(bar.maximum())
+
+    panel._settings_nav.setCurrentRow(short_row)
+    qt_app.processEvents()
+
+    assert bar.value() == 0
+    expected_scroll_range = max(
+        0,
+        panel._settings_stack.height()
+        - panel._settings_scroll.viewport().height(),
+    )
+    assert bar.maximum() == expected_scroll_range
+    assert panel._settings_stack.sizeHint() == (
+        panel._settings_stack.currentWidget().sizeHint()
+    )
+
+
+def test_late_retry_restore_does_not_reopen_a_previous_category(settings_panel):
+    panel = settings_panel
+    old_row = next(
+        row for row, (key, _sections) in enumerate(panel._settings_pages)
+        if key == "settings.cat.models"
+    )
+    current_row = next(
+        row for row, (key, _sections) in enumerate(panel._settings_pages)
+        if key == "settings.cat.general"
+    )
+    panel._settings_nav.setCurrentRow(old_row)
+    panel._settings_scroll.verticalScrollBar().setValue(24)
+    panel._chatgpt_retry_view_state = (old_row, 24)
+
+    panel._settings_nav.setCurrentRow(current_row)
+    panel._restore_chatgpt_retry_view(clear=True)
+
+    assert panel._settings_nav.currentRow() == current_row
+    assert panel._settings_scroll.verticalScrollBar().value() == 0
+    assert panel._chatgpt_retry_view_state is None
+
+
 def test_keyboard_navigation_and_focus_keep_native_pane_ownership(
     settings_panel, qt_app,
 ):

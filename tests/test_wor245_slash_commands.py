@@ -10,7 +10,6 @@ from osia.slash_commands import (
     ModelOverride,
     SlashDirectiveError,
     SlashTurnDirectivesV1,
-    consume_browser_selector,
     consume_selected_alias,
     consume_palette_prefix,
     escaped_literal_text,
@@ -19,7 +18,6 @@ from osia.slash_commands import (
     informational_payload,
     safe_availability_overlay,
     slash_palette_query,
-    tool_allowed_for_directives,
     tool_is_current_web_evidence,
     apply_to_agent,
     validate_live,
@@ -29,46 +27,12 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "reasoning", "conversation", "browser", "tools", "status", "help",
+        "web", "model", "reasoning", "conversation", "tools", "status", "help",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
     mobile = Path("../osia-mobile/assets/slash_commands/catalog.v1.json").read_bytes()
     assert pc == mobile
-
-
-def test_browser_selector_is_typed_turn_metadata_without_privilege_effect():
-    cleaned, backend = consume_browser_selector(
-        "  /browser personal vérifie cette page"
-    )
-    assert (cleaned, backend) == ("  vérifie cette page", "personal")
-    assert consume_browser_selector("utilise ma session navigateur") == (
-        "utilise ma session navigateur", None,
-    )
-    directives = SlashTurnDirectivesV1.from_wire({
-        "schema_version": 1,
-        "connector_hints": [],
-        "capability_requirements": {"current_web": False},
-        "conversation_refs": [],
-        "browser_backend_override": "personal",
-    })
-    assert directives.browser_backend_override == "personal"
-    assert SlashTurnDirectivesV1.from_wire(
-        directives.to_wire()
-    ).canonical_json() == directives.canonical_json()
-    with pytest.raises(SlashDirectiveError) as invalid:
-        SlashTurnDirectivesV1.from_wire({
-            **directives.to_wire(), "browser_backend_override": "automatic",
-        })
-    assert invalid.value.code == "unsupported_browser_backend"
-
-    class Agent:
-        permission_mode = "Standard"
-
-    agent = Agent()
-    apply_to_agent(agent, directives)
-    assert agent.permission_mode == "Standard"
-    assert agent._browser_backend_override_for_turn == "personal"
 
 
 @pytest.mark.parametrize(
@@ -227,13 +191,12 @@ def test_modifier_requires_body_or_attachment_and_connector_is_structural():
         directives.require_sendable(body="", has_attachment=False)
     assert empty.value.code == "directive_body_required"
     directives.require_sendable(body="", has_attachment=True)
-    assert tool_allowed_for_directives("mcp__linear__get_issue", directives)
-    assert not tool_allowed_for_directives("mcp__notion__search", directives)
-    assert not tool_allowed_for_directives("gmail_search", directives)
-    assert tool_allowed_for_directives("search_web", directives)
+    # WOR-301: connector hints never scope visibility or dispatch.
+    from osia import slash_commands as _slash_module
+    assert not hasattr(_slash_module, "tool_allowed_for_directives")
 
 
-def test_connector_inventory_renders_only_the_selected_runtime(monkeypatch):
+def test_connector_inventory_always_renders_every_connected_runtime(monkeypatch):
     from osia.mcp_client import registry
 
     schema = {"type": "object", "properties": {}}
@@ -247,9 +210,11 @@ def test_connector_inventory_renders_only_the_selected_runtime(monkeypatch):
             "inputSchema": schema,
         },
     })
-    block = registry.mcp_tool_prompt_block(server_id="linear")
+    # WOR-300/WOR-301: the model-visible inventory is complete and the
+    # slash connector hint never scopes visibility or dispatch.
+    block = registry.mcp_tool_prompt_block()
     assert "mcp__linear__search" in block
-    assert "mcp__notion__search" not in block
+    assert "mcp__notion__search" in block
 
 
 def test_exact_model_application_uses_model_then_provider_and_is_turn_scoped():

@@ -133,15 +133,27 @@ _register(
 _register(
     MODEL_REASONING_CAPABILITIES,
     "deepseek",
-    ("deepseek-v4-pro", "deepseek-v4-flash"),
+    ("deepseek-flash",),
     _options(
         _AUTO_OPTION,
-        _option("off", "Off", {"extra_body": {"thinking": {"type": "disabled"}}}),
+        _option("off", "Non-thinking", {"extra_body": {"thinking": {"type": "disabled"}}}, label_key=""),
+        _option("low", "Low", _deepseek_kwargs("low")),
         _option("high", "High", _deepseek_kwargs("high")),
         _option("max", "Max", _deepseek_kwargs("max")),
     ),
     "https://api-docs.deepseek.com/guides/thinking_mode",
 )
+MODEL_REASONING_CAPABILITIES[("deepseek", "deepseek-flash")].update({
+    "provider_default": "high",
+    # The model encoder supports numbers; hosted Chat Completions documents
+    # named presets only. Do not claim numeric API support or approximate it.
+    "native_numeric_effort": {
+        "minimum": 1, "maximum": 100,
+        "presets": {"low": 50, "high": 75, "max": 100},
+        "api_exposed": False,
+        "evidence": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/encoding/README.md",
+    },
+})
 _register(
     MODEL_REASONING_CAPABILITIES,
     "google",
@@ -298,7 +310,8 @@ def _account_capability(model_id: str) -> dict | None:
 
     options = [_AUTO_OPTION]
     for effort in entry.get("supportedReasoningEfforts") or []:
-        effort_id = normalize_level(effort.get("id"))
+        provider_effort = str(effort.get("id") or "").strip().lower()
+        effort_id = normalize_level(provider_effort)
         if effort_id == "auto":
             continue
         label = "Extra high" if effort_id == "xhigh" else effort_id.title()
@@ -306,7 +319,7 @@ def _account_capability(model_id: str) -> dict | None:
             _option(
                 effort_id,
                 label,
-                {"effort": effort_id},
+                {"effort": provider_effort},
                 # Ultra has the same spelling in supported UI languages; an
                 # empty key deliberately uses the sanitized runtime label.
                 label_key="" if effort_id == "ultra" else None,
@@ -387,9 +400,28 @@ def _resolve_selection(provider, model, settings=None) -> dict:
     capability = get_reasoning_capability(provider_id, model_id)
     options = list(capability.get("options") or []) if capability else []
     option_ids = _known_option_ids(options)
+    if provider_id == "chatgpt_account" and requested != "auto" and requested not in option_ids:
+        # The Account catalogue is process-local. A saved explicit choice must
+        # be checked against model/list before this turn can pin its reasoning.
+        try:
+            from osia.chatgpt_account.provider import get_account_provider
+
+            get_account_provider().list_models(force=True)
+        except Exception as exc:
+            raise ValueError(
+                "ERROR: ChatGPT Account reasoning support could not be verified."
+            ) from exc
+        capability = get_reasoning_capability(provider_id, model_id)
+        options = list(capability.get("options") or []) if capability else []
+        option_ids = _known_option_ids(options)
+        if requested not in option_ids:
+            raise ValueError(
+                "ERROR: the selected ChatGPT Account model does not support "
+                f"reasoning level {requested!r}."
+            )
     accepted = requested == "auto" or requested in option_ids
     effective = requested if accepted else "auto"
-    if not accepted and settings is None:
+    if not accepted and settings is None and provider_id != "deepseek":
         try:
             _migrate_invalid_to_default(cfg, provider_id, model_id)
         except Exception:
@@ -469,6 +501,8 @@ def build_reasoning_request(provider, model, settings=None) -> dict:
     prompts, responses, keys, hidden reasoning, or chain-of-thought content.
     """
     resolved = _resolve_selection(provider, model, settings)
+    if resolved["provider_id"] == "deepseek" and resolved["mapping_state"] == "rejected":
+        raise ValueError("ERROR: unsupported DeepSeek reasoning mode; choose Default, Non-thinking, Low, High or Max.")
     kwargs = (
         _option_kwargs(resolved["options"], resolved["effective"])
         if resolved["effective"] != "auto"

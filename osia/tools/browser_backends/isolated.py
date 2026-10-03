@@ -23,25 +23,12 @@ _OPERATIONS = frozenset({
 })
 
 
-def _personal_reference(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        session = value.get("browser_session_id")
-        if isinstance(session, str) and session.startswith("personal_"):
-            return True
-        return any(_personal_reference(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_personal_reference(item) for item in value)
-    return False
-
-
 class IsolatedBrowserBackend(BrowserBackend):
     name = "isolated"
 
     def invoke(self, operation: str, arguments: Mapping[str, Any]) -> Any:
         if operation not in _OPERATIONS:
             return _error("capability_unavailable")
-        if _personal_reference(arguments):
-            return _error("cross_backend_reference")
         from osia.tools import browser
 
         function = getattr(browser, operation, None)

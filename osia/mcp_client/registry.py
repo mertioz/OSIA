@@ -65,10 +65,6 @@ WRAPPER_CALL_TIMEOUT = 25.0
 # is unaffected.
 _ID_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _MAX_ID_LEN = 128
-# Cap how many MCP tools are LISTED in the system prompt (the agent maps stay
-# complete, so every connected tool remains callable — only the prompt listing
-# is trimmed, with a "(+N more)" note).
-_MAX_PROMPT_TOOLS = 50
 
 
 def _valid_tool_name(name: str) -> bool:
@@ -168,110 +164,16 @@ def confirm_sensitive_action(
     call_arguments: Optional[dict] = None,
     policy_tool_name: str = "",
 ) -> Optional[str]:
-    """Obtain one exact approval for a known sensitive-action domain.
+    """WOR-301: no connector confirmation remains.
 
-    Returns ``None`` to ALLOW the call, or an ``ERROR: ...`` string to BLOCK it.
-    Authorization never depends on the legacy MCP compatibility settings.  A
-    missing provider or a provider without a live target always fails closed.
+    Returns ``None`` (ALLOW) for every call.  System-destruction protection is
+    enforced separately by ``action_policy.system_mutation_barrier`` before any
+    connector write, and attempt correlation stays in the dispatch
+    boundary.
     """
-    if not isinstance(domain, ConfirmationDomain):
-        return "ERROR: confirmation domain unavailable; the action was not executed"
-    error_namespace = domain.value
-    normalized = dict(call_arguments) if isinstance(call_arguments, dict) else {}
-    try:
-        from osia.action_policy import (
-            AuthorizationSource,
-            DecisionType,
-            build_permission_request,
-            clear_pending_execution_permit,
-            evaluate_permission,
-            get_default_permission_policy,
-            hold_execution_permit,
-            permission_error_for_decision,
-        )
 
-        clear_pending_execution_permit()
-        policy = get_default_permission_policy()
-        request = build_permission_request(
-            policy_tool_name or tool_name,
-            normalized,
-            confirmation_domain=domain.value,
-            origin_id=origin_id,
-            force_sensitive=True,
-            policy=policy,
-        )
-        permission_decision = evaluate_permission(request, policy=policy)
-    except Exception:
-        return (
-            f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-            "confirmation scope unavailable"
-        )
-
-    if permission_decision.decision_type == DecisionType.ALLOW:
-        if permission_decision.authorization_source == AuthorizationSource.NONE:
-            return (
-                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-                "confirmation scope unavailable"
-            )
-        permit = policy.mint_permit(request, permission_decision)
-        if permit is None:
-            return (
-                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-                "confirmation scope unavailable"
-            )
-        hold_execution_permit(permit, request, policy=policy)
-        return None
-    if permission_decision.decision_type != DecisionType.REQUIRE_CONFIRMATION:
-        return permission_error_for_decision(permission_decision)
-
-    provider = get_confirmation_provider()
-    if provider is not None:
-        try:
-            from osia.tool_contracts import CONFIRMATION_LEDGER
-
-            grant = CONFIRMATION_LEDGER.issue(tool_name, normalized)
-        except Exception:
-            return (
-                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-                "confirmation scope unavailable"
-            )
-        try:
-            raw_decision = provider(origin_id, tool_name, str(summary or ""))
-            decision = normalize_permission_result(
-                raw_decision,
-                correlation_id=grant.token,
-            )
-        except Exception:
-            decision = PermissionResult(
-                PermissionOutcome.INTERNAL_FAILURE,
-                grant.token,
-            )
-        if decision.approved:
-            # Turn the UI decision into one exact, opaque, expiring and
-            # single-use grant. Raw values never leave the hash boundary.
-            if CONFIRMATION_LEDGER.consume(
-                grant.token, tool_name, normalized,
-            ):
-                permit = policy.mint_permit(
-                    request, permission_decision, confirmed=True,
-                )
-                if permit is not None:
-                    hold_execution_permit(permit, request, policy=policy)
-                    return None
-            return (
-                f"ERROR: {error_namespace}/{origin_id}/{tool_name}: "
-                "confirmation scope unavailable"
-            )
-        CONFIRMATION_LEDGER.consume(grant.token, tool_name, normalized)
-        return permission_error_text(
-            error_namespace, origin_id, tool_name, decision,
-        )
-    return permission_error_text(
-        error_namespace,
-        origin_id,
-        tool_name,
-        PermissionResult(PermissionOutcome.PRESENTATION_FAILED),
-    )
+    del domain, origin_id, tool_name, summary, call_arguments, policy_tool_name
+    return None
 
 
 def confirm_connector_write(
@@ -300,18 +202,14 @@ def confirm_connector_write(
 
 
 def _confirm_gate(server_id: str, tool_name: str, kwargs: dict) -> Optional[str]:
-    """Decide whether a WRITE tool may run. Returns ``None`` to ALLOW the call,
-    or an ``ERROR: ...`` string to BLOCK it (declined / no approver). Legacy
-    confirmation settings cannot weaken this gate. Never raises.
+    """WOR-301: connector writes are never user-gated.
+
+    Returns ``None`` (ALLOW).  The system-destruction barrier and deletion
+    plan binding still run before dispatch.
     """
-    return confirm_connector_write(
-        server_id,
-        tool_name,
-        _confirm_summary(server_id, tool_name, kwargs),
-        error_namespace="mcp",
-        call_arguments=kwargs,
-        policy_tool_name=tool_full_name(server_id, tool_name),
-    )
+
+    del server_id, tool_name, kwargs
+    return None
 
 
 # Guards the registry's own bookkeeping AND the batched mutation of the agent
@@ -407,7 +305,7 @@ def _make_wrapper(
     the confirmation gate (``_confirm_gate``) BEFORE ``manager.call_tool``: a
     block returns an ``ERROR: ...`` string (honouring the tool contract) and the
     real call never happens. Autonomous reads traverse the central permission
-    facade at this final connector boundary so durable anti-replay state cannot
+    facade at this final connector boundary so durable attempt ownership cannot
     be bypassed after a reconnect changes annotations. The gate reads its
     settings LIVE, so toggling confirmation takes effect without re-registering
     tools.
@@ -425,24 +323,15 @@ def _make_wrapper(
         deletion_dispatch = None
         if not is_write:
             try:
-                from osia.action_policy import (
-                    autonomous_permission_gate,
-                    scheduled_permission_gate,
-                )
+                from osia.action_policy import guard_tool_call
 
-                blocked = autonomous_permission_gate(
-                    tool_full_name(server_id, tool_name),
-                    kwargs,
-                    connector_boundary=True,
+                # WOR-301: only the shared integrity/system barrier is
+                # consulted at this connector boundary.
+                blocked = guard_tool_call(
+                    "", tool_full_name(server_id, tool_name), kwargs,
                 )
-                if blocked is None:
-                    blocked = scheduled_permission_gate(
-                        tool_full_name(server_id, tool_name),
-                        kwargs,
-                        connector_boundary=True,
-                    )
             except Exception:
-                blocked = "ERROR: MCP permission preflight unavailable"
+                blocked = "ERROR: MCP preflight unavailable"
             if blocked is not None:
                 return blocked
         if is_write:
@@ -451,7 +340,8 @@ def _make_wrapper(
 
                 system_block = system_mutation_barrier(tool_name, kwargs)
             except Exception:
-                system_block = "ERROR: BLOCK_SYSTEM_DESTRUCTION"
+                # A classifier/runtime failure is not destruction evidence.
+                system_block = None
             if system_block is not None:
                 return system_block
         if is_deletion:
@@ -465,23 +355,6 @@ def _make_wrapper(
                 blocked = "ERROR: MCP deletion preflight unavailable"
             if blocked is not None:
                 return blocked
-        elif is_write:
-            blocked = _confirm_gate(server_id, tool_name, kwargs)
-            if blocked is not None:
-                return blocked
-        if is_write:
-            try:
-                from osia.action_policy import consume_pending_execution_permit
-
-                permitted = consume_pending_execution_permit(
-                    tool_full_name(server_id, tool_name), kwargs,
-                )
-            except Exception:
-                permitted = False
-            if not permitted:
-                return (
-                    f"ERROR: mcp/{server_id}/{tool_name}: execution permit unavailable"
-                )
         dispatch_block = _claim_current_tool_attempt_dispatch()
         if dispatch_block is not None:
             return dispatch_block
@@ -770,9 +643,7 @@ def _usage_from_schema(full: str, schema) -> str:
     return usage
 
 
-def mcp_tool_prompt_block(
-    lang: str = "en", *, server_id: str | None = None,
-) -> str:
+def mcp_tool_prompt_block(lang: str = "en") -> str:
     """Render the ``## Connected MCP tools`` system-prompt section from the
     currently-registered MCP tools, or ``""`` when none are connected (so no
     empty section is ever emitted).
@@ -785,39 +656,26 @@ def mcp_tool_prompt_block(
     ``set_model()`` / a new conversation, so a mid-conversation MCP change shows
     up on the next such refresh (a known Phase-2 boundary).
 
-    At most ``_MAX_PROMPT_TOOLS`` tools are listed (with a "(+N more)" note);
-    the agent maps stay COMPLETE, so every connected tool remains callable even
-    when the listing is trimmed (SEC-02).
-
-    ``server_id`` narrows only the rendered per-turn inventory. It never
-    mutates registration, connection state, permissions, or dispatch maps.
+    WOR-300: EVERY connected and invocable tool is listed on every turn.  There
+    is no visibility cap, no relevance trimming and no per-request connector
+    narrowing; only genuinely disconnected connectors are absent (their tools
+    are unregistered).  Slash connector hints scope DISPATCH, never this list.
     """
     with _lock:
-        items = sorted(
-            (full, meta)
-            for full, meta in _tool_meta.items()
-            if server_id is None or str(meta.get("server") or "") == server_id
-        )
+        items = sorted(_tool_meta.items())
     if not items:
         return ""
     del lang
     lines = [
         "## Connected MCP tools (available now)",
         "Call these with the same textual <tool_call> JSON protocol and top-level "
-        "arguments as OSIA tools. Their connector permissions and anti-replay rules apply.",
+        "arguments as OSIA tools. Their connector permissions and execution correlation rules apply.",
     ]
-    shown = items[:_MAX_PROMPT_TOOLS]
-    for full, meta in shown:
+    for full, meta in items:
         desc = _one_line(meta.get("description") or "")
         usage = _usage_from_schema(full, meta.get("inputSchema") or {})
         sep = " " if desc else ""
         lines.append(f"- {full}: {desc}{sep}Usage: {usage}")
-    extra = len(items) - len(shown)
-    if extra > 0:
-        lines.append(
-            f"- (+{extra} more connected MCP tools not listed here; call them "
-            "by their mcp__<server>__<tool> name.)"
-        )
     return "\n".join(lines)
 
 

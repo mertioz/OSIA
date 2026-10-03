@@ -634,16 +634,16 @@ _RELEASES = (
                 ),
             ),
             ReleaseSection(
-                "Autonomous",
-                "Autonomous",
+                "Unified Chat execution",
+                "Exécution Unified Chat",
                 (
-                    "The Autonomous model picker shows only providers and models actually configured on the PC, including compatible ChatGPT Account models.",
+                    "The Chat model picker shows only providers and models actually configured on the PC, including compatible ChatGPT Account models.",
                     "Plans and runs preserve typed failure diagnostics, provider identity, progress, resumable state, and safe document artifacts.",
                     "Scoped authorization limits what each run may do and keeps destructive or out-of-scope work behind the canonical permission boundary.",
                     "Resource checks and progress-aware loop detection stop unsafe or genuinely stalled work without suppressing legitimate long-running progress.",
                 ),
                 (
-                    "Le sélecteur de modèles Autonomous n’affiche que les fournisseurs et modèles réellement configurés sur le PC, dont les modèles compatibles Compte ChatGPT.",
+                    "Le sélecteur de modèles Chat n’affiche que les fournisseurs et modèles réellement configurés sur le PC, dont les modèles compatibles Compte ChatGPT.",
                     "Plans et exécutions conservent diagnostics typés, identité du fournisseur, progression, état reprenable et artefacts documentaires sûrs.",
                     "L’autorisation limitée encadre les actions de chaque exécution et maintient les travaux destructeurs ou hors périmètre derrière la politique canonique.",
                     "Les contrôles de ressources et la détection de boucle sensible à la progression arrêtent les travaux dangereux ou réellement bloqués sans masquer les progrès légitimes.",

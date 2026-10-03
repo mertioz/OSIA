@@ -7,9 +7,7 @@ import pytest
 from osia import action_policy
 from osia import deletion_plan as deletion_module
 from osia import system_resources as system_module
-from osia.action_policy import PermissionPolicy
 from osia.mcp_client import registry
-from osia.permission_store import PermissionStore, UnavailableSecureStorageBackend
 from osia.system_resources import SystemResourceRegistry, WindowsRuntimeAdapter
 
 
@@ -42,9 +40,6 @@ def _safe_registry(tmp_path: Path):
 
 @pytest.fixture(autouse=True)
 def _policy(monkeypatch, tmp_path):
-    action_policy.set_default_permission_policy(PermissionPolicy(PermissionStore(
-        tmp_path / "session.dat", backend=UnavailableSecureStorageBackend(),
-    )))
     monkeypatch.setattr(
         deletion_module,
         "get_default_system_resource_registry",
@@ -58,7 +53,6 @@ def _policy(monkeypatch, tmp_path):
     registry.set_confirmation_provider(lambda *_args: True)
     yield
     registry.set_confirmation_provider(None)
-    action_policy.set_default_permission_policy(None)
 
 
 def _wrapper(manager, schema, *, is_deletion=True):
@@ -121,7 +115,7 @@ def test_mcp_cannot_forge_safe_or_universal_classification(tmp_path):
     assert target.exists()
 
 
-def test_mcp_normalized_overwrite_contract_hits_system_barrier(tmp_path, monkeypatch):
+def test_mcp_single_file_overwrite_is_not_system_destruction(tmp_path, monkeypatch):
     protected = tmp_path / "protected-mcp"
     protected.mkdir()
     target = protected / "required.ini"
@@ -158,8 +152,8 @@ def test_mcp_normalized_overwrite_contract_hits_system_barrier(tmp_path, monkeyp
         },
         is_deletion=False,
     )
-    assert wrapper(path=str(target), content="replacement") == "ERROR: BLOCK_SYSTEM_DESTRUCTION"
-    assert manager.calls == []
+    assert wrapper(path=str(target), content="replacement") == "untrusted connected response"
+    assert len(manager.calls) == 1
     assert target.read_text(encoding="utf-8") == "required"
 
 

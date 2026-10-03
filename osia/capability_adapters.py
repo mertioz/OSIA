@@ -36,7 +36,6 @@ class CapabilityFamily(str, Enum):
     DIRECT_API = "direct_api"
     DEEP_LINK = "deep_link"
     BROWSER_DOM = "browser_dom"
-    PERSONAL_BROWSER = "personal_browser"
     DESKTOP_UIA = "desktop_uia"
     DESKTOP_KEYBOARD = "desktop_keyboard"
     VISION_OBSERVATION = "vision_observation"
@@ -73,7 +72,6 @@ class ModalityRequirement(str, Enum):
     NONE = "none"
     TEXT = "text"
     BROWSER_DOM = "browser_dom"
-    PERSONAL_BROWSER_LIVE_AUTHORITY = "personal_browser_live_authority"
     ACCESSIBILITY = "accessibility"
     KEYBOARD_WITH_OBSERVABLE_FOCUS = "keyboard_with_observable_focus"
     VISION = "vision"
@@ -343,14 +341,16 @@ def _tool_verifier_strength(spec: ToolSpec) -> str:
 
 
 def _tool_surfaces(spec: ToolSpec) -> tuple[str, ...]:
-    surfaces = []
-    if spec.chat_eligible:
-        surfaces.append("chat")
-    if spec.autonomous_eligible:
-        surfaces.append("autonomous")
-    if spec.scheduled_eligible:
-        surfaces.append("scheduled")
-    return tuple(surfaces) or (UNKNOWN_METADATA,)
+    """Surfaces where the capability is usable (WOR-301).
+
+    WOR-303: there is one canonical Chat execution surface plus the Scheduled
+    temporal trigger.  Every capability is usable from Chat (OSIA is
+    permanently full-access), so historical eligibility flags are never
+    authoritative for dispatch.
+    """
+
+    del spec
+    return ("chat", "scheduled")
 
 
 def _runtime_value(value: object) -> str:
@@ -726,19 +726,13 @@ def adapt_browser_capability(
     spec: ToolSpec,
     *,
     state_ref: object | None = None,
-    personal_browser: bool = False,
     runtime_availability: RuntimeAvailability | str = RuntimeAvailability.UNKNOWN,
 ) -> AdaptiveCapabilityDescriptor:
     """Build browser metadata without launching or binding a browser target."""
 
-    family = (
-        CapabilityFamily.PERSONAL_BROWSER
-        if personal_browser
-        else CapabilityFamily.BROWSER_DOM
-    )
     base = adapt_tool_spec(
         spec,
-        family=family,
+        family=CapabilityFamily.BROWSER_DOM,
         runtime_availability=runtime_availability,
         source_authority="osia.tool_contracts.ToolSpec",
     )
@@ -754,17 +748,6 @@ def adapt_browser_capability(
             "state_ref_revalidation_required", True, authority
         ))
     modalities = [ModalityRequirement.BROWSER_DOM.value]
-    live_authority = UNKNOWN_METADATA
-    if personal_browser:
-        modalities.append(
-            ModalityRequirement.PERSONAL_BROWSER_LIVE_AUTHORITY.value
-        )
-        live_authority = "personal_browser_live_turn_binding"
-        constraints.append(_constraint(
-            "exact_tab_session_eligibility_external", True,
-            "osia.personal_browser.broker.PersonalBrowserBroker",
-        ))
-        authority += "+osia.personal_browser.broker(live eligibility only)"
     descriptor = replace(
         base,
         supported_surfaces=("browser",),
@@ -776,7 +759,6 @@ def adapt_browser_capability(
         ),
         deterministic_constraints=tuple(constraints),
         source_authority=authority,
-        live_eligibility_authority=live_authority,
     )
     return validate_capability_descriptor(descriptor)
 
@@ -945,11 +927,11 @@ def adapt_model_provider_capabilities(
     metadata = model_metadata if isinstance(model_metadata, Mapping) else None
     source_parts: list[str] = []
     if metadata is None and provider_id != "chatgpt_account":
-        from osia.models import HARDCODED_MODELS, VISION_MODELS
+        from osia.models import HARDCODED_MODELS
 
         metadata = next(
             (
-                item for item in (*HARDCODED_MODELS, *VISION_MODELS)
+                item for item in HARDCODED_MODELS
                 if str(item.get("provider") or "").casefold() == provider_id
                 and str(item.get("id") or "") == exact_model_id
             ),
@@ -965,29 +947,22 @@ def adapt_model_provider_capabilities(
         else:
             source_parts.append("explicit authoritative model metadata snapshot")
 
-    vision: bool | None = None
-    reasoning_controls: tuple[str, ...] = ()
-    if metadata is not None:
-        if isinstance(metadata.get("vision"), bool):
-            vision = bool(metadata["vision"])
-        elif isinstance(metadata.get("inputModalities"), (list, tuple)):
-            modalities = {
-                str(item).casefold() for item in metadata.get("inputModalities") or ()
-            }
-            vision = "image" in modalities
-        efforts = metadata.get("supportedReasoningEfforts")
-        if isinstance(efforts, (list, tuple)):
-            reasoning_controls = tuple(
-                _clean(
-                    item.get("id") if isinstance(item, Mapping) else item,
-                    fallback="",
-                )
-                for item in efforts
-                if _clean(
-                    item.get("id") if isinstance(item, Mapping) else item,
-                    fallback="",
-                )
-            )
+    from osia.model_capabilities import effective_route_capabilities
+
+    effective = effective_route_capabilities(
+        provider_id,
+        exact_model_id,
+        model_metadata=metadata,
+    )
+    vision = effective.vision_supported
+    reasoning_controls = effective.reasoning_controls
+    if effective.metadata_known and metadata is None:
+        source_parts.append(effective.source_authority)
+        metadata = {
+            "id": effective.model_id,
+            "provider": effective.provider_id,
+            "inputModalities": list(effective.input_modalities),
+        }
 
     if not reasoning_controls and provider_id != "chatgpt_account":
         from osia.reasoning import MODEL_REASONING_CAPABILITIES

@@ -87,9 +87,10 @@ HARDCODED_MODELS = [
     {"id": "gpt-4.1",             "label": "GPT-4.1",             "provider": "openai",    "tier": "mid",   "vision": True},
     {"id": "gpt-4.1-mini",        "label": "GPT-4.1 Mini",        "provider": "openai",    "tier": "light", "vision": True},
     {"id": "gpt-4.1-nano",        "label": "GPT-4.1 Nano",        "provider": "openai",    "tier": "light", "vision": True},
-    # DeepSeek — text-only, no vision.
-    {"id": "deepseek-v4-pro",     "label": "DeepSeek V4 Pro",     "provider": "deepseek",  "tier": "best",  "vision": False},
-    {"id": "deepseek-v4-flash",   "label": "DeepSeek V4 Flash",   "provider": "deepseek",  "tier": "light", "vision": False},
+    # DeepSeek — one native text/image model (official API, 2026-09-10).
+    {"id": "deepseek-flash", "label": "DeepSeek V4.1 Flash", "provider": "deepseek",
+     "tier": "light", "vision": True, "inputModalities": ["text", "image"],
+     "tool_calls": True, "supportedReasoningEfforts": ["auto", "off", "low", "high", "max"]},
     # Google — all Gemini models are multimodal.
     {"id": "gemini-3.5-flash",        "label": "Gemini 3.5 Flash",      "provider": "google", "tier": "mid",   "vision": True},
     {"id": "gemini-3.1-pro-preview",  "label": "Gemini 3.1 Pro",        "provider": "google", "tier": "best",  "vision": True},
@@ -101,8 +102,7 @@ HARDCODED_MODELS = [
     {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid",   "vision": True},
     {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light", "vision": True},
     # Groq — ids must match Groq's /models API exactly (some are namespaced).
-    # These Groq-hosted chat models are text-only (Llama 4 Scout vision lives in
-    # VISION_MODELS below); pair them with a vision companion via WOR-25.
+    # These Groq-hosted chat models are text-only.
     {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid",   "vision": False},
     {"id": "llama-3.1-8b-instant",                      "label": "Llama 3.1 8B Instant",    "provider": "groq", "tier": "light", "vision": False},
     {"id": "qwen/qwen3-32b",                            "label": "Qwen 3 32B",              "provider": "groq", "tier": "mid",   "vision": False},
@@ -117,70 +117,25 @@ HARDCODED_MODELS = [
     {"id": "codestral-2508",      "label": "Codestral",          "provider": "mistral", "tier": "mid",   "vision": False},
 ]
 
-# Vision-capable models kept OUT of the chat selector — referenced internally
-# for multimodal use (screenshot analysis, image understanding) only, and
-# offered as a vision companion in settings (WOR-25). Llama 4 Scout is vision-
-# capable but unreliable for tool calls, hence kept out of the chat selector.
-VISION_MODELS = [
-    {"id": "meta-llama/llama-4-scout-17b-16e-instruct", "label": "Llama 4 Scout 17B", "provider": "groq", "tier": "mid", "vision": True},
-]
-
-_VISION_ONLY_IDS = frozenset(m["id"] for m in VISION_MODELS)
-
-
 # ── Vision capability (WOR-25) ─────────────────────────────────────────────
 
 def model_has_vision(provider: str | None, model_id: str) -> bool:
     """Return True if ``(provider, model_id)`` can process images/screenshots.
 
-    Resolution order:
-      1. Exact ``(provider, id)`` match against the hardcoded registry
-         (``HARDCODED_MODELS`` + the dedicated ``VISION_MODELS`` list).
-      2. id-only match (covers a missing/forced provider).
-      3. A name-based heuristic for ids not in the registry (e.g. remote-
-         discovered models): Anthropic Claude, Google Gemini, xAI Grok and the
-         OpenAI GPT-4o/4.1/5.x/o-series families are vision-capable; DeepSeek,
-         Groq-hosted text models and Llama/Qwen chat models are not. Mistral
-         vision support varies by model version (Large/Medium/Small are
-         multimodal, Codestral is not), so it is taken from the registry above
-         rather than guessed here; unknown Mistral ids default to non-vision.
+    Only exact authoritative registry metadata may return ``True``. Unknown or
+    remote-discovered IDs fail closed instead of inferring capability from a
+    provider name or model-name fragment.
     """
-    if not model_id:
+    if not model_id or not provider:
         return False
-    # 1) exact provider + id, then 2) id-only.
-    for require_provider in (True, False):
-        for m in (*HARDCODED_MODELS, *VISION_MODELS):
-            if m["id"] != model_id:
-                continue
-            if require_provider and provider and m["provider"] != provider:
-                continue
-            return bool(m.get("vision", False))
-    # 3) heuristic for unknown (remote-discovered) ids. provider_for_model
-    #    already maps claude/gemini/grok name fragments to anthropic/google/xai,
-    #    so a provider-level check is sufficient and — unlike a bare name
-    #    substring — never promotes a Groq-hosted text model that happens to
-    #    contain "grok"/"gemini"/"claude".
-    prov = (provider or provider_for_model(model_id) or "").lower()
-    lid = model_id.lower()
-    if prov in ("anthropic", "google", "xai"):
-        return True
-    if prov == "openai":
-        return any(tag in lid for tag in
-                   ("gpt-4o", "gpt-4.1", "gpt-5", "gpt-4-turbo", "o1", "o3", "o4"))
+    provider_id = str(provider or "").lower()
+    for metadata in HARDCODED_MODELS:
+        if metadata["id"] != model_id:
+            continue
+        if provider_id and metadata["provider"] != provider_id:
+            return False
+        return bool(metadata.get("vision", False))
     return False
-
-
-def vision_capable_models() -> list:
-    """Return the models offerable as a vision companion (WOR-25).
-
-    Every hardcoded model flagged ``vision: True`` plus the dedicated vision-
-    only models (``VISION_MODELS``). Used by the settings UI to populate the
-    "paired vision model" dropdown. Returns copies so callers can't mutate the
-    registry.
-    """
-    out = [dict(m) for m in HARDCODED_MODELS if m.get("vision")]
-    out.extend(dict(m) for m in VISION_MODELS)
-    return out
 
 
 # ── Local Ollama discovery ────────────────────────────────────────────────
@@ -373,9 +328,6 @@ def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> li
         # Groq's endpoint mixes chat with non-chat models — keep chat only.
         if provider == "groq" and any(p in mid.lower() for p in GROQ_NON_CHAT_PATTERNS):
             continue
-        # Vision-only models (see VISION_MODELS) never appear in the selector.
-        if mid in _VISION_ONLY_IDS:
-            continue
         out.append({
             "id": mid,
             "label": item.get("display_name") or mid,
@@ -421,6 +373,8 @@ def get_all_models(api_keys: dict | None = None,
     deduped = []
     for m in models:
         key = (m["provider"], m["id"])
+        if key[0] == "deepseek" and key[1] != "deepseek-flash":
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -440,6 +394,8 @@ def get_all_models_cached(api_keys: dict | None = None,
     deduped = []
     for model in models:
         key = (model["provider"], model["id"])
+        if key[0] == "deepseek" and key[1] != "deepseek-flash":
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -494,13 +450,13 @@ def classify_complexity(prompt: str) -> str:
 COMPLEX_PREFERENCE = [
     ("claude-opus-4-8",     "anthropic"),
     ("gpt-5.5",             "openai"),
-    ("deepseek-v4-pro",     "deepseek"),
+    ("deepseek-flash",      "deepseek"),
 ]
 
 SIMPLE_API_FALLBACK = [
     ("claude-haiku-4-5-20251001", "anthropic"),
     ("gpt-4.1-mini",              "openai"),
-    ("deepseek-v4-flash",         "deepseek"),
+    ("deepseek-flash",            "deepseek"),
     ("gemini-2.5-flash",          "google"),
 ]
 

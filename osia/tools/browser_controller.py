@@ -1,46 +1,24 @@
-"""Turn-scoped authority selecting one browser backend without fallback."""
+"""Stable adapter for OSIA's canonical isolated browser runtime."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Any, Mapping
 
-from osia.tools.browser_backends import IsolatedBrowserBackend, PersonalBrowserBackend
-
-
-@dataclass
-class BrowserTurnBinding:
-    backend: str
-    personal_connection_id: str = ""
-    personal_session_id: str = ""
-    personal_target_handle: str = ""
-
-
-_TURN_BINDING: ContextVar[BrowserTurnBinding | None] = ContextVar(
-    "osia_browser_turn_binding", default=None,
-)
+from osia.tools.browser_backends import IsolatedBrowserBackend
 
 
 class BrowserController:
-    """Route a complete turn to exactly one backend.
+    """Forward semantic browser operations to the isolated OSIA runtime."""
 
-    Absence of a structured directive is deliberately isolated.  Backend
-    errors are returned verbatim; this controller never tries the other path.
-    """
-
-    def __init__(self, *, isolated=None, personal=None) -> None:
+    def __init__(self, *, isolated=None) -> None:
         self._isolated = isolated or IsolatedBrowserBackend()
-        self._personal = personal or PersonalBrowserBackend()
         self._progress_callback = None
 
     def selected_backend_name(self) -> str:
-        binding = _TURN_BINDING.get()
-        return binding.backend if binding is not None else "isolated"
+        return "isolated"
 
     def selected_backend(self):
-        return self._personal if self.selected_backend_name() == "personal" else self._isolated
+        return self._isolated
 
     def invoke(self, operation: str, arguments: Mapping[str, Any] | None = None) -> Any:
         return self.selected_backend().invoke(operation, dict(arguments or {}))
@@ -52,7 +30,6 @@ class BrowserController:
         return self.selected_backend().capabilities()
 
     def close(self) -> None:
-        self._personal.close()
         self._isolated.close()
 
     def revoke(self) -> dict[str, Any]:
@@ -79,12 +56,6 @@ class BrowserController:
             isolated_callback(callback)
         except Exception:
             pass
-        try:
-            from osia.personal_browser.broker import get_personal_browser_broker
-
-            get_personal_browser_broker().set_progress_callback(callback)
-        except Exception:
-            pass
 
 
 _CONTROLLER = BrowserController()
@@ -99,25 +70,6 @@ def set_browser_controller_for_testing(controller: BrowserController | None):
     previous = _CONTROLLER
     _CONTROLLER = controller or BrowserController()
     return previous
-
-
-@contextmanager
-def browser_turn_scope(override: str | None = None):
-    backend = str(override or "isolated")
-    if backend not in {"isolated", "personal"}:
-        raise ValueError("unsupported_browser_backend")
-    token = _TURN_BINDING.set(BrowserTurnBinding(backend=backend))
-    try:
-        yield _TURN_BINDING.get()
-    finally:
-        _TURN_BINDING.reset(token)
-
-
-def current_browser_turn_binding() -> BrowserTurnBinding:
-    binding = _TURN_BINDING.get()
-    if binding is None:
-        return BrowserTurnBinding("isolated")
-    return binding
 
 
 def isolated_browser_available() -> bool:

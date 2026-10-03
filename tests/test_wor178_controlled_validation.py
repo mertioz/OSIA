@@ -11,39 +11,6 @@ from osia import action_policy
 from osia import agent as agent_module
 from osia.agent import OSIAAgent
 from osia.mcp_client import registry as mcp_registry
-from osia.action_policy import PermissionPolicy
-from osia.permission_store import (
-    BackendAvailability,
-    PermissionStore,
-    SecureStorageBackend,
-)
-
-
-class _HermeticProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor178_controlled", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W178" + bytes(value ^ 0x53 for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W178"):
-            raise ValueError("invalid_test_blob")
-        return bytes(value ^ 0x53 for value in protected[4:])
-
-
-@pytest.fixture(autouse=True)
-def _isolated_ask_permissions(tmp_path: Path):
-    policy = PermissionPolicy(PermissionStore(
-        tmp_path / "permissions.dat", backend=_HermeticProtectedBackend(),
-    ))
-    action_policy.set_default_permission_policy(policy)
-    try:
-        yield
-    finally:
-        action_policy.clear_pending_execution_permit()
-        action_policy.set_default_permission_policy(None)
 
 
 def test_real_read_only_tools_flow_through_one_canonical_osia_turn(capsys):
@@ -86,14 +53,13 @@ def test_real_read_only_tools_flow_through_one_canonical_osia_turn(capsys):
     assert not Path(temp_dir).exists()
 
 
-def test_reversible_local_file_lifecycle_is_confirmed_verified_and_cleaned(
+def test_reversible_local_file_lifecycle_dispatches_without_confirmation_and_cleans(
     monkeypatch,
 ):
-    prompts = []
     monkeypatch.setattr(
         mcp_registry,
         "_confirmation_provider",
-        lambda server, tool, summary: prompts.append((tool, summary)) or True,
+        lambda *_args: pytest.fail("local file lifecycle must not prompt"),
     )
     with tempfile.TemporaryDirectory(prefix="osia-wor178-files-") as temp_dir:
         root = Path(temp_dir)
@@ -131,10 +97,4 @@ def test_reversible_local_file_lifecycle_is_confirmed_verified_and_cleaned(
             str(nested), recursive=False,
         ).startswith("ERROR:")
         assert not nested.exists()
-
-        assert prompts == [
-            ("delete_file", "Delete one local item"),
-            ("delete_directory", "Delete one local item"),
-        ]
-        assert all(str(root) not in summary for _tool, summary in prompts)
     assert not Path(temp_dir).exists()

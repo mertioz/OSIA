@@ -160,6 +160,7 @@ class _RegistryRecord:
     public: DesktopSurfaceRef
     native: NativeSurfaceIdentity
     stable_key: str
+    semantic_identity: str
     scene_signature: str
     stale_reason: str = ""
 
@@ -328,6 +329,7 @@ class DesktopSurfaceRegistry:
                 public=public,
                 native=native,
                 stable_key=stable_key,
+                semantic_identity=str(stable_identity or ""),
                 scene_signature=scene_signature,
             )
             self._stable_refs[stable_key] = ref_id
@@ -384,6 +386,111 @@ class DesktopSurfaceRegistry:
     def native_identity(self, ref_id: str) -> NativeSurfaceIdentity | None:
         resolved = self.resolve(ref_id)
         return resolved.native if resolved.resolved else None
+
+    def refresh_anchor(self, ref_id: str) -> SurfaceResolution:
+        """Return native authority only for a current or safely refreshable ref.
+
+        Structural and bounds changes can obsolete a public snapshot without
+        proving that its native target was replaced.  Callers may use this
+        private identity only to re-observe the exact HWND and must then call
+        :meth:`rebind_same_target` before using the refreshed public surface.
+        Other stale reasons remain opaque and fail closed.
+        """
+
+        with self._lock:
+            record = self._records.get(str(ref_id or ""))
+            if record is None:
+                return SurfaceResolution(
+                    "unknown", None, None, "unknown_surface_ref",
+                )
+            if record.stale_reason not in {
+                "", "structural_epoch_changed", "surface_bounds_changed",
+            }:
+                return SurfaceResolution(
+                    "stale", record.public, None, record.stale_reason,
+                )
+            return SurfaceResolution(
+                (
+                    "resolved"
+                    if not record.stale_reason else
+                    "refreshable"
+                ),
+                record.public,
+                record.native,
+                record.stale_reason,
+            )
+
+    def rebind_same_target(
+        self,
+        ref_id: str,
+        candidates: Iterable[DesktopSurfaceRef],
+    ) -> SurfaceResolution:
+        """Bind an old snapshot to one unique current same-native surface.
+
+        Geometry and scene epoch are deliberately not identity fields here.
+        Native window identity, process lifetime, generation and semantic
+        identity all remain exact fences, so a destroyed/recycled/replaced
+        target cannot inherit the old reference.
+        """
+
+        with self._lock:
+            old_record = self._records.get(str(ref_id or ""))
+            if old_record is None:
+                return SurfaceResolution(
+                    "unknown", None, None, "unknown_surface_ref",
+                )
+            old_public = old_record.public
+            old_native = old_record.native
+            matches: list[_RegistryRecord] = []
+            same_window_seen = False
+            for candidate in candidates:
+                candidate_record = self._records.get(candidate.ref_id)
+                if candidate_record is None or candidate_record.stale_reason:
+                    continue
+                current = candidate_record.public
+                native = candidate_record.native
+                same_native_window = bool(
+                    int(native.pid) == int(old_native.pid)
+                    and abs(
+                        float(native.process_started_at)
+                        - float(old_native.process_started_at)
+                    ) <= 0.05
+                    and native.native_window_id == old_native.native_window_id
+                    and native.class_name == old_native.class_name
+                )
+                if not same_native_window:
+                    continue
+                same_window_seen = True
+                if (
+                    current.application_id == old_public.application_id
+                    and current.process_ref == old_public.process_ref
+                    and current.window_generation
+                    == old_public.window_generation
+                    and current.surface_kind is old_public.surface_kind
+                    and current.role == old_public.role
+                    and candidate_record.semantic_identity
+                    == old_record.semantic_identity
+                    and native.runtime_id == old_native.runtime_id
+                    and native.ancestor_signature
+                    == old_native.ancestor_signature
+                ):
+                    matches.append(candidate_record)
+            if len(matches) == 1:
+                match = matches[0]
+                return SurfaceResolution(
+                    "resolved", match.public, match.native,
+                    "same_target_refreshed",
+                )
+            return SurfaceResolution(
+                "stale",
+                old_public,
+                None,
+                (
+                    "semantic_target_changed"
+                    if same_window_seen else
+                    "native_target_changed"
+                ),
+            )
 
     def safe_snapshot(self, ref_ids: Iterable[str]) -> list[dict]:
         out = []

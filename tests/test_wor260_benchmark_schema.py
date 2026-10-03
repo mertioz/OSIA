@@ -16,15 +16,14 @@ from benchmarks.wor260.schema import (
 from osia.capability_adapters import RuntimeAvailability
 
 
-def test_target_coverage_matrix_is_explicit_and_totals_164():
-    assert sum(item.target_count for item in TARGET_COVERAGE_MATRIX) == 164
+def test_target_coverage_matrix_is_explicit_and_totals_152():
+    assert sum(item.target_count for item in TARGET_COVERAGE_MATRIX) == 152
     assert len({item.category_id for item in TARGET_COVERAGE_MATRIX}) == len(
         TARGET_COVERAGE_MATRIX
     )
     assert {item.category_id for item in TARGET_COVERAGE_MATRIX} == {
         "direct_api_mcp",
         "browser_dom",
-        "personal_browser",
         "desktop_uia",
         "keyboard_deep_link",
         "vision",
@@ -35,12 +34,12 @@ def test_target_coverage_matrix_is_explicit_and_totals_164():
     }
 
 
-def test_seed_set_is_small_deterministic_and_covers_twelve_high_signal_cases():
+def test_seed_set_is_small_deterministic_and_covers_eleven_high_signal_cases():
     first = seed_scenarios()
     second = seed_scenarios()
 
     assert first == second
-    assert len(first) == 12
+    assert len(first) == 11
     assert {item.scenario_id for item in first} == {
         "direct_api_exact_match",
         "deep_link_exact_match",
@@ -51,7 +50,6 @@ def test_seed_set_is_small_deterministic_and_covers_twelve_high_signal_cases():
         "stale_ref_requires_reresolution",
         "outcome_unknown_prevents_mutation_replay",
         "permission_required_action",
-        "personal_browser_wrong_tab_rejected",
         "partial_multistep_success",
         "terminality_same_turn_continuation",
     }

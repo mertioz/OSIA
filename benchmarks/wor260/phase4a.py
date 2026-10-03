@@ -201,7 +201,7 @@ def _base_context(
 def reasoning_scenarios() -> tuple[Phase4AReasoningScenario, ...]:
     openai = _capability("openai", "gpt-5.5")
     groq = _capability("groq", "openai/gpt-oss-120b")
-    deepseek = _capability("deepseek", "deepseek-v4-pro")
+    deepseek = _capability("deepseek", "deepseek-flash")
     google = _capability("google", "gemini-3.5-flash")
     anthropic = _capability("anthropic", "claude-opus-4-8")
     account = _capability("chatgpt_account", "gpt-5.6-sol")

@@ -1,43 +1,19 @@
-"""Focused deterministic WOR-252 retry/resume and permission outcomes."""
+"""Focused deterministic WOR-252 retry/resume outcomes."""
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
-import threading
 from types import SimpleNamespace
 
 import pytest
 
 from osia import action_policy, tool_attempts
-from osia.action_policy import PermissionPolicy
 from osia.agent import OSIAAgent, TOOL_MAP
-from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
 from osia.execution_strategy import execution_strategy_scope
 from osia.mcp_client import registry as mcp_registry
 from osia.permission_outcome import PermissionOutcome, PermissionResult
-from osia.permission_store import (
-    BackendAvailability,
-    PermissionStore,
-    SecureStorageBackend,
-)
-from osia.server import server
 from osia.tool_attempts import ToolAttemptCoordinator, ToolAttemptStore
-
-
-class _ProtectedBackend(SecureStorageBackend):
-    @property
-    def availability(self):
-        return BackendAvailability(True, "wor252_synthetic", True)
-
-    def protect(self, plaintext: bytes) -> bytes:
-        return b"W252" + bytes(value ^ 0x5A for value in plaintext)
-
-    def unprotect(self, protected: bytes) -> bytes:
-        if not protected.startswith(b"W252"):
-            raise ValueError("invalid_protected_blob")
-        return bytes(value ^ 0x5A for value in protected[4:])
 
 
 class _SequenceCompletions:
@@ -66,24 +42,6 @@ def _agent_with(*responses):
     return agent, completions
 
 
-class _Channel:
-    def __init__(self):
-        self._closed = False
-        self._permission_device_id = "device-wor252"
-        self.frames = []
-        self.sent = threading.Event()
-
-    async def send_json(self, frame):
-        self.frames.append(dict(frame))
-        self.sent.set()
-
-
-class _FailingChannel(_Channel):
-    async def send_json(self, frame):
-        self.sent.set()
-        raise RuntimeError("synthetic presentation failure")
-
-
 def _configure(agent, suffix: str) -> None:
     agent.configure_tool_attempts(
         conversation_id="wor252-conversation",
@@ -106,25 +64,21 @@ def _isolated_runtime(tmp_path, monkeypatch):
     coordinator = ToolAttemptCoordinator(store)
     monkeypatch.setattr(tool_attempts, "_DEFAULT_STORE", store)
     monkeypatch.setattr(tool_attempts, "_DEFAULT_COORDINATOR", coordinator)
-    policy = PermissionPolicy(PermissionStore(
-        tmp_path / "permissions.dat",
-        backend=_ProtectedBackend(),
-    ))
-    action_policy.set_default_permission_policy(policy)
     action_policy.clear_pending_execution_permit()
     previous_provider = mcp_registry.get_confirmation_provider()
     mcp_registry.set_confirmation_provider(None)
     yield store
     action_policy.clear_pending_execution_permit()
-    action_policy.set_default_permission_policy(None)
     mcp_registry.set_confirmation_provider(previous_provider)
 
 
 def test_partial_success_retry_executes_only_unfinished_new_attempt(
     monkeypatch, _isolated_runtime,
 ):
+    from osia import execution_strategy as strategy_module
+
     dispatches = []
-    gate_count = {"command": 0}
+    state = {"block_command": True}
 
     monkeypatch.setitem(
         TOOL_MAP, "get_system_info",
@@ -136,27 +90,15 @@ def test_partial_success_retry_executes_only_unfinished_new_attempt(
     )
 
     def gate(_request, tool_name, _arguments):
-        if tool_name != "run_command":
-            return None
-        gate_count["command"] += 1
-        if gate_count["command"] == 1:
+        if tool_name == "run_command" and state["block_command"]:
             return (
-                "ERROR: action/osia/run_command: "
-                "permission_outcome=presentation_failed; "
-                "sensitive action blocked (confirmation required, "
-                "no approver available)"
+                "ERROR: execution strategy blocked this call before dispatch "
+                "(synthetic_retry_fixture). Preserve the exact goal and use the "
+                "earliest safe semantically equivalent alternative."
             )
         return None
 
     monkeypatch.setattr(action_policy, "guard_tool_call", gate)
-    monkeypatch.setattr(
-        action_policy, "pending_execution_permit_matches",
-        lambda tool, _arguments: tool == "run_command",
-    )
-    monkeypatch.setattr(
-        action_policy, "consume_pending_execution_permit",
-        lambda tool, _arguments: tool == "run_command",
-    )
     monkeypatch.setattr(
         action_policy, "is_final_external_tool_call",
         lambda *_args: False,
@@ -168,26 +110,42 @@ def test_partial_success_retry_executes_only_unfinished_new_attempt(
         '<tool_call>{"tool":"resolve_unfinished_execution",'
         '"decision":"resume"}</tool_call>',
         "Les étapes demandées sont terminées.",
+        '<tool_call>{"tool":"resolve_unfinished_execution",'
+        '"decision":"resume"}</tool_call>',
+        "Les étapes demandées sont terminées.",
     )
-    _configure(agent, "original")
-    first = agent.run("Effectue la lecture puis la commande demandée.")
-    assert "n’a pas pu être présentée" in first
-    assert dispatches == ["read"]
+    request = "Effectue la lecture puis la commande demandée."
+    # The exact strategy binding must stay inherited across the resumed turn;
+    # WOR-252 refuses a mutating resume whose binding is missing.
+    with strategy_module.execution_strategy_scope(
+        request, {"get_system_info", "run_command"},
+    ):
+        _configure(agent, "original")
+        _first = agent.run(request)
+        assert dispatches == ["read"]
+        records = _records(_isolated_runtime)
+        # WOR-301: a blocked pre-dispatch call is durably recorded as a
+        # zero-dispatch failure while the read-only step actually executed.
+        assert [
+            item["tool_name"] for item in records
+            if item["status"] != "failed_before_effect"
+        ] == ["get_system_info"]
+        blocked = [item for item in records if item["tool_name"] == "run_command"]
+        assert blocked
+        assert all(item["status"] == "failed_before_effect" for item in blocked)
 
-    _configure(agent, "retry")
-    final = agent.run("réessaye")
+        state["block_command"] = False
+        _configure(agent, "retry")
+        final = agent.run("réessaye")
     assert final == "Les étapes demandées sont terminées."
     assert dispatches == ["read", "command"]
     records = _records(_isolated_runtime)
     assert [item["status"] for item in records].count("succeeded") == 2
-    assert [item["status"] for item in records].count(
-        "failed_before_effect"
-    ) == 1
     command_records = [item for item in records if item["tool_name"] == "run_command"]
     assert {item["request_id"] for item in command_records} == {
         "wor252-request-original", "wor252-request-retry",
     }
-    assert completions.calls == 4
+    assert completions.calls == 6
 
 
 def test_completed_mutation_is_not_replayed_or_reclassified(monkeypatch):
@@ -224,140 +182,46 @@ def test_completed_mutation_is_not_replayed_or_reclassified(monkeypatch):
     assert agent._unfinished_execution is None
 
 
-def test_missing_presentation_and_provider_error_are_never_user_denied(
-    monkeypatch,
-):
+def test_legacy_presentation_failures_cannot_produce_a_user_denial():
+    """WOR-301: the connector facade never consults an approver.
+
+    A typed presentation failure, an explicit synchronous denial and a broken
+    presenter must all leave the call allowed: there is no user authorization
+    left to fail.
+    """
     mcp_registry.set_confirmation_provider(
         lambda *_args: PermissionResult(PermissionOutcome.PRESENTATION_FAILED),
     )
-    missing = mcp_registry.confirm_sensitive_action(
+    allowed = mcp_registry.confirm_sensitive_action(
         mcp_registry.ConfirmationDomain.NATIVE,
         "osia",
         "run_command",
         "Run one command",
         call_arguments={"command": "echo wor252"},
     )
-    assert "permission_outcome=presentation_failed" in missing
-    assert "user declined" not in missing
+    assert allowed is None
+
+    mcp_registry.set_confirmation_provider(lambda *_args: False)
+    assert mcp_registry.confirm_sensitive_action(
+        mcp_registry.ConfirmationDomain.NATIVE,
+        "osia",
+        "run_command",
+        "Run one command",
+        call_arguments={"command": "echo wor252"},
+    ) is None
 
     def broken(*_args):
         raise RuntimeError("synthetic disconnected presenter")
 
     mcp_registry.set_confirmation_provider(broken)
-    failed = mcp_registry.confirm_sensitive_action(
+    still_allowed = mcp_registry.confirm_sensitive_action(
         mcp_registry.ConfirmationDomain.NATIVE,
         "osia",
         "run_command",
         "Run one command",
         call_arguments={"command": "echo wor252"},
     )
-    assert "permission_outcome=internal_failure" in failed
-    assert "user declined" not in failed
-
-
-def test_explicit_correlated_deny_is_user_denied_and_zero_dispatch(monkeypatch):
-    dispatches = []
-    mcp_registry.set_confirmation_provider(
-        lambda *_args: PermissionResult(
-            PermissionOutcome.USER_DENIED,
-            "permission-request-wor252",
-        ),
-    )
-    blocked = action_policy.guard_tool_call(
-        "Exécute la commande synthétique.",
-        "run_command",
-        {"command": "echo wor252"},
-    )
-    if blocked is None:
-        dispatches.append("unexpected")
-    assert "permission_outcome=user_denied" in blocked
-    assert dispatches == []
-
-
-def test_standard_one_allow_produces_one_correlated_dispatch():
-    loop = asyncio.new_event_loop()
-    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
-    loop_thread.start()
-    channel = _Channel()
-    dispatches = []
-    results = []
-    mcp_registry.set_confirmation_provider(server._ws_confirm_provider)
-
-    def worker():
-        target_token = server._turn_target.set((channel, loop))
-        correlation_token = server._turn_confirmation_correlation.set({
-            "conversation_id": "wor252-conversation-allow",
-            "request_id": "wor252-request-allow",
-            "turn_id": "wor252-turn-allow",
-        })
-        try:
-            blocked = action_policy.guard_tool_call(
-                "Exécute la commande synthétique.",
-                "run_command",
-                {"command": "echo wor252"},
-            )
-            if blocked is None and action_policy.consume_pending_execution_permit(
-                "run_command", {"command": "echo wor252"},
-            ):
-                dispatches.append("command")
-            results.append(blocked)
-        finally:
-            server._turn_confirmation_correlation.reset(correlation_token)
-            server._turn_target.reset(target_token)
-
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
-    try:
-        assert channel.sent.wait(2)
-        assert len(channel.frames) == 1
-        frame = channel.frames[0]
-        assert frame["conversation_id"] == "wor252-conversation-allow"
-        assert frame["request_id"] == "wor252-request-allow"
-        assert frame["turn_id"] == "wor252-turn-allow"
-        assert server._resolve_confirm(
-            frame["id"], True, channel=channel,
-        ) is True
-        assert server._resolve_confirm(
-            frame["id"], True, channel=channel,
-        ) is False
-        worker_thread.join(timeout=2)
-        assert results == [None]
-        assert dispatches == ["command"]
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        loop_thread.join(timeout=2)
-        loop.close()
-
-
-def test_permission_projection_failure_stays_typed():
-    loop = asyncio.new_event_loop()
-    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
-    loop_thread.start()
-    channel = _FailingChannel()
-    channel._permission_device_id = ""
-    results = []
-
-    def worker():
-        token = server._turn_target.set((channel, loop))
-        try:
-            results.append(server._ws_confirm_provider(
-                "osia", "run_command", "Run one command",
-            ))
-        finally:
-            server._turn_target.reset(token)
-
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
-    try:
-        assert channel.sent.wait(2)
-        worker_thread.join(timeout=2)
-        assert [item.outcome for item in results] == [
-            PermissionOutcome.PRESENTATION_FAILED,
-        ]
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        loop_thread.join(timeout=2)
-        loop.close()
+    assert still_allowed is None
 
 
 def test_active_attempt_retry_surfaces_existing_state_without_ghost(monkeypatch):
@@ -383,6 +247,14 @@ def test_active_attempt_retry_surfaces_existing_state_without_ghost(monkeypatch)
 def test_outcome_unknown_resume_reconciles_before_replay(
     monkeypatch, resume_response,
 ):
+    from osia import execution_strategy as strategy_module
+    from osia.tool_contracts import (
+        ExecutionOutcome,
+        ToolExecutionRecord,
+        effective_contract,
+        get_tool_spec,
+    )
+
     order = []
     monkeypatch.setitem(
         TOOL_MAP, "read_file",
@@ -394,12 +266,6 @@ def test_outcome_unknown_resume_reconciles_before_replay(
     )
     monkeypatch.setattr(action_policy, "guard_tool_call", lambda *_args: None)
     monkeypatch.setattr(
-        action_policy, "pending_execution_permit_matches", lambda *_args: True,
-    )
-    monkeypatch.setattr(
-        action_policy, "consume_pending_execution_permit", lambda *_args: True,
-    )
-    monkeypatch.setattr(
         action_policy, "is_final_external_tool_call", lambda *_args: False,
     )
     agent, _completions = _agent_with(
@@ -408,16 +274,37 @@ def test_outcome_unknown_resume_reconciles_before_replay(
         '<tool_call>{"tool":"run_command","command":"echo wor252"}</tool_call>',
         "Reconciliation and execution completed.",
     )
-    agent._unfinished_execution = {
-        "call": {"tool": "run_command", "command": "echo wor252"},
-        "outcome": "outcome_unknown",
-        "reason_code": "tool_timeout",
-        "attempt_id": "attempt-unknown-wor252",
-        "original_request": "commande synthétique",
-    }
-    _configure(agent, "unknown-retry")
-
-    final = agent.run("vas-y")
+    request = "vas-y"
+    strategy = strategy_module.build_execution_strategy(
+        request, {"read_file", "run_command"},
+    )
+    strategy_decision = strategy_module.tool_preflight(
+        "run_command", {"command": "echo wor252"}, strategy=strategy,
+    )
+    assert strategy_decision is not None and strategy_decision.allowed
+    unknown = ToolExecutionRecord(
+        "ERROR: tool timeout",
+        True,
+        ExecutionOutcome.OUTCOME_UNKNOWN,
+        1,
+        True,
+        True,
+        effective_contract(
+            get_tool_spec("run_command"), {"command": "echo wor252"}, request,
+        ),
+        "attempt-unknown-wor252",
+    )
+    # The durable unfinished step carries its exact strategy binding; WOR-252
+    # requires that binding before a mutating resume may dispatch.
+    with strategy_module.execution_strategy_scope(request, strategy=strategy):
+        agent._record_unfinished_execution(
+            "run_command", {"command": "echo wor252"}, unknown, strategy_decision,
+        )
+        assert agent._unfinished_execution["strategy_binding"]["attempt_id"] == (
+            strategy_decision.attempt_id
+        )
+        _configure(agent, "unknown-retry")
+        final = agent.run(request)
 
     assert final == "Reconciliation and execution completed."
     assert order == ["reconcile", "replay"]
@@ -485,56 +372,6 @@ def test_provider_native_accepted_transition_can_finalize_execution():
 
     assert final == "Steam was opened at the Subnautica search results."
     assert completions.calls == 1
-
-
-def test_provider_native_presentation_failure_stays_typed(
-    tmp_path, _isolated_runtime,
-):
-    mcp_registry.set_confirmation_provider(
-        lambda *_args: PermissionResult(PermissionOutcome.PRESENTATION_FAILED),
-    )
-    client = AppServerClient(
-        base_dir=tmp_path / "native-runtime",
-        tool_attempt_store=_isolated_runtime,
-    )
-    sent = []
-    client._send = sent.append
-    attempt = _TurnAttempt(
-        thread_id="thread-wor252-native",
-        conversation_id="conversation-wor252-native",
-        osia_turn_id="turn-wor252-native",
-        turn_id="provider-turn-wor252-native",
-        model_id="wor252-model",
-        user_request="Run the synthetic command.",
-    )
-    item_id = "item-wor252-native"
-    command = "echo wor252"
-    attempt.native_items[item_id] = {
-        "id": item_id,
-        "type": "commandExecution",
-        "status": "inProgress",
-        "command": command,
-        "cwd": str(client.workspace_dir),
-    }
-
-    client._resolve_native_approval(attempt, {
-        "method": "item/commandExecution/requestApproval",
-        "request_id": 252,
-        "params": {
-            "itemId": item_id,
-            "command": command,
-            "cwd": str(client.workspace_dir),
-            "availableDecisions": ["accept", "decline"],
-        },
-    })
-
-    assert sent == [{"id": 252, "result": {"decision": "decline"}}]
-    assert attempt.native_dispatches == {}
-    denied = attempt.capability_events[-1]
-    assert denied.phase == "denied"
-    assert denied.outcome == "permission_presentation_failed"
-    assert denied.tool_name == "run_command"
-    assert denied.arguments["command"] == command
 
 
 def test_provider_native_typed_permission_failure_overrides_refusal_narration():

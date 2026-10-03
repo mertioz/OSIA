@@ -21,7 +21,6 @@ from osia.capability_search import (
     CandidateEligibility,
     CapabilityPermissionState,
     CapabilitySearchLimits,
-    PersonalBrowserAuthority,
     PermissionState,
     ShadowPlanningContext,
     StaleReference,
@@ -127,21 +126,6 @@ def test_nonvision_authority_removes_vision_candidate_without_model_name_inferen
         item.capability_id == "vision:observe_control"
         and "modality_unavailable" in item.hard_rejection_reasons
         for item in conservative.hard_rejected
-    )
-
-
-def test_personal_browser_exact_authority_wrong_tab_and_unknown_are_distinct():
-    exact = _result("personal_browser_exact_tab", full_scan=True)
-    assert exact.top_candidates[0].eligibility == CandidateEligibility.ELIGIBLE.value
-
-    wrong = _result("personal_browser_wrong_tab", full_scan=True)
-    assert "personal_browser_authority_mismatch" in (
-        wrong.hard_rejected[0].hard_rejection_reasons
-    )
-
-    unknown = _result("personal_browser_unknown_authority", full_scan=True)
-    assert "personal_browser_authority_unknown" in (
-        unknown.unresolved[0].unresolved_reasons
     )
 
 

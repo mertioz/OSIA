@@ -66,6 +66,8 @@ MOBILE_TOKEN_FILE = os.path.join(CONFIG_DIR, "mobile_token.txt")
 
 _API_KEY_CHANGE_LOCK = threading.Lock()
 _API_KEY_CHANGE_LISTENERS: set[Callable[[str], None]] = set()
+_SETTING_CHANGE_LOCK = threading.Lock()
+_SETTING_CHANGE_LISTENERS: set[Callable[[str], None]] = set()
 
 _DEFAULT_REASONING_SETTINGS = {
     "default": "auto",
@@ -118,13 +120,6 @@ DEFAULT_SETTINGS = {
     # no provider-specific parameter, so old configs and unsupported models keep
     # their provider-native behaviour.
     "reasoning": copy.deepcopy(_DEFAULT_REASONING_SETTINGS),
-    # Vision model cooperation (WOR-25): when the selected main model has no
-    # vision capability (e.g. DeepSeek text), OSIA pairs it with a vision-capable
-    # companion (e.g. Gemini) for image/screenshot tasks. Empty = no companion
-    # configured; the settings UI only surfaces these when the main model can't
-    # see. See osia.vision_router and osia.models.model_has_vision.
-    "vision_provider": "",
-    "vision_model": "",
     # Live API voice-to-voice (Bloc 4): when enabled, OSIA streams audio to a
     # provider's realtime/live endpoint and bypasses the local STT (Whisper)
     # and TTS pipelines — the live endpoint handles both natively. The API key
@@ -182,12 +177,6 @@ DEFAULT_SETTINGS = {
     "lan_direct_v1": True,
     "webrtc_direct_v1": True,
     "webrtc_stun_urls": [PRODUCTION_STUN_URL],
-    # Personal Browser is setup/readiness state only.  It never changes the
-    # default turn backend: ordinary turns remain isolated unless the typed
-    # /browser personal directive is present on that exact turn.
-    "personal_browser_enabled": False,
-    "personal_browser_preference": "automatic",
-    "personal_browser_instance_hint": "",
     # Skills (Bloc 6): enabled/disabled flag per skill file. The skill prose
     # itself lives as Markdown under ``~/.osia/skills/*.md``; only the on/off
     # state is stored here. Shape: ``{"<name>.md": true}``. A skill with no
@@ -207,29 +196,11 @@ DEFAULT_SETTINGS = {
     # under an ``mcp:<id>`` key (see get_mcp_token/set_mcp_token) — NEVER here,
     # because settings.json is git-tracked. See osia.mcp.MCPManager.
     "mcp_servers": [],
-    # Legacy MCP write-confirmation keys retained only for downgrade/schema
-    # compatibility (WOR-191). Their effective values are immutable: sensitive
-    # writes require an interactive approval and unattended writes fail closed.
-    "mcp_confirm_writes": True,
-    "mcp_allow_unattended_writes": False,
     "island_shape": "capsule",  # adaptive shape: "capsule", "circle", "docked"
     "island_dock_side": "right",  # docked screen edge: "left", "right"
     "island_x": None,          # last dragged capsule position; None = top-centre
     "island_y": None,
 }
-
-LEGACY_MCP_CONFIRMATION_SAFE_VALUES = {
-    "mcp_confirm_writes": True,
-    "mcp_allow_unattended_writes": False,
-}
-
-
-def _normalize_legacy_confirmation_settings(settings: dict) -> dict:
-    """Return settings with the two downgrade-compatible keys forced safe."""
-    normalized = dict(settings) if isinstance(settings, dict) else {}
-    normalized.update(LEGACY_MCP_CONFIRMATION_SAFE_VALUES)
-    return normalized
-
 
 def normalize_reasoning_level(value) -> str:
     """Normalize one canonical id without imposing a universal model list.
@@ -318,6 +289,33 @@ def _notify_api_key_changed(provider: str) -> None:
             callback(provider)
         except Exception:
             pass
+
+
+def add_setting_change_listener(callback: Callable[[str], None]) -> Callable[[], None]:
+    """Subscribe to canonical settings changes without exposing their values."""
+    with _SETTING_CHANGE_LOCK:
+        _SETTING_CHANGE_LISTENERS.add(callback)
+
+    def unsubscribe() -> None:
+        with _SETTING_CHANGE_LOCK:
+            _SETTING_CHANGE_LISTENERS.discard(callback)
+
+    return unsubscribe
+
+
+def _notify_setting_changed(key: str) -> None:
+    with _SETTING_CHANGE_LOCK:
+        callbacks = tuple(_SETTING_CHANGE_LISTENERS)
+    for callback in callbacks:
+        try:
+            callback(key)
+        except Exception:
+            pass
+
+
+def notify_config_changed(key: str) -> None:
+    """Notify observers after a canonical config file outside settings.json changes."""
+    _notify_setting_changed(str(key))
 
 
 def save_api_keys(keys: dict) -> None:
@@ -602,19 +600,30 @@ def load_settings() -> dict:
     antivirus scan. The return value is always a fresh, independent dict, so
     callers may mutate it (e.g. :func:`set_setting`) without touching the cache.
     """
+    persisted = _read_settings_file()
     base = dict(DEFAULT_SETTINGS)
-    base.update(_read_settings_file())
-    base.update(LEGACY_MCP_CONFIRMATION_SAFE_VALUES)
+    base.update(persisted)
+    # These fields belonged only to the abandoned personal-session browser.
+    # The supported isolated browser uses its normal automatic detection, so
+    # old family/session choices are ignored and never trigger extension setup.
+    for legacy_key in (
+        "personal_browser_enabled",
+        "personal_browser_preference",
+        "personal_browser_instance_hint",
+    ):
+        base.pop(legacy_key, None)
     # A legacy persisted true value must never reactivate acoustic detection.
     base["wake_word_enabled"] = ACOUSTIC_WAKE_AVAILABLE
     base["reasoning"] = normalize_reasoning_settings(base.get("reasoning"))
-    return base
+    from osia.deepseek import migrate_settings
+    return migrate_settings(base)
 
 
 def save_settings(settings: dict) -> None:
     global _settings_cache_signature, _settings_cache_data
     _ensure_config_dir()
-    settings = _normalize_legacy_confirmation_settings(settings)
+    from osia.deepseek import migrate_settings
+    settings = migrate_settings(settings)
     # Atomic write (temp + fsync + os.replace), mirroring _save_oauth_store: a
     # crash mid-write can never corrupt settings.json, and a concurrent reader in
     # the OTHER process never observes a half-written/torn file — the desktop and
@@ -664,31 +673,6 @@ def save_settings(settings: dict) -> None:
 
 
 _transport_migration_lock = threading.Lock()
-_legacy_confirmation_migration_lock = threading.Lock()
-
-
-def migrate_legacy_confirmation_settings() -> bool:
-    """Persist the fail-closed WOR-191 values without rewriting other keys.
-
-    Missing/corrupt files keep their existing bootstrap/recovery behavior. A
-    valid legacy file is rewritten once only when either compatibility value is
-    missing or unsafe.
-    """
-    with _legacy_confirmation_migration_lock:
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8", errors="strict") as f:
-                raw = json.load(f)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(raw, dict):
-            return False
-        if all(
-            raw.get(key) is safe_value
-            for key, safe_value in LEGACY_MCP_CONFIRMATION_SAFE_VALUES.items()
-        ):
-            return False
-        save_settings(_normalize_legacy_confirmation_settings(raw))
-        return True
 
 
 def migrate_transport_defaults() -> bool:
@@ -733,8 +717,6 @@ def get_setting(key: str, default=None):
 
 def set_setting(key: str, value) -> None:
     settings = load_settings()
-    if key in LEGACY_MCP_CONFIRMATION_SAFE_VALUES:
-        value = LEGACY_MCP_CONFIRMATION_SAFE_VALUES[key]
     if key == "wake_word_enabled":
         value = ACOUSTIC_WAKE_AVAILABLE
     if key == "reasoning":
@@ -747,6 +729,7 @@ def set_setting(key: str, value) -> None:
         # provider immediately after writing the model id.
         settings["selected_model_provider"] = None
     save_settings(settings)
+    _notify_setting_changed(key)
 
 
 def set_skill_enabled_state(name: str, enabled: bool) -> int:
@@ -766,6 +749,7 @@ def set_skill_enabled_state(name: str, enabled: bool) -> int:
     settings["skills_enabled"] = skills_enabled
     settings["skills_state_revision"] = revision
     save_settings(settings)
+    _notify_setting_changed("skills_enabled")
     return revision
 
 
@@ -898,11 +882,6 @@ def ensure_config_files(create_token: bool = True) -> None:
             print("[CONFIG] Activated direct-first transport defaults")
     except Exception as e:
         print(f"[CONFIG] could not migrate transport defaults: {e}")
-    try:
-        if migrate_legacy_confirmation_settings():
-            print("[CONFIG] Normalized legacy MCP confirmation settings")
-    except Exception as e:
-        print(f"[CONFIG] could not normalize MCP confirmation settings: {e}")
     # Mobile pairing token — generate + persist BEFORE the WebSocket server
     # starts so the server reads the same token the GUI displays. load_mobile_token()
     # returns "" for both a missing and an empty/whitespace-only token file.

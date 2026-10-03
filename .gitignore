@@ -44,8 +44,12 @@ config/memory.json.bak
 config/memory.corrupt.*.json
 config/memory.sqlite*
 config/onboarding.json
+config/autonomous.lock
+config/durable_transport/
+config/learning/
 config/tool_attempts/
 config/turn_terminality/
+config/private_media/
 config/update-state.json
 config/*.db
 config/*.dump

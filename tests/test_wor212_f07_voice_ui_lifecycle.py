@@ -307,7 +307,7 @@ def test_main_wires_one_ready_boundary_and_no_scattered_voice_idle_writes():
         "def handle_open_conversation("
     )]
 
-    assert source.count('bridge.island_state.emit("listening")') == 1
+    assert source.count('_emit_voice_state("listening")') == 1
     assert "on_ready=_mark_listening_ready" in voice_path
     assert 'bridge.island_state.emit("idle")' not in voice_path
     assert "voice_ui_lifecycle.finalize(" in voice_path

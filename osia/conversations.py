@@ -2394,6 +2394,12 @@ def delete_conversation(conv_id: str) -> bool:
             staged.unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            from osia.image_inputs import release_media_owner
+
+            release_media_owner(conv_id)
+        except Exception:
+            pass
         return True
 
 

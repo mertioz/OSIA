@@ -1,0 +1,2425 @@
+{
+  "models": [
+    {
+      "id": "claude-opus-4-8",
+      "label": "Claude Opus 4.8",
+      "provider": "anthropic",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "claude-opus-4-7",
+      "label": "Claude Opus 4.7",
+      "provider": "anthropic",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "claude-opus-4-6",
+      "label": "Claude Opus 4.6",
+      "provider": "anthropic",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "provider": "anthropic",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "label": "Claude Haiku 4.5",
+      "provider": "anthropic",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "gpt-5.5",
+      "label": "GPT-5.5",
+      "provider": "openai",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "gpt-5.4",
+      "label": "GPT-5.4",
+      "provider": "openai",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "label": "GPT-5.4 Mini",
+      "provider": "openai",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "gpt-4.1",
+      "label": "GPT-4.1",
+      "provider": "openai",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "label": "GPT-4.1 Mini",
+      "provider": "openai",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "gpt-4.1-nano",
+      "label": "GPT-4.1 Nano",
+      "provider": "openai",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "label": "Gemini 3.5 Flash",
+      "provider": "google",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "label": "Gemini 3.1 Pro",
+      "provider": "google",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "label": "Gemini 3 Flash",
+      "provider": "google",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "label": "Gemini 3.1 Flash Lite",
+      "provider": "google",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "label": "Gemini 2.5 Flash",
+      "provider": "google",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "gemini-2.5-flash-lite",
+      "label": "Gemini 2.5 Flash Lite",
+      "provider": "google",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "grok-3",
+      "label": "Grok 3",
+      "provider": "xai",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "grok-3-mini",
+      "label": "Grok 3 Mini",
+      "provider": "xai",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "llama-3.3-70b-versatile",
+      "label": "Llama 3.3 70B Versatile",
+      "provider": "groq",
+      "tier": "mid",
+      "vision": false
+    },
+    {
+      "id": "llama-3.1-8b-instant",
+      "label": "Llama 3.1 8B Instant",
+      "provider": "groq",
+      "tier": "light",
+      "vision": false
+    },
+    {
+      "id": "qwen/qwen3-32b",
+      "label": "Qwen 3 32B",
+      "provider": "groq",
+      "tier": "mid",
+      "vision": false
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "label": "GPT-OSS 120B",
+      "provider": "groq",
+      "tier": "best",
+      "vision": false
+    },
+    {
+      "id": "openai/gpt-oss-20b",
+      "label": "GPT-OSS 20B",
+      "provider": "groq",
+      "tier": "light",
+      "vision": false
+    },
+    {
+      "id": "moonshotai/kimi-k2-instruct",
+      "label": "Kimi K2",
+      "provider": "groq",
+      "tier": "best",
+      "vision": false
+    },
+    {
+      "id": "mistral-large-2512",
+      "label": "Mistral Large 3",
+      "provider": "mistral",
+      "tier": "best",
+      "vision": true
+    },
+    {
+      "id": "mistral-medium-3-5",
+      "label": "Mistral Medium 3.5",
+      "provider": "mistral",
+      "tier": "mid",
+      "vision": true
+    },
+    {
+      "id": "mistral-small-2603",
+      "label": "Mistral Small 4",
+      "provider": "mistral",
+      "tier": "light",
+      "vision": true
+    },
+    {
+      "id": "codestral-2508",
+      "label": "Codestral",
+      "provider": "mistral",
+      "tier": "mid",
+      "vision": false
+    }
+  ],
+  "providers": {
+    "chatgpt_account": {
+      "name": "ChatGPT account",
+      "base_url": "",
+      "models_endpoint": null
+    },
+    "anthropic": {
+      "name": "Anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "models_endpoint": "https://api.anthropic.com/v1/models"
+    },
+    "openai": {
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "models_endpoint": "https://api.openai.com/v1/models"
+    },
+    "google": {
+      "name": "Google",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "models_endpoint": "https://generativelanguage.googleapis.com/v1beta/models"
+    },
+    "xai": {
+      "name": "xAI",
+      "base_url": "https://api.x.ai/v1",
+      "models_endpoint": "https://api.x.ai/v1/models"
+    },
+    "groq": {
+      "name": "Groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "models_endpoint": "https://api.groq.com/openai/v1/models"
+    },
+    "mistral": {
+      "name": "Mistral",
+      "base_url": "https://api.mistral.ai/v1",
+      "models_endpoint": null
+    },
+    "ollama": {
+      "name": "Local (Ollama)",
+      "base_url": "http://localhost:11434/v1",
+      "models_endpoint": null
+    }
+  },
+  "reasoning": {
+    "anthropic:claude-opus-4-8": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "disabled"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "low"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "medium"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "high"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "label_key": "reasoning.xhigh",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "xhigh"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "label_key": "reasoning.max",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "max"
+              }
+            }
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://platform.claude.com/docs/en/build-with-claude/effort"
+    },
+    "anthropic:claude-opus-4-7": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "disabled"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "low"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "medium"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "high"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "label_key": "reasoning.xhigh",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "xhigh"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "label_key": "reasoning.max",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "max"
+              }
+            }
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://platform.claude.com/docs/en/build-with-claude/effort"
+    },
+    "anthropic:claude-opus-4-6": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "disabled"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "low"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "medium"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "high"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "label_key": "reasoning.max",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "max"
+              }
+            }
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://platform.claude.com/docs/en/build-with-claude/effort"
+    },
+    "anthropic:claude-sonnet-4-6": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "disabled"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "low"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "medium"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "high"
+              }
+            }
+          },
+          "default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "label_key": "reasoning.max",
+          "kwargs": {
+            "extra_body": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "omitted"
+              },
+              "output_config": {
+                "effort": "max"
+              }
+            }
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://platform.claude.com/docs/en/build-with-claude/effort"
+    },
+    "openai:gpt-5.5": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "label_key": "reasoning.xhigh",
+          "kwargs": {
+            "reasoning_effort": "xhigh"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://developers.openai.com/api/docs/models"
+    },
+    "openai:gpt-5.4": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "label_key": "reasoning.xhigh",
+          "kwargs": {
+            "reasoning_effort": "xhigh"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://developers.openai.com/api/docs/models"
+    },
+    "openai:gpt-5.4-mini": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "label_key": "reasoning.xhigh",
+          "kwargs": {
+            "reasoning_effort": "xhigh"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://developers.openai.com/api/docs/models"
+    },
+    "google:gemini-3.5-flash": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "label_key": "reasoning.minimal",
+          "kwargs": {
+            "reasoning_effort": "minimal"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/openai"
+    },
+    "google:gemini-3-flash-preview": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "label_key": "reasoning.minimal",
+          "kwargs": {
+            "reasoning_effort": "minimal"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/openai"
+    },
+    "google:gemini-3.1-flash-lite": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "label_key": "reasoning.minimal",
+          "kwargs": {
+            "reasoning_effort": "minimal"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/openai"
+    },
+    "google:gemini-3.1-pro-preview": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/thinking"
+    },
+    "google:gemini-2.5-flash": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "label_key": "reasoning.minimal",
+          "kwargs": {
+            "reasoning_effort": "minimal"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/openai"
+    },
+    "google:gemini-2.5-flash-lite": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "label_key": "reasoning.minimal",
+          "kwargs": {
+            "reasoning_effort": "minimal"
+          },
+          "default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://ai.google.dev/gemini-api/docs/openai"
+    },
+    "groq:openai/gpt-oss-120b": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://console.groq.com/docs/reasoning"
+    },
+    "groq:openai/gpt-oss-20b": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "label_key": "reasoning.low",
+          "kwargs": {
+            "reasoning_effort": "low"
+          },
+          "default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "label_key": "reasoning.medium",
+          "kwargs": {
+            "reasoning_effort": "medium"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://console.groq.com/docs/reasoning"
+    },
+    "groq:qwen/qwen3.6-27b": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://console.groq.com/docs/reasoning"
+    },
+    "mistral:mistral-medium-3-5": {
+      "options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "label_key": "reasoning.default",
+          "kwargs": {},
+          "default": true
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "label_key": "reasoning.off",
+          "kwargs": {
+            "reasoning_effort": "none"
+          },
+          "default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "label_key": "reasoning.high",
+          "kwargs": {
+            "reasoning_effort": "high"
+          },
+          "default": false
+        }
+      ],
+      "evidence": "https://docs.mistral.ai/studio-api/conversations/reasoning"
+    }
+  },
+  "complex": [
+    [
+      "claude-opus-4-8",
+      "anthropic"
+    ],
+    [
+      "gpt-5.5",
+      "openai"
+    ]
+  ],
+  "simple": [
+    [
+      "claude-haiku-4-5-20251001",
+      "anthropic"
+    ],
+    [
+      "gpt-4.1-mini",
+      "openai"
+    ],
+    [
+      "gemini-2.5-flash",
+      "google"
+    ]
+  ],
+  "image_adapters": {
+    "anthropic": [
+      "openai_image_url",
+      [
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]
+    ],
+    "chatgpt_account": [
+      "app_server_local_image",
+      [
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]
+    ],
+    "google": [
+      "openai_image_url",
+      [
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]
+    ],
+    "groq": [
+      "openai_image_url",
+      [
+        "image/jpeg",
+        "image/png"
+      ]
+    ],
+    "mistral": [
+      "mistral_image_url",
+      [
+        "image/jpeg",
+        "image/png"
+      ]
+    ],
+    "openai": [
+      "openai_image_url",
+      [
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ]
+    ],
+    "xai": [
+      "openai_image_url",
+      [
+        "image/jpeg",
+        "image/png"
+      ]
+    ]
+  },
+  "pc_inventory": [
+    {
+      "provider_id": "anthropic",
+      "provider_display_name": "Anthropic",
+      "model_id": "claude-opus-4-8",
+      "model_display_name": "Claude Opus 4.8",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "default": false,
+          "label_key": "reasoning.xhigh"
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "default": false,
+          "label_key": "reasoning.max"
+        }
+      ],
+      "stable_key": "anthropic:claude-opus-4-8"
+    },
+    {
+      "provider_id": "anthropic",
+      "provider_display_name": "Anthropic",
+      "model_id": "claude-opus-4-7",
+      "model_display_name": "Claude Opus 4.7",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "default": false,
+          "label_key": "reasoning.xhigh"
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "default": false,
+          "label_key": "reasoning.max"
+        }
+      ],
+      "stable_key": "anthropic:claude-opus-4-7"
+    },
+    {
+      "provider_id": "anthropic",
+      "provider_display_name": "Anthropic",
+      "model_id": "claude-opus-4-6",
+      "model_display_name": "Claude Opus 4.6",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "default": false,
+          "label_key": "reasoning.max"
+        }
+      ],
+      "stable_key": "anthropic:claude-opus-4-6"
+    },
+    {
+      "provider_id": "anthropic",
+      "provider_display_name": "Anthropic",
+      "model_id": "claude-sonnet-4-6",
+      "model_display_name": "Claude Sonnet 4.6",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "default": false,
+          "label_key": "reasoning.max"
+        }
+      ],
+      "stable_key": "anthropic:claude-sonnet-4-6"
+    },
+    {
+      "provider_id": "anthropic",
+      "provider_display_name": "Anthropic",
+      "model_id": "claude-haiku-4-5-20251001",
+      "model_display_name": "Claude Haiku 4.5",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "anthropic:claude-haiku-4-5-20251001"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-5.5",
+      "model_display_name": "GPT-5.5",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "default": false,
+          "label_key": "reasoning.xhigh"
+        }
+      ],
+      "stable_key": "openai:gpt-5.5"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-5.4",
+      "model_display_name": "GPT-5.4",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "default": false,
+          "label_key": "reasoning.xhigh"
+        }
+      ],
+      "stable_key": "openai:gpt-5.4"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-5.4-mini",
+      "model_display_name": "GPT-5.4 Mini",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        },
+        {
+          "id": "xhigh",
+          "label": "Extra high",
+          "default": false,
+          "label_key": "reasoning.xhigh"
+        }
+      ],
+      "stable_key": "openai:gpt-5.4-mini"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-4.1",
+      "model_display_name": "GPT-4.1",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "openai:gpt-4.1"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-4.1-mini",
+      "model_display_name": "GPT-4.1 Mini",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "openai:gpt-4.1-mini"
+    },
+    {
+      "provider_id": "openai",
+      "provider_display_name": "OpenAI",
+      "model_id": "gpt-4.1-nano",
+      "model_display_name": "GPT-4.1 Nano",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "openai:gpt-4.1-nano"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-3.5-flash",
+      "model_display_name": "Gemini 3.5 Flash",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "default": false,
+          "label_key": "reasoning.minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-3.5-flash"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-3.1-pro-preview",
+      "model_display_name": "Gemini 3.1 Pro",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-3.1-pro-preview"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-3-flash-preview",
+      "model_display_name": "Gemini 3 Flash",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "default": false,
+          "label_key": "reasoning.minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-3-flash-preview"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-3.1-flash-lite",
+      "model_display_name": "Gemini 3.1 Flash Lite",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "default": false,
+          "label_key": "reasoning.minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-3.1-flash-lite"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-2.5-flash",
+      "model_display_name": "Gemini 2.5 Flash",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "default": false,
+          "label_key": "reasoning.minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-2.5-flash"
+    },
+    {
+      "provider_id": "google",
+      "provider_display_name": "Google",
+      "model_id": "gemini-2.5-flash-lite",
+      "model_display_name": "Gemini 2.5 Flash Lite",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "default": false,
+          "label_key": "reasoning.minimal"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "google:gemini-2.5-flash-lite"
+    },
+    {
+      "provider_id": "xai",
+      "provider_display_name": "xAI",
+      "model_id": "grok-3",
+      "model_display_name": "Grok 3",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "xai:grok-3"
+    },
+    {
+      "provider_id": "xai",
+      "provider_display_name": "xAI",
+      "model_id": "grok-3-mini",
+      "model_display_name": "Grok 3 Mini",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "xai:grok-3-mini"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "llama-3.3-70b-versatile",
+      "model_display_name": "Llama 3.3 70B Versatile",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [],
+      "stable_key": "groq:llama-3.3-70b-versatile"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "llama-3.1-8b-instant",
+      "model_display_name": "Llama 3.1 8B Instant",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [],
+      "stable_key": "groq:llama-3.1-8b-instant"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "qwen/qwen3-32b",
+      "model_display_name": "Qwen 3 32B",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [],
+      "stable_key": "groq:qwen/qwen3-32b"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "openai/gpt-oss-120b",
+      "model_display_name": "GPT-OSS 120B",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "groq:openai/gpt-oss-120b"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "openai/gpt-oss-20b",
+      "model_display_name": "GPT-OSS 20B",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "default": false,
+          "label_key": "reasoning.low"
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "default": false,
+          "label_key": "reasoning.medium"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "groq:openai/gpt-oss-20b"
+    },
+    {
+      "provider_id": "groq",
+      "provider_display_name": "Groq",
+      "model_id": "moonshotai/kimi-k2-instruct",
+      "model_display_name": "Kimi K2",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [],
+      "stable_key": "groq:moonshotai/kimi-k2-instruct"
+    },
+    {
+      "provider_id": "mistral",
+      "provider_display_name": "Mistral",
+      "model_id": "mistral-large-2512",
+      "model_display_name": "Mistral Large 3",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "mistral:mistral-large-2512"
+    },
+    {
+      "provider_id": "mistral",
+      "provider_display_name": "Mistral",
+      "model_id": "mistral-medium-3-5",
+      "model_display_name": "Mistral Medium 3.5",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [
+        {
+          "id": "auto",
+          "label": "Default",
+          "default": true,
+          "label_key": "reasoning.default"
+        },
+        {
+          "id": "off",
+          "label": "Off",
+          "default": false,
+          "label_key": "reasoning.off"
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "default": false,
+          "label_key": "reasoning.high"
+        }
+      ],
+      "stable_key": "mistral:mistral-medium-3-5"
+    },
+    {
+      "provider_id": "mistral",
+      "provider_display_name": "Mistral",
+      "model_id": "mistral-small-2603",
+      "model_display_name": "Mistral Small 4",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "capabilities": {
+        "vision": true
+      },
+      "reasoning_options": [],
+      "stable_key": "mistral:mistral-small-2603"
+    },
+    {
+      "provider_id": "mistral",
+      "provider_display_name": "Mistral",
+      "model_id": "codestral-2508",
+      "model_display_name": "Codestral",
+      "source_type": "api",
+      "configured": true,
+      "available": true,
+      "picker_visible": true,
+      "input_modalities": [
+        "text"
+      ],
+      "capabilities": {
+        "vision": false
+      },
+      "reasoning_options": [],
+      "stable_key": "mistral:codestral-2508"
+    }
+  ],
+  "provider_order": [
+    "chatgpt_account",
+    "anthropic",
+    "openai",
+    "deepseek",
+    "google",
+    "xai",
+    "groq",
+    "mistral",
+    "ollama"
+  ]
+}

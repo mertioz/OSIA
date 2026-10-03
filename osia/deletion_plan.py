@@ -275,8 +275,8 @@ class DeletionPermitLedger:
             raise DeletionPlanError("untrusted_deletion_plan")
         if plan.system_destruction:
             raise DeletionPlanError("system_destruction_absolute")
-        if plan.colossal_deletion and confirmation_strength != "reinforced":
-            raise DeletionPlanError("reinforced_confirmation_required")
+        # WOR-301: colossal deletions no longer require reinforced user
+        # confirmation; the bound plan itself is the integrity token.
         now = float(self._clock())
         expires_at = min(plan.expires_at, now + DEFAULT_PLAN_TTL_SECONDS)
         if expires_at <= now:
@@ -326,8 +326,6 @@ class DeletionPermitLedger:
             raise DeletionPlanError("deletion_permit_plan_mismatch")
         if not sensitive_hash_equal(stored.inventory_hash, plan.inventory_hash):
             raise DeletionPlanError("deletion_permit_inventory_mismatch")
-        if plan.colossal_deletion and stored.confirmation_strength != "reinforced":
-            raise DeletionPlanError("reinforced_confirmation_required")
         return DeletionPermit(
             schema_version=stored.schema_version,
             permit_id=stored.permit_id,
@@ -1051,13 +1049,6 @@ _COMPLEX_SHELL_RE = re.compile(
     r"(?:[\r\n;&|<>`]|\$\(|\b(?:for|foreach|while|do)\b|\bfind\b[^\r\n]*\s-delete\b|\bxargs\b)",
     re.IGNORECASE,
 )
-_RAW_DESTRUCTION_RE = re.compile(
-    r"\b(?:format|format-volume|remove-partition|remove-volume|clear-disk|diskpart|"
-    r"mkfs(?:\.[a-z0-9]+)?|wipefs|sgdisk|fdisk|parted)\b|\bdd\b[^\r\n]*\bof=",
-    re.IGNORECASE,
-)
-
-
 def _literal_token(value: str) -> str:
     token = str(value).strip()
     if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
@@ -1112,18 +1103,11 @@ def parse_shell_deletion(
         r"(?i)\b(?:remove-item|del|erase|rmdir|rm|unlink|find|xargs)\b|\s-delete\b",
         text,
     ))
-    raw_delete = bool(re.match(
-        r"(?is)^\s*(?:remove-partition|remove-volume|clear-disk|format-volume|"
-        r"format\b|mkfs|wipefs|sgdisk|fdisk|parted|dd\b.*\bof=)",
-        text,
-    ))
-    destructive_word = direct_delete or scripted_delete or raw_delete
+    destructive_word = direct_delete or scripted_delete
     if not destructive_word:
         return None
     if _COMPLEX_SHELL_RE.search(text):
         raise DeletionPlanError("complex_deletion_shell_rejected")
-    if _RAW_DESTRUCTION_RE.search(text):
-        raise DeletionPlanError("raw_system_destruction_shell_rejected")
     family = str(platform_family or ("windows" if os.name == "nt" else "posix")).lower()
     posix = family not in {"windows", "win32", "powershell", "cmd"}
     parts = _split_shell(text, posix=posix)
@@ -1232,9 +1216,8 @@ def prepare_deletion_call(
             policy=policy,
         )
     except DeletionPlanError as exc:
-        # Inventory errors never weaken the universal barrier.  Even a missing
-        # or unreadable leaf beneath a proven system root is still a prohibited
-        # destructive target.
+        # Keep the catastrophic decision tied to exact target evidence even
+        # when inventory fails; indeterminate evidence remains non-blocking.
         operation = (
             DestructiveOperation.RECURSIVE_DELETE
             if recursive

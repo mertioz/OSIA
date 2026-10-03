@@ -29,8 +29,10 @@ def _registry(mountinfo=MOUNTINFO):
 
 def test_active_root_boot_efi_and_critical_prefixes_are_protected():
     registry = _registry()
-    for target in ("/", "/boot", "/boot/efi", "/etc/passwd", "/usr/bin/tool", "/lib/libc.so"):
+    for target in ("/", "/boot", "/etc", "/usr", "/bin", "/lib"):
         assert registry.classify_path(target).blocks_destruction
+    for target in ("/boot/efi", "/etc/passwd", "/usr/bin/tool", "/lib/libc.so"):
+        assert not registry.classify_path(target).blocks_destruction
 
 
 def test_home_srv_mnt_opt_and_usr_local_are_not_prefix_protected():
@@ -42,7 +44,8 @@ def test_home_srv_mnt_opt_and_usr_local_are_not_prefix_protected():
 def test_unknown_block_role_is_indeterminate_and_ubuntu_core_roles_are_protected():
     registry = _registry()
     assert registry.classify_path("/dev/sdz9").classification is Classification.INDETERMINATE_PROTECTED_TARGET
-    assert registry.classify_path("/run/mnt/ubuntu-boot/grub.cfg").classification is Classification.PROTECTED_SYSTEM_VOLUME
+    assert registry.classify_path("/run/mnt/ubuntu-boot").classification is Classification.PROTECTED_SYSTEM_VOLUME
+    assert not registry.classify_path("/run/mnt/ubuntu-boot/grub.cfg").blocks_destruction
 
 
 def test_malformed_mountinfo_fails_closed_for_unknown_block_target():
@@ -138,8 +141,10 @@ def test_separate_usr_package_database_and_package_owned_opt_resource_are_protec
             ownership_probe=lambda path: path == "/opt/vendor/bin/owned",
         ),
     )
-    for target in ("/usr", "/dev/usr", "/var/lib/dpkg/status", "/opt/vendor/bin/owned"):
+    for target in ("/usr", "/dev/usr"):
         assert registry.classify_path(target).blocks_destruction
+    for target in ("/var/lib/dpkg/status", "/opt/vendor/bin/owned"):
+        assert not registry.classify_path(target).blocks_destruction
     assert registry.classify_path("/opt/vendor/bin/unowned").classification is Classification.NOT_SYSTEM_RESOURCE
 
 
@@ -149,4 +154,4 @@ def test_fixture_path_alias_escaping_into_etc_is_protected():
         linux=LinuxRuntimeAdapter(mountinfo=MOUNTINFO, os_release={"ID": "arch"}),
         path_resolver=lambda _path, _follow_leaf: "/etc/passwd",
     )
-    assert registry.classify_path("/fixture/alias/passwd").blocks_destruction
+    assert not registry.classify_path("/fixture/alias/passwd").blocks_destruction

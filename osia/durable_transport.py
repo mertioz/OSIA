@@ -669,6 +669,9 @@ class DurableTransportStore:
         command_type: str,
         binding: Mapping[str, Any],
         execution_epoch: str = "",
+        owner_id: str = "",
+        owner_pid: int = 0,
+        owner_process_identity: str = "",
     ) -> InboxClaim:
         command_id = _safe_id(command_id, "command_id")
         command_type = _safe_id(command_type, "command_type")
@@ -711,11 +714,102 @@ class DurableTransportStore:
                 "execution_epoch": epoch,
                 "state": "claimed",
                 "claimed_at": now,
+                "owner_id": str(owner_id)[:256],
+                "owner_pid": int(owner_pid),
+                "owner_process_identity": str(owner_process_identity)[:128],
+                "execution_boundary_version": 1,
                 "completed_at": 0.0,
                 "result": {},
             }
             self._write_atomic(path, record)
             return InboxClaim(InboxDisposition.CLAIMED, command_id, epoch)
+
+    def recover_unstarted_commands(self) -> list[str]:
+        """Recover proven dead pre-acceptance owners, never legacy/running ones."""
+        from osia.turn_terminality import live_process_identity
+
+        self._ensure_dirs()
+        recovered = []
+        for path in self.inbox_dir.glob("*.json"):
+            with self._thread_lock, _process_lock(path):
+                record = self._read(path)
+                if (record.get("state") != "claimed"
+                    or record.get("execution_boundary_version") != 1
+                    or record.get("execution_binding")
+                    or not record.get("owner_pid")
+                    or not record.get("owner_process_identity")):
+                    continue
+                alive, identity = live_process_identity(record["owner_pid"])
+                if alive and (not identity or identity == record["owner_process_identity"]):
+                    continue
+                # The process is dead (or the PID was reused), and this version
+                # fences every acceptance write before execution can begin.
+                record["state"] = "completed"
+                record["completed_at"] = float(self._clock())
+                record["result"] = {
+                    "accepted": False, "state": "failed_before_execution",
+                    "reason_code": "pre_turn_owner_process_exited",
+                }
+                self._write_atomic(path, record)
+                recovered.append(str(record["command_id"]))
+        return recovered
+
+    def mark_command_running(
+        self, command_id: str, *, execution_epoch: str,
+        execution_binding: Mapping[str, Any], accepted: bool = False,
+    ) -> None:
+        """Fence execution before the canonical acceptance write can occur."""
+        command_id = _safe_id(command_id, "command_id")
+        execution_epoch = _safe_id(execution_epoch, "execution_epoch")
+        path = self._inbox_path(command_id)
+        with self._thread_lock, _process_lock(path):
+            record = self._read(path)
+            if (not record or record.get("command_id") != command_id
+                or record.get("execution_epoch") != execution_epoch):
+                raise ValueError("stale_execution_epoch")
+            if record.get("state") == "completed":
+                raise ValueError("command_already_completed")
+            binding = sanitize_payload(execution_binding)
+            previous = record.get("execution_binding")
+            if previous and previous != binding:
+                raise ValueError("command_execution_binding_changed")
+            record["state"] = "running"
+            record["execution_binding"] = binding
+            record.setdefault("acceptance_started_at", float(self._clock()))
+            record.setdefault("execution_stage", "accepting_turn")
+            if accepted:
+                record.setdefault("turn_accepted_at", float(self._clock()))
+                record["execution_stage"] = "turn_accepted"
+            self._write_atomic(path, record)
+
+    def settle_unstarted_command(
+        self, command_id: str, *, execution_epoch: str,
+        reason_code: str = "owner_exited_before_turn_acceptance",
+    ) -> bool:
+        """Terminalize only a fenced owner that never entered acceptance.
+
+        This is a failure receipt for the command transport, never a model
+        receipt or permission to replay an action. Running/legacy uncertainty
+        must be reconciled against canonical execution by its owner.
+        """
+        command_id = _safe_id(command_id, "command_id")
+        execution_epoch = _safe_id(execution_epoch, "execution_epoch")
+        path = self._inbox_path(command_id)
+        with self._thread_lock, _process_lock(path):
+            record = self._read(path)
+            if (not record or record.get("command_id") != command_id
+                or record.get("execution_epoch") != execution_epoch):
+                raise ValueError("stale_execution_epoch")
+            if record.get("state") != "claimed" or record.get("execution_binding"):
+                return False
+            record["state"] = "completed"
+            record["completed_at"] = float(self._clock())
+            record["result"] = {
+                "accepted": False, "state": "failed_before_execution",
+                "reason_code": str(reason_code)[:128],
+            }
+            self._write_atomic(path, record)
+            return True
 
     def complete_command(
         self,
@@ -751,6 +845,27 @@ class DurableTransportStore:
                 execution_epoch,
                 safe_result,
             )
+
+    def list_commands(self, *, state: str | None = None) -> list[dict[str, Any]]:
+        """Read command inbox records for lifecycle reconciliation.
+
+        This is an observation API only. Callers must settle records through
+        the epoch-fenced transition methods rather than rewriting inbox files.
+        """
+
+        self._ensure_dirs()
+        records: list[dict[str, Any]] = []
+        for path in self.inbox_dir.glob("*.json"):
+            with self._thread_lock, _process_lock(path):
+                record = self._read(path)
+            if not record or (state is not None and record.get("state") != state):
+                continue
+            records.append(record)
+        records.sort(key=lambda item: (
+            float(item.get("claimed_at") or 0.0),
+            str(item.get("command_id") or ""),
+        ))
+        return records
 
     def advance_execution_epoch(
         self, *, conversation_id: str, run_id: str,

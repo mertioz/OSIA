@@ -138,7 +138,7 @@ def test_revalidation_rejects_any_inventory_change(tmp_path):
         revalidate_deletion_plan(plan, registry=registry)
 
 
-def test_injectable_thresholds_trigger_only_reinforced_confirmation(tmp_path):
+def test_injectable_thresholds_classify_colossal_without_reinforcement(tmp_path):
     file = tmp_path / "threshold.txt"
     file.write_text("x", encoding="utf-8")
     policy = ColossalDeletionPolicy(
@@ -153,12 +153,14 @@ def test_injectable_thresholds_trigger_only_reinforced_confirmation(tmp_path):
         [file], recursive=False, registry=_safe_registry(tmp_path), policy=policy,
     )
     assert plan.colossal_deletion is True
-    ordinary_ledger = DeletionPermitLedger()
-    with pytest.raises(DeletionPlanError, match="reinforced_confirmation_required"):
-        ordinary_ledger.issue(plan, policy_epoch=0, confirmation_strength="ordinary")
-    assert ordinary_ledger.issue(
-        plan, policy_epoch=0, confirmation_strength="reinforced",
-    ).used is False
+    # WOR-301: a colossal non-system deletion needs no reinforced user
+    # confirmation; the exact bound plan is the integrity token.
+    ledger = DeletionPermitLedger()
+    permit = ledger.issue(
+        plan, policy_epoch=0, confirmation_strength="ordinary",
+    )
+    assert permit.used is False
+    assert ledger.consume(permit, plan, policy_epoch=0).used is True
 
 
 def test_risk_score_threshold_marks_sensitive_recursive_repository(tmp_path):

@@ -215,6 +215,12 @@ class _PendingAgent:
     def activate_pending_tool_attempt(self):
         return True
 
+    def pending_tool_attempt_record(self):
+        return {
+            "tool_attempt_id": "wor247-attempt-waiting",
+            "status": "pending",
+        }
+
     def terminality_result(self, _turn_id):
         return self.terminal
 
@@ -346,10 +352,10 @@ def test_wait_sentinel_never_streams_persists_or_terminalizes_chat(cancelled):
                 assert tts_sessions[0].inputs == []
 
                 follow_up = _Channel()
-                assert await server._handle_waiting_tool_command(
+                assert not await server._handle_waiting_tool_command(
                     follow_up, meta["conversation_id"], "alors",
                 )
-                assert any(
+                assert not any(
                     frame.get("type") == "conversation_busy"
                     for frame in follow_up.frames
                 )
@@ -495,6 +501,11 @@ def test_failed_list_files_is_reresolved_before_another_dispatch(
             + "}</tool_call>",
             [],
         ),
+        ("Found the synthetic Desktop fixture.", [
+            "Found the synthetic Desktop fixture.",
+        ]),
+        # WOR-303: the canonical turn keeps the same objective and asks once
+        # more when postcondition evidence is still missing.
         ("Found the synthetic Desktop fixture.", [
             "Found the synthetic Desktop fixture.",
         ]),

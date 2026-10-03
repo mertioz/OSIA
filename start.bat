@@ -3,13 +3,12 @@ REM ===========================================================================
 REM OSIA - Launcher (Windows)  -- WOR-11
 REM
 REM   * activates the venv
-REM   * launches the OSIA GUI in wake mode in a visible window (blocks here)
+REM   * launches the OSIA GUI in wake mode as a detached desktop process
 REM
-REM The mobile server (http://localhost:8765) is NOT started here: it runs as a
-REM per-user Scheduled Task (registered by install.bat) that starts at login and
-REM survives GUI restarts. The GUI also self-heals the server at launch
-REM (osia/main.py -> _ensure_mobile_server_windows). Manage it from OSIA
-REM Settings > Startup.
+REM The mobile server is owned by its per-user Scheduled Task. Before the GUI
+REM is woken, osia.relaunch performs a source-fingerprint + /health readiness
+REM check and reuses or replaces that exact server task through the existing
+REM service lifecycle. Manage login startup from OSIA Settings > Startup.
 REM ===========================================================================
 chcp 65001 >nul
 setlocal
@@ -32,8 +31,18 @@ REM It runs as the independent per-user Scheduled Task created by install.bat,
 REM starts at login, and survives GUI restarts, so it is not started here. The
 REM GUI self-heals it at launch (osia/main.py -> _ensure_mobile_server_windows).
 
-REM --- OSIA GUI - wake mode (visible window; blocks until OSIA exits) --------
-echo [start] Lancement d'OSIA en mode wake...
-"%VENV_PY%" "%PROJECT_DIR%osia\main.py" --wake
+REM --- OSIA GUI - wake mode (detached from this short-lived launcher) --------
+echo [start] Verification du serveur canonique puis activation d'OSIA...
+pushd "%PROJECT_DIR%"
+"%VENV_PY%" -m osia.relaunch --launch-desktop
+set "OSIA_START_EXIT=%ERRORLEVEL%"
+popd
 
+if not "%OSIA_START_EXIT%"=="0" (
+    echo [ERREUR] La capsule OSIA n'a pas pu etre lancee.
+    endlocal
+    exit /b %OSIA_START_EXIT%
+)
+
+echo [start] Runtime canonique sain; OSIA reveille.
 endlocal

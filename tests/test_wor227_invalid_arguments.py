@@ -72,11 +72,13 @@ def test_one_repair_dispatches_once_with_exact_provider_and_model(monkeypatch):
         '<tool_call>{"tool":"get_system_info","private_field":"SECRET"}</tool_call>',
         '<tool_call>{"tool":"get_system_info"}</tool_call>',
         "The repaired read completed.",
+        # WOR-303: one canonical continuation round when evidence is missing.
+        "The repaired read completed.",
     ], observations)
     final = agent.run("Read synthetic system info.", history=[], on_sentence=lambda _x: None)
     assert final == "The repaired read completed."
     assert dispatches == ["called"]
-    assert len(observations) == 3
+    assert len(observations) == 4
     assert {(item["provider"], item["model"]) for item in observations} == {
         ("repair-provider", "repair-model")
     }

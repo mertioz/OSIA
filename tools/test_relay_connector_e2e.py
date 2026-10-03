@@ -48,6 +48,11 @@ from osia.relay_crypto import (  # noqa: E402
     verify_handshake_confirmation,
     x25519_public_key,
 )
+from osia.transport_coordinator import ApplicationTransportCoordinator  # noqa: E402
+from osia.webrtc_transport import (  # noqa: E402
+    WebRtcDirectSession,
+    WebRtcSessionState,
+)
 
 
 class _FakeRelayWs:
@@ -141,6 +146,21 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
                 self.bridge._local_ws = _FakeLocalWs()
 
         self.bridge._connect_local = connect_local
+
+    def _attach_active_webrtc_session(self):
+        coordinator = ApplicationTransportCoordinator()
+        manager = self.bridge._webrtc_manager
+        manager._coordinator = coordinator
+        session = WebRtcDirectSession(
+            manager=manager,
+            attempt_id="a" * 32,
+            generation=1,
+        )
+        session.state = WebRtcSessionState.READY
+        session.lease = coordinator.try_acquire("webrtc", session)
+        manager._session = session
+        self.assertIsNotNone(session.lease)
+        return manager, session, coordinator
 
     def test_v2_url_is_exact_pair_only_and_rejects_metadata_bases(self):
         expected = f"wss://relay.test/ws?pair_id={self.bridge.pair_id}"
@@ -533,6 +553,9 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
         self.bridge._outbound_chunk_ids["old"] = 1.0
         self.bridge.webrtc_capabilities_sent = True
         self.bridge._webrtc_manager._latest_generation = 3
+        manager, old_webrtc_session, coordinator = self._attach_active_webrtc_session()
+        self.assertEqual(coordinator.active_transport, "webrtc")
+        self.assertIsNone(coordinator.try_acquire("relay", self.bridge))
 
         new_private_key = bytes(range(64, 96))
         new_public_key = x25519_public_key(new_private_key)
@@ -562,8 +585,34 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge._outbound_chunk_ids, {})
         self.assertFalse(self.bridge.webrtc_capabilities_sent)
         self.assertEqual(self.bridge._webrtc_manager._latest_generation, 0)
+        self.assertTrue(old_webrtc_session._closed)
+        self.assertIsNone(manager._session)
+        self.assertIsNone(coordinator.active_transport)
         self.assertFalse(self.bridge.e2e_peer_ready)
         self.assertFalse(self.bridge.e2e_pc_ready_sent)
+
+        async def connect_local(_url, **_kwargs):
+            return _FakeLocalWs()
+
+        import websockets
+
+        self.bridge._connect_local = RelayBridge._connect_local.__get__(
+            self.bridge, RelayBridge
+        )
+        with (
+            mock.patch.object(websockets, "connect", new=connect_local),
+            mock.patch(
+                "osia.relay_connector.acquire_application_transport",
+                side_effect=lambda transport, owner: coordinator.try_acquire(
+                    transport, owner
+                ),
+            ),
+        ):
+            await self.bridge._connect_local(relay_ws, start_reader=False)
+        self.assertEqual(coordinator.active_transport, "relay")
+        self.assertTrue(self.bridge._application_transport_lease.active)
+        await self.bridge._close_local()
+        self.assertIsNone(coordinator.active_transport)
 
         mobile_keys = derive_session_keys(
             token=self.token,
@@ -590,6 +639,17 @@ class RelayConnectorE2ETests(unittest.IsolatedAsyncioTestCase):
             relay_ws, self._control_message(TYPE_E2E_READY, ready), ready
         )
         self.assertEqual(len(relay_ws.sent), after_ready)
+
+    async def test_ordinary_relay_loss_keeps_active_webrtc_lease(self):
+        manager, session, coordinator = self._attach_active_webrtc_session()
+
+        self.bridge._begin_relay_connection()
+
+        self.assertIs(manager._session, session)
+        self.assertFalse(session._closed)
+        self.assertEqual(coordinator.active_transport, "webrtc")
+        await manager.close()
+        self.assertIsNone(coordinator.active_transport)
 
     async def test_settled_handshake_is_application_silent_for_simulated_minute(self):
         relay_ws = _FakeRelayWs()

@@ -66,7 +66,7 @@ psutil>=5.9.0                      # heartbeat metrics + Windows service control
 pynput>=1.7.6                      # global hotkeys (Ctrl+Alt+P, Ctrl+Alt+O)
 pyperclip>=1.8.0                   # clipboard backend on Windows (get/set_clipboard)
 pyautogui>=0.9.54                  # native mouse/keyboard control on Windows/Mac (WOR-42 desktop_* tools; Linux uses ydotool/xdotool)
-Pillow>=10.0                       # screenshots + image handling (agent.py ImageGrab, desktop_control.py)
+Pillow>=11.2.1                     # exact HWND ImageGrab(window=...) + image handling
 pypdfium2==5.12.1                 # bundled PDFium: offline native PDF text/rendering
 reportlab==4.4.10                  # bounded offline PDF generation (BSD-3-Clause)
 rapidocr==3.9.2                    # offline OCR with bundled PP-OCR ONNX models
@@ -79,10 +79,14 @@ tqdm>=4.65.0
 # Marker-guarded so `pip install -r requirements.txt` still works on Linux/Mac,
 # where the package is unavailable (cross-platform rule, WOR-11).
 pywin32>=306; sys_platform == "win32"
+# Exact HWND-bound capture for GPU-rendered/Electron windows.  GDI/PrintWindow
+# can legally return an all-black bitmap for these windows; Windows Graphics
+# Capture keeps read-only background observation exact without foregrounding.
+windows-capture==2.0.1; sys_platform == "win32"
 
 # WOR-46 — Accessibility-API (Windows UI Automation) click backend. `uiautomation`
 # (yinkaisheng) resolves a native element's exact bounding-rect center, tried
-# before the vision fallback in agent.tool_desktop_click; it pulls `comtypes`,
+# before any model-selected visual bbox in agent.tool_desktop_click; it pulls `comtypes`,
 # declared explicitly so the WOR-36 installer always provisions it. Both are
 # marker-guarded to Windows. NOTE: a PyInstaller build must add `comtypes.gen` (and
 # `comtypes`) hidden imports — the UIAutomationClient typelib cache is generated at

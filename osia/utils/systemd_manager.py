@@ -35,6 +35,7 @@ from osia.runtime import (
     cmdline_has_mode,
     is_frozen,
     resource_root,
+    source_tree_fingerprint,
 )
 from osia.utils.subprocess_policy import run_background_probe
 
@@ -63,6 +64,12 @@ _WIN_LIFECYCLE_MUTEX_TIMEOUT = 5.0
 _WIN_GRACEFUL_STOP_TIMEOUT = 12.0
 _WIN_FORCED_STOP_TIMEOUT = 20.0
 _WIN_STOP_POLL_SEC = 0.5
+_SERVER_ENSURE_MUTEX_NAME = "Local\\OSIA.ServerCanonicalEnsure"
+_SERVER_ENSURE_MUTEX_TIMEOUT = 240.0
+_SERVER_READY_TIMEOUT = 240.0
+_SERVER_READY_POLL_SEC = 0.5
+_SERVER_STARTUP_GRACE_SEC = 240.0
+_SERVER_HEALTH_TIMEOUT_SEC = 2.0
 
 _WIN_WAIT_OBJECT_0 = 0x00000000
 _WIN_WAIT_ABANDONED = 0x00000080
@@ -161,6 +168,11 @@ def _win_lifecycle_mutex_name(kind: str) -> str:
 
 def _win_restart_mutex_name(kind: str) -> str:
     return f"Local\\OSIA.ServiceRestart.{kind}"
+
+
+def _new_server_ensure_mutex():
+    """Serialize canonical source checks across start.bat and GUI wake."""
+    return _WinNamedMutex(_SERVER_ENSURE_MUTEX_NAME)
 
 
 def _win_child_job_name(kind: str, supervisor_pid: int) -> str:
@@ -280,8 +292,7 @@ def _win_is_supervisor(info: dict, kind: str) -> bool:
         _win_cmdline_has_path(" ".join(cmdline), _RUN_SERVICE)
         and kind in {arg.lower() for arg in cmdline}
     ) or bool(
-        is_frozen()
-        and cmdline_has_mode(cmdline, SERVICE_MODE)
+        cmdline_has_mode(cmdline, SERVICE_MODE)
         and kind in {arg.lower() for arg in cmdline}
     )
 
@@ -292,7 +303,7 @@ def _win_is_service_owner(info: dict, kind: str) -> bool:
     if kind == "server":
         return _win_cmdline_has_path(
             cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py",
-        ) or (is_frozen() and cmdline_has_mode(args, SERVER_MODE))
+        ) or cmdline_has_mode(args, SERVER_MODE)
     if kind == "tunnel":
         return _win_cmdline_has_path(cmdline, _TUNNEL_LOG)
     return False
@@ -381,6 +392,476 @@ def _win_listener_pids(ports=_SERVER_PORTS) -> set[int]:
         except (AttributeError, IndexError, TypeError):
             continue
     return listeners
+
+
+def _runtime_path_key(value) -> str:
+    if not value:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _expected_source_server_identity() -> dict | None:
+    """Identity a source server on this checkout must report from ``/health``."""
+
+    try:
+        root = Path(_REPO_ROOT).resolve()
+        fingerprint = source_tree_fingerprint(root)
+        executable = root / "venv" / "Scripts" / "python.exe"
+        if not fingerprint or not executable.is_file():
+            return None
+        return {
+            "checkout_root": str(root),
+            "entrypoint": str((root / "osia" / "server" / "server.py").resolve()),
+            "executable": str(executable),
+            "source_fingerprint": fingerprint,
+        }
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _server_health_matches_current_source(
+    payload: dict | None,
+    *,
+    owner_pid: int,
+    expected: dict,
+) -> bool:
+    """Require the HTTP responder to attest this exact source/PID generation."""
+
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("_http_status", 200) != 200:
+        return False
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        return False
+    try:
+        runtime_pid = int(runtime.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        payload.get("status") == "healthy"
+        and payload.get("service") == "osia-mobile-server"
+        and runtime_pid == int(owner_pid)
+        and runtime.get("source_mode") == "source"
+        and _runtime_path_key(runtime.get("checkout_root"))
+        == _runtime_path_key(expected.get("checkout_root"))
+        and _runtime_path_key(runtime.get("entrypoint"))
+        == _runtime_path_key(expected.get("entrypoint"))
+        and _runtime_path_key(runtime.get("executable"))
+        == _runtime_path_key(expected.get("executable"))
+        and str(runtime.get("source_fingerprint") or "")
+        == str(expected.get("source_fingerprint") or "")
+        and str(runtime.get("runtime_id") or "")
+        == f"{owner_pid}:{expected.get('source_fingerprint', '')}"
+    )
+
+
+def _read_local_server_health() -> dict | None:
+    """Read the local health contract; errors are unavailable, never healthy."""
+
+    import json
+    from urllib.error import HTTPError
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(
+            f"http://127.0.0.1:{_SERVER_PORT}/health",
+            timeout=_SERVER_HEALTH_TIMEOUT_SEC,
+        ) as response:
+            body = json.loads(response.read(32_768).decode("utf-8"))
+            if not isinstance(body, dict):
+                return {"_http_status": int(response.status)}
+            return {**body, "_http_status": int(response.status)}
+    except HTTPError as exc:
+        return {"_http_status": int(exc.code)}
+    except Exception:
+        return None
+
+
+def _win_source_server_identities(snapshot: list[dict]) -> dict[int, float]:
+    identities = {}
+    for info in snapshot:
+        try:
+            if _win_is_service_owner(info, "server"):
+                identities[int(info["pid"])] = float(info["create_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return identities
+
+
+def _win_related_source_server_pids(
+    owner_pid: int,
+    snapshot: list[dict],
+) -> set[int]:
+    """Group the venv launcher and its Python child as one server instance."""
+
+    by_pid = {}
+    children: dict[int, list[int]] = {}
+    for info in snapshot:
+        try:
+            pid = int(info["pid"])
+            ppid = int(info.get("ppid") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_pid[pid] = info
+        children.setdefault(ppid, []).append(pid)
+
+    related = {int(owner_pid)}
+    current = int(owner_pid)
+    visited = set()
+    while current in by_pid and current not in visited:
+        visited.add(current)
+        try:
+            parent_pid = int(by_pid[current].get("ppid") or 0)
+        except (TypeError, ValueError):
+            break
+        parent = by_pid.get(parent_pid)
+        if parent is None:
+            break
+        if _win_is_service_owner(parent, "server"):
+            related.add(parent_pid)
+        current = parent_pid
+
+    pending = list(related)
+    seen = set(pending)
+    while pending:
+        parent_pid = pending.pop()
+        for child_pid in children.get(parent_pid, ()):
+            if child_pid in seen:
+                continue
+            seen.add(child_pid)
+            child = by_pid.get(child_pid)
+            if child is not None and _win_is_service_owner(child, "server"):
+                related.add(child_pid)
+            pending.append(child_pid)
+    return related
+
+
+def _win_probe_source_server(expected: dict) -> dict:
+    """Classify :8765 by exact listener, command, checkout, and health facts."""
+
+    try:
+        listener_pids = _win_listener_pids((_SERVER_PORT,))
+    except Exception:
+        return {"kind": "unknown", "reason": "listener_owner_unavailable"}
+
+    if -1 in listener_pids:
+        return {"kind": "foreign", "reason": "listener_pid_unattributed"}
+    if not listener_pids:
+        if _win_port_open(_SERVER_PORT):
+            return {"kind": "foreign", "reason": "listener_owner_unattributed"}
+        try:
+            snapshot = _win_process_snapshot()
+            server_identities = _win_source_server_identities(snapshot)
+            if server_identities:
+                youngest_age = min(
+                    time.time() - created
+                    for created in server_identities.values()
+                )
+                if youngest_age <= _SERVER_STARTUP_GRACE_SEC:
+                    return {
+                        "kind": "starting",
+                        "server_identities": server_identities,
+                    }
+                return {
+                    "kind": "stale",
+                    "reason": "canonical_server_process_not_listening",
+                    "server_identities": server_identities,
+                }
+            starting = bool(
+                _win_supervisor_running("server")
+                or _win_task_running(_TASK_NAME["server"])
+            )
+        except Exception:
+            return {"kind": "unknown", "reason": "scheduled_task_state_unavailable"}
+        return {"kind": "starting" if starting else "stopped"}
+
+    try:
+        snapshot = _win_process_snapshot()
+    except Exception:
+        return {"kind": "unknown", "reason": "process_identity_unavailable"}
+    by_pid = {int(info["pid"]): info for info in snapshot if info.get("pid") is not None}
+    listener_infos = [by_pid.get(pid) for pid in listener_pids]
+    if any(info is None or not _win_is_service_owner(info, "server")
+           for info in listener_infos):
+        return {
+            "kind": "foreign",
+            "reason": "port_owner_is_not_canonical_osia",
+            "listener_pids": set(listener_pids),
+        }
+
+    health = _read_local_server_health()
+    health_runtime = health.get("runtime") if isinstance(health, dict) else None
+    try:
+        health_pid = int(health_runtime.get("pid")) if isinstance(health_runtime, dict) else 0
+    except (TypeError, ValueError):
+        health_pid = 0
+    if (
+        health_pid in listener_pids
+        and _server_health_matches_current_source(
+            health, owner_pid=health_pid, expected=expected,
+        )
+    ):
+        related = _win_related_source_server_pids(health_pid, snapshot)
+        all_server_ids = _win_source_server_identities(snapshot)
+        duplicates = {
+            pid: created for pid, created in all_server_ids.items()
+            if pid not in related and pid not in listener_pids
+        }
+        duplicates.update({
+            pid: float(by_pid[pid]["create_time"])
+            for pid in listener_pids if pid != health_pid
+        })
+        if duplicates:
+            return {
+                "kind": "duplicate",
+                "authoritative_pid": health_pid,
+                "duplicate_identities": duplicates,
+            }
+        return {"kind": "current", "authoritative_pid": health_pid}
+
+    all_server_ids = _win_source_server_identities(snapshot)
+    owner_identities = {
+        pid: all_server_ids[pid] for pid in listener_pids if pid in all_server_ids
+    }
+    now = time.time()
+    youngest_age = min(
+        (now - created for created in owner_identities.values()),
+        default=float("inf"),
+    )
+    # A just-bound canonical process can briefly be between TCP accept and its
+    # first health response. An HTTP response that is stale/unhealthy is direct
+    # incompatibility evidence and does not receive this grace.
+    if health is None and youngest_age <= _SERVER_STARTUP_GRACE_SEC:
+        return {"kind": "starting", "owner_identities": owner_identities}
+    return {
+        "kind": "stale",
+        "reason": (
+            "health_unavailable"
+            if health is None else
+            f"health_incompatible_http_{health.get('_http_status', 'unknown')}"
+        ),
+        "health": health,
+        "owner_identities": owner_identities,
+        "server_identities": all_server_ids,
+    }
+
+
+def _win_cleanup_duplicate_source_servers(identities: dict[int, float]) -> bool:
+    """Terminate only captured independent run_server.py PID/create-time pairs."""
+
+    if not identities:
+        return True
+    try:
+        _win_terminate_identities(dict(identities), timeout=4.0)
+        import psutil
+
+        for pid, created in identities.items():
+            try:
+                proc = psutil.Process(pid)
+                if abs(float(proc.create_time()) - float(created)) <= 0.001:
+                    return False
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.AccessDenied:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _wait_for_current_source_server(expected: dict, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        state = _win_probe_source_server(expected)
+        if state.get("kind") == "current":
+            return True
+        if state.get("kind") == "duplicate":
+            if not _win_cleanup_duplicate_source_servers(
+                state.get("duplicate_identities") or {},
+            ):
+                return False
+        elif state.get("kind") in {"foreign", "unknown", "stale"}:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_SERVER_READY_POLL_SEC, remaining))
+
+
+def _start_server_task_if_idle(task: str) -> bool:
+    """Start one registered supervisor only when Task Scheduler and psutil agree."""
+
+    try:
+        task_running = _win_task_running_for_barrier(task)
+    except Exception:
+        return False
+    supervisor_running = _win_supervisor_running("server")
+    if task_running or supervisor_running:
+        return True
+    return _win_run_task(task)
+
+
+def _revalidate_source_server_identities(
+    identities: dict[int, float],
+) -> dict[int, float]:
+    """Keep only the exact still-live canonical run_server.py identities."""
+
+    snapshot = _win_process_snapshot()
+    by_pid = {int(info["pid"]): info for info in snapshot}
+    verified = {}
+    for pid, created in identities.items():
+        if _win_process_for_identity(int(pid), float(created)) is None:
+            continue
+        info = by_pid.get(int(pid))
+        if info is not None and _win_is_service_owner(info, "server"):
+            verified[int(pid)] = float(created)
+    return verified
+
+
+def _replace_source_server(task: str, expected: dict) -> bool:
+    """Use OSIA's existing task lifecycle, then exact stale-owner fallback."""
+
+    restart_mutex = None
+    try:
+        restart_mutex = _WinNamedMutex(_win_restart_mutex_name("server"))
+        if not restart_mutex.acquire(_WIN_RESTART_MUTEX_TIMEOUT):
+            print("[win-service] source refresh failed category=restart-mutex-timeout")
+            return False
+
+        state = _win_probe_source_server(expected)
+        if state.get("kind") == "current":
+            return True
+        if state.get("kind") == "duplicate":
+            if _win_cleanup_duplicate_source_servers(
+                state.get("duplicate_identities") or {},
+            ) and _wait_for_current_source_server(expected, 5.0):
+                return True
+            state = _win_probe_source_server(expected)
+        if state.get("kind") in {"foreign", "unknown"}:
+            print(
+                "[win-service] source refresh failed "
+                f"category={state.get('reason', state.get('kind'))}"
+            )
+            return False
+
+        health = state.get("health")
+        runtime = health.get("runtime") if isinstance(health, dict) else None
+        if isinstance(runtime, dict) and (
+            runtime.get("source_mode") != "source"
+            or _runtime_path_key(runtime.get("checkout_root"))
+            != _runtime_path_key(expected.get("checkout_root"))
+        ):
+            # Refresh the existing task action from this source checkout before
+            # restarting, so an old packaged action cannot relaunch itself.
+            if not _win_register_task("server"):
+                return False
+
+        restarted = _win_coordinated_restart("server")
+        if restarted:
+            return _wait_for_current_source_server(
+                expected, _SERVER_READY_TIMEOUT,
+            )
+
+        state = _win_probe_source_server(expected)
+        if state.get("kind") == "current":
+            return True
+        if state.get("kind") == "duplicate":
+            if not _win_cleanup_duplicate_source_servers(
+                state.get("duplicate_identities") or {},
+            ):
+                return False
+            return _wait_for_current_source_server(
+                expected, _SERVER_READY_TIMEOUT,
+            )
+        if state.get("kind") in {"foreign", "unknown"}:
+            return False
+        if state.get("kind") == "starting":
+            if _wait_for_current_source_server(expected, _SERVER_READY_TIMEOUT):
+                return True
+            state = _win_probe_source_server(expected)
+            if state.get("kind") == "current":
+                return True
+            if state.get("kind") in {"foreign", "unknown"}:
+                return False
+
+        identities = (
+            state.get("owner_identities")
+            or state.get("server_identities")
+            or state.get("duplicate_identities")
+            or {}
+        )
+        # The coordinated task shutdown already gave a managed owner its
+        # orderly stop window. If an exact canonical listener was detached from
+        # that supervisor, terminate only its captured PID/create-time identity.
+        verified = _revalidate_source_server_identities(identities)
+        if not verified:
+            return False
+        _win_terminate_identities(verified, timeout=5.0)
+
+        if not _win_task_registered(task) and not _win_register_task("server"):
+            return False
+        if not _start_server_task_if_idle(task):
+            return False
+        return _wait_for_current_source_server(expected, _SERVER_READY_TIMEOUT)
+    except Exception as exc:
+        print(f"[win-service] source refresh failed category={type(exc).__name__}")
+        return False
+    finally:
+        if restart_mutex is not None:
+            restart_mutex.close()
+
+
+def _ensure_source_server_runtime(task: str) -> bool:
+    """Accept, start, or safely replace the one current source runtime."""
+
+    expected = _expected_source_server_identity()
+    if expected is None:
+        print("[win-service] source runtime unavailable category=fingerprint")
+        return False
+    if not _win_task_registered(task) and not _win_register_task("server"):
+        print("[win-service] source runtime unavailable category=task-registration")
+        return False
+
+    state = _win_probe_source_server(expected)
+    if state.get("kind") == "current":
+        return True
+    if state.get("kind") == "duplicate":
+        if not _win_cleanup_duplicate_source_servers(
+            state.get("duplicate_identities") or {},
+        ):
+            print("[win-service] source runtime unavailable category=duplicate-cleanup")
+            return False
+        if _wait_for_current_source_server(expected, 5.0):
+            return True
+        state = _win_probe_source_server(expected)
+    if state.get("kind") in {"foreign", "unknown"}:
+        print(
+            "[win-service] source runtime unavailable "
+            f"category={state.get('reason', state.get('kind'))}"
+        )
+        return False
+
+    if state.get("kind") in {"starting", "stopped"}:
+        if state.get("kind") == "stopped" and not _start_server_task_if_idle(task):
+            print("[win-service] source runtime unavailable category=task-start")
+            return False
+        if _wait_for_current_source_server(expected, _SERVER_READY_TIMEOUT):
+            return True
+        state = _win_probe_source_server(expected)
+        if state.get("kind") == "current":
+            return True
+        if state.get("kind") in {"foreign", "unknown"}:
+            print(
+                "[win-service] source runtime unavailable "
+                f"category={state.get('reason', state.get('kind'))}"
+            )
+            return False
+
+    return _replace_source_server(task, expected)
 
 
 def _win_unowned_service_pids(kind: str, tree: _WinServiceTree) -> set[int]:
@@ -871,12 +1352,11 @@ def _win_supervisor_running(kind: str) -> bool:
             continue
         joined = " ".join(cmdline)
         source_match = _win_cmdline_has_path(joined, _RUN_SERVICE) and kind in cmdline
-        frozen_match = (
-            is_frozen()
-            and cmdline_has_mode(cmdline, SERVICE_MODE)
+        mode_match = (
+            cmdline_has_mode(cmdline, SERVICE_MODE)
             and kind in cmdline
         )
-        if source_match or frozen_match:
+        if source_match or mode_match:
             return True
     return False
 
@@ -919,7 +1399,7 @@ def _win_stop_server() -> bool:
         raw_cmdline = proc.info.get("cmdline") or []
         if _win_cmdline_has_path(
             cmdline, _REPO_ROOT / "osia" / "server" / "run_server.py"
-        ) or (is_frozen() and cmdline_has_mode(raw_cmdline, SERVER_MODE)):
+        ) or cmdline_has_mode(raw_cmdline, SERVER_MODE):
             try:
                 proc.terminate()
                 targets.append(proc)
@@ -1075,10 +1555,11 @@ def remove_windows_services() -> bool:
 
 
 def ensure_service_running(name: str) -> bool:
-    """Ensure ``name``'s Scheduled Task is registered and the service is running,
-    without re-registering a task that already exists. Used by the GUI startup
-    self-heal (``osia/main.py``) so the server comes up even on an install that
-    predates the task model. Windows-only; no-op (returns True) elsewhere.
+    """Ensure the canonical Windows server is serving this source generation.
+
+    Source-mode callers do not accept a task/process/port as proof of health.
+    The one-time readiness check is serialized across GUI wake and start.bat;
+    the frozen app keeps its established service path. Windows-only.
     """
     if not _IS_WINDOWS:
         return True
@@ -1087,14 +1568,29 @@ def ensure_service_running(name: str) -> bool:
         return False
     if kind == "tunnel":
         return False
-    if is_frozen() and kind == "server" and _SERVER_DISABLED_MARKER.exists():
-        return True
     task = _TASK_NAME[kind]
-    if not _win_task_registered(task):
-        _win_register_task(kind)
-    if _win_should_start(kind):
-        _win_run_task(task)
-    return True
+    if is_frozen():
+        if kind == "server" and _SERVER_DISABLED_MARKER.exists():
+            return True
+        if not _win_task_registered(task) and not _win_register_task(kind):
+            return False
+        if _win_should_start(kind) and not _win_run_task(task):
+            return False
+        return True
+
+    mutex = None
+    try:
+        mutex = _new_server_ensure_mutex()
+        if not mutex.acquire(_SERVER_ENSURE_MUTEX_TIMEOUT):
+            print("[win-service] source readiness failed category=ensure-mutex-timeout")
+            return False
+        return _ensure_source_server_runtime(task)
+    except Exception as exc:
+        print(f"[win-service] source readiness failed category={type(exc).__name__}")
+        return False
+    finally:
+        if mutex is not None:
+            mutex.close()
 
 
 def is_service_enabled(name: str) -> bool:

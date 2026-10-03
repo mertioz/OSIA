@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -288,7 +288,7 @@ def test_post_dispatch_uia_exception_remains_outcome_unknown():
     )
 
 
-def test_pre_dispatch_failure_attaches_targeted_observation_only_for_poor_uia():
+def test_pre_dispatch_failure_exposes_observers_without_auto_invoking_vision():
     from osia import desktop_scene
 
     scene = _scene(target=False)
@@ -311,9 +311,15 @@ def test_pre_dispatch_failure_attaches_targeted_observation_only_for_poor_uia():
             ),
             patch("osia.tools.desktop_control._load_uiautomation", return_value=None),
             patch(
-                "osia.desktop_scene._capture_bounds_timed",
-                return_value=(PNG, 3.0, 1.0),
-            ) as capture,
+                "osia.desktop_scene.request_visual_observation",
+                return_value={
+                    "receipt": {
+                        "outcome": "observed",
+                        "reason_code": "image_first_effective_model",
+                    },
+                    "screenshot": "bounded-fixture-image",
+                },
+            ) as observe_image,
         ):
             result = desktop_scene.activate_desktop_surface(
                 stale_target.ref_id, "Compose",
@@ -322,14 +328,15 @@ def test_pre_dispatch_failure_attaches_targeted_observation_only_for_poor_uia():
         desktop_scene.reset_effective_model(route)
         desktop_scene.end_desktop_turn(tokens)
 
-    assert capture.call_count == 1
-    assert capture.call_args.args[0] == scene.window_ref.bounds
+    assert observe_image.call_count == 0
     assert result["receipt"]["accessibility_quality"] == "target_missing"
-    assert result["receipt"]["adaptive_visual_observation"] == "observed"
-    assert "screenshot" in result
+    assert result["receipt"]["available_read_only_observers"] == [
+        "inspect_desktop_surfaces", "request_visual_observation",
+    ]
+    assert "screenshot" not in result
 
 
-def test_delayed_tree_is_reobserved_without_unnecessary_capture():
+def test_delayed_tree_failure_returns_before_optional_visual_observation():
     from osia import desktop_scene
 
     initial = _scene(target=False)
@@ -355,7 +362,15 @@ def test_delayed_tree_is_reobserved_without_unnecessary_capture():
                 return_value=resolution,
             ),
             patch("osia.tools.desktop_control._load_uiautomation", return_value=None),
-            patch("osia.desktop_scene._capture_bounds_timed") as capture,
+            patch(
+                "osia.desktop_scene.request_visual_observation",
+                return_value={
+                    "receipt": {
+                        "outcome": "observed",
+                        "reason_code": "image_first_effective_model",
+                    },
+                },
+            ) as observe_image,
         ):
             result = desktop_scene.activate_desktop_surface(
                 stale_target.ref_id, "Compose",
@@ -364,11 +379,11 @@ def test_delayed_tree_is_reobserved_without_unnecessary_capture():
         desktop_scene.reset_effective_model(route)
         desktop_scene.end_desktop_turn(tokens)
 
-    assert observe.call_count == 2
-    capture.assert_not_called()
-    assert result["receipt"]["adaptive_visual_observation"] == (
-        "structured_evidence_sufficient"
-    )
+    assert observe.call_count == 1
+    observe_image.assert_not_called()
+    assert result["receipt"]["available_read_only_observers"] == [
+        "inspect_desktop_surfaces", "request_visual_observation",
+    ]
 
 
 def test_stale_target_is_reresolved_only_to_one_equivalent_surface():
@@ -660,124 +675,111 @@ def test_missing_bound_node_cannot_fall_back_to_another_semantic_node():
     assert len(strategy.pending_nodes()) == 2
 
 
-def test_local_capture_refuses_foreground_window_identity_change(tmp_path):
-    from osia import agent as agent_module
+def test_visual_click_refuses_missing_or_stale_frame_identity():
     from osia import desktop_scene
 
-    scene = _scene(target=False)
-    output = tmp_path / "local-window.png"
-    with (
-        patch("osia.desktop_scene.observe_foreground_scene", return_value=scene),
-        patch.object(
-            desktop_scene.DESKTOP_SURFACE_REGISTRY,
-            "native_identity",
-            return_value=_native(),
-        ),
-        patch(
-            "osia.desktop_scene._capture_bounds_timed",
-            return_value=(b"png", 1.0, 1.0),
-        ),
-        patch(
-            "osia.tools.desktop_control._foreground_window_win32",
-            return_value=(999, "different", 123),
-        ),
-    ):
-        bounds = agent_module._capture_exact_foreground_window(str(output))
+    route = desktop_scene.bind_effective_model("openai", "gpt-5.4")
+    frames_token = desktop_scene._VISUAL_FRAMES.set({})
+    try:
+        result = desktop_scene.vision_guided_desktop_click(
+            "Compose",
+            Mock(),
+            visual_frame_id="frame_from_old_foreground",
+            visual_bbox={"left": 0.1, "top": 0.1, "right": 0.2, "bottom": 0.2},
+        )
+    finally:
+        desktop_scene._VISUAL_FRAMES.reset(frames_token)
+        desktop_scene.reset_effective_model(route)
 
-    assert bounds is None
-    assert not output.exists()
+    assert result["reason_code"] == "VISUAL_FRAME_REQUIRED"
+    assert result["dispatched"] is False
 
 
-def test_local_vision_uses_exact_window_before_global_coordinates():
+def test_canonical_vision_replaces_legacy_local_and_global_coordinates():
     from osia import desktop_scene
     from osia import agent as agent_module
 
-    bounds = SurfaceBounds(-100, 50, 900, 650, dpi_scale=1.5)
     route = desktop_scene.bind_effective_model("openai", "gpt-5.4")
     try:
         with (
-            patch("osia.agent._capture_screen", return_value=None),
             patch("osia.tools.desktop_control.resolve_element_rect", return_value=None),
-            patch("osia.tools.desktop_control.activate_by_keyboard", return_value=None),
-            patch("osia.agent._capture_exact_foreground_window", return_value=bounds),
             patch(
-                "osia.agent._vision_locate",
-                return_value={"found": True, "x": 100, "y": 100},
-            ) as locate,
-            patch(
-                "osia.agent._refine_click_target",
-                return_value=(0, 150, True),
-            ),
+                "osia.desktop_scene.vision_guided_desktop_click",
+                return_value={
+                    "dispatched": True,
+                    "outcome": "verified",
+                    "text": "canonical click",
+                    "receipt": {
+                        "proposal_id": "proposal_fixture",
+                        "source_frame_id": "frame_fixture",
+                    },
+                },
+            ) as canonical,
             patch("osia.tools.desktop_control.click_at", return_value="clicked") as click,
-            patch("osia.agent._screens_changed", return_value=True),
         ):
-            result = agent_module.tool_desktop_click("Compose")
+            result = agent_module.tool_desktop_click(
+                "Compose",
+                visual_frame_id="frame_fixture",
+                visual_bbox={"left": 0.1, "top": 0.2, "right": 0.3, "bottom": 0.4},
+            )
     finally:
         desktop_scene.reset_effective_model(route)
 
-    assert not result.startswith("ERROR:")
-    assert locate.call_count == 1
-    assert locate.call_args.args[0].endswith("osia_desktop_window_local.png")
-    click.assert_called_once_with(0, 150)
+    assert result["outcome"] == "verified"
+    canonical.assert_called_once()
+    assert canonical.call_args.kwargs["visual_frame_id"] == "frame_fixture"
+    assert canonical.call_args.kwargs["visual_bbox"]["right"] == 0.3
+    click.assert_not_called()
 
 
-def test_global_vision_is_used_only_after_local_failure():
+def test_legacy_global_vision_is_never_used_after_canonical_failure():
     from osia import desktop_scene
     from osia import agent as agent_module
 
-    bounds = SurfaceBounds(100, 50, 900, 650)
     route = desktop_scene.bind_effective_model("openai", "gpt-5.4")
     try:
         with (
-            patch("osia.agent._capture_screen", return_value=None),
             patch("osia.tools.desktop_control.resolve_element_rect", return_value=None),
-            patch("osia.tools.desktop_control.activate_by_keyboard", return_value=None),
-            patch("osia.agent._capture_exact_foreground_window", return_value=bounds),
             patch(
-                "osia.agent._vision_locate",
-                side_effect=(
-                    {"found": False, "reason": "not in local window"},
-                    {"found": True, "x": 400, "y": 300},
-                ),
-            ) as locate,
+                "osia.desktop_scene.vision_guided_desktop_click",
+                return_value={
+                    "dispatched": False,
+                    "outcome": "ambiguous",
+                    "text": "ERROR: canonical target ambiguous",
+                    "receipt": {"reason_code": "visual_action_ambiguous"},
+                },
+            ) as canonical,
             patch("osia.tools.desktop_control.click_at", return_value="clicked") as click,
-            patch("osia.agent._screens_changed", return_value=True),
         ):
-            result = agent_module.tool_desktop_click("Compose")
+            result = agent_module.tool_desktop_click(
+                "Compose",
+                visual_frame_id="frame_fixture",
+                visual_bbox={"left": 0.1, "top": 0.2, "right": 0.3, "bottom": 0.4},
+            )
     finally:
         desktop_scene.reset_effective_model(route)
 
-    assert not result.startswith("ERROR:")
-    assert locate.call_count == 2
-    assert locate.call_args_list[0].args[0].endswith(
-        "osia_desktop_window_local.png"
-    )
-    assert locate.call_args_list[1].args[0].endswith("osia_desktop_click.png")
-    click.assert_called_once_with(400, 300)
+    assert result["outcome"] == "ambiguous"
+    canonical.assert_called_once()
+    click.assert_not_called()
 
 
-def test_nonvision_legacy_path_never_invokes_coordinate_vision():
+def test_nonvision_path_never_invokes_coordinate_click():
     from osia import desktop_scene
     from osia import agent as agent_module
 
     route = desktop_scene.bind_effective_model("deepseek", "deepseek-v4-pro")
     try:
         with (
-            patch("osia.agent._capture_screen", return_value=None),
             patch("osia.tools.desktop_control.resolve_element_rect", return_value=None),
-            patch("osia.tools.desktop_control.activate_by_keyboard", return_value=None),
-            patch("osia.agent._capture_exact_foreground_window") as local_capture,
-            patch("osia.agent._vision_locate") as locate,
             patch("osia.tools.desktop_control.click_at") as click,
         ):
             result = agent_module.tool_desktop_click("Compose")
     finally:
         desktop_scene.reset_effective_model(route)
 
-    assert result.startswith("ERROR:")
-    assert "no model screenshot" in result
-    local_capture.assert_not_called()
-    locate.assert_not_called()
+    assert result["outcome"] == "inapplicable"
+    assert str(result["text"]).startswith("ERROR:")
     click.assert_not_called()
 
 

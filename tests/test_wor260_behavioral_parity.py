@@ -25,7 +25,7 @@ from osia.turn_terminality import TurnTerminalityController
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PHASE0_PROMPT_SHA256 = (
-    "23d7c1c90388759c45486b4762f07eb78b1a0ee23159d65df71941ad7451419e"
+    "d5c512d9b4ff0a86356d57ae3209efe480c4819c70d8a9ffdfcc773a7f740271"
 )
 
 
@@ -84,8 +84,8 @@ print(json.dumps({
 
     assert evidence == {
         "equal": True,
-        "chat_count": 95,
-        "account_count": 98,
+        "chat_count": 92,
+        "account_count": 95,
         "dynamic_count": 0,
         "prompt_sha256": _PHASE0_PROMPT_SHA256,
     }
@@ -104,18 +104,18 @@ def test_current_chat_and_chatgpt_account_identity_universes_are_unchanged():
         if item.source in {"provider_native", "provider_hosted"}
     )
 
-    assert len(chat_ids) == 95
+    assert len(chat_ids) == 92
     assert account_osia_ids == chat_ids
     assert account_native_ids == ("webSearch", "commandExecution", "fileChange")
-    assert len(account) == 98
+    assert len(account) == 95
     assert chat_ids == tuple(sorted(chat_ids))
 
 
 def test_phase0_prompt_tool_block_is_byte_for_byte_identical():
     prompt = static_tool_prompt_block().encode("utf-8")
 
-    assert len(prompt) == 13_016
-    assert len(prompt.decode("utf-8").splitlines()) == 97
+    assert len(prompt) == 13_607
+    assert len(prompt.decode("utf-8").splitlines()) == 94
     assert hashlib.sha256(prompt).hexdigest() == _PHASE0_PROMPT_SHA256
 
 
@@ -190,10 +190,11 @@ def test_active_runtime_modules_do_not_import_phase1_sidecars():
     )
     for path in active_paths:
         source = path.read_text(encoding="utf-8")
-        assert "import osia.goal_contract" not in source
-        assert "from osia.goal_contract" not in source
+        # WOR-291+: goal_contract is a canonical runtime module now; the
+        # phase-1 benchmark sidecars below must stay non-runtime.
         assert "import osia.capability_adapters" not in source
         assert "from osia.capability_adapters" not in source
+        assert "benchmarks.wor260" not in source
 
 
 def test_tool_preflight_signature_and_no_strategy_path_are_unchanged():

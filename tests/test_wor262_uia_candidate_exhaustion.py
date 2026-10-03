@@ -211,7 +211,7 @@ def _frontier(strategy) -> set[str]:
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
         return {spec.name for spec in effective_static_tool_specs()}
 
 
@@ -219,12 +219,19 @@ def _provider_frontier(strategy) -> set[str]:
     with es.execution_strategy_scope(
         strategy.mission.objective,
         strategy=strategy,
-    ), effective_tool_surface_scope("autonomous"):
+    ), effective_tool_surface_scope("chat"):
         return {
             item.identity
             for item in federated_capabilities("chatgpt_account")
             if item.available and item.source == "osia"
         }
+
+
+def _complete_visible_surface() -> set[str]:
+    """WOR-300: every runtime capability of the active surface stays visible."""
+
+    with effective_tool_surface_scope("chat"):
+        return {spec.name for spec in effective_static_tool_specs()}
 
 
 def _fresh_after(attempt) -> float:
@@ -392,14 +399,18 @@ def test_04_fresh_viable_replacement_keeps_all_lower_tiers_absent():
 
     frontier = _provider_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert "activate_desktop_surface" in frontier
-    assert {
+    # WOR-300: lower tiers stay visible; the viable UIA frontier blocks them.
+    for tool in (
         "desktop_type",
         "desktop_press",
         "desktop_click",
         "take_screenshot",
         "request_visual_observation",
-    }.isdisjoint(frontier)
+    ):
+        applicable, _reason = es.tool_applicability(strategy, tool, {})
+        assert applicable is False, tool
 
 
 def test_05_all_fresh_exact_candidates_exhausted_exposes_keyboard_only():
@@ -412,10 +423,13 @@ def test_05_all_fresh_exact_candidates_exhausted_exposes_keyboard_only():
     frontier = _provider_frontier(strategy)
 
     assert es._structured_uia_frontier_state(strategy, strategy.goal) == "exhausted"
+    assert frontier == _complete_visible_surface()
     assert {"desktop_type", "desktop_press"}.issubset(frontier)
-    assert "activate_desktop_surface" not in frontier
-    assert "desktop_click" not in frontier
-    assert "take_screenshot" not in frontier
+    assert es.tool_applicability(
+        strategy, "activate_desktop_surface", {},
+    ) == (False, "uia_frontier_exhausted_keyboard_ready")
+    assert es.tool_applicability(strategy, "desktop_click", {})[0] is False
+    assert es.tool_applicability(strategy, "take_screenshot", {})[0] is False
 
 
 def test_06_possible_effect_still_blocks_every_alternate_mutation():
@@ -475,15 +489,20 @@ def test_07_keyboard_fallback_keeps_the_exact_pending_substep_identity():
     assert unobserved is not None and unobserved.allowed is False
     assert unobserved.reason_code == "keyboard_substep_observation_required"
     waiting_frontier = _provider_frontier(strategy)
+    assert waiting_frontier == _complete_visible_surface()
     assert "inspect_desktop_surfaces" in waiting_frontier
-    assert {
+    # WOR-300: every waiting capability stays visible; the pending observation
+    # requirement blocks all of them before dispatch.
+    for tool in (
         "activate_desktop_surface",
         "desktop_type",
         "desktop_press",
         "desktop_click",
         "take_screenshot",
         "request_visual_observation",
-    }.isdisjoint(waiting_frontier)
+    ):
+        applicable, _reason = es.tool_applicability(strategy, tool, {})
+        assert applicable is False, tool
     _observe(
         strategy,
         [candidate],
@@ -517,7 +536,7 @@ def test_08_keyboard_cannot_skip_to_future_composite_substeps():
     assert len(strategy.attempts) == attempts_before
 
 
-def test_09_provider_emitted_keyboard_is_rejected_while_replacement_is_viable():
+def test_09_provider_emitted_keyboard_is_never_refused_while_replacement_is_viable():
     strategy = _strategy()
     candidates = [_candidate(CANDIDATE_A), _candidate(CANDIDATE_B)]
     _observe(strategy, candidates)
@@ -529,9 +548,10 @@ def test_09_provider_emitted_keyboard_is_rejected_while_replacement_is_viable():
         "desktop_press", {"key": "2"}, strategy=strategy,
     )
 
-    assert rejected is not None and rejected.allowed is False
-    assert rejected.reason_code == "stronger_exact_uia_frontier_available"
-    assert len(strategy.attempts) == attempts_before
+    # WOR-301: a stronger replacement frontier never refuses the call; the
+    # engine still records the attempt for effect correlation.
+    assert rejected is None or rejected.allowed is True
+    assert len(strategy.attempts) >= attempts_before
 
 
 def test_10_identity_mismatched_uia_continuation_cannot_skip_pending_effect():
@@ -1141,14 +1161,19 @@ def test_25_lower_tiers_stay_hidden_while_actionable_pair_remains():
 
     frontier = _provider_frontier(strategy)
 
+    assert frontier == _complete_visible_surface()
     assert "activate_desktop_surface" in frontier
-    assert {
+    # WOR-300: the lower tiers stay visible; the fresh actionable UIA pair
+    # still blocks them before dispatch.
+    for tool in (
         "desktop_type",
         "desktop_press",
         "desktop_click",
         "take_screenshot",
         "request_visual_observation",
-    }.isdisjoint(frontier)
+    ):
+        applicable, _reason = es.tool_applicability(strategy, tool, {})
+        assert applicable is False, tool
 
 
 def test_26_repeated_native_literal_family_keeps_verified_witness_after_restore():

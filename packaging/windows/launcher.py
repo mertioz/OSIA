@@ -25,7 +25,9 @@ from osia.runtime import (
 )
 
 BROWSER_SMOKE_MODE = "--osia-browser-smoke"
-REMOVE_PERSONAL_BROWSER_MODE = "--osia-remove-personal-browser-registration"
+# The old flag remains an alias for already-installed uninstaller records.
+REMOVE_LEGACY_BROWSER_REGISTRATION_MODE = "--osia-remove-legacy-browser-registration"
+REMOVE_PERSONAL_BROWSER_REGISTRATION_ALIAS = "--osia-remove-personal-browser-registration"
 _PACKAGE_SMOKE_REPORT_ENV = "OSIA_PACKAGE_SMOKE_REPORT"
 
 
@@ -422,11 +424,27 @@ def main(args: list[str] | None = None) -> int:
         return _package_smoke()
     if mode == BROWSER_SMOKE_MODE:
         return _browser_smoke()
-    if mode == REMOVE_PERSONAL_BROWSER_MODE:
-        from osia.personal_browser.registration import remove_personal_browser
+    if mode in {
+        REMOVE_LEGACY_BROWSER_REGISTRATION_MODE,
+        REMOVE_PERSONAL_BROWSER_REGISTRATION_ALIAS,
+    }:
+        from osia.legacy_browser_cleanup import remove_legacy_browser_registration
 
-        result = remove_personal_browser()
-        return 0 if result.get("removed") or result.get("state") == "setup_required" else 1
+        result = remove_legacy_browser_registration()
+        return 0 if result.get("removed") or result.get("state") in {
+            "not_registered", "not_applicable",
+        } else 1
+    if is_frozen() and sys.platform == "win32":
+        try:
+            from osia.legacy_browser_cleanup import (
+                remove_legacy_browser_registration,
+            )
+
+            remove_legacy_browser_registration()
+        except Exception:
+            # An unavailable or already-removed legacy registration must not
+            # prevent the supported isolated browser from starting.
+            pass
     if mode == RELAUNCH_MODE:
         if len(argv) != 2:
             return 2
@@ -443,13 +461,6 @@ def main(args: list[str] | None = None) -> int:
     mutex = _acquire_gui_mutex()
     if mutex is False:
         return 0
-    if is_frozen() and sys.platform == "win32":
-        try:
-            from osia.personal_browser.registration_windows import repair_owned_registration
-
-            repair_owned_registration()
-        except Exception:
-            pass
     from osia.main import main as desktop_main
 
     original = sys.argv

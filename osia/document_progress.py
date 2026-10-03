@@ -72,11 +72,11 @@ def document_progress_scope(
     revision: int = 0,
     sink: Callable[[dict], None] | None = None,
 ):
-    """Bind one Chat turn or Autonomous run to a sanitized progress sink."""
+    """Bind one canonical Chat turn to a sanitized progress sink."""
 
     if (
         sink is None
-        or scope_type not in {"chat", "autonomous"}
+        or scope_type != "chat"
         or not isinstance(scope_id, str)
         or not scope_id
     ):

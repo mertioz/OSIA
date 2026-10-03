@@ -26,7 +26,7 @@ MAX_RECONCILIATION_EVENTS = 64
 
 
 class CanonicalEffectClass(str, Enum):
-    """Replay semantics derived from the authoritative capability contract."""
+    """Factual effect classification derived from the authoritative capability contract."""
 
     READ_ONLY = "read_only"
     IDEMPOTENT_WRITE = "idempotent_write"
@@ -144,6 +144,12 @@ class RetryDecision:
 
 @dataclass(frozen=True)
 class ReconciliationDecision:
+    """Factual reconciliation output; fresh requests are never vetoed.
+
+    replay_allowed is retained for compatibility and is always true for a
+    new model-requested call. Exact request/attempt idempotency and stale or
+    cancelled target checks live at their own dispatch boundaries.
+    """
     action_id: str
     state: ActionState
     effect_truth: EffectTruth
@@ -162,6 +168,7 @@ class ActionIntent:
     dependency_action_ids: tuple[str, ...] = ()
     dependency_effect_ids: tuple[str, ...] = ()
     independent_of_action_ids: tuple[str, ...] = ()
+    state_refreshed_after_action_ids: tuple[str, ...] = ()
     conflict_scope: str = ""
     idempotency_identity: str = ""
     target: dict[str, Any] = field(default_factory=dict)
@@ -302,7 +309,7 @@ def canonical_effect_class(
     *,
     idempotency_identity: str = "",
 ) -> CanonicalEffectClass:
-    """Map the authoritative tool contract to replay semantics.
+    """Map the authoritative tool contract to factual effect classes.
 
     Names and HTTP verbs are deliberately ignored. Unknown/dynamic contracts
     fail closed as high risk.
@@ -338,6 +345,13 @@ def action_target_for_tool(tool_name: str, arguments: Mapping[str, Any]) -> dict
     name = _bounded(tool_name, 96)
     source = arguments if isinstance(arguments, Mapping) else {}
     target: dict[str, Any] = {"kind": "generic"}
+    if name in {"bash", "run_command"}:
+        from osia.capability_federation import mutation_equivalence_arguments
+
+        execution = mutation_equivalence_arguments(name, source)
+        target = {"kind": "system", "shell_identity_version": 1}
+        if execution is not None:
+            target["provider_resource_ref"] = evidence_reference(execution["cwd"])
     url = source.get("url") or source.get("target_url")
     if name in _URL_OPERATIONS and url:
         target.update({"kind": "browser", "safe_url": safe_url_identity(url)})
@@ -359,14 +373,33 @@ def action_target_for_tool(tool_name: str, arguments: Mapping[str, Any]) -> dict
         })
     if name in {
         "activate_desktop_surface", "inspect_desktop_surfaces",
-        "request_visual_observation",
+        "request_visual_observation", "desktop_click", "desktop_type",
+        "desktop_press", "desktop_scroll",
     }:
         target.update({
             "kind": "desktop",
             "surface_ref": _safe_id(source.get("surface_ref"), "surface"),
-            "application": _safe_id(source.get("target"), "application"),
+            "application": _safe_id(
+                source.get("expected_application")
+                or source.get("application")
+                or (
+                    source.get("target")
+                    if name == "inspect_desktop_surfaces" else ""
+                ),
+                "application",
+            ),
             "window_generation": _safe_id(
                 source.get("expected_window_generation"), "generation"
+            ),
+            "native_window_id": _safe_id(
+                source.get("expected_native_window_id")
+                or source.get("native_window_id"),
+                "window",
+            ),
+            "frame_id": _safe_id(
+                source.get("visual_frame_id")
+                if name == "desktop_click" else "",
+                "frame",
             ),
         })
     return _safe_action_target(target)
@@ -390,7 +423,7 @@ def _safe_action_target(value: Any) -> dict[str, Any]:
         safe = _safe_id(source.get(key), key)
         if safe:
             target[key] = safe
-    for key in ("page_generation", "document_epoch", "context_epoch"):
+    for key in ("page_generation", "document_epoch", "context_epoch", "shell_identity_version"):
         try:
             number = max(0, int(source.get(key) or 0))
         except (TypeError, ValueError, OverflowError):
@@ -416,21 +449,26 @@ def semantic_effect_identity(
     equivalence_fingerprint: str = "",
     argument_fingerprint: str = "",
 ) -> str:
+    shell_operation = operation in {"bash", "run_command"}
+    content_mutation = operation in {"write_file", "edit_file_lines"}
     strong_semantic_binding = bool(semantic_node_id and attempted_effect)
     semantic_material = {
         "turn_id": _safe_id(turn_id, "turn"),
-        "semantic_node_id": _safe_id(semantic_node_id, "node"),
-        "attempted_effect": _safe_id(attempted_effect, "effect"),
+        "semantic_node_id": "" if shell_operation else _safe_id(semantic_node_id, "node"),
+        "attempted_effect": "shell_execution" if shell_operation else _safe_id(attempted_effect, "effect"),
         # Tool/mechanism names must not split one semantic effect across
         # equivalent strategies once the strategy has supplied a canonical
         # node + attempted effect binding.
         "operation": (
+            "shell_execution" if shell_operation else
             "" if strong_semantic_binding else _safe_id(operation, "operation")
         ),
         "target": _safe_action_target(target),
         "equivalence": _bounded(equivalence_fingerprint, 80),
         "argument": (
-            "" if (strong_semantic_binding or equivalence_fingerprint) else
+            "" if not content_mutation and (
+                equivalence_fingerprint or (strong_semantic_binding and not shell_operation)
+            ) else
             _bounded(argument_fingerprint, 80)
         ),
     }
@@ -975,143 +1013,20 @@ def retry_decision(
     dispatch_started: bool,
     idempotency_identity: str = "",
 ) -> RetryDecision:
-    effect = _enum_value(
-        effect_class, CanonicalEffectClass,
-        CanonicalEffectClass.DESTRUCTIVE_OR_HIGH_RISK,
-    )
-    current = _enum_value(state, ActionState, ActionState.EFFECT_POSSIBLE)
-    truth = _enum_value(
-        effect_truth,
-        EffectTruth,
-        _truth_from_state(current, dispatch_started),
-    )
-    if current is ActionState.CANCELLED:
-        return RetryDecision(False, "authoritative_user_cancellation")
-    if effect is CanonicalEffectClass.READ_ONLY:
-        return RetryDecision(True, "read_only_reexecution_safe")
-    if truth is EffectTruth.VERIFIED or current is ActionState.EFFECT_VERIFIED:
-        return RetryDecision(False, "effect_verified_replay_closed")
-    if current in {
-        ActionState.FAILED_BEFORE_EFFECT,
-        ActionState.PRECONDITION_FAILED,
-    } or (
-        not dispatch_started and truth is EffectTruth.NOT_POSSIBLE
-    ):
-        return RetryDecision(
-            True, "failed_before_effect_frontier_open",
-            alternate_mechanism_only=True,
-        )
-    if truth is EffectTruth.NOT_APPLIED or current is ActionState.NOT_APPLIED_VERIFIED:
-        return RetryDecision(
-            True, "not_applied_verified_frontier_open",
-            alternate_mechanism_only=True,
-        )
-    if (
-        effect is CanonicalEffectClass.IDEMPOTENT_WRITE
-        and bool(_safe_id(idempotency_identity, "idempotency"))
-    ):
-        return RetryDecision(
-            True,
-            "canonical_idempotency_identity_reusable",
-            reuse_idempotency_identity=True,
-        )
-    return RetryDecision(False, "blocked_due_to_possible_duplicate_effect")
+    """Compatibility API: historical outcomes never prohibit a new request.
+
+    Current cancellation is enforced at the dispatch boundary, independently
+    of the state of an earlier attempt.
+    """
+    return RetryDecision(True, "new_request_allowed")
 
 
 def gate_action(
     proposed: ActionIntent,
     unresolved_actions: Iterable[ActionRecord | Mapping[str, Any]],
 ) -> ActionGateDecision:
-    """Block only duplicative/dependent mutations; reads are never blocked."""
-
-    if proposed.effect_class is CanonicalEffectClass.READ_ONLY:
-        return ActionGateDecision(True, "read_only_allowed_during_reconciliation")
-    blockers: list[str] = []
-    unresolved = []
-    for raw in unresolved_actions:
-        if isinstance(raw, ActionRecord):
-            item = raw
-        elif isinstance(raw, Mapping):
-            try:
-                item = ActionRecord(**{
-                    key: raw.get(key)
-                    for key in ActionRecord.__dataclass_fields__
-                })
-            except TypeError:
-                continue
-        else:
-            continue
-        if item.effect_class == CanonicalEffectClass.READ_ONLY.value:
-            continue
-        if item.effect_truth not in {
-            EffectTruth.POSSIBLE.value, EffectTruth.OBSERVED.value,
-        } and item.current_state not in {
-            ActionState.RECONCILING.value,
-            ActionState.EFFECT_POSSIBLE.value,
-            ActionState.STILL_RUNNING.value,
-            ActionState.TARGET_STALE.value,
-        }:
-            continue
-        unresolved.append(item)
-    for action in unresolved:
-        same_effect = bool(
-            proposed.semantic_effect_id
-            and proposed.semantic_effect_id == action.semantic_effect_id
-        )
-        dependent = bool(
-            action.action_id in proposed.dependency_action_ids
-            or action.semantic_effect_id in proposed.dependency_effect_ids
-            or (
-                proposed.semantic_node_id
-                and proposed.semantic_node_id in action.dependencies
-            )
-        )
-        conflicts = bool(
-            proposed.conflict_scope
-            and proposed.conflict_scope == str(
-                action.conflict_scope
-                or (action.target or {}).get("conflict_scope")
-                or (action.target or {}).get("surface_ref")
-                or (action.target or {}).get("page_id")
-                or ""
-            )
-        )
-        existing_target = action.target or {}
-        proposed_target = proposed.target or {}
-        provably_disjoint = bool(
-            existing_target.get("kind") == proposed_target.get("kind") == "desktop"
-            and existing_target.get("application")
-            and proposed_target.get("application")
-            and existing_target.get("application")
-            != proposed_target.get("application")
-        ) or bool(
-            existing_target.get("kind") == proposed_target.get("kind") == "browser"
-            and existing_target.get("page_id")
-            and proposed_target.get("page_id")
-            and existing_target.get("page_id") != proposed_target.get("page_id")
-        )
-        explicitly_independent = bool(
-            action.action_id in proposed.independent_of_action_ids
-            or provably_disjoint
-        )
-        canonical_idempotent_replay = bool(
-            same_effect
-            and proposed.effect_class is CanonicalEffectClass.IDEMPOTENT_WRITE
-            and action.effect_class == CanonicalEffectClass.IDEMPOTENT_WRITE.value
-            and proposed.idempotency_identity
-            and proposed.idempotency_identity == action.idempotency_identity
-        )
-        if canonical_idempotent_replay:
-            continue
-        if same_effect or dependent or conflicts or not explicitly_independent:
-            blockers.append(action.action_id)
-    if blockers:
-        return ActionGateDecision(
-            False,
-            "blocked_due_to_possible_duplicate_effect",
-            tuple(dict.fromkeys(blockers)),
-        )
-    return ActionGateDecision(True, "independent_branch_allowed")
+    """Compatibility API; ActionTruth is factual history, without veto power."""
+    return ActionGateDecision(True, "new_request_allowed")
 
 
 class ProvidedObservationAdapter:
@@ -1329,6 +1244,8 @@ class DesktopReconciliationAdapter:
             or action.operation in {
                 "activate_desktop_surface", "open_application",
                 "inspect_desktop_surfaces", "request_visual_observation",
+                "desktop_click", "desktop_type", "desktop_press",
+                "desktop_scroll",
             }
         )
 
@@ -1375,6 +1292,7 @@ class DesktopReconciliationAdapter:
             "surface": receipt.get("observed_window_surface_ref")
             or receipt.get("window_surface_ref"),
             "generation": receipt.get("window_generation"),
+            "native_window": receipt.get("native_window_id"),
         })
         generation = _safe_id(
             receipt.get("window_generation"), "generation"
@@ -1397,10 +1315,43 @@ class DesktopReconciliationAdapter:
         expected_generation = str(
             (action.target or {}).get("window_generation") or ""
         )
+        expected_native = str(
+            (action.target or {}).get("native_window_id") or ""
+        )
+        observed_native = str(receipt.get("native_window_id") or "")
+        if expected_native and observed_native and observed_native != expected_native:
+            return ObservationResult(
+                ObservationClassification.TARGET_STALE,
+                self.name,
+                "desktop_native_window_target_stale",
+                evidence,
+                observed_at=float(receipt.get("observed_at") or 0.0),
+                exact=True,
+                target_generation=generation,
+            )
+        exact_surface_identity = bool(
+            (
+                not expected_surface
+                or observed_surface == expected_surface
+                or (
+                    expected_native
+                    and observed_native
+                    and observed_native == expected_native
+                )
+            )
+            and (
+                not expected_native
+                or (
+                    expected_native
+                    and observed_native
+                    and observed_native == expected_native
+                )
+            )
+        )
         exact_visual_binding = bool(
             expected_ref
             and verdict_expected_ref == expected_ref
-            and (not expected_surface or observed_surface == expected_surface)
+            and exact_surface_identity
             and (not expected_generation or generation == expected_generation)
             and receipt.get("exact_surface_pixels") is True
         )
@@ -1409,6 +1360,21 @@ class DesktopReconciliationAdapter:
                 ObservationClassification.MATCH,
                 "desktop_vision_observer",
                 "vision_postcondition_verified",
+                evidence,
+                observed_at=float(receipt.get("observed_at") or 0.0),
+                exact=True,
+                target_generation=generation,
+                provider_operation_ref=str(receipt.get("frame_id") or ""),
+            )
+        if (
+            verdict.get("status") == "nonmatch"
+            and exact_visual_binding
+            and receipt.get("no_partial_effect") is True
+        ):
+            return ObservationResult(
+                ObservationClassification.NON_APPLIED,
+                "desktop_vision_observer",
+                "vision_exact_non_application_verified",
                 evidence,
                 observed_at=float(receipt.get("observed_at") or 0.0),
                 exact=True,
@@ -1622,7 +1588,7 @@ class ActionTruthCoordinator:
                 EffectTruth.NOT_POSSIBLE,
                 ReconciliationStatus.EXHAUSTED,
                 "action_record_missing",
-                False,
+                True,
                 ObserverStatus.NOT_RUN,
                 True,
             )
@@ -1641,7 +1607,7 @@ class ActionTruthCoordinator:
                 ),
                 ReconciliationStatus.CANCELLED,
                 "authoritative_user_cancellation",
-                False,
+                True,
                 ObserverStatus.NOT_RUN,
             )
         if action.effect_truth == EffectTruth.VERIFIED.value:
@@ -1651,7 +1617,7 @@ class ActionTruthCoordinator:
                 EffectTruth.VERIFIED,
                 ReconciliationStatus.VERIFIED,
                 "effect_already_verified",
-                False,
+                True,
                 ObserverStatus.MATCH,
             )
         if (
@@ -1757,7 +1723,7 @@ class ActionTruthCoordinator:
                     EffectTruth.VERIFIED,
                     ReconciliationStatus.VERIFIED,
                     "effect_verified",
-                    False,
+                    True,
                     ObserverStatus.MATCH,
                 )
             if (
@@ -1797,7 +1763,7 @@ class ActionTruthCoordinator:
                     EffectTruth.POSSIBLE,
                     ReconciliationStatus.PROPAGATION_PENDING,
                     "propagation_pending",
-                    False,
+                    True,
                     ObserverStatus.RUNNING,
                 )
             if observed.classification is ObservationClassification.TARGET_STALE:
@@ -1816,7 +1782,7 @@ class ActionTruthCoordinator:
                     EffectTruth.POSSIBLE,
                     ReconciliationStatus.PENDING,
                     "target_stale",
-                    False,
+                    True,
                     ObserverStatus.TARGET_STALE,
                 )
             action = self._update(
@@ -1859,7 +1825,7 @@ class ActionTruthCoordinator:
             EffectTruth.POSSIBLE,
             status,
             reason,
-            False,
+            True,
             last_status,
             exhausted,
         )

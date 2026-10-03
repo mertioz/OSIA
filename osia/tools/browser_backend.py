@@ -1,8 +1,7 @@
-"""Small backend contract for OSIA's semantic browser capability.
+"""Small contract for OSIA's isolated semantic browser adapter.
 
-The isolated Playwright implementation remains in :mod:`osia.tools.browser`.
-Backends exposed here only select and transport the existing semantic
-operations; they do not redefine browser state or receipt contracts.
+The Playwright implementation remains in :mod:`osia.tools.browser`; this
+adapter forwards operations without redefining browser state or receipts.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from typing import Any, Mapping
 
 
 class BrowserBackend(ABC):
-    """Minimal lifecycle shared by isolated and explicitly personal browsers."""
+    """Minimal lifecycle for the supported OSIA browser runtime."""
 
     name: str
 

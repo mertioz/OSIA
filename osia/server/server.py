@@ -29,26 +29,18 @@ Protocol (JSON over WebSocket, port 8765):
     {"type": "delete_api_fallback_key", "provider": "...", "index": int}             # remove the fallback key at index from settings.json api_key_fallbacks
     {"type": "set_setting",          "key": "...", "value": ...}       # set one whitelisted key in config/settings.json
                                                                        #   (heavy_chain/medium_chain map onto ai_hierarchy.{heavy,medium})
-    {"type": "get_config"}                                             # request the full config snapshot (settings incl. api_key_fallbacks, personality, skills)
+    {"type": "get_config"}                                             # request the safe config snapshot (settings/status metadata, personality, skills)
     {"type": "set_personality",      "text": "..."}                    # save the personality document (~/.osia/personality.md)
     {"type": "set_skill",            "name": "...", "enabled": true, "text": "..."}  # update a skill's enabled flag and/or prose (both optional)
     {"type": "create_skill",         "name": "..."}                    # create a new skill from the template (starts enabled)
     {"type": "delete_skill",         "name": "..."}                    # delete a skill and drop its enabled flag
-    {"type": "get_api_keys"}                                           # request the actual stored provider keys (mobile API-keys editor)
+    {"type": "get_api_keys"}                                           # request configured/not-configured status only
     {"type": "get_heartbeat_config"}                                   # request the live-heartbeat enable flag + push interval (seconds)
     {"type": "restart_server"}                                         # restart the server process in place via os.execv; acked with status "done" + "message": "restarting" first (WOR-28)
-    {"type": "autonomous_start",     "objective": "...", "model": "..."}  # WOR-45 P5: begin ONE machine-global autonomous run (planner→orchestrator); refused with autonomous_progress{event:"busy"} if a run already holds the single-runner lock
-    {"type": "cancel_active_work", "schema_version": 1, "scope": "chat|autonomous", ...correlated target...}  # WOR-231: exact idempotent cancellation control; never a user turn
-    {"type": "autonomous_interrupt"}                                   # WOR-45 P5: pause the autonomous run — state stays in_progress (resumable)
-    {"type": "autonomous_abort", "run_id": "..."}                    # WOR-45 P5 compatibility alias: exact run correlation is still required before terminalizing the workflow
-    {"type": "get_autonomous_status"}                                  # WOR-45 P5: request the current autonomous snapshot (or {event:"idle"}); a paused run reports {event:"interrupted"}; lets a phone reconnecting mid-run render progress
-    {"type": "autonomous_resume"}                                      # WOR-45: resume a PAUSED (interrupted) autonomous run from its cursor (re-acquires the single-runner lock; refused with {event:"busy"} if another run holds it, {event:"idle"} if nothing is resumable)
-    {"type": "scheduled_task_authorization_request", "task_id": "..."}
-    {"type": "scheduled_task_authorization_response", "request_id": "...", "task_id": "...", "task_revision": int, "definition_hash": "...", "authorization_revision": int, "policy_epoch": int, "expiration": number, "origin_ref": "...", "action": "approve|deny"}
-    {"type": "scheduled_task_authorization_revoke", ...bound task fields...}
-    {"type": "scheduled_task_disable", ...bound task fields...}
+    {"type": "cancel_active_work", "schema_version": 1, "scope": "chat", ...correlated target...}  # WOR-231: exact idempotent cancellation control; never a user turn
+    {"type": "scheduled_task_disable", "task_id": "..."}                # stop a scheduled task; pure execution edit, no authorization envelope
   Server → Client:
-    {"type": "api_keys",             "keys": {provider: key, ...}}     # actual stored keys, one entry per models.API_PROVIDERS ("" if unset)
+    {"type": "api_keys",             "keys": {provider: "", ...}, "keys_set": {provider: bool}} # legacy shape; no credential values
     {"type": "heartbeat_config",     "config": {"enabled": bool, "interval_seconds": int}}
     {"type": "heartbeat_data",       "cpu_percent": float, "ram_mb": int,
                                      "ram_percent": float, "disk_percent": float,
@@ -74,26 +66,18 @@ Protocol (JSON over WebSocket, port 8765):
                                        "account": {...}}
     {"type": "chatgpt_account_state", "account": {...}}
     {"type": "file_received",        "filename": "...", "success": true|false}
-    {"type": "config",               "config": {...}}                  # full config snapshot (settings incl. api_key_fallbacks, personality, skills)
+    {"type": "config",               "config": {...}}                  # safe config snapshot (credential values omitted)
     {"type": "cron_notification",    "id": "...", "task_id": "...", "title": "...",
                                      "status": "completed|failed", "conversation_id": "...", "created_at": "..."}  # in-app fallback for scheduled task completion
     {"type": "status",               "status": "done|error"}           # ack for the config-family setters (create_skill adds "name", restart_server adds "message": "restarting")
-    {"type": "autonomous_progress",  "event": "running|interrupted|aborted|plan_failed|busy|idle|task_done|task_failed|salvaged|done|failed",
-                                     "tasks_done": int, "tasks_total": int, "phase_name": "...", "objective": "...", "status": "..."}
-                                     # WOR-45 P5: autonomous-run progress. Broadcast to ALL clients on every engine/synthesized transition (the run is machine-global);
-                                     # the host synthesizes running/interrupted/aborted/plan_failed/busy/idle and enriches every frame with the live task_state snapshot.
-    {"type": "scheduled_task_authorization_context|scheduled_task_authorization_request|scheduled_task_authorization_state", ...sanitized revision-bound fields...}
 """
 
 import asyncio
 import base64
 import binascii
-import concurrent.futures
-import contextvars
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import secrets
@@ -118,18 +102,19 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Requ
 from osia import chat_routing, conversations, document_sources, i18n
 from osia.attachments import (
     ATTACHMENT_EVENT_TYPES,
+    MAX_ATTACHMENT_BYTES,
     AttachmentBatchManager,
     AttachmentProtocolError,
     build_agent_input,
     cleanup_orphan_batches,
 )
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
-from osia.permission_outcome import (
-    PermissionOutcome,
-    PermissionResult,
-    normalize_permission_result,
-)
 from osia.document_progress import document_progress_scope
+from osia.runtime import (
+    application_dir as _runtime_application_dir,
+    is_frozen as _runtime_is_frozen,
+    source_tree_fingerprint as _source_tree_fingerprint,
+)
 from osia.durable_transport import (
     InboxDisposition,
     get_durable_transport_store,
@@ -156,7 +141,7 @@ from osia.turn_context import (
     localized_text,
     log_final,
     normalize_locale,
-    response_language_drift,
+    persisted_language_drift_diagnostic,
     resolve_turn_context,
 )
 
@@ -351,7 +336,7 @@ def load_or_create_token() -> str:
 
 
 MOBILE_TOKEN = load_or_create_token()
-_PERMISSION_SERVER_ID = hashlib.sha256(
+_MOBILE_SERVER_ID = hashlib.sha256(
     ("osia-permission-server-v1\0" + MOBILE_TOKEN).encode("utf-8")
 ).hexdigest()
 
@@ -711,6 +696,18 @@ def decode_base64_wav(b64_data: str) -> tuple[np.ndarray, int]:
 # ---------------------------------------------------------------------------
 app = FastAPI(title="OSIA Mobile Server", version=current_product_version())
 
+# Immutable identity captured when this source module is imported. The Windows
+# startup contract compares this fingerprint with the current checkout; a live
+# listener cannot claim freshness merely because it owns port 8765.
+_SERVER_RUNTIME_SOURCE_MODE = "frozen" if _runtime_is_frozen() else "source"
+_SERVER_RUNTIME_CHECKOUT_ROOT = str(_runtime_application_dir().resolve())
+_SERVER_RUNTIME_ENTRYPOINT = str(Path(__file__).resolve())
+_SERVER_RUNTIME_SOURCE_FINGERPRINT = _source_tree_fingerprint()
+_SERVER_RUNTIME_EXECUTABLE = str(sys.executable or "")
+_SERVER_RUNTIME_ID = (
+    f"{os.getpid()}:{_SERVER_RUNTIME_SOURCE_FINGERPRINT}"
+)
+
 
 # Registry of authenticated mobile clients (WOR-10). Holds each connection's
 # OUTBOUND CHANNEL (``_OutboundChannel``) — NOT the raw WebSocket — so a
@@ -724,565 +721,34 @@ _MOBILE_CATALOGUE_BROADCAST_LOCK: asyncio.Lock | None = None
 _CONVERSATION_BROADCAST_LOCK: asyncio.Lock | None = None
 _LAST_BROADCAST_REVISIONS: dict[str, int] = {}
 
-_PERMISSION_REQUEST_CACHE_MAX = 512
-_PERMISSION_REQUEST_RETENTION_SECONDS = 600.0
-_MOBILE_FULL_ACCESS_REQUEST_TTL_SECONDS = 30.0
-_PERMISSION_REQUESTS: "OrderedDict[str, dict]" = OrderedDict()
-_PERMISSION_REQUESTS_LOCK = threading.Lock()
-_PERMISSION_SESSIONS: set["_PermissionMobileSession"] = set()
-_PERMISSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_PERMISSION_REVOCATION_OPERATIONS = {
-    "revoke_temporary_permission",
-    "revoke_autonomous_run",
-    "revoke_scheduled_task",
-    "revoke_all_delegated_authority",
-    "disable_full_access",
-}
-_PERMISSION_CHANGE_OPERATIONS = {
-    "set_category",
-    "apply_default_access",
-    "request_full_access",
-    "revoke_all_temporary_permissions",
-}
-_PERMISSION_REQUEST_FIELDS = {
-    "type", "schema_version", "request_id", "device_id", "session_id",
-    "expected_policy_epoch", "expected_snapshot_sequence", "operation",
-    "target_id", "expires_at",
-}
-_PERMISSION_CHANGE_FIELDS = {
-    "schema_version", "contract_schema_version", "request_id", "session_id",
-    "expected_policy_epoch", "expected_snapshot_sequence", "operation",
-    "category_id", "enabled", "auth_method", "auth_nonce", "expires_at",
-}
+_MOBILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-def _permission_safe_id(value) -> str:
+def _mobile_safe_id(value) -> str:
     candidate = str(value or "")
-    return candidate if _PERMISSION_ID_RE.fullmatch(candidate) else ""
-
-
-def _permission_safe_binding_label(value, *, maximum: int = 160) -> str:
-    """Keep exact provider/model labels without treating them as opaque IDs."""
-
-    candidate = str(value or "").strip()
-    if (
-        not candidate
-        or len(candidate) > maximum
-        or any(ord(char) < 32 or ord(char) == 127 for char in candidate)
-    ):
-        return ""
-    return candidate
-
-
-def _permission_confirmation_value(key: str, value) -> str:
-    if key in {"provider_id", "model_id", "effective_reasoning"}:
-        return _permission_safe_binding_label(
-            value,
-            maximum=160 if key == "model_id" else 64,
-        )
-    return _permission_safe_id(value)
+    return candidate if _MOBILE_ID_RE.fullmatch(candidate) else ""
 
 
 def _mobile_document_owner(device_id: str) -> str:
     """Stable private owner identity for one authenticated mobile device."""
 
-    safe_device = _permission_safe_id(device_id)
+    safe_device = _mobile_safe_id(device_id)
     if not safe_device:
         return ""
     return "mobile-document:" + hashlib.sha256(
-        f"{_PERMISSION_SERVER_ID}\0{safe_device}".encode("utf-8"),
+        f"{_MOBILE_SERVER_ID}\0{safe_device}".encode("utf-8"),
     ).hexdigest()
 
 
-def _purge_permission_requests(now: float) -> None:
-    with _PERMISSION_REQUESTS_LOCK:
-        expired = [
-            request_id
-            for request_id, record in _PERMISSION_REQUESTS.items()
-            if float(record.get("retain_until", 0.0)) <= now
-        ]
-        for request_id in expired:
-            _PERMISSION_REQUESTS.pop(request_id, None)
-        while len(_PERMISSION_REQUESTS) > _PERMISSION_REQUEST_CACHE_MAX:
-            _PERMISSION_REQUESTS.popitem(last=False)
+def _current_policy_epoch() -> int:
+    """Canonical epoch used to bind document sources.
 
+    WOR-301: no permission epochs remain; the constant generation keeps the
+    binding contract while freshness is proven against the source itself.
+    """
 
-def _permission_request_statuses(
-    request_ids: tuple[str, ...], *, device_id: str,
-) -> tuple[dict, ...]:
-    now = time.time()
-    _purge_permission_requests(now)
-    statuses = []
-    with _PERMISSION_REQUESTS_LOCK:
-        for request_id in request_ids:
-            record = _PERMISSION_REQUESTS.get(request_id)
-            status = "unknown"
-            if record is not None and record.get("device_id") == device_id:
-                status = str(record.get("status") or "unknown")
-            statuses.append({"request_id": request_id, "status": status})
-    return tuple(statuses)
+    return 0
 
-
-async def _refresh_revoked_permission_contexts(result) -> None:
-    """Refresh loaded run/task state without changing dispatched outcomes."""
-
-    operation = str(getattr(result, "operation", "") or "")
-    epoch = int(getattr(result, "policy_epoch", 0) or 0)
-    execution_type = str(getattr(result, "execution_type", "") or "")
-    authority_ref = str(getattr(result, "authority_ref", "") or "")
-    revoke_all = operation == "revoke_all_delegated_authority"
-    revoke_run = operation == "revoke_autonomous_run" or (
-        operation == "revoke_temporary_permission"
-        and execution_type == "autonomous"
-    )
-    st = _autonomous.get("st")
-    if isinstance(st, dict):
-        same_run = revoke_all or (
-            revoke_run and str(st.get("run_id") or "") == authority_ref
-        )
-        disable_full = operation == "disable_full_access"
-        if same_run or disable_full:
-            orch = _autonomous.get("orch")
-            if orch is not None:
-                try:
-                    await asyncio.to_thread(orch.stop)
-                except Exception:
-                    pass
-            if same_run:
-                _aauthorization.apply_external_permission_revocation(
-                    st,
-                    policy_epoch=epoch,
-                    grant_ref=str(getattr(result, "grant_ref", "") or ""),
-                    revoke_all=(
-                        operation in {
-                            "revoke_autonomous_run",
-                            "revoke_all_delegated_authority",
-                        }
-                    ),
-                )
-            else:
-                _aauthorization.revalidate_loaded_authorization(
-                    st, origin_ref="mobile_revocation",
-                )
-                _astate.save_task_state(st)
-
-    try:
-        from osia import scheduled_tasks
-
-        scheduled_tasks.refresh_after_permission_epoch(
-            epoch,
-            revoked_task_id=(
-                authority_ref
-                if operation == "revoke_scheduled_task" or (
-                    operation == "revoke_temporary_permission"
-                    and execution_type == "scheduled"
-                )
-                else None
-            ),
-            revoke_all=revoke_all,
-            full_access_disabled=(operation == "disable_full_access"),
-        )
-    except Exception:
-        pass
-
-
-class _PermissionMobileSession:
-    """One authenticated connection's monotonic permission snapshot stream."""
-
-    def __init__(self, out: "_OutboundChannel", loop, store) -> None:
-        self.out = out
-        self.loop = loop
-        self.store = store
-        self.server_id = _PERMISSION_SERVER_ID
-        self.session_id = "permission-session:" + secrets.token_urlsafe(24)
-        self.device_id = ""
-        self.sequence = 0
-        self.active = False
-        self._suppress_epoch_snapshot = False
-        self._epoch_listener = self._on_epoch
-
-    def activate(self) -> None:
-        if self.active:
-            return
-        self.active = True
-        _PERMISSION_SESSIONS.add(self)
-        self.store.add_epoch_listener(self._epoch_listener)
-
-    def close(self) -> None:
-        if not self.active:
-            return
-        self.active = False
-        _PERMISSION_SESSIONS.discard(self)
-        self.store.remove_epoch_listener(self._epoch_listener)
-
-    def bind_device(self, value) -> bool:
-        device_id = _permission_safe_id(value)
-        if not device_id:
-            return False
-        if self.device_id and self.device_id != device_id:
-            return False
-        self.device_id = device_id
-        return True
-
-    def _on_epoch(self, _epoch: int) -> None:
-        if (
-            not self.active
-            or not self.device_id
-            or self._suppress_epoch_snapshot
-        ):
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(self.send_snapshot(), self.loop)
-        except Exception:
-            pass
-
-    async def send_snapshot(
-        self, pending_request_ids: tuple[str, ...] = (),
-    ) -> dict | None:
-        if not self.active or not self.device_id:
-            return None
-        safe_ids = tuple(dict.fromkeys(
-            request_id
-            for request_id in (
-                _permission_safe_id(item) for item in pending_request_ids[:64]
-            )
-            if request_id
-        ))
-        pending = _permission_request_statuses(
-            safe_ids, device_id=self.device_id,
-        )
-        self.sequence += 1
-        frame = self.store.mobile_permission_snapshot(
-            server_id=self.server_id,
-            session_id=self.session_id,
-            sequence=self.sequence,
-            pending_requests=pending,
-        )
-        await self.out.send_json(frame)
-        return frame
-
-    async def _send_ack(
-        self,
-        *,
-        request_id: str,
-        base_epoch: int,
-        base_sequence: int,
-        status: str,
-        reason: str,
-        policy_epoch: int | None = None,
-    ) -> dict:
-        if policy_epoch is None:
-            policy_epoch = self.store.load_state().policy_epoch
-        frame = {
-            "type": "permission_revocation_ack",
-            "schema_version": 1,
-            "request_id": request_id,
-            "server_id": self.server_id,
-            "session_id": self.session_id,
-            "base_policy_epoch": base_epoch,
-            "base_snapshot_sequence": base_sequence,
-            "status": status,
-            "reason": reason,
-            "policy_epoch": int(policy_epoch),
-        }
-        await self.out.send_json(frame)
-        return frame
-
-    async def handle_revocation(self, message: dict) -> dict:
-        request_id = _permission_safe_id(message.get("request_id"))
-        base_epoch = message.get("expected_policy_epoch")
-        base_sequence = message.get("expected_snapshot_sequence")
-        safe_base_epoch = base_epoch if type(base_epoch) is int else -1
-        safe_base_sequence = base_sequence if type(base_sequence) is int else -1
-
-        async def reject(reason: str) -> dict:
-            return await self._send_ack(
-                request_id=request_id,
-                base_epoch=safe_base_epoch,
-                base_sequence=safe_base_sequence,
-                status="rejected",
-                reason=reason,
-            )
-
-        if set(message) != _PERMISSION_REQUEST_FIELDS:
-            return await reject("malformed_request")
-        if message.get("type") != "permission_revocation_request":
-            return await reject("malformed_request")
-        if message.get("schema_version") != 1:
-            return await reject("unsupported_schema")
-        if not request_id:
-            return await reject("malformed_request")
-        if not self.bind_device(message.get("device_id")):
-            return await reject("wrong_device")
-        if message.get("session_id") != self.session_id:
-            return await reject("wrong_session")
-        operation = str(message.get("operation") or "")
-        if operation not in _PERMISSION_REVOCATION_OPERATIONS:
-            return await reject("unsupported_operation")
-        target_id = str(message.get("target_id") or "")
-        if target_id and not _permission_safe_id(target_id):
-            return await reject("malformed_request")
-        expires_at = message.get("expires_at")
-        if (
-            isinstance(expires_at, bool)
-            or not isinstance(expires_at, (int, float))
-            or not math.isfinite(float(expires_at))
-            or float(expires_at) <= time.time()
-            or float(expires_at) > time.time() + 120.0
-        ):
-            return await reject("expired_request")
-        if safe_base_sequence != self.sequence:
-            return await reject("stale_snapshot")
-        state = self.store.load_state()
-        if safe_base_epoch != state.policy_epoch:
-            return await reject("stale_epoch")
-
-        _purge_permission_requests(time.time())
-        with _PERMISSION_REQUESTS_LOCK:
-            duplicate = _PERMISSION_REQUESTS.get(request_id)
-        if duplicate is not None:
-            same = (
-                duplicate.get("device_id") == self.device_id
-                and duplicate.get("operation") == operation
-                and duplicate.get("target_id") == target_id
-            )
-            if same and duplicate.get("status") in {"applied", "idempotent"}:
-                ack = await self._send_ack(
-                    request_id=request_id,
-                    base_epoch=safe_base_epoch,
-                    base_sequence=safe_base_sequence,
-                    status="idempotent",
-                    reason="already_applied",
-                    policy_epoch=int(duplicate.get("policy_epoch", state.policy_epoch)),
-                )
-                await self.send_snapshot((request_id,))
-                return ack
-            return await reject("duplicate_request")
-
-        record = {
-            "device_id": self.device_id,
-            "operation": operation,
-            "target_id": target_id,
-            "status": "pending",
-            "reason": "pending",
-            "policy_epoch": state.policy_epoch,
-            "retain_until": time.time() + _PERMISSION_REQUEST_RETENTION_SECONDS,
-        }
-        with _PERMISSION_REQUESTS_LOCK:
-            _PERMISSION_REQUESTS[request_id] = record
-            _PERMISSION_REQUESTS.move_to_end(request_id)
-
-        try:
-            self._suppress_epoch_snapshot = True
-            result = self.store.revoke_mobile_authority(
-                operation=operation,
-                target_id=target_id,
-                expected_policy_epoch=safe_base_epoch,
-            )
-        except Exception as exc:
-            from osia.permission_store import (
-                PermissionStoreCorrupt,
-                PermissionStoreError,
-                PersistentPermissionUnavailable,
-            )
-
-            if isinstance(exc, PersistentPermissionUnavailable):
-                reason = "changes_unavailable"
-            elif isinstance(exc, PermissionStoreCorrupt):
-                reason = "changes_unavailable"
-            elif isinstance(exc, PermissionStoreError):
-                reason = {
-                    "stale_policy_epoch": "stale_epoch",
-                    "unknown_mobile_target": "unknown_target",
-                    "unsupported_mobile_revocation": "unsupported_operation",
-                }.get(exc.code, "rejected")
-            else:
-                reason = "internal_failure"
-            with _PERMISSION_REQUESTS_LOCK:
-                record.update({
-                    "status": "rejected",
-                    "reason": reason,
-                    "policy_epoch": self.store.load_state().policy_epoch,
-                })
-            return await reject(reason)
-        finally:
-            self._suppress_epoch_snapshot = False
-
-        await _refresh_revoked_permission_contexts(result)
-        status = "applied" if result.changed else "idempotent"
-        reason = "applied" if result.changed else "already_revoked"
-        with _PERMISSION_REQUESTS_LOCK:
-            record.update({
-                "status": status,
-                "reason": reason,
-                "policy_epoch": result.policy_epoch,
-            })
-        ack = await self._send_ack(
-            request_id=request_id,
-            base_epoch=safe_base_epoch,
-            base_sequence=safe_base_sequence,
-            status=status,
-            reason=reason,
-            policy_epoch=result.policy_epoch,
-        )
-        await self.send_snapshot((request_id,))
-        return ack
-
-    async def handle_change_request(self, message) -> None:
-        """Apply one snapshot-bound Mobile request without optimistic grants."""
-
-        async def reject() -> None:
-            if self.device_id:
-                await self.send_snapshot()
-
-        if not isinstance(message, dict) or set(message) != _PERMISSION_CHANGE_FIELDS:
-            await reject()
-            return
-        if (
-            message.get("schema_version") != 1
-            or message.get("contract_schema_version") != 2
-        ):
-            await reject()
-            return
-        request_id = _permission_safe_id(message.get("request_id"))
-        operation = str(message.get("operation") or "")
-        category_id = str(message.get("category_id") or "")
-        enabled = message.get("enabled")
-        auth_method = str(message.get("auth_method") or "")
-        auth_nonce = _permission_safe_id(message.get("auth_nonce"))
-        base_epoch = message.get("expected_policy_epoch")
-        base_sequence = message.get("expected_snapshot_sequence")
-        expires_at = message.get("expires_at")
-        if (
-            not request_id
-            or not self.device_id
-            or message.get("session_id") != self.session_id
-            or operation not in _PERMISSION_CHANGE_OPERATIONS
-            or type(base_epoch) is not int
-            or type(base_sequence) is not int
-            or isinstance(expires_at, bool)
-            or not isinstance(expires_at, (int, float))
-            or not math.isfinite(float(expires_at))
-            or float(expires_at) <= time.time()
-            or float(expires_at) > time.time() + 120.0
-            or base_sequence != self.sequence
-        ):
-            await reject()
-            return
-        state = self.store.load_state()
-        if base_epoch != state.policy_epoch:
-            await reject()
-            return
-
-        from osia.action_policy import AUTOMATIC_PERMISSION_CATEGORIES
-
-        category_request = operation == "set_category"
-        full_access_request = operation == "request_full_access"
-        if (
-            category_request
-            and (
-                category_id not in AUTOMATIC_PERMISSION_CATEGORIES
-                or not isinstance(enabled, bool)
-            )
-        ) or (
-            not category_request and (category_id or enabled is not False)
-        ) or (
-            full_access_request
-            and (
-                auth_method != "osia_confirmation"
-                or not auth_nonce
-                or float(expires_at) > time.time() + _MOBILE_FULL_ACCESS_REQUEST_TTL_SECONDS
-            )
-        ) or (
-            not full_access_request and (auth_method or message.get("auth_nonce"))
-        ):
-            await reject()
-            return
-
-        _purge_permission_requests(time.time())
-        with _PERMISSION_REQUESTS_LOCK:
-            duplicate = _PERMISSION_REQUESTS.get(request_id)
-            replayed_auth = full_access_request and any(
-                item.get("auth_nonce") == auth_nonce
-                for item in _PERMISSION_REQUESTS.values()
-            )
-        if duplicate is not None or replayed_auth:
-            await reject()
-            return
-
-        record = {
-            "device_id": self.device_id,
-            "operation": operation,
-            "target_id": category_id,
-            "enabled": enabled,
-            "auth_nonce": auth_nonce,
-            "status": "pending",
-            "reason": "pending",
-            "policy_epoch": state.policy_epoch,
-            "retain_until": time.time() + _PERMISSION_REQUEST_RETENTION_SECONDS,
-        }
-        with _PERMISSION_REQUESTS_LOCK:
-            _PERMISSION_REQUESTS[request_id] = record
-            _PERMISSION_REQUESTS.move_to_end(request_id)
-
-        try:
-            self._suppress_epoch_snapshot = True
-            if operation == "request_full_access":
-                from osia.local_reauth import (
-                    issue_mobile_full_access_activation_proof,
-                )
-
-                result = self.store.activate_full_access(
-                    activation_proof=issue_mobile_full_access_activation_proof(),
-                    expected_policy_epoch=base_epoch,
-                )
-                result_epoch = result.policy_epoch
-            elif operation == "set_category":
-                result = self.store.update_automatic_permissions(
-                    {category_id: enabled},
-                    expected_policy_epoch=base_epoch,
-                )
-                result_epoch = result.policy_epoch
-            elif operation == "apply_default_access":
-                result = self.store.apply_default_access(
-                    expected_policy_epoch=base_epoch,
-                )
-                result_epoch = result.policy_epoch
-            else:
-                result = self.store.revoke_all_grants(
-                    expected_policy_epoch=base_epoch,
-                )
-                result_epoch = result.policy_epoch
-        except Exception as exc:
-            from osia.permission_store import (
-                PermissionStoreCorrupt,
-                PermissionStoreError,
-                PersistentPermissionUnavailable,
-            )
-
-            if isinstance(exc, (PersistentPermissionUnavailable, PermissionStoreCorrupt)):
-                reason = "changes_unavailable"
-            elif isinstance(exc, PermissionStoreError):
-                reason = exc.code
-            else:
-                reason = "internal_failure"
-            record.update({
-                "status": "rejected",
-                "reason": reason,
-                "policy_epoch": self.store.load_state().policy_epoch,
-            })
-            await reject()
-            return
-        finally:
-            self._suppress_epoch_snapshot = False
-
-        changed = result_epoch != base_epoch
-        record.update({
-            "status": "applied" if changed else "idempotent",
-            "reason": "applied" if changed else "already_applied",
-            "policy_epoch": result_epoch,
-        })
-        await self.send_snapshot()
 
 _CRON_NOTIFICATION_MAX = 30
 _CRON_NOTIFICATIONS: "deque[dict]" = deque(maxlen=_CRON_NOTIFICATION_MAX)
@@ -1392,8 +858,7 @@ class _OutboundChannel:
 
     __slots__ = (
         "_closed", "_durable_buffer", "_durable_client_id",
-        "_durable_ready", "_permission_device_id", "_queue",
-        "_text_coalescer",
+        "_durable_ready", "_queue", "_text_coalescer",
     )
 
     def __init__(self) -> None:
@@ -1402,10 +867,6 @@ class _OutboundChannel:
         self._durable_buffer: list[dict] = []
         self._durable_client_id = ""
         self._durable_ready = False
-        # Stable opaque identity bound only after Mobile authentication.  It
-        # lets one pending approval follow the same device across a transport
-        # reconnect without ever falling back to an unrelated connection.
-        self._permission_device_id = ""
         self._text_coalescer = AssistantTextCoalescer(
             lambda frame: self._queue.put_nowait(("json", frame)),
             loop=asyncio.get_running_loop(),
@@ -1794,10 +1255,7 @@ def _clean_client_request_id(value) -> str | None:
 
 
 _DURABLE_COMMAND_TYPES = frozenset({
-    "text", "audio", "cancel_active_work", "mcp_confirm_response",
-    "scheduled_task_authorization_response",
-    "autonomous_authorization_response",
-    "autonomous_scope_extension_response",
+    "text", "audio", "cancel_active_work",
 })
 
 
@@ -1858,16 +1316,6 @@ def _durable_command_identity(msg_type: str, msg: dict) -> tuple[str, dict] | No
         if not binding.get("scope") or not binding.get("run_id"):
             return None
         identity = dict(binding)
-    elif msg_type == "mcp_confirm_response":
-        if not isinstance(msg.get("approved"), bool):
-            return None
-        binding = {
-            "confirmation_id": str(msg.get("id") or ""),
-            "approved": msg.get("approved") is True,
-        }
-        if not binding["confirmation_id"]:
-            return None
-        identity = {"confirmation_id": binding["confirmation_id"]}
     else:
         binding = {
             key: msg.get(key)
@@ -1898,20 +1346,240 @@ def _durable_command_identity(msg_type: str, msg: dict) -> tuple[str, dict] | No
     return "command_" + hashlib.sha256(material).hexdigest()[:48], binding
 
 
-async def _complete_durable_command(msg: dict, result: dict) -> None:
+def _complete_durable_command_now(msg: dict, result: dict):
     command_id = str(msg.get("_durable_command_id") or "")
     execution_epoch = str(msg.get("_durable_command_epoch") or "")
     if not command_id or not execution_epoch:
-        return
+        return None
+    if result.get("state") == "turn_accepted":
+        # Acceptance transfers authority to the canonical turn; it is not
+        # command completion. The pre-write fence was persisted below.
+        return None
+    return _DURABLE_TRANSPORT.complete_command(
+        command_id,
+        execution_epoch=execution_epoch,
+        result=result,
+    )
+
+
+async def _complete_durable_command(msg: dict, result: dict) -> None:
     try:
         await asyncio.to_thread(
-            _DURABLE_TRANSPORT.complete_command,
-            command_id,
-            execution_epoch=execution_epoch,
-            result=result,
+            _complete_durable_command_now,
+            msg,
+            result,
         )
     except (RuntimeError, TypeError, ValueError):
         pass
+
+
+def _cancelled_command_result(
+    turn_binding: dict,
+    terminal_result: dict,
+    *,
+    reason_code: str,
+    superseded_by_turn_id: str = "",
+    tool_attempt: dict | None = None,
+) -> dict:
+    """Build a factual durable cancellation result without assistant prose."""
+
+    result = {
+        "accepted": True,
+        "state": "superseded" if superseded_by_turn_id else "cancelled",
+        "reason_code": str(reason_code or "turn_cancelled")[:128],
+        "terminal_state": "user_cancelled",
+        "reservation_id": str(terminal_result.get("reservation_id") or ""),
+        "assistant_final_persisted": False,
+        **{
+            key: str(turn_binding.get(key) or "")
+            for key in (
+                "conversation_id", "request_id", "turn_id", "run_id",
+            )
+        },
+    }
+    if superseded_by_turn_id:
+        result["superseded_by_turn_id"] = str(superseded_by_turn_id)
+    if isinstance(tool_attempt, dict):
+        result["tool_attempt_id"] = str(
+            tool_attempt.get("tool_attempt_id") or ""
+        )
+        result["tool_attempt_status"] = str(tool_attempt.get("status") or "")
+        result["tool_attempt_outcome"] = str(
+            tool_attempt.get("terminal_outcome") or ""
+        )
+        result["tool_dispatch_state"] = str(
+            tool_attempt.get("dispatch_state") or ""
+        )
+    return result
+
+
+def _reconcile_cancelled_websocket_commands(
+    *, conversation_id: str = "",
+) -> list[str]:
+    """Settle accepted commands whose exact turn already has a cancel tombstone.
+
+    The canonical TurnTerminality reservation is the authority. This path
+    never resumes provider work and never manufactures an assistant final.
+    """
+
+    from osia.turn_terminality import load_persisted_terminal_result
+
+    recovered: list[str] = []
+    for record in _DURABLE_TRANSPORT.list_commands(state="running"):
+        if record.get("command_type") not in {"text", "audio"}:
+            continue
+        command_id = str(record.get("command_id") or "")
+        execution_epoch = str(record.get("execution_epoch") or "")
+        execution_binding = record.get("execution_binding")
+        command_binding = record.get("binding")
+        if (
+            not command_id
+            or not execution_epoch
+            or not isinstance(execution_binding, dict)
+            or not isinstance(command_binding, dict)
+        ):
+            continue
+        conv_id = str(execution_binding.get("conversation_id") or "")
+        request_id = str(execution_binding.get("request_id") or "")
+        turn_id = str(execution_binding.get("turn_id") or "")
+        if (
+            not conv_id
+            or not request_id
+            or not turn_id
+            or (conversation_id and conversation_id != conv_id)
+            or str(command_binding.get("conversation_id") or "") != conv_id
+            or str(command_binding.get("request_id") or "") != request_id
+        ):
+            continue
+        terminal = load_persisted_terminal_result(turn_id)
+        if (
+            not isinstance(terminal, dict)
+            or terminal.get("terminal_state") != "user_cancelled"
+            or terminal.get("final_text") != ""
+        ):
+            continue
+        turn_binding = terminal.get("execution_binding")
+        if (
+            not isinstance(turn_binding, dict)
+            or any(
+                str(turn_binding.get(key) or "") != value
+                for key, value in (
+                    ("conversation_id", conv_id),
+                    ("request_id", request_id),
+                    ("turn_id", turn_id),
+                    ("run_id", str(execution_binding.get("run_id") or turn_id)),
+                )
+            )
+        ):
+            continue
+        run_id = str(turn_binding.get("run_id") or turn_id)
+        try:
+            stream = _DURABLE_TRANSPORT.get_stream(conv_id, run_id)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        stream_binding = stream.get("binding")
+        if (
+            not isinstance(stream_binding, dict)
+            or str(stream_binding.get("conversation_id") or "") != conv_id
+            or str(stream_binding.get("run_id") or "") != run_id
+            or stream.get("authority_state") not in {"active", "cancelled"}
+        ):
+            continue
+        if stream.get("authority_state") != "cancelled":
+            turn_meta = {
+                **turn_binding,
+                "client_request_id": request_id,
+                "persisted": True,
+                "_execution_epoch": str(stream.get("execution_epoch") or ""),
+                "_terminal_reason_code": str(
+                    terminal.get("cancellation_reason")
+                    or terminal.get("reason_code")
+                    or "authoritative_user_cancellation"
+                ),
+                "_superseded_by_turn_id": str(
+                    terminal.get("superseded_by_turn_id") or ""
+                ),
+            }
+            try:
+                _turn_status_frame(turn_meta, "cancelled")
+            except (RuntimeError, TypeError, ValueError):
+                continue
+        result = _cancelled_command_result(
+            turn_binding,
+            terminal,
+            reason_code=str(
+                terminal.get("cancellation_reason")
+                or terminal.get("reason_code")
+                or "authoritative_user_cancellation"
+            ),
+            superseded_by_turn_id=str(
+                terminal.get("superseded_by_turn_id") or ""
+            ),
+        )
+        try:
+            claim = _DURABLE_TRANSPORT.complete_command(
+                command_id,
+                execution_epoch=execution_epoch,
+                result=result,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if (
+            claim.disposition is InboxDisposition.DUPLICATE_COMPLETED
+            and (claim.result or {}).get("state") in {"cancelled", "superseded"}
+            and (claim.result or {}).get("terminal_state") == "user_cancelled"
+        ):
+            recovered.append(command_id)
+    return recovered
+
+
+async def _settle_websocket_command_owner(owner: dict | None) -> None:
+    """Close the receive-loop ownership scope without replaying execution."""
+    if not owner or owner.get("transferred"):
+        return
+    claim_task = owner["claim_task"]
+    try:
+        try:
+            claim = await asyncio.shield(claim_task)
+        except Exception:
+            # Claim persistence can fail before returning its receipt. Settle
+            # only our preassigned epoch; absence/another owner is not ours.
+            try:
+                await asyncio.to_thread(
+                    _DURABLE_TRANSPORT.settle_unstarted_command,
+                    owner["command_id"], execution_epoch=owner["execution_epoch"],
+                )
+            except ValueError:
+                pass
+            return
+        if claim.disposition is not InboxDisposition.CLAIMED:
+            return
+        settled = await asyncio.to_thread(
+            _DURABLE_TRANSPORT.settle_unstarted_command,
+            claim.command_id, execution_epoch=claim.execution_epoch,
+        )
+        if not settled:
+            # Acceptance might have committed before dispatch failed. Do not
+            # classify this as safe pre-turn release or fresh execution.
+            await asyncio.to_thread(
+                _DURABLE_TRANSPORT.complete_command,
+                claim.command_id, execution_epoch=claim.execution_epoch,
+                result={"state": "outcome_unknown", "accepted": None,
+                        "reason_code": "owner_exited_after_acceptance_fence"},
+            )
+    except Exception as exc:
+        print("[WS command] ownership settlement failed: "
+              f"{type(exc).__name__} command={owner['command_id']}", flush=True)
+        raise
+
+
+async def _websocket_owned_messages(ws, owners: list):
+    async for raw_msg in ws.iter_text():
+        yield raw_msg
+        # Executed before the next receive even when dispatch used continue.
+        if owners:
+            await _settle_websocket_command_owner(owners[-1])
+            owners.pop()
 
 
 def _application_transport_coordination_enabled() -> bool:
@@ -2114,7 +1782,13 @@ def _bind_pre_agent_cancellation_authority(turn_meta: dict) -> None:
     if any(not value for value in binding.values()) or not objective:
         return
 
-    def _request(turn_id: str, *, effect_possible: bool = False) -> bool:
+    def _request(
+        turn_id: str,
+        *,
+        effect_possible: bool = False,
+        reason_code: str = "",
+        superseded_by_turn_id: str = "",
+    ) -> bool:
         if str(turn_id or "") != binding["turn_id"]:
             return False
         from osia.turn_terminality import TurnTerminalityController
@@ -2132,9 +1806,14 @@ def _bind_pre_agent_cancellation_authority(turn_meta: dict) -> None:
             controller.set_execution_binding(binding)
         return controller.try_request_cancellation(
             effect_possible=bool(effect_possible),
+            reason_code=reason_code,
+            superseded_by_turn_id=superseded_by_turn_id,
         )
 
     turn_meta["_terminality_cancel_intent"] = _request
+    # Preserve the fast durable CAS separately from the Agent callback that
+    # also asks its provider/tool worker to stop.
+    turn_meta["_terminality_cancel_authority"] = _request
     turn_meta["_terminality_cancel"] = _request
 
 
@@ -2267,6 +1946,12 @@ def _turn_status_frame(turn_meta: dict, status: str) -> dict:
     tool_attempt_id = str(turn_meta.get("_tool_attempt_id") or "")
     if tool_attempt_id:
         payload["tool_attempt_id"] = tool_attempt_id
+    reason_code = str(turn_meta.get("_terminal_reason_code") or "")
+    if reason_code:
+        payload["reason_code"] = reason_code[:160]
+    superseded_by = str(turn_meta.get("_superseded_by_turn_id") or "")
+    if superseded_by:
+        payload["superseded_by_turn_id"] = superseded_by[:256]
     return _turn_event_frame(
         turn_meta,
         "turn_status",
@@ -2628,7 +2313,9 @@ def _legacy_attachment_manifest(
     for logical_order, raw_path in enumerate(paths):
         path = Path(raw_path)
         data = path.read_bytes()
-        image_mime = _image_mime_for(path)
+        from osia.attachments import detect_image_mime
+
+        image_mime = detect_image_mime(data) or _image_mime_for(path)
         manifest.append({
             "logical_order": logical_order,
             "display_name": str(names.get(str(path)) or path.suffix.lower()),
@@ -2765,7 +2452,9 @@ def _active_turn_working_status(conv_id: str) -> str:
         "action_running",
         "action_starting", "blocked_unknown_effect", "cancelled_proven",
     }:
-        return remembered
+        from osia.chat_routing import project_chat_tool_attempt_status
+
+        return project_chat_tool_attempt_status(remembered)
     return "working"
 
 
@@ -2960,16 +2649,10 @@ async def _handle_waiting_tool_command(
         handled = True
         status = _active_turn_working_status(conv_id)
     else:
-        # The conversation is occupied by the suspended turn. Consume the
-        # command on this bounded control path and report busy truthfully; it
-        # must never fall through into a separate provider or Autonomous turn.
-        await _send_conversation_busy(channel, conv_id)
-        meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-        if isinstance(meta, dict):
-            await channel.send_json(
-                _turn_status_frame(meta, _active_turn_working_status(conv_id))
-            )
-        return True
+        # Only recognized waiting-turn controls belong to this bounded path.
+        # Ordinary text is a new user turn and must reach canonical turn
+        # acceptance, where it supersedes this conversation's active turn.
+        return False
     if handled:
         meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
         if isinstance(meta, dict):
@@ -3134,8 +2817,495 @@ def _durable_cancelled_chat_terminal_frame(
     return None
 
 
+def _tool_attempt_may_have_effect(attempt: dict | None) -> bool:
+    """Use the durable attempt boundary, never parent-turn cancellation, as fact."""
+
+    if not isinstance(attempt, dict):
+        return False
+    from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
+
+    try:
+        status = ToolAttemptStatus(attempt.get("status"))
+    except (TypeError, ValueError):
+        return True
+    action_truth = attempt.get("action_truth")
+    effect_truth = (
+        str(action_truth.get("effect_truth") or "")
+        if isinstance(action_truth, dict) else ""
+    )
+    if status in TERMINAL_STATUSES:
+        return bool(
+            status is ToolAttemptStatus.UNKNOWN_AFTER_START
+            or effect_truth == "possible"
+        )
+    dispatch_state = str(attempt.get("dispatch_state") or "")
+    if (
+        dispatch_state in {"not_dispatched", "cancelled_before_effect"}
+        and not attempt.get("owner_dispatch_claimed_at")
+    ):
+        return False
+    return bool(
+        attempt.get("owner_dispatch_claimed_at")
+        or dispatch_state in {
+            "dispatch_started", "effect_unknown", "effect_confirmed",
+            "effect_applied",
+        }
+        or effect_truth in {"possible", "observed", "verified"}
+    )
+
+
+async def _commit_canonical_chat_cancellation(
+    turn_meta: dict,
+    *,
+    reason_code: str,
+    superseded_by_turn_id: str = "",
+    new_turn_meta: dict | None = None,
+    tool_attempt: dict | None = None,
+    channel: "_OutboundChannel | None" = None,
+    streaming_tasks: dict | None = None,
+    control_message: dict | None = None,
+    send_busy_false: bool = False,
+) -> dict | None:
+    """Win one turn-cancellation CAS and settle its durable command truthfully."""
+
+    if not isinstance(turn_meta, dict):
+        return None
+    conv_id = str(turn_meta.get("conversation_id") or "")
+    request_id = str(
+        turn_meta.get("request_id") or turn_meta.get("client_request_id") or ""
+    )
+    turn_id = str(turn_meta.get("turn_id") or "")
+    run_id = str(turn_meta.get("run_id") or turn_id)
+    if not all((conv_id, request_id, turn_id, run_id)):
+        return None
+
+    from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
+    from osia.turn_terminality import load_persisted_terminal_result
+
+    def exact_terminal():
+        terminal = load_persisted_terminal_result(turn_id)
+        binding = terminal.get("execution_binding") if isinstance(terminal, dict) else None
+        if (
+            not isinstance(binding, dict)
+            or any(
+                str(binding.get(key) or "") != value
+                for key, value in (
+                    ("conversation_id", conv_id), ("request_id", request_id),
+                    ("turn_id", turn_id), ("run_id", run_id),
+                )
+            )
+        ):
+            return None
+        return terminal
+
+    terminal = exact_terminal()
+    if terminal and terminal.get("terminal_state") != "user_cancelled":
+        # A previously committed normal final is immutable. Its owner can
+        # finish receipt delivery while a newer turn proceeds independently.
+        return None
+
+    store = None
+    attempt = tool_attempt if isinstance(tool_attempt, dict) else None
+    attempt_id = str(
+        turn_meta.get("_tool_attempt_id")
+        or turn_meta.get("_existing_tool_attempt_id") or ""
+    )
+    if not attempt_id and isinstance(attempt, dict):
+        attempt_id = str(attempt.get("tool_attempt_id") or "")
+    try:
+        from osia.tool_attempts import get_tool_attempt_store
+
+        store = get_tool_attempt_store()
+        if attempt is None and attempt_id:
+            attempt = store.get_attempt(attempt_id)
+        if attempt is None:
+            candidate = store.find_compatible_suspended_turn(conv_id)
+            if isinstance(candidate, dict) and _tool_attempt_matches_turn_meta(
+                candidate, turn_meta, conversation_id=conv_id,
+            ):
+                attempt = candidate
+                attempt_id = str(candidate.get("tool_attempt_id") or "")
+    except Exception:
+        store = None
+        attempt = None
+    if isinstance(attempt, dict) and not _tool_attempt_matches_turn_meta(
+        attempt, turn_meta, conversation_id=conv_id,
+    ):
+        attempt = None
+        attempt_id = ""
+
+    if isinstance(attempt, dict) and attempt_id:
+        try:
+            attempt_status = ToolAttemptStatus(attempt.get("status"))
+        except (TypeError, ValueError):
+            attempt_status = None
+        if attempt_status in TERMINAL_STATUSES:
+            # A parent turn may still list a terminal attempt as active when
+            # its result callback raced Stop. Reconcile from the exact durable
+            # ToolAttempt before deciding whether cancellation implies any
+            # possible effect; completed success/failure stays factual.
+            try:
+                from osia.turn_terminality import TurnTerminalityController
+
+                objective = str(
+                    turn_meta.get("_terminality_objective")
+                    or turn_meta.get("_original_user_text") or ""
+                ).strip()
+                if objective:
+                    controller = TurnTerminalityController(
+                        turn_id=turn_id,
+                        objective=objective,
+                        execution_required=True,
+                    )
+                    expected_binding = {
+                        key: str(turn_meta.get(key) or "")
+                        for key in (
+                            "conversation_id", "request_id", "turn_id", "run_id",
+                            "provider_id", "model_id", "effective_reasoning",
+                        )
+                    }
+                    existing_binding = (
+                        controller.snapshot().get("execution_binding") or {}
+                    )
+                    if not existing_binding:
+                        controller.set_execution_binding(expected_binding)
+                        existing_binding = expected_binding
+                    if existing_binding == expected_binding:
+                        controller.reconcile_tool_attempt(attempt_id)
+            except Exception:
+                # A missing/mismatched terminal ToolAttempt cannot justify
+                # rewriting its result or erasing uncertainty.
+                pass
+
+    effect_possible = _tool_attempt_may_have_effect(attempt)
+    terminality_authority = (
+        turn_meta.get("_terminality_cancel_authority")
+        or turn_meta.get("_terminality_cancel_intent")
+        or turn_meta.get("_terminality_cancel")
+    )
+    accepted = bool(
+        terminal
+        and terminal.get("terminal_state") == "user_cancelled"
+        and terminal.get("final_text") == ""
+    )
+    if not accepted and callable(terminality_authority):
+        try:
+            accepted = terminality_authority(
+                turn_id, effect_possible=effect_possible,
+                reason_code=reason_code,
+                superseded_by_turn_id=superseded_by_turn_id,
+            ) is True
+        except Exception:
+            accepted = False
+    if not accepted:
+        terminal = exact_terminal()
+        accepted = bool(
+            terminal
+            and terminal.get("terminal_state") == "user_cancelled"
+            and terminal.get("final_text") == ""
+        )
+    if not accepted:
+        return None
+    terminal = exact_terminal()
+    if (
+        not isinstance(terminal, dict)
+        or terminal.get("terminal_state") != "user_cancelled"
+        or terminal.get("final_text") != ""
+    ):
+        return None
+
+    turn_meta["_tool_cancel_requested"] = True
+    turn_meta["_terminal_reason_code"] = str(reason_code or "turn_cancelled")[:160]
+    turn_meta["_superseded_by_turn_id"] = str(superseded_by_turn_id or "")
+    if attempt_id:
+        turn_meta["_tool_attempt_id"] = attempt_id
+    if isinstance(attempt, dict) and store is not None:
+        try:
+            status = ToolAttemptStatus(attempt.get("status"))
+        except (TypeError, ValueError):
+            status = None
+        if status is not None and status not in TERMINAL_STATUSES:
+            try:
+                attempt = store.request_cancellation(attempt_id)
+            except Exception:
+                # The turn tombstone still wins; the attempt remains factual
+                # uncertainty until its own owner supplies a terminal receipt.
+                pass
+        turn_meta["_tool_attempt_status"] = str(attempt.get("status") or "")
+
+    cancel_generation = turn_meta.get("_execution_generation_cancel")
+    if callable(cancel_generation):
+        try:
+            cancel_generation(turn_id)
+        except Exception:
+            # The durable cancellation tombstone remains authoritative; the
+            # worker/task cancellation and ToolAttempt boundary still apply.
+            pass
+
+    terminal = exact_terminal() or terminal or {}
+    result = _cancelled_command_result(
+        terminal.get("execution_binding") or {
+            "conversation_id": conv_id, "request_id": request_id,
+            "turn_id": turn_id, "run_id": run_id,
+        },
+        terminal,
+        reason_code=reason_code,
+        superseded_by_turn_id=superseded_by_turn_id,
+        tool_attempt=attempt,
+    )
+    frame = _turn_status_frame(turn_meta, "cancelled")
+
+    # Persist both terminal facts before cancelling the orchestration task.
+    # Its CancelledError recovery is allowed to race, but the command CAS keeps
+    # this cancellation receipt as the winner and never invents a model final.
+    try:
+        _complete_durable_command_now(turn_meta, result)
+        if isinstance(control_message, dict):
+            control_result = {
+                **result,
+                "control": "cancel_active_work",
+                "state": "cancelled",
+                "command_id": str(
+                    control_message.get("_durable_command_id") or ""
+                ),
+            }
+            _complete_durable_command_now(control_message, control_result)
+            control_message["_cancellation_command_result"] = control_result
+    except (RuntimeError, TypeError, ValueError):
+        # Keep the persisted TurnTerminality/stream tombstone authoritative;
+        # startup reconciliation retries the exact command epoch.
+        pass
+
+    active_task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
+    active_meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+    if active_meta is turn_meta:
+        if isinstance(new_turn_meta, dict):
+            new_turn_meta["_supersedes_turn_id"] = turn_id
+            new_turn_meta["_supersession_history_from_store"] = True
+            if active_task is not None:
+                new_turn_meta["_superseded_previous_task"] = active_task
+        if active_task is not None:
+            _clear_conversation_turn(conv_id, active_task)
+        else:
+            _ACTIVE_TURN_META_BY_CONV.pop(conv_id, None)
+            request_id = str(
+                turn_meta.get("request_id")
+                or turn_meta.get("client_request_id") or ""
+            )
+            if request_id:
+                _ACTIVE_CONV_BY_REQUEST.pop(request_id, None)
+    if isinstance(streaming_tasks, dict):
+        local_task = streaming_tasks.get(conv_id)
+        if local_task is not None:
+            if isinstance(new_turn_meta, dict):
+                new_turn_meta.setdefault("_supersedes_turn_id", turn_id)
+                new_turn_meta.setdefault("_supersession_history_from_store", True)
+                new_turn_meta.setdefault("_superseded_previous_task", local_task)
+    else:
+        local_task = None
+    current_task = asyncio.current_task()
+    tasks = {task for task in (active_task, local_task) if task is not None}
+    for task in tasks:
+        if task is current_task or task.done():
+            continue
+        task.cancel()
+
+    worker_cancel = turn_meta.get("_terminality_cancel")
+    if callable(worker_cancel) and worker_cancel is not terminality_authority:
+        propagation = asyncio.create_task(
+            _propagate_committed_turn_cancellation(
+                worker_cancel, turn_id, effect_possible=effect_possible,
+            )
+        )
+        _PENDING_FINAL_PERSIST_TASKS.add(propagation)
+        propagation.add_done_callback(_PENDING_FINAL_PERSIST_TASKS.discard)
+
+    if channel is not None:
+        await channel.send_json(frame)
+    await _broadcast_turn_status(
+        turn_meta,
+        "cancelled",
+        exclude=channel,
+        frame=frame,
+    )
+    if send_busy_false and active_meta is turn_meta and active_task is not None:
+        # This is only the live ownership projection; the cancellation turn
+        # status above is the sole durable terminal event for the old run.
+        busy_frame = _conversation_busy_changed_frame(conv_id, False, turn_meta)
+        if channel is not None:
+            await channel.send_json(busy_frame)
+        await _broadcast_conversation_busy_changed(
+            conv_id, False, frame=busy_frame, exclude=channel,
+        )
+    if (
+        isinstance(control_message, dict)
+        and control_message.get("_durable_command_id")
+        and channel is not None
+    ):
+        await channel.send_json({
+            "type": "cancellation_control",
+            "schema_version": 1,
+            "scope": "chat",
+            "state": "cancelled",
+            "reason_code": str(reason_code or "user_cancelled")[:160],
+            "command_id": str(
+                control_message.get("_durable_command_id") or ""
+            ),
+            "conversation_id": conv_id,
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "run_id": run_id,
+        })
+    return result
+
+
+def _history_for_superseding_turn(
+    conversation_id: str,
+    turn_meta: dict,
+) -> list:
+    """Reload committed history while omitting cancelled turn instructions."""
+
+    conversation = conversations.get_conversation(conversation_id)
+    messages = list(
+        conversation.get("messages") or []
+        if isinstance(conversation, dict) else []
+    )
+    cancelled_turn_ids = {
+        str(item.get("_turn_id") or "")
+        for item in messages
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and conversations._has_exact_user_cancelled_terminal(item)
+        and str(item.get("_turn_id") or "")
+    }
+    current_turn_id = str(turn_meta.get("turn_id") or "")
+    current_request_id = str(
+        turn_meta.get("request_id") or turn_meta.get("client_request_id") or ""
+    )
+    history = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        item_turn_id = str(item.get("_turn_id") or "")
+        item_request_id = str(
+            item.get("_request_id") or item.get("_client_request_id") or ""
+        )
+        if item_turn_id in cancelled_turn_ids:
+            continue
+        if (
+            item.get("role") == "user"
+            and item_turn_id == current_turn_id
+            and item_request_id == current_request_id
+        ):
+            continue
+        history.append(item)
+    return history
+
+
+async def _supersede_active_conversation_turn(
+    channel: "_OutboundChannel",
+    conversation_id: str,
+    new_turn_meta: dict,
+    *,
+    streaming_tasks: dict | None = None,
+) -> bool:
+    """Supersede only this conversation's prior canonical turn at acceptance."""
+
+    # Repair accepted commands whose turn already has a durable cancellation
+    # tombstone, including an owner that exited after the old turn was stopped.
+    repaired = _reconcile_cancelled_websocket_commands(
+        conversation_id=conversation_id,
+    )
+    if repaired:
+        new_turn_meta["_supersession_history_from_store"] = True
+
+    old_meta = _ACTIVE_TURN_META_BY_CONV.get(conversation_id)
+    old_task = _ACTIVE_TURNS_BY_CONV.get(conversation_id)
+    if not isinstance(old_meta, dict):
+        existing_conversation = conversations.get_conversation(conversation_id)
+        if isinstance(existing_conversation, dict) and any(
+            isinstance(item, dict)
+            and item.get("role") == "user"
+            and conversations._has_exact_user_cancelled_terminal(item)
+            for item in existing_conversation.get("messages") or []
+        ):
+            new_turn_meta["_supersession_history_from_store"] = True
+        # A terminal TTS worker does not own the chat turn, but its lease can
+        # otherwise reject a new committed user message. Stop only that exact
+        # post-turn media task and release its existing lease.
+        media_task = _POST_TURN_MEDIA_BY_CONV.get(conversation_id)
+        media_meta = _POST_TURN_MEDIA_META_BY_CONV.get(conversation_id)
+        if media_task is not None:
+            if isinstance(media_meta, dict):
+                media_meta["_response_media_cancelled"] = True
+                lease_id = str(media_meta.get("_post_turn_media_lease_id") or "")
+                if lease_id:
+                    try:
+                        conversations.release_post_turn_media_cas(
+                            conversation_id, lease_id,
+                        )
+                        media_meta["_post_turn_media_lease_released"] = True
+                    except Exception:
+                        pass
+            if not media_task.done():
+                media_task.cancel()
+            if _POST_TURN_MEDIA_BY_CONV.get(conversation_id) is media_task:
+                _POST_TURN_MEDIA_BY_CONV.pop(conversation_id, None)
+                _POST_TURN_MEDIA_META_BY_CONV.pop(conversation_id, None)
+            new_turn_meta["_supersession_history_from_store"] = True
+        elif old_task is not None and not old_task.done():
+            # Do not cancel an uncorrelated background owner.
+            return False
+        return True
+
+    old_turn_id = str(old_meta.get("turn_id") or "")
+    if not old_turn_id or old_turn_id == str(new_turn_meta.get("turn_id") or ""):
+        return False
+
+    from osia.turn_terminality import load_persisted_terminal_result
+
+    old_terminal = load_persisted_terminal_result(old_turn_id)
+    if old_terminal and old_terminal.get("terminal_state") != "user_cancelled":
+        old_request_id = str(
+            old_meta.get("request_id") or old_meta.get("client_request_id") or ""
+        )
+        found = conversations.find_correlated_turn(
+            conversation_id, old_request_id,
+        ) if old_request_id else None
+        if not isinstance(found, dict) or found.get("assistant_content") is None:
+            # Its normal terminal reservation exists, but its required
+            # assistant receipt is not persisted yet. Keep normal final truth.
+            return False
+        # RACE 1: the normal final won just before this request. Keep its
+        # durable command unchanged, detach the finishing owner, and let the
+        # new turn reload that already persisted history.
+        if old_task is not None:
+            new_turn_meta["_superseded_previous_task"] = old_task
+        new_turn_meta["_supersedes_turn_id"] = old_turn_id
+        new_turn_meta["_supersession_history_from_store"] = True
+        if _ACTIVE_TURN_META_BY_CONV.get(conversation_id) is old_meta:
+            _clear_conversation_turn(conversation_id, old_task)
+        return True
+
+    result = await _commit_canonical_chat_cancellation(
+        old_meta,
+        reason_code="turn_superseded",
+        superseded_by_turn_id=str(new_turn_meta.get("turn_id") or ""),
+        new_turn_meta=new_turn_meta,
+        streaming_tasks=streaming_tasks,
+        send_busy_false=False,
+    )
+    if result is None:
+        return False
+    new_turn_meta["_supersession_history_from_store"] = True
+    return True
+
+
 async def _handle_correlated_chat_cancellation(
-    channel: "_OutboundChannel", msg: dict,
+    channel: "_OutboundChannel",
+    msg: dict,
+    *,
+    streaming_tasks: dict | None = None,
 ) -> bool:
     """Request cancellation only for the exact active canonical chat turn."""
 
@@ -3160,16 +3330,35 @@ async def _handle_correlated_chat_cancellation(
         "run_id": run_id,
         "tool_attempt_id": supplied_attempt_id,
     }
+
+    def _settle_control(result: dict) -> None:
+        msg["_cancellation_command_result"] = result
+        _complete_durable_command_now(msg, result)
+
+    async def _reject(reason_code: str) -> bool:
+        result = {
+            "accepted": False,
+            "state": "rejected",
+            "reason_code": str(reason_code or "cancellation_rejected")[:128],
+            **{
+                key: target[key]
+                for key in ("conversation_id", "request_id", "turn_id", "run_id")
+                if target.get(key)
+            },
+        }
+        _settle_control(result)
+        await _send_cancellation_rejection(
+            channel, "chat", reason_code, **target,
+        )
+        return False
+
     if (
         not conv_id
         or request_id is None
         or not turn_id
         or (msg.get("run_id") and not supplied_run_id)
     ):
-        await _send_cancellation_rejection(
-            channel, "chat", "incomplete_target", **target,
-        )
-        return False
+        return await _reject("incomplete_target")
     meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
     active_target_matches = bool(
         isinstance(meta, dict)
@@ -3179,6 +3368,7 @@ async def _handle_correlated_chat_cancellation(
         == request_id
     )
     if not active_target_matches:
+        _reconcile_cancelled_websocket_commands(conversation_id=conv_id)
         historical = _durable_cancelled_chat_terminal_frame(
             conversation_id=conv_id,
             request_id=request_id,
@@ -3187,13 +3377,39 @@ async def _handle_correlated_chat_cancellation(
             tool_attempt_id=supplied_attempt_id,
         )
         if historical is not None:
+            terminal = None
+            try:
+                from osia.turn_terminality import load_persisted_terminal_result
+
+                terminal = load_persisted_terminal_result(turn_id)
+            except Exception:
+                terminal = None
+            result = _cancelled_command_result(
+                (terminal or {}).get("execution_binding") or target,
+                terminal or {"reservation_id": ""},
+                reason_code="turn_cancelled",
+            )
+            result.update({
+                "control": "cancel_active_work",
+                "command_id": str(msg.get("_durable_command_id") or ""),
+            })
+            _settle_control(result)
+            if msg.get("_durable_command_id"):
+                await channel.send_json({
+                    "type": "cancellation_control",
+                    "schema_version": 1,
+                    "scope": "chat",
+                    "state": "cancelled",
+                    "reason_code": "turn_cancelled",
+                    "command_id": str(msg.get("_durable_command_id") or ""),
+                    **{key: target[key] for key in (
+                        "conversation_id", "request_id", "turn_id", "run_id",
+                    )},
+                })
             await channel.send_json(historical)
             return True
     if not isinstance(meta, dict):
-        await _send_cancellation_rejection(
-            channel, "chat", "target_not_active", **target,
-        )
-        return False
+        return await _reject("target_not_active")
     active_run_id = str(meta.get("run_id") or meta.get("turn_id") or "")
     if (
         str(meta.get("turn_id") or "") != turn_id
@@ -3201,9 +3417,7 @@ async def _handle_correlated_chat_cancellation(
         or str(meta.get("request_id") or meta.get("client_request_id") or "")
         != request_id
     ):
-        await _send_cancellation_rejection(
-            channel, "chat", "target_mismatch", **target,
-        )
+        await _reject("target_mismatch")
         await _send_recovered_turn_state(channel, conv_id)
         return False
     remembered_control = meta.get("_cancellation_control_target")
@@ -3216,131 +3430,70 @@ async def _handle_correlated_chat_cancellation(
             or supplied_attempt_id == remembered_control[4]
         )
     ):
+        terminal = None
+        try:
+            from osia.turn_terminality import load_persisted_terminal_result
+
+            terminal = load_persisted_terminal_result(turn_id)
+        except Exception:
+            terminal = None
+        result = _cancelled_command_result(
+            (terminal or {}).get("execution_binding") or target,
+            terminal or {"reservation_id": ""},
+            reason_code="turn_cancelled",
+        )
+        result.update({
+            "control": "cancel_active_work",
+            "command_id": str(msg.get("_durable_command_id") or ""),
+        })
+        _settle_control(result)
+        if msg.get("_durable_command_id"):
+            await channel.send_json({
+                "type": "cancellation_control",
+                "schema_version": 1,
+                "scope": "chat",
+                "state": "cancelled",
+                "reason_code": "turn_cancelled",
+                "command_id": str(msg.get("_durable_command_id") or ""),
+                **{key: target[key] for key in (
+                    "conversation_id", "request_id", "turn_id", "run_id",
+                )},
+            })
         await channel.send_json(_turn_status_frame(meta, "cancelled"))
         return True
     if not _is_conversation_busy(conv_id):
-        await _send_cancellation_rejection(
-            channel, "chat", "target_not_active", **target,
-        )
-        return False
+        return await _reject("target_not_active")
 
-    from osia.tool_attempts import (
-        TERMINAL_STATUSES,
-        ToolAttemptStatus,
-        get_tool_attempt_store,
-    )
+    from osia.tool_attempts import get_tool_attempt_store
 
     store = get_tool_attempt_store()
     attempt = store.find_compatible_suspended_turn(conv_id)
     if isinstance(attempt, dict) and not _tool_attempt_matches_turn_meta(
         attempt, meta, conversation_id=conv_id,
     ):
-        await _send_cancellation_rejection(
-            channel, "chat", "active_receipt_mismatch", **target,
-        )
-        return False
+        return await _reject("active_receipt_mismatch")
     remembered_attempt_id = str(meta.get("_tool_attempt_id") or "")
     active_attempt_id = str(
         (attempt or {}).get("tool_attempt_id") or remembered_attempt_id
     )
     if supplied_attempt_id and supplied_attempt_id != active_attempt_id:
-        await _send_cancellation_rejection(
-            channel, "chat", "tool_attempt_mismatch", **target,
-        )
-        return False
+        return await _reject("tool_attempt_mismatch")
 
     control_target = (
         conv_id, request_id, turn_id, run_id, active_attempt_id,
     )
-    if attempt is None and remembered_attempt_id:
-        remembered = store.get_attempt(remembered_attempt_id)
-        if (
-            isinstance(remembered, dict)
-            and ToolAttemptStatus(remembered["status"]) in TERMINAL_STATUSES
-        ):
-            await _send_cancellation_rejection(
-                channel, "chat", "target_not_cancellable", **target,
-            )
-            return False
-
-    status = "cancelled"
-    terminality_intent = meta.get("_terminality_cancel_intent")
-    terminality_cancel = meta.get("_terminality_cancel")
-    if not callable(terminality_intent):
-        terminality_intent = terminality_cancel
-    if not callable(terminality_intent):
-        await _send_cancellation_rejection(
-            channel, "chat", "cancellation_unavailable", **target,
-        )
-        return False
-    try:
-        terminality_accepted = terminality_intent(
-            turn_id,
-            effect_possible=bool(active_attempt_id),
-        )
-    except Exception:
-        await _send_cancellation_rejection(
-            channel, "chat", "cancellation_unavailable", **target,
-        )
-        return False
-    if terminality_accepted is not True:
-        await _send_cancellation_rejection(
-            channel, "chat", "target_not_cancellable", **target,
-        )
-        return False
-    meta["_tool_cancel_requested"] = True
-    if isinstance(attempt, dict):
-        attempt_id = str(attempt.get("tool_attempt_id") or "")
-        meta["_tool_attempt_id"] = attempt_id
-    else:
-        # The provider is still planning. Carry the intent to the first exact
-        # accepted tool boundary; it can then be proven cancelled pre-dispatch.
-        meta["_tool_cancel_requested"] = True
-    meta["_tool_attempt_status"] = status
     meta["_cancellation_control_target"] = control_target
-    frame = _turn_status_frame(meta, status)
-    await channel.send_json(frame)
-    await _broadcast_turn_status(meta, status, exclude=channel, frame=frame)
-    if isinstance(attempt, dict):
-        try:
-            store.request_cancellation(active_attempt_id)
-        except Exception:
-            # Stop is already the terminal authority. A failed observer/tool
-            # shutdown is retained as possible evidence; it cannot undo Stop.
-            pass
-    if callable(terminality_cancel) and terminality_cancel is not terminality_intent:
-        propagation_task = asyncio.create_task(
-            _propagate_committed_turn_cancellation(
-            terminality_cancel,
-            turn_id,
-            effect_possible=bool(active_attempt_id),
-            )
-        )
-        meta["_cancellation_propagation_task"] = propagation_task
-    active_task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
-    current_task = asyncio.current_task()
-    released = bool(
-        isinstance(active_task, asyncio.Future)
-        and _clear_conversation_turn(conv_id, active_task)
+    result = await _commit_canonical_chat_cancellation(
+        meta,
+        reason_code="user_cancelled",
+        tool_attempt=attempt,
+        channel=channel,
+        streaming_tasks=streaming_tasks,
+        control_message=msg,
+        send_busy_false=True,
     )
-    if released:
-        # The terminal Stop event is already durable.  Busy=false is an
-        # ephemeral ownership projection, deliberately not another event in
-        # the tombstoned execution stream.
-        busy_frame = _conversation_busy_changed_frame(conv_id, False)
-        await channel.send_json(busy_frame)
-        await _broadcast_conversation_busy_changed(
-            conv_id,
-            False,
-            frame=busy_frame,
-            exclude=channel,
-        )
-    if (
-        isinstance(active_task, asyncio.Future)
-        and active_task is not current_task
-        and not active_task.done()
-    ):
-        active_task.cancel()
+    if result is None:
+        return await _reject("target_not_cancellable")
     return True
 
 
@@ -3977,13 +4130,13 @@ def _reserve_failed_server_turn_terminal(
         terminal_state = TerminalState.USER_CANCELLED.value
         reason_code = "authoritative_user_cancellation"
         final_text = localized_text(
-            "autonomous.status_cancelled_proven", language,
+            "chat.status_cancelled_proven", language,
         )
     elif cancellation.get("requested") and snapshot.get("unknown_effects"):
         terminal_state = TerminalState.BLOCKED_VERIFIED.value
         reason_code = "durable_outcome_unknown"
         final_text = localized_text(
-            "autonomous.status_outcome_unknown", language,
+            "chat.status_outcome_unknown", language,
         )
     elif hard_safety_reason:
         terminal_state = TerminalState.HARD_SAFETY_BLOCK.value
@@ -3997,12 +4150,59 @@ def _reserve_failed_server_turn_terminal(
         terminal_state = TerminalState.BLOCKED_VERIFIED.value
         reason_code = "durable_outcome_unknown"
         final_text = localized_text(
-            "autonomous.status_outcome_unknown", language,
+            "chat.status_outcome_unknown", language,
         )
     else:
         terminal_state = TerminalState.BLOCKED_VERIFIED.value
-        reason_code = "durable_turn_setup_failed"
-        final_text = localized_text("provider_failure", language)
+        first_causal = snapshot.get("first_causal_error") or {}
+        first_reason = str(
+            first_causal.get("reason_code")
+            if isinstance(first_causal, dict) else ""
+        )
+        completed_provider_turns = sum(
+            1 for item in snapshot.get("invocations") or []
+            if isinstance(item, dict)
+            and item.get("status") == "provider_invocation_completed"
+        )
+        if first_reason == "provider_output_truncated":
+            reason_code = first_reason
+            final_text = (
+                "ERROR: le fournisseur a interrompu sa réponse à la limite "
+                "de sortie ; la réponse partielle est incomplète."
+                if language == "fr" else
+                "ERROR: the provider ended its response at the output-length "
+                "limit; the partial response is incomplete."
+            )
+        elif first_reason in {
+            "TARGET_PARSE_AMBIGUOUS", "TARGET_CONFLICT", "TARGET_MISSING",
+            "TARGET_AMBIGUOUS", "TARGET_STALE",
+        }:
+            reason_code = first_reason
+            final_text = (
+                "Je n’ai pas pu identifier de façon fiable la fenêtre "
+                "d’application demandée."
+                if language == "fr" else
+                "I could not reliably identify the requested application window."
+            )
+        elif first_reason:
+            reason_code = first_reason
+            final_text = (
+                "L’exécution ne peut pas progresser de façon sûre avec "
+                "l’état actuel."
+                if language == "fr" else
+                "Execution cannot safely progress from the current state."
+            )
+        elif completed_provider_turns:
+            reason_code = "WAIT_WITHOUT_PENDING_TOOL"
+            final_text = (
+                "L’exécution ne peut pas progresser de façon sûre avec "
+                "l’état actuel."
+                if language == "fr" else
+                "Execution cannot safely progress from the current state."
+            )
+        else:
+            reason_code = "durable_turn_setup_failed"
+            final_text = localized_text("provider_failure", language)
     if not controller.reserve_final(
         terminal_state,
         reason_code=reason_code,
@@ -4273,7 +4473,17 @@ def _persist_accepted_user_message(
     if not request_id or not turn_id or not message_id:
         return False
     try:
+        command_id = str(turn_meta.get("_durable_command_id") or "")
+        if command_id:
+            _DURABLE_TRANSPORT.mark_command_running(
+                command_id,
+                execution_epoch=str(turn_meta.get("_durable_command_epoch") or ""),
+                execution_binding={"conversation_id": conv_id,
+                                   "request_id": request_id, "turn_id": turn_id},
+            )
         metadata = {
+            "_durable_command_id": str(turn_meta.get("_durable_command_id") or ""),
+            "_durable_command_epoch": str(turn_meta.get("_durable_command_epoch") or ""),
             "_conversation_id": conv_id,
             "_request_id": request_id,
             "_client_request_id": request_id,
@@ -4351,6 +4561,14 @@ def _persist_accepted_user_message(
         )
         return False
     turn_meta["_user_commit"] = receipt
+    if receipt is not None and command_id:
+        _DURABLE_TRANSPORT.mark_command_running(
+            command_id,
+            execution_epoch=str(turn_meta.get("_durable_command_epoch") or ""),
+            execution_binding={"conversation_id": conv_id,
+                               "request_id": request_id, "turn_id": turn_id},
+            accepted=True,
+        )
     return receipt is not None
 
 
@@ -4398,6 +4616,8 @@ def _persist_completed_assistant_message(
         return False
     try:
         metadata = {
+            "_durable_command_id": str(turn_meta.get("_durable_command_id") or ""),
+            "_durable_command_epoch": str(turn_meta.get("_durable_command_epoch") or ""),
             "_conversation_id": conv_id,
             "_request_id": request_id,
             "_client_request_id": request_id,
@@ -4457,6 +4677,30 @@ def _persist_completed_assistant_message(
         )
         if safe_trace is not None:
             metadata["_execution_trace_v1"] = safe_trace
+        language_diagnostic = persisted_language_drift_diagnostic(
+            turn_meta.get("_language_validation_diagnostic_v1")
+        )
+        if language_diagnostic is not None:
+            metadata["_language_validation_diagnostic_v1"] = language_diagnostic
+        from osia.tool_contracts import (
+            persisted_computer_use_argument_diagnostic,
+        )
+        argument_diagnostic = persisted_computer_use_argument_diagnostic(
+            turn_meta.get("_computer_use_argument_diagnostic_v1")
+        )
+        if (
+            argument_diagnostic is not None
+            and argument_diagnostic["conversation_id"] == conv_id
+            and argument_diagnostic["request_id"] == request_id
+            and argument_diagnostic["turn_id"] == turn_id
+            and argument_diagnostic["provider_id"] == provider_id
+            and argument_diagnostic["model_id"] == model_id
+        ):
+            # Persist only the sanitized diagnostic in private conversation
+            # metadata. It is not added to any WebSocket event or model prompt.
+            metadata["_computer_use_argument_diagnostic_v1"] = (
+                argument_diagnostic
+            )
         receipt = conversations.commit_message(
             conv_id,
             "assistant",
@@ -4534,6 +4778,30 @@ def _persist_completed_assistant_message(
         )
     ):
         return False
+    command_id = str(turn_meta.get("_durable_command_id") or "")
+    command_epoch = str(turn_meta.get("_durable_command_epoch") or "")
+    if not command_id:
+        for user in messages:
+            if (isinstance(user, dict) and user.get("role") == "user"
+                and str(user.get("_request_id") or "") == request_id
+                and str(user.get("_turn_id") or "") == turn_id):
+                command_id = str(user.get("_durable_command_id") or "")
+                command_epoch = str(user.get("_durable_command_epoch") or "")
+                break
+    if command_id:
+        try:
+            _DURABLE_TRANSPORT.complete_command(
+                command_id,
+                execution_epoch=command_epoch,
+                result={"accepted": True, "state": "turn_completed",
+                        "conversation_id": conv_id, "request_id": request_id,
+                        "turn_id": turn_id, "message_id": message_id,
+                        "status": str(terminal_frame.get("status") or "done")},
+            )
+        except Exception as exc:
+            print("[WS command] final settlement failed: "
+                  f"{type(exc).__name__} command={command_id}", flush=True)
+            return False
     turn_meta["_assistant_commit"] = receipt
     if post_turn_media_lease_id:
         exact_media_lease = bool(
@@ -5145,6 +5413,17 @@ def _normalize_mobile_reasoning_setting(value) -> dict:
     return normalize_reasoning_settings(value)
 
 
+def _safe_api_key_status_frame(stored_keys, providers) -> dict:
+    """Build the legacy API-key response without returning credential values."""
+    stored = stored_keys if isinstance(stored_keys, dict) else {}
+    provider_ids = [str(provider) for provider in providers]
+    return {
+        "type": "api_keys",
+        "keys": {provider: "" for provider in provider_ids},
+        "keys_set": {provider: bool(stored.get(provider)) for provider in provider_ids},
+    }
+
+
 def _build_config_snapshot() -> dict:
     """Build the mobile config snapshot — the ``config`` payload of a
     ``{"type": "config", "config": {...}}`` frame. ONE source of truth shared by
@@ -5154,17 +5433,13 @@ def _build_config_snapshot() -> dict:
     frame type, no partial frame that could clobber unrelated config state on the
     phone.
 
-    Carries NO secret beyond what ``get_config`` already ships on the
-    authenticated+TLS connection (the raw ``api_key_fallbacks`` keys, identical to
-    the existing ``get_config`` path); the per-server MCP token is NOT here
-    (``mcp_servers`` env is always ``{}``). Synchronous file reads — callers run
-    it OFF the event loop (the mirror worker thread) where possible. May raise;
-    callers handle (``get_config`` already wraps it)."""
+    Credential values are never sent to Mobile. Provider/MCP keys and fallback
+    keys are represented only by configured-status metadata. Synchronous file
+    reads — callers run it OFF the event loop where possible. May raise; callers
+    handle (``get_config`` already wraps it)."""
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
-    from osia.permission_contract import mobile_permission_contract
     cfg = load_settings()
-    cfg["permission_contract"] = mobile_permission_contract()
     try:
         from osia import scheduled_tasks
 
@@ -5175,6 +5450,14 @@ def _build_config_snapshot() -> dict:
         cfg["cron_jobs"] = []
     cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
+    try:
+        from osia.voice.stt import available_whisper_model_sizes
+
+        cfg["stt_local_models_available"] = sorted(
+            available_whisper_model_sizes().intersection({"small", "medium"})
+        )
+    except Exception:
+        cfg["stt_local_models_available"] = []
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     try:
         from osia.slash_commands import safe_availability_overlay
@@ -5188,10 +5471,17 @@ def _build_config_snapshot() -> dict:
             "current_web_available": False,
             "connectors": [],
         }
-    # api_key_fallbacks holds the raw ordered fallback keys per provider (WOR-29).
-    # The mobile fallback-keys editor needs the actual keys, so ship them as-is —
-    # the connection is already authenticated + TLS, identical to get_api_keys.
-    cfg["api_key_fallbacks"] = get_setting("api_key_fallbacks", {})
+    # Mobile can manage fallback slots without receiving their credential values.
+    raw_fallbacks = get_setting("api_key_fallbacks", {})
+    if isinstance(raw_fallbacks, dict):
+        cfg["api_key_fallbacks_set"] = {
+            str(provider): [bool(key) for key in keys]
+            for provider, keys in raw_fallbacks.items()
+            if isinstance(keys, list)
+        }
+    else:
+        cfg["api_key_fallbacks_set"] = {}
+    cfg.pop("api_key_fallbacks", None)
     # Desktop-only capsule position is meaningless to the phone.
     cfg.pop("island_x", None)
     cfg.pop("island_y", None)
@@ -5219,31 +5509,6 @@ def _build_config_snapshot() -> dict:
     cfg["api_keys_set"] = {
         p: bool(k) for p, k in load_api_keys().items()
     }
-    # FIX 3 — MCP token parity (BUG 2). Provider keys already travel raw to the
-    # mobile editor over this authenticated+TLS WS (api_keys_set above is only a
-    # boolean; api_key_fallbacks ships raw values). MCP Bearer/stdio tokens live in
-    # the SAME api_keys.json (namespaced mcp:<id>) but were stripped here — ship
-    # them too, raw, ADDITIVELY in this existing config frame, so mobile can render
-    # them half-masked + copyable exactly like provider/fallback keys (same path,
-    # same posture — no new WS message type). ONLY token-auth connectors that have
-    # a stored token; OAuth blobs are NEVER shipped (SDK-managed, not OSIA keys).
-    try:
-        from osia.config import get_mcp_token
-        mcp_tokens: dict = {}
-        for s in (get_setting("mcp_servers", []) or []):
-            if not isinstance(s, dict):
-                continue
-            if str(s.get("auth_type") or "").strip().lower() != "token":
-                continue
-            sid = str(s.get("id") or "").strip()
-            if not sid:
-                continue
-            tok = get_mcp_token(sid)
-            if tok:
-                mcp_tokens[sid] = tok
-        cfg["mcp_tokens"] = mcp_tokens
-    except Exception:
-        cfg["mcp_tokens"] = {}
     return cfg
 
 
@@ -5277,21 +5542,6 @@ async def _broadcast_personality_config() -> None:
         })
     except Exception:
         print("[OSIA Server] personality config broadcast failed (details withheld)")
-
-
-async def _broadcast_permission_snapshots() -> int:
-    """Push fresh PC-canonical state to every bound Mobile session."""
-
-    sent = 0
-    for session in list(_PERMISSION_SESSIONS):
-        if not session.active or not session.device_id:
-            continue
-        try:
-            if await session.send_snapshot() is not None:
-                sent += 1
-        except Exception:
-            continue
-    return sent
 
 
 def _memory_store() -> MemoryStore:
@@ -5392,17 +5642,6 @@ async def internal_chatgpt_account_changed(request: Request):
         refresh_account=True, include_account_state=True
     )
     return {"ok": True, "clients": len(_WS_CLIENTS)}
-
-
-@app.post("/internal/permission_changed")
-async def internal_permission_changed(request: Request):
-    """Loopback-only invalidation after a canonical PC permission change."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"ok": False, "error": "forbidden"}
-    sent = await _broadcast_permission_snapshots()
-    return {"ok": True, "sessions": sent}
 
 
 @app.post("/internal/new_chat")
@@ -6098,480 +6337,23 @@ async def internal_mcp_oauth_switch(request: Request):
 # complementary supervisor-side cause fix.
 
 
-# ── MCP write-tool confirmation provider (WOR-44 Phase 5, 5-conf-c) ──────────
-# The headless gate (osia.mcp.registry, 5-conf-a) calls a registered provider
-# ``provider(server_id, tool_name, summary) -> bool`` before every write/
-# destructive MCP tool. THIS server registers a provider that does a WS round-
-# trip to the mobile client that ORIGINATED the current turn: send an
-# ``mcp_confirm_request``, block the agent's worker thread on a Future, then
-# resolve it when the matching ``mcp_confirm_response`` arrives. Timeout,
-# missing presentation and delivery failures stay typed. A device-bound
-# request keeps waiting across a transient Mobile transport disconnect.
-#
-# Correlating the worker-thread provider call back to the originating connection:
-# ``_turn_target`` is a ContextVar holding ``(channel, loop)``. The actual agent
-# worker binds it to the originating connection; every further provider/tool
-# thread bridge copies that context, so a confirm is always routed to the
-# device that asked.
-# No secret rides these frames: only the server id, tool name, and an
-# arg-NAMES-only summary (osia.mcp.registry._confirm_summary).
-#
-# Process isolation: the DESKTOP process registers a Qt provider in osia.main;
-# THIS provider is registered only in the server process (the startup hook
-# below). Different processes => different registry singletons => no conflict.
-_turn_target: "contextvars.ContextVar" = contextvars.ContextVar(
-    "osia_mcp_turn_target", default=None
-)
-_turn_confirmation_correlation: "contextvars.ContextVar" = (
-    contextvars.ContextVar("osia_permission_turn_correlation", default=None)
-)
-
-# request_id -> _PendingConfirmation.  The existing Future and immutable frame
-# survive a Mobile transport reconnect; only the exact authenticated device's
-# presentation channel is rebound.
-_pending_confirms: dict = {}
-_pending_confirms_lock = threading.Lock()
-_confirmation_channels_by_device: dict = {}
-
-# Confirmation wait budget. Kept UNDER the per-call MCP tool budget granted in
-# 5-conf-a (osia.agent._MCP_CONFIRM_TOOL_TIMEOUT == 150 s) so the worker returns
-# (deny) BEFORE the tool executor would kill the call.
-_MCP_CONFIRM_WS_TIMEOUT = 120.0
-
-
-class _PendingConfirmation:
-    __slots__ = (
-        "channel", "deadline", "device_id", "frame", "future",
-        "last_projected_channel", "loop",
-    )
-
-    def __init__(
-        self, *, future, channel, loop, device_id: str, frame: dict,
-        deadline: float,
-    ) -> None:
-        self.future = future
-        self.channel = channel
-        self.loop = loop
-        self.device_id = device_id
-        self.frame = dict(frame)
-        self.deadline = float(deadline)
-        self.last_projected_channel = None
-
-
-def _settle_confirmation(entry: "_PendingConfirmation", result) -> None:
-    if entry.future.done():
+@app.on_event("startup")
+async def _recover_websocket_commands_at_startup() -> None:
+    try:
+        recovered = await asyncio.to_thread(_DURABLE_TRANSPORT.recover_unstarted_commands)
+        cancelled = await asyncio.to_thread(
+            _reconcile_cancelled_websocket_commands,
+        )
+    except Exception as exc:
+        print(f"[WS command] startup settlement unavailable: {type(exc).__name__}")
         return
-    try:
-        entry.future.set_result(normalize_permission_result(
-            result,
-            correlation_id=str(entry.frame.get("id") or ""),
-        ))
-    except Exception:
-        pass
-
-
-async def _project_pending_confirmation(
-    request_id: str, entry: "_PendingConfirmation", channel,
-) -> None:
-    """Queue one still-current immutable approval frame on one exact channel."""
-
-    expired = False
-    with _pending_confirms_lock:
-        current = _pending_confirms.get(request_id)
-        if (
-            current is not entry
-            or entry.channel is not channel
-            or entry.last_projected_channel is not channel
-        ):
-            return
-        if entry.deadline <= time.monotonic():
-            _pending_confirms.pop(request_id, None)
-            expired = True
-        frame = dict(entry.frame)
-    if expired:
-        _settle_confirmation(
-            entry,
-            PermissionResult(PermissionOutcome.TIMEOUT, request_id),
+    if recovered:
+        print(f"[WS command] settled {len(recovered)} dead pre-turn owner(s)")
+    if cancelled:
+        print(
+            "[WS command] settled "
+            f"{len(cancelled)} durably cancelled accepted command(s)"
         )
-        return
-    try:
-        await channel.send_json(frame)
-    except Exception:
-        preserved_for_reconnect = False
-        with _pending_confirms_lock:
-            if _pending_confirms.get(request_id) is entry:
-                if entry.device_id:
-                    entry.channel = None
-                    entry.loop = None
-                    replacement = _confirmation_channels_by_device.get(
-                        entry.device_id,
-                    )
-                    if replacement is not None and replacement[0] is not channel:
-                        _schedule_confirmation_projection_locked(
-                            request_id, entry, replacement[0], replacement[1],
-                        )
-                    preserved_for_reconnect = True
-                else:
-                    _pending_confirms.pop(request_id, None)
-        if preserved_for_reconnect:
-            return
-        outcome = (
-            PermissionOutcome.DISCONNECTED
-            if bool(getattr(channel, "_closed", False))
-            else PermissionOutcome.PRESENTATION_FAILED
-        )
-        _settle_confirmation(
-            entry,
-            PermissionResult(outcome, request_id),
-        )
-
-
-def _schedule_confirmation_projection_locked(
-    request_id: str,
-    entry: "_PendingConfirmation",
-    channel,
-    loop,
-) -> bool:
-    """Bind and schedule one projection. Caller holds the pending lock."""
-
-    if (
-        channel is None
-        or loop is None
-        or not loop.is_running()
-        or bool(getattr(channel, "_closed", False))
-    ):
-        return False
-    if entry.last_projected_channel is channel:
-        return True
-    entry.channel = channel
-    entry.loop = loop
-    entry.last_projected_channel = channel
-    try:
-        asyncio.run_coroutine_threadsafe(
-            _project_pending_confirmation(request_id, entry, channel), loop,
-        )
-    except Exception:
-        entry.channel = None
-        entry.loop = None
-        return False
-    return True
-
-
-def _attach_confirmation_channel(device_id: str, channel, loop) -> int:
-    """Register one authenticated device channel and restore its pending UI."""
-
-    safe_device = _permission_safe_id(device_id)
-    if (
-        not safe_device
-        or channel is None
-        or loop is None
-        or not loop.is_running()
-    ):
-        return 0
-    restored = 0
-    expired = []
-    with _pending_confirms_lock:
-        _confirmation_channels_by_device[safe_device] = (channel, loop)
-        for request_id, entry in list(_pending_confirms.items()):
-            if entry.device_id != safe_device:
-                continue
-            if entry.deadline <= time.monotonic():
-                _pending_confirms.pop(request_id, None)
-                expired.append(entry)
-                continue
-            # A live old channel may still be finishing teardown.  Its detach
-            # path will rebind to this new channel, avoiding two simultaneous
-            # presentations of the same request.
-            if entry.channel is not None and not bool(
-                getattr(entry.channel, "_closed", False)
-            ):
-                continue
-            if _schedule_confirmation_projection_locked(
-                request_id, entry, channel, loop,
-            ):
-                restored += 1
-    for entry in expired:
-        _settle_confirmation(
-            entry,
-            PermissionResult(
-                PermissionOutcome.TIMEOUT,
-                str(entry.frame.get("id") or ""),
-            ),
-        )
-    return restored
-
-
-def _resolve_confirm(
-    request_id: str,
-    approved: bool,
-    *,
-    channel=None,
-    response_correlation: dict | None = None,
-) -> bool:
-    """Resolve a pending confirmation Future by id and remove it. Returns True if
-    a pending entry was found and resolved, False if the id was unknown/expired
-    (a late / duplicate / foreign response — ignored cleanly). Thread-safe; never
-    raises."""
-    expired = False
-    with _pending_confirms_lock:
-        entry = _pending_confirms.get(request_id)
-        if entry is None:
-            return False
-        if entry.deadline <= time.monotonic():
-            _pending_confirms.pop(request_id, None)
-            expired = True
-        elif channel is not None and entry.channel is not channel:
-            # A stale transport cannot approve a request already rebound to the
-            # same device's replacement channel.
-            return False
-        elif isinstance(response_correlation, dict) and any(
-            key in response_correlation
-            and (
-                not _permission_confirmation_value(
-                    key, response_correlation.get(key),
-                )
-                or _permission_confirmation_value(
-                    key, response_correlation.get(key),
-                )
-                != str(entry.frame.get(key) or "")
-            )
-            for key in (
-                "conversation_id", "request_id", "turn_id", "run_id",
-                "provider_id", "model_id", "effective_reasoning",
-            )
-            if entry.frame.get(key)
-        ):
-            # Legacy clients may omit additive correlation fields.  Any field
-            # they do send must match the immutable projected request exactly.
-            return False
-        else:
-            _pending_confirms.pop(request_id, None)
-    _settle_confirmation(
-        entry,
-        PermissionResult(
-            PermissionOutcome.TIMEOUT if expired else (
-                PermissionOutcome.ALLOWED
-                if bool(approved) else PermissionOutcome.USER_DENIED
-            ),
-            request_id,
-        ),
-    )
-    return not expired
-
-
-def _deny_confirms_for_channel(channel) -> None:
-    """Detach a transport while preserving device-bound pending approvals.
-
-    Requests without a stable authenticated device id still fail closed. A
-    device-bound request keeps its original Future, id, and deadline until the
-    same device reconnects or the request expires.
-    """
-    denied = []
-    with _pending_confirms_lock:
-        device_id = _permission_safe_id(
-            getattr(channel, "_permission_device_id", "")
-        )
-        registered = _confirmation_channels_by_device.get(device_id)
-        if registered is not None and registered[0] is channel:
-            _confirmation_channels_by_device.pop(device_id, None)
-        for request_id, entry in list(_pending_confirms.items()):
-            if entry.channel is not channel:
-                continue
-            if not entry.device_id:
-                _pending_confirms.pop(request_id, None)
-                denied.append(entry)
-                continue
-            replacement = _confirmation_channels_by_device.get(entry.device_id)
-            if replacement is not None and replacement[0] is not channel:
-                if _schedule_confirmation_projection_locked(
-                    request_id, entry, replacement[0], replacement[1],
-                ):
-                    continue
-            entry.channel = None
-            entry.loop = None
-    for entry in denied:
-        _settle_confirmation(
-            entry,
-            PermissionResult(
-                PermissionOutcome.DISCONNECTED,
-                str(entry.frame.get("id") or ""),
-            ),
-        )
-
-
-def _ws_confirm_provider(
-    server_id: str, tool_name: str, summary: str,
-) -> PermissionResult:
-    """MCP confirmation provider for the SERVER process. CALLED ON THE AGENT'S
-    WORKER THREAD. Sends an ``mcp_confirm_request`` to the turn's originating
-    client and blocks until the user answers or the timeout elapses. Every exit
-    preserves its exact typed outcome; only a correlated response can produce
-    ``user_denied``. Never raises (the provider contract)."""
-    try:
-        target = _turn_target.get()
-        if not target:
-            return PermissionResult(PermissionOutcome.PRESENTATION_FAILED)
-        channel, loop = target
-        if (
-            channel is None
-            or loop is None
-            or not loop.is_running()
-            or bool(getattr(channel, "_closed", False))
-        ):
-            device_id = _permission_safe_id(
-                getattr(channel, "_permission_device_id", "")
-            )
-            with _pending_confirms_lock:
-                replacement = _confirmation_channels_by_device.get(device_id)
-            if replacement is not None:
-                channel, loop = replacement
-        if (
-            channel is None
-            or loop is None
-            or not loop.is_running()
-            or bool(getattr(channel, "_closed", False))
-        ):
-            return PermissionResult(PermissionOutcome.PRESENTATION_FAILED)
-        with _pending_confirms_lock:
-            request_id = secrets.token_hex(8)
-            while request_id in _pending_confirms:
-                request_id = secrets.token_hex(8)
-        fut: "concurrent.futures.Future" = concurrent.futures.Future()
-        deadline = time.monotonic() + _MCP_CONFIRM_WS_TIMEOUT
-        frame = {
-            "type": "mcp_confirm_request",
-            "id": request_id,
-            "permission_request_id": request_id,
-            "operation_id": request_id,
-            "server": str(server_id),
-            "tool": str(tool_name),
-            "summary": str(summary or ""),
-            "expires_at": time.time() + _MCP_CONFIRM_WS_TIMEOUT,
-        }
-        correlation = _turn_confirmation_correlation.get()
-        if isinstance(correlation, dict):
-            values = {
-                key: _permission_confirmation_value(key, correlation.get(key))
-                for key in (
-                    "conversation_id", "request_id", "turn_id", "run_id",
-                    "provider_id", "model_id", "effective_reasoning",
-                )
-            }
-            # A run-bound normal Chat confirmation is fail-closed unless its
-            # exact provider/model route is available for projection. Legacy
-            # callers without run_id retain the earlier three-field contract.
-            if values["run_id"] and any(
-                not values[key]
-                for key in (
-                    "conversation_id", "request_id", "turn_id", "provider_id",
-                    "model_id",
-                )
-            ):
-                return PermissionResult(
-                    PermissionOutcome.PRESENTATION_FAILED,
-                    request_id,
-                )
-            for key, value in values.items():
-                if value:
-                    frame[key] = value
-        entry = _PendingConfirmation(
-            future=fut,
-            channel=channel,
-            loop=loop,
-            device_id=_permission_safe_id(
-                getattr(channel, "_permission_device_id", "")
-            ),
-            frame=frame,
-            deadline=deadline,
-        )
-        with _pending_confirms_lock:
-            # Never overwrite a live request even if the opaque-id generator
-            # were unexpectedly forced to collide.
-            if request_id in _pending_confirms:
-                return PermissionResult(
-                    PermissionOutcome.INTERNAL_FAILURE,
-                    request_id,
-                )
-            _pending_confirms[request_id] = entry
-            scheduled = _schedule_confirmation_projection_locked(
-                request_id, entry, channel, loop,
-            )
-            if not scheduled:
-                _pending_confirms.pop(request_id, None)
-        if not scheduled:
-            return PermissionResult(
-                PermissionOutcome.PRESENTATION_FAILED,
-                request_id,
-            )
-        try:
-            result = fut.result(
-                timeout=max(0.0, deadline - time.monotonic()),
-            )
-        except concurrent.futures.TimeoutError:
-            timeout_result = PermissionResult(
-                PermissionOutcome.TIMEOUT,
-                request_id,
-            )
-            _settle_confirmation(entry, timeout_result)
-            result = fut.result()
-        except Exception:
-            result = PermissionResult(
-                PermissionOutcome.INTERNAL_FAILURE,
-                request_id,
-            )
-        finally:
-            # Idempotent drop: a resolve already popped it; a timeout pops it here
-            # so a late response finds nothing and is ignored (no double-resolve).
-            with _pending_confirms_lock:
-                if _pending_confirms.get(request_id) is entry:
-                    _pending_confirms.pop(request_id, None)
-        return normalize_permission_result(
-            result,
-            correlation_id=request_id,
-        )
-    except Exception:
-        return PermissionResult(PermissionOutcome.INTERNAL_FAILURE)
-
-
-def _ws_reinforced_deletion_provider(plan) -> bool:
-    """Notify mobile with sanitized PC-review state, but never accept approval."""
-
-    try:
-        from osia.deletion_plan import DeletionPlan
-
-        if not isinstance(plan, DeletionPlan) or not plan.colossal_deletion:
-            return False
-        target = _turn_target.get()
-        if not target:
-            return False
-        channel, loop = target
-        if channel is None or loop is None or not loop.is_running():
-            return False
-        summary = plan.safe_public_summary()
-        if float(summary["expires_at"]) <= time.time():
-            return False
-        frame = {
-            "type": "mcp_confirm_request",
-            "id": str(summary["request_id"]),
-            "server": "osia",
-            "tool": "colossal_deletion",
-            "summary": "Complete review required locally on the PC",
-            "confirmation_kind": "colossal_deletion_pc_only",
-            "can_approve": False,
-            "files_count": int(summary["files_count"]),
-            "folders_count": int(summary["folders_count"]),
-            "total_bytes": int(summary["total_bytes"]),
-            "root_count": int(summary["root_count"]),
-            "safe_reason": "colossal_deletion",
-            "expires_at": float(summary["expires_at"]),
-        }
-        future = asyncio.run_coroutine_threadsafe(channel.send_json(frame), loop)
-        future.result(timeout=2.0)
-    except Exception:
-        pass
-    # Phase 2 mobile is never an authorization owner.  The request id is not
-    # entered in _pending_confirms, so old clients also fail closed.
-    return False
 
 
 @app.on_event("startup")
@@ -6633,52 +6415,8 @@ async def _recover_tool_attempts_at_startup() -> None:
         )
 
 
-@app.on_event("startup")
-async def _recover_autonomous_checkpoint_at_startup() -> None:
-    """Reconnect a durable mobile tool checkpoint after attempt reconciliation."""
-
-    try:
-        st = _astate.load_task_state()
-    except Exception:
-        st = None
-    if not isinstance(st, dict):
-        return
-    loop = asyncio.get_running_loop()
-    scheduled = _schedule_durable_autonomous_recovery(
-        st,
-        origin_ref=str(st.get("authorization_origin_ref") or "mobile_legacy"),
-        loop=loop,
-    )
-    if not scheduled and (
-        st.get("status") == "in_progress"
-        and st.get("run_state") in _DURABLE_AUTONOMOUS_RECOVERY_STATES
-    ):
-        asyncio.create_task(_retry_durable_autonomous_recovery(loop))
 
 
-async def _retry_durable_autonomous_recovery(loop) -> None:
-    """Wait boundedly for an outgoing server owner to release its live lock."""
-
-    for _ in range(30):
-        await asyncio.sleep(1.0)
-        try:
-            st = _astate.load_task_state()
-        except Exception:
-            return
-        if (
-            not isinstance(st, dict)
-            or st.get("status") != "in_progress"
-            or st.get("run_state") not in _DURABLE_AUTONOMOUS_RECOVERY_STATES
-        ):
-            return
-        if _schedule_durable_autonomous_recovery(
-            st,
-            origin_ref=str(
-                st.get("authorization_origin_ref") or "mobile_legacy"
-            ),
-            loop=loop,
-        ):
-            return
 
 
 @app.on_event("startup")
@@ -6700,27 +6438,6 @@ async def _start_server_cron_manager() -> None:
         manager.start()
     except Exception as e:
         print(f"[OSIA Server CRON] scheduler startup skipped: {e}")
-
-
-@app.on_event("startup")
-async def _register_mcp_confirm_provider() -> None:
-    """WOR-44 Phase 5 (5-conf-c): register the SERVER's WS confirmation provider
-    so a write/destructive MCP tool prompts the ORIGINATING mobile client before
-    it runs. Server-process only (this module's app); the desktop process
-    registers its OWN Qt provider in osia.main, and the two never share a
-    registry. Without this, server-side writes are hard-denied (5-conf-a)."""
-    try:
-        from osia.mcp_client import registry as _mcp_registry
-        _mcp_registry.set_confirmation_provider(_ws_confirm_provider)
-        from osia.action_policy import (
-            set_reinforced_deletion_confirmation_provider,
-        )
-        set_reinforced_deletion_confirmation_provider(
-            _ws_reinforced_deletion_provider
-        )
-        print("[OSIA Server] MCP write-tool confirmation provider registered (WS).")
-    except Exception as e:
-        print(f"[OSIA Server] MCP confirm provider not registered: {e}")
 
 
 @app.on_event("startup")
@@ -6826,6 +6543,43 @@ async def _disable_browser_on_server() -> None:
         print(f"[OSIA Server] webbrowser guard not applied: {e}")
 
 
+@app.on_event("shutdown")
+async def _cleanup_on_server_shutdown() -> None:
+    """Canonical server cleanup: cron owner, media workers and source cleanup.
+
+    WOR-303: no execution engine owns shutdown any more; the canonical Chat
+    runtime is per-request and needs no stop hook.
+    """
+
+    global _SERVER_CRON_MANAGER, _SERVER_CRON_UNSUBSCRIBE
+    if _SERVER_CRON_UNSUBSCRIBE is not None:
+        try:
+            _SERVER_CRON_UNSUBSCRIBE()
+        except Exception:
+            pass
+        _SERVER_CRON_UNSUBSCRIBE = None
+    if _SERVER_CRON_MANAGER is not None:
+        try:
+            _SERVER_CRON_MANAGER.stop()
+        except Exception as e:
+            print(f"[OSIA Server CRON] stop on shutdown failed: {e}")
+        _SERVER_CRON_MANAGER = None
+    media_tasks = list(_POST_TURN_MEDIA_TASKS)
+    for task in media_tasks:
+        task.cancel()
+    if media_tasks:
+        await asyncio.gather(*media_tasks, return_exceptions=True)
+    _POST_TURN_MEDIA_TASKS.clear()
+    _POST_TURN_MEDIA_BY_CONV.clear()
+    _POST_TURN_MEDIA_META_BY_CONV.clear()
+    source_cleanup_tasks = list(_PENDING_SOURCE_CLEANUP_TASKS)
+    for task in source_cleanup_tasks:
+        task.cancel()
+    if source_cleanup_tasks:
+        await asyncio.gather(*source_cleanup_tasks, return_exceptions=True)
+    _PENDING_SOURCE_CLEANUP_TASKS.clear()
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "osia-mobile-server"}
@@ -6833,7 +6587,32 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    runtime = {
+        "pid": os.getpid(),
+        "checkout_root": _SERVER_RUNTIME_CHECKOUT_ROOT,
+        "entrypoint": _SERVER_RUNTIME_ENTRYPOINT,
+        "executable": _SERVER_RUNTIME_EXECUTABLE,
+        "source_mode": _SERVER_RUNTIME_SOURCE_MODE,
+        "source_fingerprint": _SERVER_RUNTIME_SOURCE_FINGERPRINT,
+        "runtime_id": _SERVER_RUNTIME_ID,
+    }
+    if _SERVER_RUNTIME_SOURCE_MODE == "source" and not _SERVER_RUNTIME_SOURCE_FINGERPRINT:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "service": "osia-mobile-server",
+                "runtime": runtime,
+                "reason_code": "source_fingerprint_unavailable",
+            },
+        )
+    return {
+        "status": "healthy",
+        "service": "osia-mobile-server",
+        "runtime": runtime,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -7179,76 +6958,6 @@ def _server_notify_cron_task(
         print(f"[OSIA Server CRON] notification broadcast failed: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Autonomous-agent support (WOR-45 Phase 5 — SERVER side only)
-# ---------------------------------------------------------------------------
-# A mobile client can start / interrupt / abort / observe ONE long-running
-# autonomous task over the existing WebSocket. The planner + orchestrator +
-# state layer (osia.autonomous.*) are consumed strictly as BLACK BOXES — there
-# are ZERO edits to the engine. Everything below is purely additive and lives
-# off the chat streaming path, the per-connection conn_agents and the
-# single-writer _OutboundChannel/_writer model.
-import osia.autonomous.state as _astate
-from osia.autonomous import authorization as _aauthorization
-from osia.autonomous import diagnostics as _adiagnostics
-from osia.autonomous import planner as _aplanner
-from osia.autonomous.orchestrator import Orchestrator as _Orchestrator
-
-# Layer 1 — STATE ISOLATION (collision fix). Redirect the engine's persistent
-# task-state file process-locally so the server never collides with the desktop
-# GUI's task_state.json. The engine resolves TASK_STATE_FILE lazily (every
-# load/save/clear reads this module global at call time), so reassigning it here
-# redirects ALL server-side state I/O with zero engine edits. CONFIG_DIR is the
-# same dir the GUI uses, resolved via osia.config (never recomputed).
-_astate.TASK_STATE_FILE = CONFIG_DIR / "task_state_mobile.json"
-
-# Layer 2 — SINGLE-RUNNER LOCK (collision fix). A machine-wide lockfile so at
-# most ONE autonomous run (GUI or mobile) exists at a time — they share the
-# browser, filesystem and LLM spend. Holds {owner, pid, task_id}. A stale lock
-# whose pid is dead is reclaimable.
-_AUTONOMOUS_LOCK_FILE = CONFIG_DIR / "autonomous.lock"
-
-# THE one server-side autonomous run. The dedicated agent + orchestrator are
-# built lazily on first start (a server that never runs an autonomous task pays
-# nothing) and are NEVER shared with the per-connection chat agents. `loop` is
-# the running event loop captured at start, used to hop progress frames from the
-# orchestrator's daemon thread back onto each connection's single writer.
-_autonomous: dict = {
-    "agent": None,    # dedicated OSIAAgent (lazy)
-    "orch": None,     # Orchestrator over `agent` (lazy)
-    "st": None,       # current task_state dict (the engine mutates it in place)
-    "loop": None,     # asyncio loop for run_coroutine_threadsafe broadcasts
-    "active": False,  # True while THIS process holds the single-runner slot
-    "gen": 0,         # acquisition generation — bumped on every successful
-                      # acquire so a start worker can tell whether ITS slot is
-                      # still the current one (a cancel-then-reacquire during the
-                      # multi-second planning window invalidates a stale worker).
-    "interrupting": False,  # ORPHAN-LOOP RACE gate (WOR-45). Set True by
-                      # autonomous_interrupt; cleared ONLY once the (possibly
-                      # still-draining) orchestrator loop is confirmed dead. While
-                      # set, a terminal event from that paused/superseded loop is
-                      # neither broadcast as the run outcome (R1) nor allowed to
-                      # stop()/release a newer run (R2) — see
-                      # _on_autonomous_progress and _autonomous_resume_worker.
-    "origin_ref": "",
-    "document_owner_device": "",
-}
-# Guards `_autonomous` lifecycle mutations + the lockfile across the event-loop
-# thread and the orchestrator/worker daemon threads. Non-reentrant — the helpers
-# below NEVER nest acquisitions of it.
-_autonomous_lock = threading.Lock()
-_CHAT_ROUTE_REQUESTS_LOCK = threading.Lock()
-_CHAT_ROUTE_REQUESTS: OrderedDict[str, dict] = OrderedDict()
-
-# Sentinel so _autonomous_frame() can tell "snapshot the current run" (default)
-# apart from an explicit "no run → empty snapshot" (st=None).
-_AUTO_UNSET = object()
-_AUTONOMOUS_PROTOCOL_LOCK = threading.Lock()
-_AUTONOMOUS_PROTOCOL_SESSION_ID = "autonomous-session:" + secrets.token_urlsafe(24)
-_AUTONOMOUS_PROTOCOL_STATE = {
-    "sequences": {},
-    "terminals": {},
-}
 _DOCUMENT_PROTOCOL_LOCK = threading.Lock()
 _DOCUMENT_PROTOCOL_SESSION_ID = "document-session:" + secrets.token_urlsafe(24)
 _DOCUMENT_PROTOCOL_STATE = {"scopes": OrderedDict()}
@@ -7272,30 +6981,7 @@ _DOCUMENT_ITEM_RE = re.compile(r"^item_[0-9a-f]{24}$")
 _DOCUMENT_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,31}$")
 _BROWSER_PROTOCOL_SESSION_ID = "browser-session:" + secrets.token_urlsafe(24)
 _BROWSER_PROTOCOL_SEQUENCE = 0
-_AUTONOMOUS_SAFE_EVENTS = frozenset({
-    "action_in_progress", "action_starting",
-    "aborted", "authorization_denied", "authorization_pending",
-    "blocked_outcome_unknown", "blocked_unknown_effect", "busy", "cancelled",
-    "cancelled_proven", "cancellation_requested", "done", "failed", "idle",
-    "interrupted", "plan_failed", "running", "salvaged",
-    "resuming", "verifying_tool", "waiting_tool",
-    "scope_extension_denied", "state_updated",
-    "suspended_authorization_revoked", "suspended_browser_intervention",
-    "suspended_browser_state", "suspended_scope_extension",
-    "task_done", "task_failed",
-})
-_AUTONOMOUS_DURABLE_TOOL_EVENTS = frozenset({
-    "action_starting", "action_in_progress", "waiting_tool",
-    "verifying_tool", "resuming", "cancellation_requested",
-    "blocked_unknown_effect", "cancelled_proven",
-})
-_AUTONOMOUS_ABANDON_STATES = frozenset({
-    "abandon_requested", "abandoned_proven",
-})
-_AUTONOMOUS_ABANDON_EFFECT_STATES = frozenset({
-    "no_current_effect", "no_effect_proven", "effect_confirmed",
-    "effect_possible_or_unknown",
-})
+_BROWSER_PROGRESS_LOOP = None
 
 
 def _document_progress_frame(
@@ -7313,16 +6999,12 @@ def _document_progress_frame(
     item_id = str(payload.get("item_id") or "")
     phase = str(payload.get("phase") or "")
     if (
-        scope_type not in {"chat", "autonomous"}
+        scope_type != "chat"
         or not _DOCUMENT_SAFE_ID_RE.fullmatch(scope_id)
         or not _DOCUMENT_ITEM_RE.fullmatch(item_id)
         or phase not in {*_DOCUMENT_PHASE_RANK, "failed"}
     ):
         return None
-    if scope_type == "autonomous":
-        with _AUTONOMOUS_PROTOCOL_LOCK:
-            if scope_id in _AUTONOMOUS_PROTOCOL_STATE["terminals"]:
-                return None
     revision = payload.get("revision", 0)
     if type(revision) is not int or revision < 0:
         return None
@@ -7399,7 +7081,7 @@ def _document_progress_frame(
         "type": "document_progress",
         "schema_version": 1,
         "event_id": "document-event:" + secrets.token_urlsafe(24),
-        "server_id": _PERMISSION_SERVER_ID,
+        "server_id": _MOBILE_SERVER_ID,
         "session_id": _DOCUMENT_PROTOCOL_SESSION_ID,
         "scope_type": scope_type,
         "scope_id": scope_id,
@@ -7439,7 +7121,7 @@ def _document_progress_snapshot(
                 "type": "document_progress",
                 "schema_version": 1,
                 "event_id": "document-event:" + secrets.token_urlsafe(24),
-                "server_id": _PERMISSION_SERVER_ID,
+                "server_id": _MOBILE_SERVER_ID,
                 "session_id": _DOCUMENT_PROTOCOL_SESSION_ID,
                 "scope_type": scope_key[0],
                 "scope_id": scope_key[1],
@@ -7463,597 +7145,26 @@ def _retire_document_scope(scope_type: str, scope_id: str) -> None:
             scope["terminal"] = True
 
 
-def _on_autonomous_document_progress(payload: dict) -> None:
-    frame = _document_progress_frame(
-        payload,
-        owner_device=str(_autonomous.get("document_owner_device") or ""),
-    )
-    if frame is not None:
-        _broadcast_autonomous(frame)
 
 
-def _autonomous_snapshot(st) -> dict:
-    """WS-contract snapshot (tasks_done/tasks_total + current phase/status)
-    computed from a task_state dict. Pure reads — safe on any thread. Mirrors
-    main.py's ``_orch_snapshot`` but emits the mobile WS field names."""
-    if not isinstance(st, dict):
-        return {}
-    done, total, _phase_name = _astate.count_progress(st)
-    browser_checkpoint = _astate.normalize_browser_checkpoint(
-        st.get("browser_checkpoint")
-    )
-    receipt = browser_checkpoint.get("last_action_receipt") or {}
-    safe_site = ""
-    for item in reversed(receipt.get("evidence") or []):
-        if not isinstance(item, dict):
-            continue
-        candidate = item.get("safe_url_after") or item.get("safe_url_before")
-        if isinstance(candidate, str):
-            from osia.tools.browser_state import safe_origin
-
-            safe_site = safe_origin(candidate)[:512]
-            break
-    pending = browser_checkpoint.get("pending_operation") or {}
-    _phase_index, _task_index, current_task = _astate.current_task(st)
-    current_task = current_task or {}
-    run_id = str(st.get("run_id") or "")
-    chat_progress = chat_routing.durable_progress_from_state(st)
-    legacy_compatibility = not bool(
-        st.get("chat_route_type") == "autonomous"
-        and all(
-            str(chat_progress.get(field) or "").strip()
-            for field in (
-                "conversation_id", "request_id", "turn_id", "run_id",
-                "provider_id", "model_id", "effective_reasoning",
-            )
-        )
-    )
-    abandon_state = str(st.get("abandon_state") or "")
-    if abandon_state not in _AUTONOMOUS_ABANDON_STATES:
-        abandon_state = ""
-    abandon_effect_state = str(st.get("abandon_effect_state") or "")
-    if abandon_effect_state not in _AUTONOMOUS_ABANDON_EFFECT_STATES:
-        abandon_effect_state = ""
-    return {
-        "legacy_compatibility": legacy_compatibility,
-        "checkpoint_task_id": str(st.get("task_id") or "")[:160],
-        "task_id": str(current_task.get("id") or "")[:160],
-        "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
-        "tool_attempt_id": str(current_task.get("tool_attempt_id") or "")[:160],
-        "tasks_done": done,
-        "tasks_total": total,
-        # Free-form objective/plan text may repeat a private basename, message
-        # body or secret even after path/URL redaction. Mobile needs the plan
-        # structure and safe capability summaries, not model-authored strings.
-        "phase_name": "",
-        "objective": "",
-        "status": st.get("status", "") or "",
-        "run_state": str(st.get("run_state") or "")[:64],
-        "abandon_state": abandon_state,
-        "abandon_effect_state": abandon_effect_state,
-        "provider": str(st.get("provider") or ""),
-        "model": str(st.get("model") or ""),
-        "language": normalize_locale(st.get("language")) or i18n.DEFAULT_LANG,
-        "plan_summary": [
-            {
-                "name": f"Phase {phase_index + 1}",
-                "tasks": [
-                    f"Task {phase_index + 1}.{task_index + 1}"
-                    for task_index, task in enumerate(phase.get("tasks") or [])
-                    if isinstance(task, dict)
-                ],
-            }
-            for phase_index, phase in enumerate(st.get("phases") or [])
-            if isinstance(phase, dict)
-        ],
-        "browser_progress": {
-            "state": (
-                "manual_intervention"
-                if browser_checkpoint.get("manual_intervention")
-                else "pending" if pending else "current"
-            ),
-            "safe_operation_phase": str(pending.get("kind") or "")[:32],
-            "safe_site_display": safe_site,
-            "manual_intervention": str(
-                browser_checkpoint.get("manual_intervention") or ""
-            )[:64],
-            "artifact_summary": browser_checkpoint.get("last_artifact_summary"),
-        },
-        "document_progress": _document_progress_snapshot(
-            "autonomous",
-            run_id,
-            owner_device=str(_autonomous.get("document_owner_device") or ""),
-        ),
-        **_aauthorization.mobile_projection(st),
-        **_adiagnostics.projection(st),
-    }
 
 
-def _autonomous_failure_state(*, stage, category, reason_code,
-                              provider="", model="",
-                              language: str | None = None,
-                              emit_log: bool = True,
-                              planning_output_category: str = "") -> dict:
-    """Build an objective-free terminal state carrying one safe diagnostic."""
-    st = _astate.new_task_state(
-        "", provider, model, [], language=language,
-    )
-    st["status"] = "failed"
-    st["run_state"] = "failed"
-    st["authorization_status"] = "corrupt"
-    diagnostic = _adiagnostics.make_diagnostic(
-        st,
-        stage=stage,
-        category=category,
-        reason_code=reason_code,
-        provider=provider,
-        model=model,
-        resumable=False,
-        checkpoint_present=False,
-        planning_output_category=planning_output_category,
-    )
-    _adiagnostics.record_diagnostic(st, diagnostic, emit=emit_log)
-    return st
 
 
-def _establish_autonomous_failure(st: dict, my_gen: int) -> bool:
-    """Persist a failure only while ``my_gen`` still owns the runner slot."""
-    with _autonomous_lock:
-        if (not _autonomous.get("active")
-                or int(_autonomous.get("gen", 0)) != my_gen):
-            return False
-        _autonomous["st"] = st
-        _write_autonomous_lock(st.get("task_id"))
-    _adiagnostics.set_checkpoint_present(st, True)
-    try:
-        _astate.save_task_state(st)
-    except Exception:
-        _adiagnostics.set_checkpoint_present(st, False)
-    _adiagnostics.emit_diagnostic_log(st.get("failure_diagnostic"))
-    return True
 
 
-def _autonomous_frame(payload: dict, st=_AUTO_UNSET) -> dict:
-    """Build an outbound ``autonomous_progress`` frame: the event payload
-    enriched with the run snapshot. The engine only emits
-    task_done/task_failed/salvaged/done/failed; the host synthesizes
-    running/interrupted/aborted/plan_failed/busy/idle. Pass ``st=None`` to force
-    an empty snapshot (no run); omit ``st`` to snapshot the current run."""
-    if st is _AUTO_UNSET:
-        st = _autonomous.get("st")
-    snapshot = _autonomous_snapshot(st)
-    requested_event = str(payload.get("event") or "idle")[:64]
-    if requested_event not in _AUTONOMOUS_SAFE_EVENTS:
-        requested_event = "state_updated"
-    terminal_state = bool(
-        isinstance(st, dict)
-        and (
-            st.get("status") in {"done", "failed", "aborted", "cancelled"}
-            or st.get("run_state") in {
-                "completed", "failed", "cancelled", "cancelled_proven",
-            }
-        )
-    )
-    durable_state = (
-        ""
-        if terminal_state
-        else requested_event
-        if requested_event in _AUTONOMOUS_DURABLE_TOOL_EVENTS
-        else str(snapshot.get("run_state") or "")[:64]
-    )
-    if durable_state not in _AUTONOMOUS_DURABLE_TOOL_EVENTS:
-        durable_state = ""
-    # Keep the established event vocabulary for older strict clients.  The
-    # exact new lifecycle is an additive safe field on the same frame type.
-    event = (
-        "cancelled" if requested_event == "cancelled_proven"
-        else "blocked_outcome_unknown"
-        if requested_event == "blocked_unknown_effect"
-        else "state_updated"
-        if requested_event in _AUTONOMOUS_DURABLE_TOOL_EVENTS
-        else requested_event
-    )
-    run_id = str(st.get("run_id") or "")[:256] if isinstance(st, dict) else "idle"
-    terminal = event in {
-        "done", "failed", "aborted", "plan_failed", "cancelled",
-        "cancelled_proven",
-    }
-    with _AUTONOMOUS_PROTOCOL_LOCK:
-        existing_terminal = _AUTONOMOUS_PROTOCOL_STATE["terminals"].get(run_id)
-        if existing_terminal is not None:
-            if terminal:
-                return dict(existing_terminal)
-            return {"_drop_after_terminal": True, "run_id": run_id}
-        sequence = int(
-            _AUTONOMOUS_PROTOCOL_STATE["sequences"].get(run_id, 0)
-        ) + 1
-        _AUTONOMOUS_PROTOCOL_STATE["sequences"][run_id] = sequence
-        while len(_AUTONOMOUS_PROTOCOL_STATE["sequences"]) > 256:
-            retired_run = next(iter(_AUTONOMOUS_PROTOCOL_STATE["sequences"]))
-            if retired_run == run_id:
-                break
-            _AUTONOMOUS_PROTOCOL_STATE["sequences"].pop(retired_run, None)
-            _AUTONOMOUS_PROTOCOL_STATE["terminals"].pop(retired_run, None)
-    frame = {
-        "type": "autonomous_progress",
-        "schema_version": 1,
-        "event_id": "autonomous-event:" + secrets.token_urlsafe(24),
-        "sequence": sequence,
-        "server_id": _PERMISSION_SERVER_ID,
-        "session_id": _AUTONOMOUS_PROTOCOL_SESSION_ID,
-        "run_id": run_id,
-        "plan_revision": int(st.get("plan_revision", 0) or 0) if isinstance(st, dict) else 0,
-        "authorization_revision": int(
-            st.get("authorization_revision", 0) or 0
-        ) if isinstance(st, dict) else 0,
-        "event": event,
-        "durable_state": durable_state,
-        "safe_operation_phase": event,
-        "safe_site_display": str(
-            (snapshot.get("browser_progress") or {}).get("safe_site_display") or ""
-        )[:512],
-        "safe_progress_text": {
-            "running": "Autonomous work is running",
-            "action_starting": "Autonomous action is starting",
-            "action_in_progress": "Autonomous action is in progress",
-            "waiting_tool": "Autonomous is waiting to verify an action",
-            "verifying_tool": "Autonomous is verifying an action",
-            "resuming": "Autonomous is resuming the mission",
-            "cancellation_requested": "Cancellation was requested",
-            "blocked_unknown_effect": "The action outcome could not be established",
-            "cancelled_proven": "The action was cancelled before effect",
-            "task_done": "One planned step completed",
-            "task_failed": "One planned step needs attention",
-            "done": "Autonomous work completed",
-            "failed": "Autonomous work stopped with an error",
-            "plan_failed": "Autonomous work stopped with an error",
-            "interrupted": "Autonomous work is paused",
-            "aborted": "Autonomous work was cancelled",
-            "cancelled": "Autonomous work was cancelled",
-            "idle": "No Autonomous work is active",
-        }.get(event, "Autonomous state updated"),
-        "artifact_safe_summary": (
-            (snapshot.get("browser_progress") or {}).get("artifact_summary")
-        ),
-        "terminal": terminal,
-        **snapshot,
-    }
-    # A legacy Resume control is exposed only from a fresh/paused projection,
-    # never merely because a checkpoint file exists while its runner is live.
-    frame["resumable"] = bool(
-        _legacy_autonomous_resume_is_safe(st)
-        and (
-            requested_event == "interrupted"
-            or not bool(_autonomous.get("active"))
-        )
-    )
-    final_answer = payload.get("final_answer")
-    if (
-        event == "done"
-        and terminal
-        and isinstance(final_answer, str)
-        and final_answer.strip()
-    ):
-        frame["final_answer"] = _astate.sanitize_autonomous_text(
-            final_answer,
-        ).strip()[:8_000]
-    if terminal and terminal_state:
-        with _AUTONOMOUS_PROTOCOL_LOCK:
-            _AUTONOMOUS_PROTOCOL_STATE["terminals"][run_id] = dict(frame)
-    return frame
 
 
-def _autonomous_cancellation_correlation(st: dict) -> dict:
-    _phase_index, _task_index, current_task = _astate.current_task(st)
-    current_task = current_task or {}
-    return {
-        "run_id": str(st.get("run_id") or "")[:256],
-        "task_id": str(current_task.get("id") or "")[:160],
-        "operation_id": str(current_task.get("tool_operation_id") or "")[:160],
-        "tool_attempt_id": str(current_task.get("tool_attempt_id") or "")[:160],
-    }
 
 
-def _autonomous_abandon_effect_state(st: dict) -> str:
-    """Classify the current exact tool receipt without changing or replaying it."""
-
-    existing = str(st.get("abandon_effect_state") or "")
-    if existing in _AUTONOMOUS_ABANDON_EFFECT_STATES:
-        return existing
-    _phase_index, _task_index, current_task = _astate.current_task(st)
-    current_task = current_task or {}
-    attempt_id = str(current_task.get("tool_attempt_id") or "")
-    if not attempt_id:
-        if str(st.get("run_state") or "") in {
-            "blocked_outcome_unknown", "blocked_unknown_effect",
-        }:
-            return "effect_possible_or_unknown"
-        return "no_current_effect"
-    try:
-        from osia.tool_attempts import get_tool_attempt_store
-
-        attempt = get_tool_attempt_store().get_attempt(attempt_id) or {}
-    except Exception:
-        return "effect_possible_or_unknown"
-    if (
-        attempt.get("owner_scope") != "autonomous"
-        or str(attempt.get("autonomous_run_id") or "")
-        != str(st.get("run_id") or "")
-        or str(attempt.get("autonomous_task_id") or "")
-        != str(current_task.get("id") or "")
-    ):
-        return "effect_possible_or_unknown"
-    status = str(attempt.get("status") or "")
-    dispatch = str(attempt.get("dispatch_state") or "")
-    outcome = str(attempt.get("terminal_outcome") or "")
-    if (
-        status == "cancelled_proven"
-        or dispatch in {"not_dispatched", "cancelled_before_effect"}
-        or outcome in {
-            "cancelled_proven", "confirmed_failure_before_effect",
-            "rejected_before_execution",
-        }
-    ):
-        return "no_effect_proven"
-    if dispatch == "effect_confirmed" or outcome in {
-        "success_verified", "confirmed_success", "failed_after_effect",
-    }:
-        return "effect_confirmed"
-    return "effect_possible_or_unknown"
 
 
-def _request_exact_autonomous_attempt_abandon(st: dict) -> str:
-    """Request cancellation of this run's receipt once, without resuming it."""
-
-    _phase_index, _task_index, current_task = _astate.current_task(st)
-    current_task = current_task or {}
-    attempt_id = str(current_task.get("tool_attempt_id") or "")
-    if not attempt_id:
-        return _autonomous_abandon_effect_state(st)
-    try:
-        from osia.tool_attempts import TERMINAL_STATUSES, ToolAttemptStatus
-        from osia.tool_attempts import get_tool_attempt_store
-
-        store = get_tool_attempt_store()
-        attempt = store.get_attempt(attempt_id) or {}
-        if (
-            attempt.get("owner_scope") != "autonomous"
-            or str(attempt.get("autonomous_run_id") or "")
-            != str(st.get("run_id") or "")
-            or str(attempt.get("autonomous_task_id") or "")
-            != str(current_task.get("id") or "")
-        ):
-            return "effect_possible_or_unknown"
-        status = ToolAttemptStatus(attempt.get("status"))
-        if status not in TERMINAL_STATUSES:
-            store.request_cancellation(attempt_id)
-    except Exception:
-        return _autonomous_abandon_effect_state(st)
-    st.pop("abandon_effect_state", None)
-    return _autonomous_abandon_effect_state(st)
 
 
-def _terminalize_autonomous_abandon(st: dict, orch) -> bool:
-    """Prove workflow abandonment while preserving the external-effect truth."""
-
-    if not isinstance(st, dict):
-        return False
-    if st.get("abandon_state") == "abandoned_proven":
-        return False
-    original_status = str(
-        st.get("abandon_origin_status") or st.get("status") or ""
-    )
-    original_run_state = str(
-        st.get("abandon_origin_run_state") or st.get("run_state") or ""
-    )
-    effect_state = _request_exact_autonomous_attempt_abandon(st)
-    preserve_terminal = (
-        original_status in {"done", "failed"}
-        or original_run_state in {"completed", "failed"}
-    )
-    if not preserve_terminal:
-        st["status"] = "aborted"
-        st["run_state"] = "cancelled"
-        try:
-            _aauthorization.revoke_run_authorization(
-                st, save=lambda _state: None,
-            )
-        except Exception:
-            pass
-        st["status"] = "aborted"
-        st["run_state"] = "cancelled"
-        agent = _autonomous.get("agent")
-        provider_now, model_now = _adiagnostics.actual_provider_model(
-            agent, st.get("provider", ""), st.get("model", ""),
-        )
-        diagnostic = _adiagnostics.make_diagnostic(
-            st,
-            stage=_adiagnostics.AutonomousStage.CONTROL,
-            category=_adiagnostics.FailureCategory.ABORTED,
-            reason_code="user_aborted",
-            provider=provider_now,
-            model=model_now,
-            resumable=False,
-            checkpoint_present=True,
-        )
-        _adiagnostics.record_diagnostic(st, diagnostic)
-    st["abandon_effect_state"] = effect_state
-    st["abandon_state"] = "abandoned_proven"
-    if not preserve_terminal:
-        _astate.establish_user_cancelled_terminal(st)
-    if orch is not None and not preserve_terminal:
-        try:
-            orch.stop()
-        except Exception:
-            _adiagnostics.emit_diagnostic_log(
-                _adiagnostics.make_diagnostic(
-                    st,
-                    stage=_adiagnostics.AutonomousStage.CONTROL,
-                    category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
-                    reason_code="abort_stop_failure",
-                    resumable=False,
-                    checkpoint_present=True,
-                )
-            )
-    try:
-        _astate.save_task_state(st)
-    except Exception:
-        _adiagnostics.set_checkpoint_present(st, False)
-    return not preserve_terminal
 
 
-async def _send_autonomous_abandon_ack(
-    channel: "_OutboundChannel", st: dict,
-) -> None:
-    await channel.send_json({
-        "type": "cancellation_control",
-        "schema_version": 1,
-        "scope": "autonomous",
-        "state": "accepted",
-        **_autonomous_cancellation_correlation(st),
-        "abandon_state": str(st.get("abandon_state") or ""),
-        "abandon_effect_state": str(st.get("abandon_effect_state") or ""),
-    })
 
 
-async def _prepare_correlated_autonomous_cancellation(
-    channel: "_OutboundChannel", msg: dict,
-) -> bool:
-    """Validate and durably mark one exact Autonomous cancellation target."""
-
-    supplied = {
-        "run_id": _clean_cancellation_target_id(msg.get("run_id")),
-        "task_id": _clean_cancellation_target_id(
-            msg.get("task_id"), maximum=160,
-        ) if msg.get("task_id") else "",
-        "operation_id": _clean_cancellation_target_id(
-            msg.get("operation_id"), maximum=160,
-        ) if msg.get("operation_id") else "",
-        "tool_attempt_id": _clean_cancellation_target_id(
-            msg.get("tool_attempt_id"), maximum=160,
-        ) if msg.get("tool_attempt_id") else "",
-    }
-    if not supplied["run_id"]:
-        await _send_cancellation_rejection(
-            channel, "autonomous", "incomplete_target", **supplied,
-        )
-        return False
-    st = _autonomous.get("st")
-    if not isinstance(st, dict):
-        await _send_cancellation_rejection(
-            channel, "autonomous", "target_not_active", **supplied,
-        )
-        return False
-    strict_keys = (
-        "checkpoint_task_id", "plan_revision", "authorization_revision",
-    )
-    strict_control = any(key in msg for key in strict_keys)
-    if strict_control:
-        checkpoint_task_id = msg.get("checkpoint_task_id")
-        plan_revision = msg.get("plan_revision")
-        authorization_revision = msg.get("authorization_revision")
-        clean_checkpoint_task_id = _clean_cancellation_target_id(
-            checkpoint_task_id, maximum=160,
-        )
-        if (
-            any(key not in msg for key in strict_keys)
-            or not isinstance(checkpoint_task_id, str)
-            or checkpoint_task_id != clean_checkpoint_task_id
-            or type(plan_revision) is not int
-            or plan_revision < 0
-            or type(authorization_revision) is not int
-            or authorization_revision < 0
-        ):
-            await _send_cancellation_rejection(
-                channel, "autonomous", "incomplete_target", **supplied,
-            )
-            return False
-        if (
-            checkpoint_task_id != str(st.get("task_id") or "")
-            or not _autonomous_resume_target_matches(
-                st,
-                supplied["run_id"],
-                plan_revision,
-                authorization_revision,
-            )
-        ):
-            await _send_cancellation_rejection(
-                channel, "autonomous", "target_mismatch", **supplied,
-            )
-            await channel.send_json(
-                _autonomous_frame({"event": "state_updated"}, st)
-            )
-            return False
-    current = _autonomous_cancellation_correlation(st)
-    if supplied["run_id"] != current["run_id"]:
-        await _send_cancellation_rejection(
-            channel, "autonomous", "target_mismatch", **supplied,
-        )
-        await channel.send_json(_autonomous_frame({"event": "state_updated"}, st))
-        return False
-    for field in ("task_id", "operation_id", "tool_attempt_id"):
-        if supplied[field] and supplied[field] != current[field]:
-            await _send_cancellation_rejection(
-                channel, "autonomous", f"{field}_mismatch", **supplied,
-            )
-            await channel.send_json(
-                _autonomous_frame({"event": "state_updated"}, st)
-            )
-            return False
-    if st.get("abandon_state") == "abandoned_proven":
-        await _send_autonomous_abandon_ack(channel, st)
-        return False
-    if _autonomous.get("interrupting"):
-        await _send_cancellation_rejection(
-            channel, "autonomous", "control_busy", **supplied,
-        )
-        return False
-    if (
-        st.get("status") in {"done", "failed", "aborted", "cancelled"}
-        or st.get("run_state") in {
-            "completed", "failed", "cancelled", "cancelled_proven",
-        }
-    ):
-        _terminalize_autonomous_abandon(st, _autonomous.get("orch"))
-        await _send_autonomous_abandon_ack(channel, st)
-        return False
-
-    control_target = tuple(current[field] for field in (
-        "run_id", "task_id", "operation_id", "tool_attempt_id",
-    ))
-    if (
-        _autonomous.get("cancellation_control_target") == control_target
-        or st.get("abandon_state") == "abandon_requested"
-    ):
-        await _send_autonomous_abandon_ack(channel, st)
-        await channel.send_json(
-            _autonomous_frame({"event": "cancellation_requested"}, st)
-        )
-        return False
-
-    control_generation = _claim_autonomous_control_generation(st)
-    if control_generation is None:
-        await _send_cancellation_rejection(
-            channel, "autonomous", "single_runner_busy", **supplied,
-        )
-        return False
-    _autonomous["cancellation_control_target"] = control_target
-    _autonomous["cancellation_control_generation"] = control_generation
-    _autonomous["correlated_cancellation_published"] = True
-    st["abandon_origin_status"] = str(st.get("status") or "")[:32]
-    st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
-    st["abandon_state"] = "abandon_requested"
-    st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
-    st["run_state"] = "cancellation_requested"
-    try:
-        _astate.save_task_state(st)
-    except Exception:
-        pass
-    _broadcast_autonomous(
-        _autonomous_frame({"event": "cancellation_requested"}, st)
-    )
-    await _send_autonomous_abandon_ack(channel, st)
-    return True
 
 
 def _snapshot_ws_clients() -> tuple:
@@ -8068,20 +7179,6 @@ def _snapshot_ws_clients() -> tuple:
     return ()
 
 
-def _broadcast_autonomous(frame: dict) -> None:
-    """Fan ``frame`` out to every connected client from a NON-loop thread. Never
-    touches ``ws.send_*`` directly (that corrupts Starlette's writer state — see
-    ``_OutboundChannel``); instead hops onto the captured event loop so each
-    connection's single writer task enqueues it (the same thread→loop pattern
-    the chat stream uses). Best-effort — a dead client is skipped, never fatal."""
-    loop = _autonomous.get("loop")
-    if loop is None or frame.get("_drop_after_terminal") is True:
-        return
-    for ch in _snapshot_ws_clients():
-        try:
-            asyncio.run_coroutine_threadsafe(ch.send_json(frame), loop)
-        except Exception:
-            pass
 
 
 def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> dict:
@@ -8095,11 +7192,7 @@ def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> d
     phase = "snapshot" if snapshot else str(payload.get("phase") or "")
     if phase not in allowed_phases:
         phase = "failed"
-    st = _autonomous.get("st")
-    run_id = (
-        str(st.get("run_id") or "")[:256]
-        if isinstance(st, dict) else "chat"
-    ) or "chat"
+    run_id = "chat"
     safe_site = ""
     browser_session_id = ""
     try:
@@ -8115,9 +7208,8 @@ def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> d
             )[:96]
     except Exception:
         pass
-    with _AUTONOMOUS_PROTOCOL_LOCK:
-        _BROWSER_PROTOCOL_SEQUENCE += 1
-        sequence = _BROWSER_PROTOCOL_SEQUENCE
+    _BROWSER_PROTOCOL_SEQUENCE += 1
+    sequence = _BROWSER_PROTOCOL_SEQUENCE
     byte_size = payload.get("bytes")
     if not isinstance(byte_size, int) or isinstance(byte_size, bool) or byte_size < 0:
         byte_size = None
@@ -8131,14 +7223,12 @@ def _browser_progress_frame(payload: dict | None = None, *, snapshot=False) -> d
         "schema_version": 1,
         "event_id": "browser-event:" + secrets.token_urlsafe(24),
         "sequence": sequence,
-        "server_id": _PERMISSION_SERVER_ID,
+        "server_id": _MOBILE_SERVER_ID,
         "session_id": _BROWSER_PROTOCOL_SESSION_ID,
         "browser_session_id": browser_session_id,
         "run_id": run_id,
-        "plan_revision": int(st.get("plan_revision", 0) or 0) if isinstance(st, dict) else 0,
-        "authorization_revision": int(
-            st.get("authorization_revision", 0) or 0
-        ) if isinstance(st, dict) else 0,
+        "plan_revision": 0,
+        "authorization_revision": 0,
         "safe_operation_phase": phase,
         "safe_site_display": safe_site,
         "safe_progress_text": {
@@ -8159,7 +7249,7 @@ def _on_browser_progress(payload: dict) -> None:
     """Thread-safe callback installed on the browser owner."""
     try:
         frame = _browser_progress_frame(payload)
-        loop = _autonomous.get("loop")
+        loop = _BROWSER_PROGRESS_LOOP
         if loop is None:
             return
         for channel in _snapshot_ws_clients():
@@ -8169,2302 +7259,6 @@ def _on_browser_progress(payload: dict) -> None:
                 pass
     except Exception:
         print("[WOR-186] browser progress callback failed")
-
-
-def _read_autonomous_lock():
-    """Parse the single-runner lockfile, or ``None`` when absent/unreadable/
-    corrupt (e.g. a torn cross-process write) — graceful, never raises."""
-    try:
-        if not _AUTONOMOUS_LOCK_FILE.exists():
-            return None
-        return json.loads(_AUTONOMOUS_LOCK_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def _write_autonomous_lock(task_id=None) -> None:
-    """Write OUR ownership record atomically (temp + ``os.replace``, like
-    state.py) so a concurrent cross-process reader never sees a torn file.
-    Best-effort — a write failure must not abort a start (the in-process
-    ``active`` flag still guards same-process re-entry). Callers hold
-    ``_autonomous_lock``."""
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = _AUTONOMOUS_LOCK_FILE.with_name(_AUTONOMOUS_LOCK_FILE.name + ".tmp")
-        tmp.write_text(
-            json.dumps({"owner": "mobile", "pid": os.getpid(),
-                        "task_id": task_id}),
-            encoding="utf-8",
-        )
-        os.replace(tmp, _AUTONOMOUS_LOCK_FILE)
-    except OSError:
-        print("[WOR-45] could not write autonomous lockfile")
-
-
-def _acquire_single_runner(task_id=None):
-    """Reserve the machine-wide single autonomous-run slot. Returns the new
-    acquisition GENERATION (int ≥ 1) on success, or ``None`` if a run is already
-    active in THIS process OR a valid lock from another LIVE owner exists. A
-    stale lock whose pid is dead is reclaimed. Atomic under ``_autonomous_lock``
-    so two concurrent starts can't both win. The generation lets a start worker
-    detect that its slot was released-and-reacquired during planning (so a stale
-    worker never establishes/starts over a newer run)."""
-    with _autonomous_lock:
-        if _autonomous.get("active"):
-            return None  # this process already has a run in flight
-        existing = _read_autonomous_lock()
-        if isinstance(existing, dict):
-            pid = existing.get("pid")
-            if isinstance(pid, int) and pid != os.getpid():
-                try:
-                    alive = psutil.pid_exists(pid)
-                except Exception:
-                    alive = False
-                if alive:
-                    return None  # another live owner holds the slot
-        # No active run here and no foreign live owner ⇒ claim it.
-        gen = int(_autonomous.get("gen", 0)) + 1
-        _autonomous["gen"] = gen
-        _write_autonomous_lock(task_id)
-        _autonomous["active"] = True
-        return gen
-
-
-def _do_release_locked() -> None:
-    """Clear the in-process flag and delete OUR lockfile — never a foreign live
-    owner's (the pid guard). MUST be called holding ``_autonomous_lock``."""
-    _autonomous["active"] = False
-    _autonomous.pop("cancellation_control_target", None)
-    _autonomous.pop("cancellation_control_generation", None)
-    _autonomous.pop("correlated_cancellation_published", None)
-    existing = _read_autonomous_lock()
-    if isinstance(existing, dict) and existing.get("pid") != os.getpid():
-        return  # not ours — leave the other owner's lock intact
-    try:
-        if _AUTONOMOUS_LOCK_FILE.exists():
-            _AUTONOMOUS_LOCK_FILE.unlink()
-    except OSError:
-        pass
-
-
-def _release_single_runner() -> None:
-    """Release the CURRENT run's slot unconditionally. Used by the terminal,
-    interrupt, abort and shutdown paths, which all act on the established run (no
-    new acquisition can race them — ``active`` stays True until they release)."""
-    with _autonomous_lock:
-        _do_release_locked()
-
-
-def _release_single_runner_if_gen(my_gen: int) -> None:
-    """Release the slot ONLY if generation ``my_gen`` is still the current one.
-    Used by a start worker's failure paths so a stale worker (whose slot was
-    already released and reacquired by a newer start during planning) can never
-    free the newer run's slot."""
-    with _autonomous_lock:
-        if int(_autonomous.get("gen", 0)) != my_gen:
-            return  # a newer acquisition owns the slot now — don't touch it
-        _do_release_locked()
-
-
-def _claim_autonomous_control_generation(st: dict) -> int | None:
-    """Own the exact legacy run while a stop/cancel control is terminalized.
-
-    A paused checkpoint has no active runner generation.  Claim one before the
-    asynchronous control worker starts so a later resume cannot be acquired and
-    then accidentally released by that older worker.  A live exact run already
-    owns its generation, which is captured instead of reacquired.
-    """
-
-    run_id = str(st.get("run_id") or "") if isinstance(st, dict) else ""
-    if not run_id:
-        return None
-    with _autonomous_lock:
-        current = _autonomous.get("st")
-        if (
-            _autonomous.get("active")
-            and isinstance(current, dict)
-            and str(current.get("run_id") or "") == run_id
-        ):
-            return int(_autonomous.get("gen", 0))
-    generation = _acquire_single_runner(task_id=st.get("task_id"))
-    if generation is None:
-        return None
-    keep = False
-    with _autonomous_lock:
-        current = _autonomous.get("st")
-        if (
-            not isinstance(current, dict)
-            or str(current.get("run_id") or "") == run_id
-        ):
-            _autonomous["st"] = st
-            _write_autonomous_lock(st.get("task_id"))
-            keep = True
-    if not keep:
-        _release_single_runner_if_gen(generation)
-        return None
-    return generation
-
-
-def _legacy_autonomous_resume_is_safe(st: dict) -> bool:
-    """Return whether an existing legacy checkpoint may be resumed safely."""
-
-    return bool(
-        isinstance(st, dict)
-        and _astate.resume_state_is_valid(st)
-        and str(st.get("run_id") or "")
-        and st.get("authorization_status") in {
-            "authorized", "not_required_full_access",
-        }
-        and st.get("run_state") in {
-            "ready", "running", "waiting_tool", "verifying_tool", "resuming",
-        }
-        and st.get("abandon_state") not in {
-            "abandon_requested", "abandoned_proven",
-        }
-        and st.get("abandon_effect_state") not in {
-            "effect_possible_or_unknown", "effect_confirmed",
-        }
-    )
-
-
-def _autonomous_resume_target_matches(
-    st: dict,
-    expected_run_id: str,
-    expected_plan_revision: int,
-    expected_authorization_revision: int,
-) -> bool:
-    """Validate the immutable legacy resume identity without coercing values."""
-
-    if (
-        not isinstance(st, dict)
-        or not expected_run_id
-        or str(st.get("run_id") or "") != expected_run_id
-        or not isinstance(expected_plan_revision, int)
-        or isinstance(expected_plan_revision, bool)
-        or not isinstance(expected_authorization_revision, int)
-        or isinstance(expected_authorization_revision, bool)
-    ):
-        return False
-    try:
-        plan_revision = int(st.get("plan_revision", 0) or 0)
-        authorization_revision = int(
-            st.get("authorization_revision", 0) or 0
-        )
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return bool(
-        plan_revision == expected_plan_revision
-        and authorization_revision == expected_authorization_revision
-    )
-
-
-def _finalize_terminal_release(orch, term_gen: int) -> None:
-    """Release the slot for a run that reached a TERMINAL engine event, on a
-    SEPARATE thread that JOINS the (now-finishing) orchestrator thread FIRST.
-
-    The terminal event fires synchronously on the orchestrator's own daemon
-    thread, which is therefore still ``is_alive()`` for a brief window. If we
-    cleared ``active`` from inside that callback, a back-to-back ``autonomous_start``
-    could acquire the freed slot and call ``orch.start()`` while the old thread is
-    still alive — ``Orchestrator._begin`` would silently no-op (its
-    ``is_alive()`` early-return), wedging the new run with the slot held but no
-    loop. ``orch.stop()`` joins the finishing thread (idempotent, ≤2 s), so by
-    the time we release, the loop thread is truly dead and the next start spawns
-    cleanly. A self-join can't happen — this always runs on a different thread.
-
-    GENERATION GUARD (WOR-45) — ``term_gen`` is the acquisition generation that was
-    current when this terminal was OBSERVED (captured by the progress callback).
-    A stale/orphan run's LATE terminal must NEVER ``stop()`` or free a NEWER
-    generation's run: the engine checks its stop flag only ONCE per step, so a step
-    already past that check (inside the verifier ``agent.run()`` or a replan) can
-    still run through to a terminal emit AFTER a newer run took over the slot. So
-    BOTH the join and the release are gated on the generation still being
-    ``term_gen``: if a newer run has since acquired, this terminal belongs to a
-    superseded run ⇒ no-op (touching ``orch``/the slot would stop/free the newer
-    run). The release itself also goes through ``_release_single_runner_if_gen`` so
-    the gate is re-checked atomically under the lock at release time."""
-    with _autonomous_lock:
-        if int(_autonomous.get("gen", 0)) != term_gen:
-            return  # a newer generation owns the slot — this terminal is stale
-    try:
-        if orch is not None:
-            orch.stop()  # joins the finishing loop thread; idempotent
-    except Exception:
-        print("[WOR-45] terminal orchestrator.stop failed")
-    _release_single_runner_if_gen(term_gen)
-
-
-def _on_autonomous_progress(payload: dict) -> None:
-    """Orchestrator ``progress_cb`` — runs on the orchestrator's daemon thread.
-    ONLY builds a plain frame and broadcasts it (never a ws/Qt touch). On a
-    TERMINAL engine event (done/failed) the run is over, so release the
-    single-runner slot — but OFF this (still-alive) thread, joining it first (see
-    ``_finalize_terminal_release``). Wrapped so a callback error never kills the
-    loop. For a live run ``active`` stays True until that release, so no start can
-    race in; the generation captured below makes a STALE orphan's late terminal a
-    no-op so it can never stop/free a newer run (see ``_finalize_terminal_release``).
-
-    ORPHAN-LOOP RACE GATE (WOR-45) — a timed-out ``autonomous_interrupt`` stop()
-    leaves the old loop draining: the engine checks its stop flag only ONCE per
-    step (loop top + after ``agent.run``), NEVER inside ``_verify``/``_llm_judge``/
-    ``_replan``, so an interrupted step already past that check still runs through
-    to a terminal ``done``/``failed`` emit on THIS thread — AFTER the slot was
-    freed (interrupt) or re-acquired by a resume. Such a terminal is NOT the
-    outcome of a live, owned run. Gate it: when we are mid-interrupt
-    (``interrupting``) OR no run owns the slot (``active`` False), DROP it — do
-    NOT broadcast it (closes R1: the spurious "failed" reaching the phone) and do
-    NOT spawn the finalizer (closes R2: stopping/freeing a newer run). The
-    drain/resume logic (:func:`_autonomous_resume_worker`) decides the real state
-    from disk. A genuinely live run keeps ``active`` True and ``interrupting``
-    False, so its terminal still broadcasts + finalizes exactly as before."""
-    try:
-        event = payload.get("event")
-        current_state = _autonomous.get("st")
-        if (
-            isinstance(current_state, dict)
-            and current_state.get("abandon_state") in {
-                "abandon_requested", "abandoned_proven",
-            }
-            and event != "cancellation_requested"
-        ):
-            return
-        chat_blocked_terminal = bool(
-            event == "blocked_unknown_effect"
-            and isinstance(current_state, dict)
-            and current_state.get("chat_route_type") == "autonomous"
-        )
-        if event in ("done", "failed", "cancelled_proven") or chat_blocked_terminal:
-            # ── Terminal: gate a paused/superseded orphan's late terminal ──
-            if _autonomous.get("interrupting") or not _autonomous.get("active"):
-                print(f"[WOR-45] gating stale autonomous terminal {event!r} "
-                      f"(interrupting={_autonomous.get('interrupting')}, "
-                      f"active={_autonomous.get('active')}) — orphan-loop race; "
-                      "drain/resume decides the real state from disk")
-                return
-            if isinstance(current_state, dict):
-                _persist_chat_durable_terminal(current_state)
-            frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
-            _retire_document_scope(
-                "autonomous", str(frame.get("run_id") or ""),
-            )
-            _broadcast_autonomous(frame)
-            # Capture the generation NOW (terminal-observation time) so the
-            # release/stop can be gated to it — a superseded orphan's late
-            # terminal must not free/stomp whatever generation owns the slot later.
-            term_gen = int(_autonomous.get("gen", 0))
-            threading.Thread(
-                target=_finalize_terminal_release,
-                args=(_autonomous.get("orch"), term_gen),
-                daemon=True,
-            ).start()
-        else:
-            # Non-terminal progress (running/task_done/task_failed/salvaged/…) is
-            # never the run OUTCOME — broadcast it unchanged, as before.
-            frame = _autonomous_frame(dict(payload), _autonomous.get("st"))
-            _broadcast_autonomous(frame)
-    except Exception:
-        print("[WOR-45] autonomous progress callback failed")
-
-
-def _ensure_autonomous_engine():
-    """Lazily build (exactly once) the dedicated server-side autonomous agent
-    and its Orchestrator — NEVER shared with conn_agents. Returns
-    ``(agent, orchestrator)``."""
-    with _autonomous_lock:
-        if _autonomous.get("orch") is None:
-            from osia.agent import OSIAAgent
-            agent = OSIAAgent()
-            # A persisted Autonomous run owns one exact provider/model pair.
-            # Normal chat hierarchy routing must never replace it mid-run.
-            agent._disable_hierarchy_for_turn = True
-            _autonomous["agent"] = agent
-            _autonomous["orch"] = _Orchestrator(
-                agent,
-                progress_cb=_on_autonomous_progress,
-                document_progress_cb=_on_autonomous_document_progress,
-            )
-        return _autonomous["agent"], _autonomous["orch"]
-
-
-def _autonomous_start_worker(
-    objective: str,
-    model: str,
-    my_gen: int,
-    turn_context: TurnContext,
-    origin_ref: str = "mobile_legacy",
-    document_inventory=(),
-    document_session_owner: str = "",
-    document_permission_epoch: int = 0,
-    document_owner_device: str = "",
-    strict_provider: str = "",
-    chat_route: dict | None = None,
-) -> None:
-    """Plan + launch OFF the event loop (planning blocks on an LLM run). The
-    single-runner slot (generation ``my_gen``) was already acquired by the
-    handler. Mirrors main.py's ``handle_autonomous_start``: validate the exact
-    inventory identity → provider-aware set_model → create_plan_state → save →
-    start → emit running.
-
-    Two hardening rules around the long planning gap and the held slot:
-
-    * Wrap the WHOLE body so ANY failure (engine build, set_model, planning,
-      start) RELEASES the slot and tells clients — otherwise a raise would leave
-      ``active`` True forever and wedge every later start at ``busy``.
-    * Before starting, ESTABLISH atomically and only if generation ``my_gen`` is
-      still current. A cancel (abort/interrupt) during planning releases the slot
-      (and a later start may reacquire it, bumping the generation); a stale worker
-      must NOT persist or ``orch.start()`` the run the user cancelled — doing so
-      would run it UNLOCKED (single-runner invariant broken) and/or stomp a newer
-      run. ``orch.start()`` clears the stop signal, so this gate is load-bearing.
-
-    ORPHAN-LOOP RACE (WOR-45) — like the resume worker, DRAIN any orphan loop
-    BEFORE spawning. A timed-out ``autonomous_interrupt`` can leave the previous
-    loop draining (the engine never checks its stop flag inside ``_verify``/
-    ``_llm_judge``/``_replan``); ``orch.start()`` would then spawn a SECOND loop on
-    the shared agent (``Orchestrator._begin``'s ``is_alive`` guard is blind once
-    ``stop()`` nulled ``_thread``), AND this fresh run's terminal would be dropped
-    by the ``interrupting`` gate still up for the orphan (a WEDGE). So drain first,
-    then reopen the gate — exactly as the resume path does."""
-    try:
-        agent, orch = _ensure_autonomous_engine()
-        autonomous_context = (
-            turn_context
-            if isinstance(turn_context, TurnContext)
-            else fixed_turn_context(
-                str(turn_context or ""),
-                source="autonomous_start",
-                reference=f"autonomous-{my_gen}",
-            )
-        )
-        language = autonomous_context.language
-        agent.set_turn_context(autonomous_context)
-
-        # ── DRAIN before spawning (never two loops on the shared agent) ──
-        # Wait (GENEROUS bound) until no orchestrator loop remains, so start
-        # happens only against a dead/idle engine. If a prior interrupt's orphan
-        # is wedged past the bound, do NOT spawn a second loop: report the start
-        # failed and defer the slot release until the orphan truly dies.
-        waited = 0.0
-        while _orch_loop_alive() and waited < 120.0:
-            time.sleep(0.2)
-            waited += 0.2
-        if _orch_loop_alive():
-            print("[WOR-45] autonomous start: orchestrator loop wedged past the "
-                  "drain bound — not spawning a second loop; reporting plan_failed")
-            failed_state = _autonomous_failure_state(
-                stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
-                category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
-                reason_code="orchestrator_unavailable",
-                language=language,
-            )
-            _broadcast_autonomous(
-                _autonomous_frame({"event": "plan_failed"}, failed_state)
-            )
-            threading.Thread(
-                target=_release_after_orphan_drained,
-                args=(my_gen,),
-                daemon=True,
-            ).start()
-            return
-        # Orphan drained (engine dead/idle) — reopen the gate (self-heal: a prior
-        # interrupt's bounded poller may have given up while the orphan was alive).
-        # Safe: no loop is alive, so no terminal can fire in between.
-        _autonomous["interrupting"] = False
-
-        from osia.mobile_model_catalogue import (
-            apply_autonomous_agent_model,
-            resolve_current_autonomous_selection,
-        )
-        resolution = resolve_current_autonomous_selection(
-            provider_id=strict_provider if strict_provider else "",
-            model_id=model if strict_provider else "",
-            wire_value=None if strict_provider else model,
-            refresh_account=True,
-            strict=bool(strict_provider),
-            persist=not bool(strict_provider),
-        )
-        provider = resolution.get("provider_id") or ""
-        model = resolution.get("model_id") or ""
-        if resolution.get("fallback_occurred"):
-            print(
-                "[WOR-182] Mobile Autonomous model fallback: "
-                f"{resolution.get('reason') or 'unavailable'}"
-            )
-        model_setup_failed = False
-        if provider and model:
-            try:
-                apply_autonomous_agent_model(agent, provider, model)
-            except Exception:
-                model_setup_failed = True
-                _adiagnostics.emit_diagnostic_log(
-                    _adiagnostics.make_diagnostic(
-                        None,
-                        stage=_adiagnostics.AutonomousStage.PLANNING,
-                        category=(
-                            _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
-                        ),
-                        reason_code="model_setup_failure",
-                        provider=provider,
-                        model=model,
-                        resumable=False,
-                        checkpoint_present=False,
-                    )
-                )
-        if provider and model and not model_setup_failed:
-            provider, model = _adiagnostics.actual_provider_model(
-                agent, provider, model,
-            )
-        planning_failures = []
-        planned_run_id = secrets.token_hex(16)
-        if provider and model and not model_setup_failed:
-            try:
-                st = _aplanner.create_plan_state(
-                    objective, provider, model, agent,
-                    failure_cb=planning_failures.append,
-                    language=language,
-                    turn_context=autonomous_context,
-                    origin_ref=origin_ref,
-                    run_id=planned_run_id,
-                    document_sources=document_inventory,
-                )
-            except Exception:
-                st = None
-        else:
-            st = None
-        if not st:
-            planning_output_category = ""
-            if planning_failures:
-                failure = planning_failures[-1]
-                category = failure.error_category
-                reason_code = failure.reason
-                planning_output_category = failure.output_category
-            else:
-                category = _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
-                if model_setup_failed:
-                    reason_code = "model_setup_failure"
-                elif not provider or not model:
-                    reason_code = "no_configured_model"
-                else:
-                    reason_code = "planning_internal_failure"
-            failed_state = _autonomous_failure_state(
-                stage=_adiagnostics.AutonomousStage.PLANNING,
-                category=category,
-                reason_code=reason_code,
-                provider=provider,
-                model=model,
-                language=language,
-                emit_log=False,
-                planning_output_category=planning_output_category,
-            )
-            if _establish_autonomous_failure(failed_state, my_gen):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "plan_failed"}, failed_state)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-
-        if isinstance(chat_route, dict):
-            request_id = str(chat_route.get("request_id") or "")[:160]
-            reason_code = str(chat_route.get("reason_code") or "")[:48]
-            if request_id:
-                st["chat_route_request_id"] = request_id
-            if reason_code:
-                st["chat_route_reason_code"] = reason_code
-            confidence = chat_route.get("confidence")
-            if isinstance(confidence, (int, float)) and not isinstance(
-                confidence, bool
-            ):
-                st["chat_route_confidence"] = max(
-                    0.0, min(1.0, float(confidence))
-                )
-            st["chat_route_type"] = "autonomous"
-            st["source_conversation_id"] = str(
-                chat_route.get("conversation_id") or ""
-            )[:160]
-            st["source_turn_id"] = str(
-                chat_route.get("source_turn_id") or request_id
-            )[:160]
-            st["source_request_id"] = str(
-                chat_route.get("source_request_id") or request_id
-            )[:160]
-            st["source_assistant_message_id"] = str(
-                chat_route.get("source_assistant_message_id") or ""
-            )[:160]
-            st["source_permission_epoch"] = int(
-                chat_route.get("permission_epoch") or 0
-            )
-            st["attached_tool_attempt_id"] = str(
-                chat_route.get("tool_attempt_id") or ""
-            )[:160]
-
-        # ── Establish the run atomically — only if our slot is still current ──
-        established = False
-        source_binding_failed = False
-        with _autonomous_lock:
-            if _autonomous.get("active") and int(_autonomous.get("gen", 0)) == my_gen:
-                try:
-                    if document_inventory:
-                        from osia.action_policy import get_default_permission_policy
-
-                        current_epoch = int(
-                            get_default_permission_policy().store.load_state().policy_epoch
-                        )
-                        if (
-                            current_epoch != int(document_permission_epoch)
-                            or int(st.get("policy_epoch", -1)) != current_epoch
-                        ):
-                            raise document_sources.DocumentSourceError(
-                                "stale_permission_epoch"
-                            )
-                        bound = document_sources.get_source_store().bind_for_run(
-                            [item["source_ref"] for item in document_inventory],
-                            owner_id=document_session_owner,
-                            run_owner_id=str(st.get("task_id") or ""),
-                            run_id=str(st.get("run_id") or ""),
-                            permission_epoch=current_epoch,
-                        )
-                        st["document_sources"] = _astate.normalize_document_sources(
-                            bound
-                        )
-                    _autonomous["st"] = st
-                    _autonomous["document_owner_device"] = str(
-                        document_owner_device or ""
-                    )[:128]
-                    _write_autonomous_lock(st.get("task_id"))  # stamp the real id
-                    established = True
-                except document_sources.DocumentSourceError:
-                    source_binding_failed = True
-        if source_binding_failed:
-            failed_state = _autonomous_failure_state(
-                stage=_adiagnostics.AutonomousStage.PLANNING,
-                category=_adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT,
-                reason_code="invalid_document_sources",
-                provider=provider,
-                model=model,
-                language=language,
-                emit_log=False,
-            )
-            if _establish_autonomous_failure(failed_state, my_gen):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "plan_failed"}, failed_state)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-        if not established:
-            # A cancel landed during planning (and the cancel handler already
-            # released the slot, cleared any checkpoint and broadcast its
-            # outcome) — or a newer start reacquired. Do NOT persist or start the
-            # run the user cancelled; the slot is correctly owned by neither us
-            # nor a stale generation.
-            print("[WOR-45] autonomous start cancelled during planning — not starting")
-            return
-
-        try:
-            _astate.save_task_state(st)
-        except Exception:
-            diagnostic = _adiagnostics.make_diagnostic(
-                st,
-                stage=_adiagnostics.AutonomousStage.PERSISTENCE,
-                category=_adiagnostics.FailureCategory.CHECKPOINT_FAILURE,
-                reason_code="checkpoint_failure",
-                provider=provider,
-                model=model,
-                resumable=False,
-                checkpoint_present=False,
-            )
-            _adiagnostics.record_diagnostic(st, diagnostic)
-        if st.get("run_state") != "ready":
-            _broadcast_autonomous(_autonomous_frame({
-                "type": "autonomous_plan_ready",
-                "event": "authorization_pending",
-            }, st))
-            return
-        attached_attempt_id = str(st.get("attached_tool_attempt_id") or "")
-        if attached_attempt_id:
-            if orch.attach_existing_tool_attempt(st, attached_attempt_id):
-                return
-            phase_index, task_index, task = _astate.current_task(st)
-            if task is not None:
-                _astate.set_task_status(
-                    st,
-                    phase_index,
-                    task_index,
-                    "blocked_unknown_effect",
-                    last_error="suspended_attempt_attachment_unsafe",
-                    tool_durable_state="blocked_unknown_effect",
-                    tool_terminal_reason="suspended_attempt_attachment_unsafe",
-                )
-            st["run_state"] = "blocked_unknown_effect"
-            st["authorization_status"] = "outcome_unknown"
-            _astate.save_task_state(st)
-            _broadcast_autonomous(_autonomous_frame({
-                "event": "blocked_unknown_effect",
-                "reason": "suspended_attempt_attachment_unsafe",
-            }, st))
-            _release_single_runner_if_gen(my_gen)
-            return
-        orch.start(st)
-        # Flip "planning" → "running" only AFTER start() spawned the loop. The
-        # engine emits events only on task transitions, never on start, so this
-        # won't double-fire.
-        _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
-    except Exception:
-        # Any unexpected failure (e.g. OSIAAgent build error, or thread
-        # exhaustion in orch.start) must NOT wedge the slot at busy forever:
-        # release it (only if still ours) and tell clients the start failed.
-        failed_state = _autonomous_failure_state(
-            stage=_adiagnostics.AutonomousStage.ORCHESTRATOR,
-            category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
-            reason_code="start_worker_failure",
-            language=language,
-            emit_log=False,
-        )
-        if _establish_autonomous_failure(failed_state, my_gen):
-            _broadcast_autonomous(
-                _autonomous_frame({"event": "plan_failed"}, failed_state)
-            )
-        _release_single_runner_if_gen(my_gen)
-        # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
-        # (e.g. _ensure_autonomous_engine raised) must not leave it stuck — but
-        # only reopen if no orphan is alive (else its terminal must stay gated;
-        # the interrupt backstop / next drain reopens it once the orphan dies).
-        if not _orch_loop_alive():
-            _autonomous["interrupting"] = False
-
-
-def _chat_route_result_from_state(st: dict | None, *, active: bool) -> dict:
-    if not isinstance(st, dict):
-        return {"status": "failed", "error_code": "start_state_unavailable"}
-    base = {
-        "task_id": str(st.get("task_id") or "")[:160],
-        "run_id": str(st.get("run_id") or "")[:160],
-    }
-    provider = str(st.get("provider") or "")[:48]
-    model = str(st.get("model") or "")[:160]
-    if provider and model:
-        base.update({"provider_id": provider, "model_id": model})
-    run_state = str(st.get("run_state") or "")
-    status = str(st.get("status") or "")
-    if status == "done" or run_state == "completed":
-        return {
-            **base,
-            **chat_routing.terminal_result_from_state(
-                st, str(st.get("language") or "en"),
-            ),
-        }
-    if status in {"aborted", "cancelled"} or run_state in {
-        "cancelled", "cancelled_proven",
-    }:
-        return {
-            **base,
-            **chat_routing.terminal_result_from_state(
-                st, str(st.get("language") or "en"),
-            ),
-        }
-    if status in {"failed", "aborted"} or st.get("failure_diagnostic"):
-        diagnostic = st.get("failure_diagnostic")
-        code = (
-            str(diagnostic.get("reason_code") or "")[:80]
-            if isinstance(diagnostic, dict) else "start_failed"
-        )
-        return {**base, "status": "failed", "error_code": code or "start_failed"}
-    if run_state == "blocked_outcome_unknown":
-        return {**base, "status": "outcome_unknown"}
-    if run_state in {
-        "waiting_tool", "verifying_tool", "resuming",
-        "cancellation_requested",
-    }:
-        return {**base, "status": "running"}
-    if run_state == "blocked_unknown_effect":
-        return {**base, "status": "outcome_unknown"}
-    if run_state in {
-        "authorization_pending",
-        "suspended_scope_extension",
-        "suspended_authorization_revoked",
-    }:
-        return {**base, "status": "authorization_pending"}
-    if active:
-        return {**base, "status": "running"}
-    if status == "in_progress":
-        return {**base, "status": "outcome_unknown"}
-    return {**base, "status": "failed", "error_code": "start_not_active"}
-
-
-def _chat_durable_state_matches(st: dict | None, request: dict) -> bool:
-    return bool(
-        isinstance(st, dict)
-        and st.get("chat_route_type") == "autonomous"
-        and str(st.get("source_conversation_id") or "")
-        == str(request.get("conversation_id") or "")
-        and str(st.get("source_request_id") or "")
-        == str(request.get("source_request_id") or "")
-        and str(st.get("source_turn_id") or "")
-        == str(request.get("source_turn_id") or "")
-    )
-
-
-def _persist_chat_durable_terminal(st: dict) -> dict | None:
-    """Commit one terminal durable result to its exact originating Chat turn."""
-
-    result = chat_routing.terminal_result_from_state(
-        st, str(st.get("language") or "en"),
-    )
-    if not result.get("terminal"):
-        return None
-    conv_id = str(st.get("source_conversation_id") or "")
-    request_id = str(st.get("source_request_id") or "")
-    turn_id = str(st.get("source_turn_id") or "")
-    message_id = str(st.get("source_assistant_message_id") or "")
-    if not all((conv_id, request_id, turn_id, message_id)):
-        return None
-    try:
-        receipt = conversations.commit_durable_assistant_message(
-            conv_id,
-            str(result.get("final_text") or ""),
-            metadata={
-                "_conversation_id": conv_id,
-                "_request_id": request_id,
-                "_client_request_id": request_id,
-                "_turn_id": turn_id,
-                "_message_id": message_id,
-                "_operation_id": message_id,
-                "_durable_run_id": str(st.get("run_id") or ""),
-                "_durable_status": str(result.get("status") or "blocked"),
-                "_durable_outcome_unknown": bool(
-                    result.get("outcome_unknown")
-                ),
-                "_durable_provider_id": str(st.get("provider") or ""),
-                "_durable_model_id": str(st.get("model") or ""),
-                "_language": str(st.get("language") or ""),
-            },
-        )
-    except (OSError, ValueError):
-        return None
-    if receipt and receipt.get("committed"):
-        loop = _autonomous.get("loop")
-        if loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    _broadcast_canonical_conversation_change(
-                        conv_id,
-                        revision=int(receipt.get("revision") or 0),
-                        operation_id=str(receipt.get("operation_id") or ""),
-                    ),
-                    loop,
-                )
-            except Exception:
-                pass
-    return receipt
-
-
-def _wait_for_chat_autonomous_result(
-    initial_result: dict,
-    request: dict,
-    *,
-    progress_callback=None,
-    bind_execution=None,
-) -> dict:
-    """Wait on the canonical checkpoint until this exact Chat run terminates."""
-
-    last_progress = None
-    while True:
-        st = _current_autonomous_state()
-        if _chat_durable_state_matches(st, request):
-            progress = chat_routing.durable_progress_from_state(st)
-            if callable(bind_execution) and progress.get("run_id"):
-                try:
-                    bind_execution(progress, request)
-                except Exception:
-                    pass
-            identity = tuple(sorted(progress.items()))
-            if identity != last_progress and callable(progress_callback):
-                try:
-                    progress_callback(dict(progress))
-                except Exception:
-                    pass
-            last_progress = identity
-            if progress.get("terminal"):
-                return chat_routing.terminal_result_from_state(
-                    st, str(st.get("language") or "en"),
-                )
-        try:
-            persisted = conversations.find_correlated_turn(
-                str(request.get("conversation_id") or ""),
-                str(request.get("source_request_id") or ""),
-            )
-        except ValueError:
-            persisted = None
-        if (
-            isinstance(persisted, dict)
-            and persisted.get("assistant_message_id")
-            == request.get("source_assistant_message_id")
-            and persisted.get("durable_run_id")
-            and isinstance(persisted.get("assistant_content"), str)
-        ):
-            return {
-                "status": str(persisted.get("durable_status") or "blocked"),
-                "progress_status": str(
-                    persisted.get("durable_status") or "blocked"
-                ),
-                "terminal": True,
-                "outcome_unknown": bool(
-                    persisted.get("durable_outcome_unknown")
-                ),
-                "conversation_id": str(persisted.get("conversation_id") or ""),
-                "request_id": str(persisted.get("request_id") or ""),
-                "turn_id": str(persisted.get("turn_id") or ""),
-                "assistant_message_id": str(
-                    persisted.get("assistant_message_id") or ""
-                ),
-                "run_id": str(persisted.get("durable_run_id") or ""),
-                "provider_id": str(persisted.get("durable_provider_id") or ""),
-                "model_id": str(persisted.get("durable_model_id") or ""),
-                "final_text": str(persisted.get("assistant_content") or "")[:32_000],
-            }
-        time.sleep(0.2)
-
-
-def _cancel_chat_autonomous_execution(binding: dict) -> dict:
-    """Cancel only the exact durable run bound to one originating Chat turn."""
-
-    st = _current_autonomous_state()
-    if not isinstance(st, dict) or any(
-        str(st.get(state_key) or "") != str(binding.get(binding_key) or "")
-        for state_key, binding_key in (
-            ("run_id", "run_id"),
-            ("source_conversation_id", "conversation_id"),
-            ("source_request_id", "request_id"),
-            ("source_turn_id", "turn_id"),
-        )
-    ):
-        return {"accepted": False, "error_code": "target_mismatch"}
-    terminal = chat_routing.terminal_result_from_state(
-        st, str(st.get("language") or "en"),
-    )
-    if terminal.get("terminal"):
-        return {**terminal, "accepted": False}
-    if st.get("abandon_state") == "abandon_requested":
-        return {
-            "accepted": True,
-            "status": "cancellation_requested",
-            "outcome_unknown": (
-                st.get("abandon_effect_state") == "effect_possible_or_unknown"
-            ),
-        }
-    generation = _claim_autonomous_control_generation(st)
-    if generation is None:
-        return {"accepted": False, "error_code": "single_runner_busy"}
-    st["abandon_origin_status"] = str(st.get("status") or "")[:32]
-    st["abandon_origin_run_state"] = str(st.get("run_state") or "")[:64]
-    st["abandon_state"] = "abandon_requested"
-    st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
-    st["run_state"] = "cancellation_requested"
-    try:
-        _astate.save_task_state(st)
-    except Exception:
-        pass
-    _broadcast_autonomous(
-        _autonomous_frame({"event": "cancellation_requested"}, st)
-    )
-
-    def _cancel_worker() -> None:
-        terminalized = _terminalize_autonomous_abandon(
-            st, _autonomous.get("orch"),
-        )
-        _persist_chat_durable_terminal(st)
-        if terminalized:
-            _broadcast_autonomous(_autonomous_frame({"event": "aborted"}, st))
-        _release_single_runner_if_gen(generation)
-
-    threading.Thread(
-        target=_cancel_worker,
-        name="osia-chat-autonomous-cancel",
-        daemon=True,
-    ).start()
-    return {
-        "accepted": True,
-        "status": "cancellation_requested",
-        "outcome_unknown": (
-            st.get("abandon_effect_state") == "effect_possible_or_unknown"
-        ),
-    }
-
-
-def _remember_chat_route_result(
-    request_id: str,
-    fingerprint: str,
-    result: dict,
-) -> dict:
-    safe = dict(result)
-    with _CHAT_ROUTE_REQUESTS_LOCK:
-        _CHAT_ROUTE_REQUESTS[request_id] = {
-            "fingerprint": fingerprint,
-            "result": safe,
-        }
-        _CHAT_ROUTE_REQUESTS.move_to_end(request_id)
-        while len(_CHAT_ROUTE_REQUESTS) > 256:
-            _CHAT_ROUTE_REQUESTS.popitem(last=False)
-    return safe
-
-
-def _launch_autonomous_from_chat(request: dict) -> dict:
-    """Synchronously launch one validated chat handoff on the canonical runner."""
-
-    if not isinstance(request, dict):
-        return {"status": "failed", "error_code": "invalid_request"}
-    objective = str(request.get("objective") or "").strip()
-    request_id = str(request.get("request_id") or "").strip()
-    source_request_id = str(
-        request.get("source_request_id") or request_id
-    ).strip()
-    source_turn_id = str(request.get("source_turn_id") or request_id).strip()
-    source_assistant_message_id = str(
-        request.get("source_assistant_message_id") or ""
-    ).strip()
-    conversation_id = str(request.get("conversation_id") or "").strip()
-    origin_ref = str(request.get("origin_ref") or "desktop").strip()[:160]
-    device_id = str(request.get("device_id") or "").strip()[:128]
-    provider = str(request.get("provider_id") or "").strip().lower()
-    model = str(request.get("model_id") or "").strip()
-    source_refs = request.get("source_refs") or []
-    if not provider or not model:
-        return {
-            "status": "failed",
-            "error_code": "chat_model_identity_missing",
-        }
-    if (
-        not objective
-        or len(objective) > 16_000
-        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", request_id)
-        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_request_id)
-        or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", source_turn_id)
-        or (
-            source_assistant_message_id
-            and not re.fullmatch(
-                r"[A-Za-z0-9_.:-]{8,160}", source_assistant_message_id
-            )
-        )
-        or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", conversation_id)
-        or not re.fullmatch(r"[a-z0-9_-]{1,48}", provider)
-        or len(model) > 160
-        or not isinstance(source_refs, list)
-        or len(source_refs) > 10
-        or any(
-            not isinstance(ref, str)
-            or not re.fullmatch(r"(?:src|doc|web)_[0-9a-f]{32}", ref)
-            for ref in source_refs
-        )
-    ):
-        return {"status": "failed", "error_code": "invalid_request"}
-    fingerprint = hashlib.sha256(json.dumps(
-        {
-            "conversation_id": conversation_id,
-            "source_request_id": source_request_id,
-            "source_turn_id": source_turn_id,
-            "source_assistant_message_id": source_assistant_message_id,
-            "objective": objective,
-            "provider_id": provider,
-            "model_id": model,
-            "source_refs": source_refs,
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")).hexdigest()
-    with _CHAT_ROUTE_REQUESTS_LOCK:
-        existing = _CHAT_ROUTE_REQUESTS.get(request_id)
-        if isinstance(existing, dict):
-            if existing.get("fingerprint") != fingerprint:
-                return {
-                    "status": "failed",
-                    "error_code": "duplicate_request_conflict",
-                }
-            result = existing.get("result")
-            return dict(result) if isinstance(result, dict) else {
-                "status": "starting",
-            }
-        _CHAT_ROUTE_REQUESTS[request_id] = {
-            "fingerprint": fingerprint,
-            "result": {"status": "starting"},
-        }
-
-    # Restart/reconnect idempotency: never create a second mission for a chat
-    # request already bound into the persisted Autonomous state.
-    with _autonomous_lock:
-        current_state = _autonomous.get("st")
-        current_active = bool(_autonomous.get("active"))
-    if not isinstance(current_state, dict):
-        try:
-            current_state = _astate.load_task_state()
-        except Exception:
-            current_state = None
-    if (
-        isinstance(current_state, dict)
-        and current_state.get("chat_route_request_id") == request_id
-    ):
-        return _remember_chat_route_result(
-            request_id,
-            fingerprint,
-            _chat_route_result_from_state(current_state, active=current_active),
-        )
-
-    # WOR-265: the old Chat -> Autonomous handoff is now compatibility-only.
-    # A previously persisted exact request may reattach above, but no request is
-    # allowed to create a new legacy plan/run after the Unified Chat migration.
-    return _remember_chat_route_result(request_id, fingerprint, {
-        "status": "failed",
-        "error_code": "unified_chat_only",
-    })
-
-    from osia.mobile_model_catalogue import resolve_current_autonomous_selection
-
-    requested_provider, requested_model = provider, model
-    resolution = resolve_current_autonomous_selection(
-        provider_id=provider,
-        model_id=model,
-        refresh_account=True,
-        strict=True,
-        persist=False,
-    )
-    provider = str(resolution.get("provider_id") or "")
-    model = str(resolution.get("model_id") or "")
-    if (
-        not provider
-        or not model
-        or resolution.get("fallback_occurred")
-        or provider != requested_provider
-        or model != requested_model
-    ):
-        return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "failed",
-            "error_code": "chat_model_unavailable",
-        })
-
-    try:
-        from osia.action_policy import get_default_permission_policy
-
-        permission_epoch = int(
-            get_default_permission_policy().store.load_state().policy_epoch
-        )
-        document_inventory = (
-            document_sources.get_source_store().inspect_for_binding(
-                source_refs,
-                owner_id=conversation_id,
-                permission_epoch=permission_epoch,
-            )
-            if source_refs else []
-        )
-    except document_sources.DocumentSourceError:
-        return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "failed",
-            "error_code": "invalid_document_sources",
-        })
-
-    compatible_attempt = None
-    try:
-        from osia.tool_attempts import get_tool_attempt_store
-
-        suspended = get_tool_attempt_store().find_compatible_suspended_turn(
-            conversation_id
-        )
-        if isinstance(suspended, dict):
-            if (
-                str(suspended.get("turn_id") or "") == source_turn_id
-                and str(suspended.get("provider_id") or "") == provider
-                and str(suspended.get("model_id") or "") == model
-            ):
-                compatible_attempt = suspended
-            else:
-                return _remember_chat_route_result(request_id, fingerprint, {
-                    "status": "failed",
-                    "error_code": "suspended_attempt_attachment_unsafe",
-                })
-    except Exception:
-        return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "failed",
-            "error_code": "suspended_attempt_attachment_unavailable",
-        })
-
-    autonomous_context = request.get("turn_context")
-    if not isinstance(autonomous_context, TurnContext):
-        autonomous_context = resolve_turn_context(
-            objective,
-            client_locale=request.get("language"),
-            saved_language=i18n.get_language(),
-            reference=request_id,
-        )
-    generation = _acquire_single_runner()
-    if generation is None:
-        return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "busy",
-            "error_code": "single_runner_busy",
-        })
-
-    _autonomous["origin_ref"] = origin_ref or "desktop"
-    _autonomous["document_owner_device"] = device_id
-    try:
-        _autonomous_start_worker(
-            objective,
-            model,
-            generation,
-            autonomous_context,
-            origin_ref or "desktop",
-            document_inventory,
-            conversation_id,
-            permission_epoch,
-            device_id,
-            provider,
-            {
-                "request_id": request_id,
-                "source_request_id": source_request_id,
-                "source_turn_id": source_turn_id,
-                "source_assistant_message_id": source_assistant_message_id,
-                "conversation_id": conversation_id,
-                "permission_epoch": permission_epoch,
-                "tool_attempt_id": str(
-                    (compatible_attempt or {}).get("tool_attempt_id") or ""
-                ),
-                "reason_code": str(request.get("reason_code") or "")[:48],
-                "confidence": request.get("confidence"),
-            },
-        )
-    except Exception:
-        _release_single_runner_if_gen(generation)
-        return _remember_chat_route_result(request_id, fingerprint, {
-            "status": "failed",
-            "error_code": "start_worker_failure",
-        })
-    with _autonomous_lock:
-        state = _autonomous.get("st")
-        active = bool(_autonomous.get("active"))
-    result = _chat_route_result_from_state(state, active=active)
-    return _remember_chat_route_result(request_id, fingerprint, result)
-
-
-def _orch_loop_alive() -> bool:
-    """True iff an orchestrator execution loop is still running IN THIS PROCESS.
-
-    Detected by THREAD NAME — the engine names its loop thread
-    ``"osia-orchestrator"`` (orchestrator.py). This is the only externally
-    observable handle on it: ``Orchestrator.stop()`` (called by
-    ``autonomous_interrupt``) nulls the engine's private ``_thread`` even when its
-    2 s join TIMES OUT mid ``agent.run()``, so the old loop can still be alive
-    while ``_begin``'s ``is_alive()`` idempotency guard is blind to it. The resume
-    worker uses this to avoid EVER spawning a second loop over the same agent/state
-    (see WOR-45 race note there). Read-only introspection — ZERO engine edits."""
-    return any(getattr(t, "name", "") == "osia-orchestrator" and t.is_alive()
-               for t in threading.enumerate())
-
-
-def _release_after_orphan_drained(my_gen: int, timeout: float = 120.0) -> None:
-    """Hold the single-runner slot until a still-draining orphan orchestrator loop
-    is truly dead, THEN release it — only if generation ``my_gen`` still owns it.
-
-    Used by the resume guard's "loop still alive after the bounded wait" branch.
-    PRIMARY defence: releasing the slot WHILE the orphan is alive would let a newer
-    run acquire it and then be stopped+freed by the orphan's LATE terminal event
-    (the engine checks ``_stop`` only ONCE per step, so an interrupted step already
-    past that check — inside the verifier ``agent.run()`` or a replan — still runs
-    through to a terminal ``done``/``failed`` emit). Keeping the slot ``busy`` until
-    the orphan drains means a newer run can NEVER coexist with it, so the question
-    of attributing that terminal never arises; it also honours the single-runner
-    invariant (the orphan is still using the shared agent). Bounded so a wedged
-    orphan can never hold the slot forever; runs on a daemon thread so it never
-    blocks the event loop. If the orphan instead drains via a terminal event,
-    :func:`_finalize_terminal_release` (now generation-gated — the second line of
-    defence) already released the slot under our generation, so the ``_if_gen``
-    release here is then a safe no-op (a newer generation owns it) or a harmless
-    idempotent re-release.
-
-    ORPHAN-LOOP RACE (WOR-45) — this is one of the drain-completion sites, so it
-    also CLEARS the ``interrupting`` gate, but ONLY once the orphan is truly DEAD
-    (see below): clearing it while the orphan is still alive would let its late
-    terminal breach the gate and be broadcast as a newer run's outcome."""
-    waited = 0.0
-    while _orch_loop_alive() and waited < timeout:
-        time.sleep(0.2)
-        waited += 0.2
-    # Reopen terminals ONLY if the orphan is truly DEAD. If the bound elapsed with
-    # it still alive (pathological), leave the gate UP — its late terminal stays
-    # gated, and the next start/resume drain (or the orphan's eventual death)
-    # reopens it (self-heal). The SLOT release below stays bounded so a wedged
-    # orphan can never hold the slot forever; a still-draining orphan still can't
-    # spawn a 2nd loop because BOTH start and resume drain before spawning.
-    if not _orch_loop_alive():
-        _autonomous["interrupting"] = False
-    _release_single_runner_if_gen(my_gen)
-
-
-def _clear_interrupting_after_orphan_drained(timeout: float = 120.0) -> None:
-    """Clear the ``interrupting`` gate once a still-draining orphan orchestrator
-    loop is dead — WITHOUT releasing the slot (the caller already released it).
-
-    ORPHAN-LOOP RACE (WOR-45) — used by ``autonomous_interrupt`` for the
-    NO-RESUME case: a timed-out stop() can leave the old loop draining, so the
-    gate must stay set until that loop's late terminal has been observed (and
-    dropped). The wait is BOUNDED (daemon thread, never blocks the loop), but the
-    flag is cleared ONLY if the orphan is truly DEAD — clearing it while the orphan
-    is still alive (bound exceeded) would let its late terminal breach the gate.
-    If the bound elapses with the orphan still alive, the gate is left UP; it is a
-    harmless stuck-True (there is no live owned run whose terminal it could
-    swallow) and the NEXT start/resume drain reopens it once the orphan dies
-    (self-heal). Idempotent: the resume worker may clear the same flag concurrently."""
-    waited = 0.0
-    while _orch_loop_alive() and waited < timeout:
-        time.sleep(0.2)
-        waited += 0.2
-    if not _orch_loop_alive():
-        _autonomous["interrupting"] = False
-
-
-def _autonomous_resume_worker(
-    my_gen: int,
-    origin_ref: str = "mobile_legacy",
-    expected_run_id: str = "",
-    expected_plan_revision: int | None = None,
-    expected_authorization_revision: int | None = None,
-) -> None:
-    """Resume a PAUSED autonomous run OFF the event loop, converging BYTE-FOR-BYTE
-    onto the PROVEN GUI resume flow (``main.py``: ``load_task_state()`` → exact
-    provider/model validation → provider-aware ``set_model`` →
-    ``orchestrator.resume(state)``): resume ONLY
-    against a dead/idle engine, against the on-disk state. The single-runner slot
-    (generation ``my_gen``) was re-acquired by the handler — interrupt freed it.
-    There is NO planning step: the plan already lives in the persisted task_state,
-    so resume picks up at the cursor (the engine re-checks the interrupted task's
-    success_criterion before re-executing — crash-salvage).
-
-    ORPHAN-LOOP RACE FIX (WOR-45). A timed-out ``autonomous_interrupt`` stop()
-    can leave the old orchestrator loop alive (the engine never checks its stop
-    flag inside ``_verify``/``_llm_judge``/``_replan``); the GUI never hits this
-    because it resumes on a FRESH process where no loop exists. So we make the
-    server path the same by DRAINING the orphan first:
-
-    * Fix #1 — DRAIN BEFORE the resumable generation acts. Before any
-      generation-sensitive establish/resume, wait (GENEROUS bound, not the old
-      3 s cap) until no live ``osia-orchestrator`` thread remains. This
-      guarantees the orphan's terminal is observed (and dropped by the
-      ``interrupting`` gate in :func:`_on_autonomous_progress`) while the loop is
-      unambiguously its own — never a SECOND concurrent loop on the shared agent.
-      If the orphan is wedged past the bound, step back: report ``interrupted``
-      (resumable, as ``get_autonomous_status`` reports) and defer the slot
-      release until it truly dies (:func:`_release_after_orphan_drained`).
-    * Fix #2 — re-read the (mobile-isolated) task state FROM DISK and branch on
-      its REAL status, mirroring the GUI exactly: ``in_progress`` ⇒
-      ``orch.resume(st)`` (the proven idle-engine + disk-state path); a TERMINAL
-      status (done/failed/aborted) ⇒ surface it TRUTHFULLY (broadcast it) and do
-      NOT start a loop. This is the orphan's genuine result when it really ran the
-      task to completion before draining — NOT the mis-attributed terminal the
-      old code wrongly broadcast onto the just-resumed run.
-
-    Hardening, exactly like the start worker:
-
-    * Wrap the WHOLE body so ANY failure RELEASES the slot (only if generation
-      ``my_gen`` is still current) — a raise must never wedge ``active`` True
-      forever and refuse every later start/resume at ``busy``.
-    * ESTABLISH atomically, only if generation ``my_gen`` is still current — a
-      newer start/resume that reacquired during this window must not be stomped
-      (the same load-bearing gate the start worker uses)."""
-    try:
-        agent, orch = _ensure_autonomous_engine()
-
-        # ── Fix #1: DRAIN the orphan BEFORE the resumable generation acts ──
-        # Resume must run only against a dead/idle engine (the GUI flow). Wait,
-        # with a GENEROUS bound, until no orchestrator loop remains in-process so
-        # the orphan's late terminal lands while the loop is still unambiguously
-        # its own (and is dropped by the interrupting gate) — never a 2nd loop.
-        waited = 0.0
-        while _orch_loop_alive() and waited < 120.0:
-            time.sleep(0.2)
-            waited += 0.2
-        if _orch_loop_alive():
-            # Orphan wedged past the drain bound — do NOT spawn a second loop.
-            # Report INTERRUPTED (the run stays paused/resumable, matching
-            # get_autonomous_status) and release our slot only AFTER the orphan is
-            # truly dead: freeing it now would let a newer run acquire the slot and
-            # then be stopped/freed by the orphan's late terminal. That poller also
-            # clears the interrupting gate when the drain completes.
-            print("[WOR-45] autonomous resume: orchestrator loop wedged past the "
-                  "drain bound — reporting interrupted; deferring slot release "
-                  "until it exits")
-            _broadcast_autonomous(
-                _autonomous_frame({"event": "interrupted"}, _autonomous.get("st")))
-            threading.Thread(
-                target=_release_after_orphan_drained,
-                args=(my_gen,),
-                daemon=True,
-            ).start()
-            return
-
-        # ── Orphan drained: the engine is dead/idle. This is a drain-completion
-        # site, so reopen terminals (clear the interrupting gate) — the resumed
-        # run's OWN terminals must broadcast normally. Safe here: no loop is alive
-        # (orphan dead, resume not started), so no terminal can fire in between. ──
-        _autonomous["interrupting"] = False
-
-        # ── Fix #2: re-read the persisted (mobile-isolated) state from DISK and
-        # branch on its REAL status — mirror the GUI's _offer_resume_if_pending. ──
-        try:
-            st = _astate.load_task_state()
-        except Exception:
-            st = None
-        if not isinstance(st, dict):
-            failed_state = _autonomous_failure_state(
-                stage=_adiagnostics.AutonomousStage.RESUME,
-                category=_adiagnostics.FailureCategory.INVALID_RESUME_STATE,
-                reason_code="resume_state_unavailable",
-                emit_log=False,
-            )
-            if _establish_autonomous_failure(failed_state, my_gen):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "idle"}, failed_state)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-        has_expected_target = bool(
-            expected_run_id
-            or expected_plan_revision is not None
-            or expected_authorization_revision is not None
-        )
-        if has_expected_target and not _autonomous_resume_target_matches(
-            st,
-            expected_run_id,
-            expected_plan_revision,
-            expected_authorization_revision,
-        ):
-            # The checkpoint changed after the caller's validation. Never
-            # reinterpret that control as permission to resume the replacement.
-            if str(st.get("run_id") or "") == expected_run_id:
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "state_updated"}, st)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-        _aauthorization.revalidate_loaded_authorization(
-            st, origin_ref=origin_ref,
-        )
-        _astate.save_task_state(st)
-        if st.get("run_state") in {
-            "authorization_pending",
-            "suspended_scope_extension",
-            "suspended_authorization_revoked",
-            "blocked_outcome_unknown",
-        }:
-            established = False
-            with _autonomous_lock:
-                if (
-                    _autonomous.get("active")
-                    and int(_autonomous.get("gen", 0)) == my_gen
-                ):
-                    _autonomous["st"] = st
-                    _write_autonomous_lock(st.get("task_id"))
-                    established = True
-            if established:
-                pending_review = st.get("run_state") == "authorization_pending"
-                _broadcast_autonomous(_autonomous_frame({
-                    "type": (
-                        "autonomous_plan_ready" if pending_review
-                        else "autonomous_authorization_state"
-                    ),
-                    "event": (
-                        "authorization_pending" if pending_review
-                        else st.get("run_state")
-                    ),
-                }, st))
-            return
-        status = st.get("status", "")
-        if status == "in_progress" and not _astate.resume_state_is_valid(st):
-            st["status"] = "failed"
-            diagnostic = _adiagnostics.make_diagnostic(
-                st,
-                stage=_adiagnostics.AutonomousStage.RESUME,
-                category=_adiagnostics.FailureCategory.INVALID_RESUME_STATE,
-                reason_code="invalid_resume_state",
-                resumable=False,
-                checkpoint_present=True,
-            )
-            _adiagnostics.record_diagnostic(st, diagnostic, emit=False)
-            if _establish_autonomous_failure(st, my_gen):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "failed"}, st)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-        if status != "in_progress":
-            # Disk shows a TERMINAL outcome — surface it truthfully and start NO
-            # loop (the GUI only resumes an in_progress run). When the drained
-            # orphan genuinely failed/finished the task, this is its REAL result.
-            ev = {"done": "done", "failed": "failed",
-                  "aborted": "aborted"}.get(status, "idle")
-            _broadcast_autonomous(_autonomous_frame({"event": ev}, st))
-            _release_single_runner_if_gen(my_gen)
-            return
-
-        # ── status == in_progress ⇒ resume EXACTLY like the GUI ──
-        resume_context = fixed_turn_context(
-            st.get("language"),
-            source="autonomous_resume",
-            reference=str(st.get("task_id") or "autonomous"),
-            mode=str(st.get("language_mode") or "single-language"),
-            allowed_languages=st.get("allowed_languages") or (),
-            source_language=st.get("source_language"),
-            target_language=st.get("target_language"),
-        )
-        agent.set_turn_context(resume_context)
-        from osia.mobile_model_catalogue import (
-            apply_autonomous_agent_model,
-            resolve_current_autonomous_selection,
-        )
-        resolution = resolve_current_autonomous_selection(
-            provider_id=st.get("provider", ""),
-            model_id=st.get("model", ""),
-            refresh_account=True,
-            strict=True,
-            persist=False,
-        )
-        provider = resolution.get("provider_id") or ""
-        model = resolution.get("model_id") or ""
-        durable_tool_resume = st.get("run_state") in {
-            "waiting_tool", "verifying_tool", "resuming",
-            "cancellation_requested",
-        }
-        exact_recovery_identity = (
-            provider == str(st.get("provider") or "")
-            and model == str(st.get("model") or "")
-            and not resolution.get("fallback_occurred")
-        )
-        if durable_tool_resume and not exact_recovery_identity:
-            established = False
-            with _autonomous_lock:
-                if (
-                    _autonomous.get("active")
-                    and int(_autonomous.get("gen", 0)) == my_gen
-                ):
-                    _autonomous["st"] = st
-                    _write_autonomous_lock(st.get("task_id"))
-                    established = True
-            if established:
-                orch.block_tool_recovery(
-                    st, "tool_recovery_model_mismatch",
-                )
-            return
-        if resolution.get("fallback_occurred"):
-            print(
-                "[WOR-182] Mobile Autonomous resume model fallback: "
-                f"{resolution.get('reason') or 'unavailable'}"
-            )
-        if not provider or not model:
-            st["status"] = "failed"
-            diagnostic = _adiagnostics.make_diagnostic(
-                st,
-                stage=_adiagnostics.AutonomousStage.RESUME,
-                category=_adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE,
-                reason_code="no_configured_model",
-                resumable=False,
-                checkpoint_present=True,
-            )
-            _adiagnostics.record_diagnostic(st, diagnostic)
-            try:
-                _astate.save_task_state(st)
-            except Exception:
-                _adiagnostics.set_checkpoint_present(st, False)
-            if _establish_autonomous_failure(st, my_gen):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "failed"}, st)
-                )
-            _release_single_runner_if_gen(my_gen)
-            return
-        if model:
-            try:
-                apply_autonomous_agent_model(agent, provider, model)
-            except Exception:
-                st["status"] = "failed"
-                diagnostic = _adiagnostics.make_diagnostic(
-                    st,
-                    stage=_adiagnostics.AutonomousStage.RESUME,
-                    category=(
-                        _adiagnostics.FailureCategory.PLANNING_PROVIDER_FAILURE
-                    ),
-                    reason_code="model_setup_failure",
-                    provider=provider,
-                    model=model,
-                    resumable=False,
-                    checkpoint_present=True,
-                )
-                _adiagnostics.record_diagnostic(st, diagnostic)
-                try:
-                    _astate.save_task_state(st)
-                except Exception:
-                    _adiagnostics.set_checkpoint_present(st, False)
-                if _establish_autonomous_failure(st, my_gen):
-                    _broadcast_autonomous(
-                        _autonomous_frame({"event": "failed"}, st)
-                    )
-                _release_single_runner_if_gen(my_gen)
-                return
-        provider_now, model_now = _adiagnostics.actual_provider_model(
-            agent, provider, model,
-        )
-        if durable_tool_resume and (
-            provider_now != str(st.get("provider") or "")
-            or model_now != str(st.get("model") or "")
-        ):
-            established = False
-            with _autonomous_lock:
-                if (
-                    _autonomous.get("active")
-                    and int(_autonomous.get("gen", 0)) == my_gen
-                ):
-                    _autonomous["st"] = st
-                    _write_autonomous_lock(st.get("task_id"))
-                    established = True
-            if established:
-                orch.block_tool_recovery(
-                    st, "tool_recovery_model_mismatch",
-                )
-            return
-        st["provider"] = provider_now
-        st["model"] = model_now
-        try:
-            _astate.save_task_state(st)
-        except Exception:
-            _adiagnostics.set_checkpoint_present(st, False)
-
-        # ── Establish the run atomically — only if our slot is still current ──
-        established = False
-        with _autonomous_lock:
-            if _autonomous.get("active") and int(_autonomous.get("gen", 0)) == my_gen:
-                _autonomous["st"] = st
-                _write_autonomous_lock(st.get("task_id"))  # stamp the real id
-                established = True
-        if not established:
-            # A cancel landed during this window (its handler already released
-            # the slot and broadcast its outcome) or a newer start/resume
-            # reacquired — do NOT resume over the run the user cancelled / a
-            # newer run; the slot is owned by neither us nor a stale generation.
-            print("[WOR-45] autonomous resume superseded/cancelled — not resuming")
-            return
-
-        orch.resume(st)
-        # A durable tool recovery can synchronously remain waiting or fail closed
-        # before spawning a loop. Publish running only when resume established
-        # that exact state; recovery already emitted its waiting/terminal event.
-        if st.get("status") == "in_progress" and st.get("run_state") == "running":
-            _broadcast_autonomous(_autonomous_frame({"event": "running"}, st))
-    except Exception:
-        # Any unexpected failure (engine build, orch.resume thread exhaustion)
-        # must NOT wedge the slot at busy forever: release it (only if still ours)
-        # and tell clients the resume did not take.
-        failed_state = _autonomous_failure_state(
-            stage=_adiagnostics.AutonomousStage.RESUME,
-            category=_adiagnostics.FailureCategory.ORCHESTRATOR_FAILURE,
-            reason_code="resume_worker_failure",
-            emit_log=False,
-        )
-        if _establish_autonomous_failure(failed_state, my_gen):
-            _broadcast_autonomous(
-                _autonomous_frame({"event": "plan_failed"}, failed_state)
-            )
-        _release_single_runner_if_gen(my_gen)
-        # ORPHAN-LOOP RACE (WOR-45): a crash BEFORE the drain reopened the gate
-        # (engine build / disk load) must not leave it stuck. Reopen only if no
-        # orphan is alive; otherwise the interrupt backstop / next drain reopens
-        # it once the orphan dies (its terminal must stay gated until then).
-        if not _orch_loop_alive():
-            _autonomous["interrupting"] = False
-
-
-_DURABLE_AUTONOMOUS_RECOVERY_STATES = frozenset({
-    "waiting_tool", "verifying_tool", "resuming", "cancellation_requested",
-})
-
-
-def _schedule_durable_autonomous_recovery(
-    st: dict,
-    *,
-    origin_ref: str,
-    loop,
-    document_owner_device: str = "",
-) -> bool:
-    """Resume a persisted in-flight tool checkpoint once on fresh-process status."""
-
-    if (
-        not isinstance(st, dict)
-        or st.get("status") != "in_progress"
-        or st.get("run_state") not in _DURABLE_AUTONOMOUS_RECOVERY_STATES
-    ):
-        return False
-    generation = _acquire_single_runner(task_id=st.get("task_id"))
-    if generation is None:
-        return False
-    _autonomous["loop"] = loop
-    _autonomous["origin_ref"] = origin_ref
-    _autonomous["document_owner_device"] = document_owner_device
-    threading.Thread(
-        target=_autonomous_resume_worker,
-        args=(
-            generation,
-            origin_ref,
-            str(st.get("run_id") or ""),
-            st.get("plan_revision"),
-            st.get("authorization_revision"),
-        ),
-        daemon=True,
-    ).start()
-    return True
-
-
-def _autonomous_pc_snapshot(st: dict | None) -> dict:
-    """Local-PC projection for reviewing the server-owned mobile run."""
-
-    if not isinstance(st, dict):
-        return {}
-    checkpoint = _astate._checkpoint_projection(st)
-    pc = _aauthorization.pc_projection(st)
-    checkpoint.update(pc)
-    checkpoint["_runtime_pc_capability_details"] = dict(
-        pc.get("private_scope_details") or {}
-    )
-    checkpoint["_server_mobile_run"] = True
-    # Projection-only fields are rebuilt from canonical state below; never let
-    # a stale/migrated checkpoint value impersonate either desktop surface.
-    checkpoint.pop("chat_execution", None)
-    checkpoint.pop("legacy_execution", None)
-    compatibility = {
-        "compatibility_mode": "legacy_autonomous_checkpoint",
-        "legacy_compatibility": True,
-    }
-    resumable = bool(
-        _legacy_autonomous_resume_is_safe(st)
-        and not bool(_autonomous.get("active"))
-    )
-    progress = chat_routing.durable_progress_from_state(st)
-    canonical_chat_execution = False
-    if st.get("chat_route_type") == "autonomous":
-        chat_execution = dict(progress)
-        if chat_execution.get("terminal"):
-            chat_execution = chat_routing.terminal_result_from_state(
-                st, str(st.get("language") or "en"),
-            )
-        canonical_chat_execution = all(
-            str(chat_execution.get(field) or "").strip()
-            for field in (
-                "conversation_id", "request_id", "turn_id", "run_id",
-                "provider_id", "model_id", "effective_reasoning",
-            )
-        )
-        if not canonical_chat_execution:
-            chat_execution.update(compatibility)
-            chat_execution["resumable"] = resumable
-        checkpoint["chat_execution"] = chat_execution
-    raw_run_id = str(st.get("run_id") or "")
-    raw_task_id = str(st.get("task_id") or "")
-    run_id = _clean_cancellation_target_id(raw_run_id)
-    task_id = _clean_cancellation_target_id(raw_task_id, maximum=160)
-    plan_revision = st.get("plan_revision")
-    authorization_revision = st.get("authorization_revision")
-    exact_identity = bool(
-        run_id
-        and task_id
-        and run_id == raw_run_id
-        and task_id == raw_task_id
-        and type(plan_revision) is int
-        and plan_revision >= 0
-        and type(authorization_revision) is int
-        and authorization_revision >= 0
-    )
-    if run_id and not canonical_chat_execution:
-        terminal = bool(progress.get("terminal"))
-        cancel_requested = bool(progress.get("cancel_requested"))
-        checkpoint["legacy_execution"] = {
-            "schema_version": 1,
-            **compatibility,
-            "run_id": run_id,
-            "task_id": task_id,
-            "plan_revision": plan_revision if exact_identity else None,
-            "authorization_revision": (
-                authorization_revision if exact_identity else None
-            ),
-            "status": str(progress.get("status") or "")[:32],
-            "run_state": str(st.get("run_state") or "")[:64],
-            "terminal": terminal,
-            "outcome_unknown": bool(progress.get("outcome_unknown")),
-            "cancel_requested": cancel_requested,
-            "cancellable": bool(
-                exact_identity and not terminal and not cancel_requested
-            ),
-            "resumable": bool(exact_identity and resumable),
-        }
-    return checkpoint
-
-
-def _current_autonomous_state() -> dict | None:
-    """Return the in-memory run, recovering its persisted checkpoint if needed."""
-
-    st = _autonomous.get("st")
-    if isinstance(st, dict):
-        return st
-    try:
-        loaded = _astate.load_task_state()
-    except Exception:
-        loaded = None
-    if not isinstance(loaded, dict):
-        return None
-    _aauthorization.restore_planned_runtime_descriptors(loaded)
-    # A relay reconnect can recreate the canonical mobile checkpoint before the
-    # local PC endpoint observes the process-owned in-memory reference. Publish
-    # that same dict atomically; never replace a run established meanwhile.
-    with _autonomous_lock:
-        current = _autonomous.get("st")
-        if isinstance(current, dict):
-            return current
-        _autonomous["st"] = loaded
-        return loaded
-
-
-def _internal_autonomous_origin(st: dict) -> str:
-    request = st.get("authorization_request") or st.get(
-        "pending_scope_extension"
-    )
-    if not isinstance(request, dict):
-        return ""
-    # The loopback-only endpoint is the authenticated PC authority. Atomically
-    # transfer this still-pending request away from its mobile observer before
-    # validating the local decision; any stale mobile response then fails its
-    # origin binding.
-    request["origin_ref"] = "desktop"
-    return "desktop"
-
-
-def _apply_internal_autonomous_model(agent, st: dict) -> bool:
-    """Restore a persisted mobile run's model before local-PC execution."""
-
-    saved_provider = str(st.get("provider") or "").strip()
-    saved_model = str(st.get("model") or "").strip()
-    if not saved_provider or not saved_model:
-        # Compatibility for old checkpoints that predate the persisted pair.
-        return True
-    try:
-        from osia.mobile_model_catalogue import (
-            apply_autonomous_agent_model,
-            resolve_current_autonomous_selection,
-        )
-
-        resolution = resolve_current_autonomous_selection(
-            provider_id=saved_provider,
-            model_id=saved_model,
-            refresh_account=True,
-            strict=True,
-            persist=False,
-        )
-        provider = resolution.get("provider_id") or ""
-        model = resolution.get("model_id") or ""
-        if resolution.get("fallback_occurred"):
-            print(
-                "[WOR-188] Autonomous authorization model fallback: "
-                f"{resolution.get('reason') or 'unavailable'}"
-            )
-        if not provider or not model:
-            return False
-        apply_autonomous_agent_model(agent, provider, model)
-        return True
-    except Exception:
-        return False
-
-
-@app.post("/internal/chat_autonomous_start")
-async def internal_chat_autonomous_start(request: Request):
-    """Loopback-only PC handoff into the canonical server-owned runner."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"status": "failed", "error_code": "forbidden"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    if not isinstance(body, dict):
-        return {"status": "failed", "error_code": "invalid_request"}
-    allowed = {
-        "objective", "source_refs", "request_id", "conversation_id",
-        "source_request_id", "source_turn_id", "source_assistant_message_id",
-        "provider_id", "model_id", "reason_code", "confidence",
-        "explicit_request", "language",
-    }
-    if set(body) - allowed:
-        return {"status": "failed", "error_code": "invalid_request"}
-    payload = {key: body.get(key) for key in allowed}
-    payload["origin_ref"] = "desktop"
-    payload["device_id"] = ""
-    _autonomous["loop"] = asyncio.get_running_loop()
-    return await asyncio.to_thread(_launch_autonomous_from_chat, payload)
-
-
-@app.post("/internal/chat_autonomous_cancel")
-async def internal_chat_autonomous_cancel(request: Request):
-    """Loopback-only exact cancellation for a Chat-owned durable run."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"accepted": False, "error_code": "forbidden"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    allowed = {"conversation_id", "request_id", "turn_id", "task_id", "run_id"}
-    if not isinstance(body, dict) or set(body) - allowed:
-        return {"accepted": False, "error_code": "invalid_request"}
-    return await asyncio.to_thread(
-        _cancel_chat_autonomous_execution,
-        {key: str(body.get(key) or "")[:160] for key in allowed},
-    )
-
-
-def _legacy_execution_control_target_matches(
-    st: dict | None,
-    body: dict | None,
-) -> bool:
-    """Validate one loopback control against an exact legacy checkpoint."""
-
-    if not isinstance(st, dict) or not isinstance(body, dict):
-        return False
-    if body.get("schema_version", 1) != 1:
-        return False
-    run_id = _clean_cancellation_target_id(body.get("run_id"))
-    task_id = _clean_cancellation_target_id(
-        body.get("task_id"), maximum=160,
-    )
-    plan_revision = body.get("plan_revision")
-    authorization_revision = body.get("authorization_revision")
-    return bool(
-        run_id
-        and task_id
-        and task_id == str(st.get("task_id") or "")
-        and _autonomous_resume_target_matches(
-            st,
-            run_id,
-            plan_revision,
-            authorization_revision,
-        )
-    )
-
-
-def _legacy_execution_control_result(
-    st: dict | None,
-    *,
-    accepted: bool,
-    error_code: str = "",
-) -> dict:
-    progress = chat_routing.durable_progress_from_state(st)
-    result = {
-        "accepted": bool(accepted),
-        "terminal": bool(progress.get("terminal")),
-        "outcome_unknown": bool(progress.get("outcome_unknown")),
-        "state": _autonomous_pc_snapshot(st),
-    }
-    if error_code:
-        result["error_code"] = str(error_code)[:80]
-    return result
-
-
-@app.post("/internal/legacy_execution_resume")
-async def internal_legacy_execution_resume(request: Request):
-    """Resume only the exact persisted legacy run shown in the Chat banner."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return _legacy_execution_control_result(
-            None, accepted=False, error_code="forbidden",
-        )
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    allowed = {
-        "schema_version", "run_id", "task_id", "plan_revision",
-        "authorization_revision",
-    }
-    if not isinstance(body, dict) or set(body) - allowed:
-        return _legacy_execution_control_result(
-            None, accepted=False, error_code="invalid_request",
-        )
-    st = _current_autonomous_state()
-    if not _legacy_execution_control_target_matches(st, body):
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="target_mismatch",
-        )
-    if not _legacy_autonomous_resume_is_safe(st):
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="resume_not_safe",
-        )
-    with _autonomous_lock:
-        if _autonomous.get("active"):
-            return _legacy_execution_control_result(
-                st, accepted=False, error_code="single_runner_busy",
-            )
-    generation = _acquire_single_runner(task_id=st.get("task_id"))
-    if generation is None:
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="single_runner_busy",
-        )
-    current = _current_autonomous_state()
-    if not _legacy_execution_control_target_matches(current, body):
-        _release_single_runner_if_gen(generation)
-        return _legacy_execution_control_result(
-            current, accepted=False, error_code="target_changed",
-        )
-    _autonomous["loop"] = asyncio.get_running_loop()
-    _autonomous["origin_ref"] = "desktop_legacy"
-    _autonomous["document_owner_device"] = ""
-    threading.Thread(
-        target=_autonomous_resume_worker,
-        args=(
-            generation,
-            "desktop_legacy",
-            str(body.get("run_id") or ""),
-            body.get("plan_revision"),
-            body.get("authorization_revision"),
-        ),
-        name="osia-legacy-execution-resume",
-        daemon=True,
-    ).start()
-    return _legacy_execution_control_result(current, accepted=True)
-
-
-@app.post("/internal/legacy_execution_cancel")
-async def internal_legacy_execution_cancel(request: Request):
-    """Stop only the exact persisted legacy run shown in the Chat banner."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return _legacy_execution_control_result(
-            None, accepted=False, error_code="forbidden",
-        )
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    allowed = {
-        "schema_version", "run_id", "task_id", "plan_revision",
-        "authorization_revision",
-    }
-    if not isinstance(body, dict) or set(body) - allowed:
-        return _legacy_execution_control_result(
-            None, accepted=False, error_code="invalid_request",
-        )
-    st = _current_autonomous_state()
-    if not _legacy_execution_control_target_matches(st, body):
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="target_mismatch",
-        )
-    progress = chat_routing.durable_progress_from_state(st)
-    if progress.get("terminal"):
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="run_terminal",
-        )
-    if st.get("abandon_state") in {
-        "abandon_requested", "abandoned_proven",
-    }:
-        return _legacy_execution_control_result(st, accepted=True)
-    if _autonomous.get("interrupting"):
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="control_busy",
-        )
-    generation = _claim_autonomous_control_generation(st)
-    if generation is None:
-        return _legacy_execution_control_result(
-            st, accepted=False, error_code="single_runner_busy",
-        )
-    current = _current_autonomous_state()
-    if not _legacy_execution_control_target_matches(current, body):
-        _release_single_runner_if_gen(generation)
-        return _legacy_execution_control_result(
-            current, accepted=False, error_code="target_changed",
-        )
-    if current.get("abandon_state") in {
-        "abandon_requested", "abandoned_proven",
-    }:
-        return _legacy_execution_control_result(current, accepted=True)
-    correlation = _autonomous_cancellation_correlation(current)
-    control_target = tuple(
-        correlation[field]
-        for field in ("run_id", "task_id", "operation_id", "tool_attempt_id")
-    )
-    _autonomous["cancellation_control_target"] = control_target
-    _autonomous["cancellation_control_generation"] = generation
-    current["abandon_origin_status"] = str(
-        current.get("status") or ""
-    )[:32]
-    current["abandon_origin_run_state"] = str(
-        current.get("run_state") or ""
-    )[:64]
-    current["abandon_state"] = "abandon_requested"
-    current["abandon_effect_state"] = _autonomous_abandon_effect_state(
-        current
-    )
-    current["run_state"] = "cancellation_requested"
-    try:
-        _astate.save_task_state(current)
-    except Exception:
-        pass
-    _broadcast_autonomous(
-        _autonomous_frame({"event": "cancellation_requested"}, current)
-    )
-
-    def _cancel_exact_legacy_run(
-        target=current,
-        orch=_autonomous.get("orch"),
-        owned_generation=generation,
-    ) -> None:
-        try:
-            if _terminalize_autonomous_abandon(target, orch):
-                _broadcast_autonomous(
-                    _autonomous_frame({"event": "aborted"}, target)
-                )
-        finally:
-            _release_single_runner_if_gen(owned_generation)
-
-    threading.Thread(
-        target=_cancel_exact_legacy_run,
-        name="osia-legacy-execution-cancel",
-        daemon=True,
-    ).start()
-    return _legacy_execution_control_result(current, accepted=True)
-
-
-@app.get("/internal/autonomous_authorization_state")
-async def internal_autonomous_authorization_state(request: Request):
-    """Expose the canonical mobile run only to the local PC review panel."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"ok": False, "error": "forbidden"}
-    return {
-        "ok": True,
-        "state": _autonomous_pc_snapshot(_current_autonomous_state()),
-    }
-
-
-@app.post("/internal/autonomous_authorization_action")
-async def internal_autonomous_authorization_action(request: Request):
-    """Apply one explicit local-PC decision to the canonical mobile run."""
-
-    host = request.client.host if request.client else ""
-    if host not in ("127.0.0.1", "::1", "localhost"):
-        return {"ok": False, "error": "forbidden"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    action = str(body.get("action") or "") if isinstance(body, dict) else ""
-    allowed = {
-        "action", "schema_version", "run_id", "task_id", "plan_revision",
-        "authorization_revision",
-    }
-    if not isinstance(body, dict) or set(body) - allowed:
-        return {"ok": False, "error": "invalid_request"}
-    if action not in {
-        "authorize", "scope_approve", "scope_deny", "revoke", "cancel",
-    }:
-        return {"ok": False, "error": "invalid_action"}
-    st = _current_autonomous_state()
-    if not isinstance(st, dict):
-        return {"ok": False, "error": "run_missing"}
-    if not _legacy_execution_control_target_matches(st, body):
-        return {
-            "ok": False,
-            "error": "target_mismatch",
-            "state": _autonomous_pc_snapshot(st),
-        }
-    cancel_generation = None
-    try:
-        prepared_engine = None
-        if action in {"authorize", "scope_approve"}:
-            prepared_engine = _ensure_autonomous_engine()
-            if not _apply_internal_autonomous_model(prepared_engine[0], st):
-                return {
-                    "ok": False,
-                    "error": "model_setup_failure",
-                    "state": _autonomous_pc_snapshot(st),
-                }
-        if (
-            _current_autonomous_state() is not st
-            or not _legacy_execution_control_target_matches(st, body)
-        ):
-            return {
-                "ok": False,
-                "error": "target_changed",
-                "state": _autonomous_pc_snapshot(
-                    _current_autonomous_state()
-                ),
-            }
-        if action == "authorize":
-            origin_ref = _internal_autonomous_origin(st)
-            response = _aauthorization.response_for_current_request(
-                st, action="approve", origin_ref=origin_ref,
-            )
-            _aauthorization.authorize_and_start(
-                st, response, origin_ref=origin_ref,
-            )
-            _astate.save_task_state(st)
-            _agent, orch = prepared_engine
-            orch.start(st)
-            event = "running"
-        elif action in {"scope_approve", "scope_deny"}:
-            origin_ref = _internal_autonomous_origin(st)
-            response_action = (
-                "approve_exact" if action == "scope_approve" else "deny"
-            )
-            response = _aauthorization.response_for_current_request(
-                st, action=response_action, origin_ref=origin_ref,
-            )
-            _aauthorization.approve_scope_extension(
-                st, response, origin_ref=origin_ref,
-            )
-            _astate.save_task_state(st)
-            if action == "scope_approve":
-                _agent, orch = prepared_engine
-                orch.resume(st)
-                event = "running"
-            else:
-                event = "scope_extension_denied"
-        elif action == "revoke":
-            _aauthorization.revoke_run_authorization(
-                st, save=_astate.save_task_state,
-            )
-            orch = _autonomous.get("orch")
-            if orch is not None:
-                await asyncio.to_thread(orch.stop)
-            _astate.save_task_state(st)
-            event = "suspended_authorization_revoked"
-        else:
-            cancel_generation = _claim_autonomous_control_generation(st)
-            if cancel_generation is None:
-                return {
-                    "ok": False,
-                    "error": "single_runner_busy",
-                    "state": _autonomous_pc_snapshot(st),
-                }
-            if (
-                _current_autonomous_state() is not st
-                or not _legacy_execution_control_target_matches(st, body)
-            ):
-                _release_single_runner_if_gen(cancel_generation)
-                cancel_generation = None
-                return {
-                    "ok": False,
-                    "error": "target_changed",
-                    "state": _autonomous_pc_snapshot(
-                        _current_autonomous_state()
-                    ),
-                }
-            run_state = str(st.get("run_state") or "")
-            origin_ref = _internal_autonomous_origin(st)
-            pending_request = (
-                st.get("authorization_request")
-                if run_state == "authorization_pending"
-                else st.get("pending_scope_extension")
-            )
-            already_responded = bool(
-                isinstance(pending_request, dict)
-                and pending_request.get("responded") is True
-            )
-            if run_state == "authorization_pending" and not already_responded:
-                response = _aauthorization.response_for_current_request(
-                    st, action="cancel", origin_ref=origin_ref,
-                )
-                _aauthorization.authorize_and_start(
-                    st, response, origin_ref=origin_ref,
-                )
-            elif run_state == "suspended_scope_extension" and not already_responded:
-                response = _aauthorization.response_for_current_request(
-                    st, action="cancel", origin_ref=origin_ref,
-                )
-                _aauthorization.approve_scope_extension(
-                    st, response, origin_ref=origin_ref,
-                )
-            st["abandon_origin_status"] = str(
-                st.get("status") or ""
-            )[:32]
-            st["abandon_origin_run_state"] = str(
-                st.get("run_state") or ""
-            )[:64]
-            st["abandon_state"] = "abandon_requested"
-            st["abandon_effect_state"] = _autonomous_abandon_effect_state(st)
-            st["run_state"] = "cancellation_requested"
-            _astate.save_task_state(st)
-            await asyncio.to_thread(
-                _terminalize_autonomous_abandon,
-                st,
-                _autonomous.get("orch"),
-            )
-            _release_single_runner_if_gen(cancel_generation)
-            cancel_generation = None
-            event = "aborted"
-    except _aauthorization.AuthorizationError as exc:
-        if cancel_generation is not None:
-            _release_single_runner_if_gen(cancel_generation)
-        return {
-            "ok": False,
-            "error": exc.code,
-            "state": _autonomous_pc_snapshot(st),
-        }
-    except Exception:
-        if cancel_generation is not None:
-            _release_single_runner_if_gen(cancel_generation)
-        return {
-            "ok": False,
-            "error": "authorization_internal_failure",
-            "state": _autonomous_pc_snapshot(st),
-        }
-    frame = _autonomous_frame({"event": event}, st)
-    _broadcast_autonomous(frame)
-    return {
-        "ok": True,
-        "event": event,
-        "state": _autonomous_pc_snapshot(st),
-    }
-
-
-@app.on_event("shutdown")
-async def _stop_autonomous_on_shutdown() -> None:
-    """Server cleanup: stop the autonomous loop (safe if never started) and
-    release the single-runner slot so a restart isn't wrongly seen as busy."""
-    global _SERVER_CRON_MANAGER, _SERVER_CRON_UNSUBSCRIBE
-    if _SERVER_CRON_UNSUBSCRIBE is not None:
-        try:
-            _SERVER_CRON_UNSUBSCRIBE()
-        except Exception:
-            pass
-        _SERVER_CRON_UNSUBSCRIBE = None
-    if _SERVER_CRON_MANAGER is not None:
-        try:
-            _SERVER_CRON_MANAGER.stop()
-        except Exception as e:
-            print(f"[OSIA Server CRON] stop on shutdown failed: {e}")
-        _SERVER_CRON_MANAGER = None
-    orch = _autonomous.get("orch")
-    if orch is not None:
-        try:
-            orch.stop()
-        except Exception:
-            print("[WOR-45] orchestrator.stop on shutdown failed")
-    _release_single_runner()
-    media_tasks = list(_POST_TURN_MEDIA_TASKS)
-    for task in media_tasks:
-        task.cancel()
-    if media_tasks:
-        await asyncio.gather(*media_tasks, return_exceptions=True)
-    _POST_TURN_MEDIA_TASKS.clear()
-    _POST_TURN_MEDIA_BY_CONV.clear()
-    _POST_TURN_MEDIA_META_BY_CONV.clear()
-    source_cleanup_tasks = list(_PENDING_SOURCE_CLEANUP_TASKS)
-    for task in source_cleanup_tasks:
-        task.cancel()
-    if source_cleanup_tasks:
-        await asyncio.gather(*source_cleanup_tasks, return_exceptions=True)
-    _PENDING_SOURCE_CLEANUP_TASKS.clear()
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -10480,25 +7274,26 @@ async def websocket_endpoint(ws: WebSocket):
     # is active yet / the process is about to be replaced.
     out = _OutboundChannel()
     writer_task: asyncio.Task = asyncio.create_task(_writer(ws, out))
-    # WOR-44 Phase 5 (5-conf-c): bind THIS connection's outbound channel + loop to
-    # the turn-target ContextVar so a write/destructive MCP tool's confirmation
-    # provider (_ws_confirm_provider) routes its prompt to THIS originating client.
-    # Set ONCE per connection, in the endpoint's own context: every turn task
-    # (asyncio.create_task) copies this context, and it propagates onward through
-    # asyncio.to_thread (agent run) and the tool executor's copy_context, so the
-    # worker-thread provider reads the right (channel, loop). Each connection has
-    # its own context, so a confirm never reaches the wrong device.
-    _turn_target.set((out, asyncio.get_running_loop()))
     loop = asyncio.get_running_loop()
-    from osia.action_policy import get_default_permission_policy
+    # Stable opaque connection identity used as the durable-transport client id
+    # when the device does not present a bound mobile identity yet.
+    connection_id = "mobile-connection:" + secrets.token_urlsafe(24)
+    mobile_device_id = ""
 
-    permission_session = _PermissionMobileSession(
-        out,
-        loop,
-        get_default_permission_policy().store,
-    )
+    def _bind_mobile_device(value) -> bool:
+        nonlocal mobile_device_id
+        device_id = _mobile_safe_id(value)
+        if not device_id:
+            return False
+        if mobile_device_id and mobile_device_id != device_id:
+            return False
+        mobile_device_id = device_id
+        return True
+
     unsubscribe_scheduled_tasks = None
     unsubscribe_api_key_changes = None
+    unsubscribe_setting_changes = None
+    unsubscribe_memory_changes = None
     unsubscribe_account_changes = None
     try:
         from osia import scheduled_tasks as _scheduled_tasks
@@ -10530,7 +7325,6 @@ async def websocket_endpoint(ws: WebSocket):
     pending_file_display_names: dict[str, str] = {}
     legacy_uploads = LegacyUploadManager(UPLOAD_DIR)
     attachment_batches = AttachmentBatchManager(ATTACHMENT_UPLOAD_DIR)
-    autonomous_attachment_acks: dict[str, dict] = {}
 
     async def _expire_attachment_batches() -> None:
         while True:
@@ -10545,8 +7339,11 @@ async def websocket_endpoint(ws: WebSocket):
     chatgpt_login_started_here = False
     catalogue_change_task: asyncio.Task | None = None
     account_change_task: asyncio.Task | None = None
+    canonical_config_task: asyncio.Task | None = None
     catalogue_change_again = False
     account_change_again = False
+    canonical_config_again = False
+    canonical_config_keys: set[str] = set()
 
     async def _send_model_catalogue(
         *, refresh_local: bool = True, refresh_account: bool = True
@@ -10571,6 +7368,63 @@ async def websocket_endpoint(ws: WebSocket):
             "current_provider": catalogue["currentProvider"],
             "account": catalogue["account"],
         })
+
+    def _canonical_config_changed(key: str) -> None:
+        """Push the safe PC-owned snapshot after any canonical setting change."""
+        if not authenticated:
+            return
+        loop.call_soon_threadsafe(_schedule_canonical_config_refresh, str(key))
+
+    def _memory_changed(memory: dict) -> None:
+        """Push PC-owned memory changes to this authenticated mobile client."""
+        if not authenticated:
+            return
+
+        async def send_snapshot() -> None:
+            try:
+                await out.send_json({"type": "memory_updated", "memory": memory})
+            except Exception:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(send_snapshot())
+                if authenticated else None
+            )
+        except RuntimeError:
+            pass
+
+    def _schedule_canonical_config_refresh(key: str) -> None:
+        nonlocal canonical_config_task, canonical_config_again
+        canonical_config_keys.add(key)
+        if canonical_config_task is not None and not canonical_config_task.done():
+            canonical_config_again = True
+            return
+
+        async def refresh() -> None:
+            nonlocal canonical_config_task, canonical_config_again
+            try:
+                while True:
+                    canonical_config_again = False
+                    changed = set(canonical_config_keys)
+                    canonical_config_keys.clear()
+                    cfg = await asyncio.to_thread(_build_config_snapshot)
+                    await out.send_json({"type": "config", "config": cfg})
+                    if changed.intersection({"selected_model", "selected_model_provider"}):
+                        await _send_model_catalogue(
+                            refresh_local=False, refresh_account=False
+                        )
+                    if not canonical_config_again:
+                        break
+            except Exception as exc:
+                print(
+                    "[OSIA Server] canonical config push failed: "
+                    f"{type(exc).__name__}"
+                )
+            finally:
+                canonical_config_task = None
+
+        canonical_config_task = asyncio.create_task(refresh())
 
     def _request_remote_catalogue_refresh() -> None:
         """Coalesce remote discovery and push its safe result on this socket."""
@@ -10620,7 +7474,10 @@ async def websocket_endpoint(ws: WebSocket):
         """Coalesce canonical PC/mobile key changes into one catalogue push."""
         from osia.models import API_PROVIDERS
 
-        if not authenticated or provider_id not in API_PROVIDERS:
+        if not authenticated:
+            return
+        _canonical_config_changed("api_key_status")
+        if provider_id not in API_PROVIDERS:
             return
 
         def schedule() -> None:
@@ -10683,10 +7540,18 @@ async def websocket_endpoint(ws: WebSocket):
         loop.call_soon_threadsafe(schedule)
 
     try:
-        from osia.config import add_api_key_change_listener
+        from osia.config import (
+            add_api_key_change_listener,
+            add_setting_change_listener,
+        )
+        from osia.memory import add_memory_change_listener
         from osia.chatgpt_account.provider import add_account_change_listener
 
         unsubscribe_api_key_changes = add_api_key_change_listener(_api_key_changed)
+        unsubscribe_setting_changes = add_setting_change_listener(
+            _canonical_config_changed
+        )
+        unsubscribe_memory_changes = add_memory_change_listener(_memory_changed)
         unsubscribe_account_changes = add_account_change_listener(_account_changed)
     except Exception as e:
         print(f"[OSIA Server] mobile catalogue change hooks unavailable: {e}")
@@ -10702,16 +7567,13 @@ async def websocket_endpoint(ws: WebSocket):
     streaming_tasks: dict = {}
 
     # ── Per-connection agent reuse (perf fix #3) ─────────────────────────
-    # One OSIAAgent per CONVERSATION this connection has touched, reused across
-    # that conversation's (serialized) turns instead of rebuilt — with its
-    # SSL/certifi OpenAI client — on every message. Keyed by conv_id because
-    # turns on the SAME conversation are serialized (see _run_turn), so a
-    # per-conversation agent never has concurrent turns, while turns on
-    # DIFFERENT conversations of this one connection CAN overlap (a backgrounded
-    # stream): giving them distinct agents prevents a cross-thread race on
-    # self.messages/self.client. The cache is local to this handler, so two
-    # connections (users) NEVER share an agent. LRU-bounded here, disposed in
-    # the finally block.
+    # One cached OSIAAgent per conversation is reused across ordinary serialized
+    # turns. A superseding turn may overlap an uncancellable old worker; in that
+    # case _get_conn_agent replaces the busy cache entry so mutable history,
+    # client, and terminality state are not shared. Different conversations can
+    # also overlap as backgrounded streams, so they retain distinct agents. The
+    # cache is local to this handler, LRU-bounded, and disposed in the finally
+    # block.
     conn_agents: "OrderedDict[str, object]" = OrderedDict()
 
     def _get_conn_agent(conv_id: str):
@@ -10726,9 +7588,13 @@ async def websocket_endpoint(ws: WebSocket):
         """
         from osia.agent import OSIAAgent
         agent = conn_agents.get(conv_id)
-        if agent is not None:
+        if agent is not None and not getattr(agent, "_in_use", False):
             conn_agents.move_to_end(conv_id)
             return agent
+        # A superseding turn can start while its predecessor's uncancellable
+        # worker thread still owns this agent. Its mutable history and
+        # terminality controller cannot be shared across the two turns; let
+        # the old worker keep its reference and give the new turn a fresh agent.
         agent = OSIAAgent()
         conn_agents[conv_id] = agent
         while len(conn_agents) > _AGENT_CACHE_MAX:
@@ -10867,6 +7733,31 @@ async def websocket_endpoint(ws: WebSocket):
                 or ""
             )[:32_000]
         _bind_pre_agent_cancellation_authority(turn_meta)
+        if not await _supersede_active_conversation_turn(
+            out,
+            conv_id,
+            turn_meta,
+            streaming_tasks=streaming_tasks,
+        ):
+            _release_unaccepted_turn_sources(turn_meta, owner_id=conv_id)
+            _complete_durable_command_now(turn_meta, {
+                "accepted": False,
+                "state": "failed_before_execution",
+                "reason_code": "previous_turn_not_terminal_or_supersedable",
+                "conversation_id": conv_id,
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "turn_id": str(turn_meta.get("turn_id") or ""),
+            })
+            await out.send_json({
+                "type": "status",
+                "content": "error",
+                "pre_accept_rejection": True,
+                "error": "previous_turn_not_terminal_or_supersedable",
+                "conversation_id": conv_id,
+                "request_id": str(turn_meta.get("request_id") or ""),
+                "client_request_id": str(turn_meta.get("request_id") or ""),
+            })
+            return False
         accepted = _persist_accepted_user_message(
             conv_id, persisted_content, turn_meta,
         )
@@ -10932,23 +7823,32 @@ async def websocket_endpoint(ws: WebSocket):
         nonlocal session_history, active_conv_id
         snapshot: list = []
         try:
-            # Serialise turns on the SAME conversation: wait for an earlier
-            # in-flight turn to finish so this one sees its result and the two
-            # never append to that conversation concurrently.
-            if prev is not None and not prev.done():
+            # Serialise turns on one conversation unless this accepted turn
+            # superseded the predecessor. A terminalized predecessor must not
+            # hold the new request behind its cancelled provider/tool worker.
+            supersedes = bool(
+                isinstance(turn_meta, dict)
+                and turn_meta.get("_supersession_history_from_store")
+            )
+            if prev is not None and not prev.done() and not supersedes:
                 try:
                     await prev
                 except Exception:
                     pass
             # Snapshot the working history for THIS conversation right before
             # the turn runs — independent of whatever conversation is viewed.
-            if active_conv_id == conv_id:
+            if supersedes:
+                snapshot = _history_for_superseding_turn(conv_id, turn_meta)
+            elif active_conv_id == conv_id:
                 snapshot = list(session_history)
             else:
                 conv = conversations.get_conversation(conv_id)
                 snapshot = list(conv.get("messages") or []) if conv else []
             new_history, result_conv_id = await make_coro(snapshot)
         except asyncio.CancelledError:
+            owner = (turn_meta or {}).get("_durable_command_owner")
+            if isinstance(owner, dict):
+                await _settle_websocket_command_owner({**owner, "transferred": False})
             raise
         except Exception as e:
             print(f"[OSIA Server] streaming turn failed: {e}")
@@ -10960,13 +7860,28 @@ async def websocket_endpoint(ws: WebSocket):
                 snapshot,
             )
             if recovered is None:
+                owner = (turn_meta or {}).get("_durable_command_owner")
+                if isinstance(owner, dict):
+                    await _settle_websocket_command_owner({**owner, "transferred": False})
                 return
             new_history, result_conv_id = recovered
+        if isinstance(turn_meta, dict) and not turn_meta.get("_user_commit"):
+            owner = turn_meta.get("_durable_command_owner")
+            if isinstance(owner, dict):
+                await _settle_websocket_command_owner({**owner, "transferred": False})
         # Keep the in-memory pointer coherent ONLY when the user is still
         # viewing this conversation. Otherwise the new messages live on disk
         # and are reloaded on demand — the currently-viewed conversation is
         # never clobbered by a background stream completing.
-        if result_conv_id is not None and active_conv_id == result_conv_id:
+        still_owner = bool(
+            turn_meta is None
+            or _ACTIVE_TURN_META_BY_CONV.get(result_conv_id) is turn_meta
+        )
+        if (
+            result_conv_id is not None
+            and active_conv_id == result_conv_id
+            and still_owner
+        ):
             session_history = new_history
 
     def _spawn_turn(conv_id, make_coro, turn_meta: dict | None = None):
@@ -11049,6 +7964,9 @@ async def websocket_endpoint(ws: WebSocket):
                 recovery_task = asyncio.create_task(
                     _recover_admitted_claim_conflict()
                 )
+                owner = turn_meta.get("_durable_command_owner")
+                if isinstance(owner, dict):
+                    owner["transferred"] = True
                 _PENDING_FINAL_PERSIST_TASKS.add(recovery_task)
                 recovery_task.add_done_callback(
                     _PENDING_FINAL_PERSIST_TASKS.discard
@@ -11073,6 +7991,10 @@ async def websocket_endpoint(ws: WebSocket):
                 })
             return False
         streaming_tasks[conv_id] = task
+        if isinstance(turn_meta, dict):
+            owner = turn_meta.get("_durable_command_owner")
+            if isinstance(owner, dict):
+                owner["transferred"] = True
         if isinstance(turn_meta, dict) and turn_meta.get("persisted") is True:
             turn_meta["_turn_publication_started"] = True
             out.send_json_nowait(_turn_accepted_frame(turn_meta))
@@ -11094,6 +8016,14 @@ async def websocket_endpoint(ws: WebSocket):
             )
 
         def _clear(t):
+            if (t.cancelled() or t.exception() is not None) and isinstance(turn_meta, dict):
+                owner = turn_meta.get("_durable_command_owner")
+                if isinstance(owner, dict):
+                    settlement = asyncio.create_task(_settle_websocket_command_owner(
+                        {**owner, "transferred": False},
+                    ))
+                    _PENDING_FINAL_PERSIST_TASKS.add(settlement)
+                    settlement.add_done_callback(_PENDING_FINAL_PERSIST_TASKS.discard)
             if streaming_tasks.get(conv_id) is t:
                 streaming_tasks.pop(conv_id, None)
             meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
@@ -11161,8 +8091,23 @@ async def websocket_endpoint(ws: WebSocket):
             pass
 
     first_message_logged = False
+    command_owners: list[dict] = []
+    receive_task = asyncio.current_task()
+
+    def _writer_owner_exited(_task) -> None:
+        # A dead writer can otherwise leave dispatch parked before acceptance
+        # even though the transport has already closed (e.g. a failed PONG).
+        # Accepted workers retain their independent canonical ownership.
+        if (out._closed and receive_task is not None
+            and any(not owner.get("transferred") for owner in command_owners)):
+            print("[WS command] writer exited before ownership transfer", flush=True)
+            receive_task.cancel()
+
+    writer_task.add_done_callback(_writer_owner_exited)
+    from osia.turn_terminality import live_process_identity
+    _alive, owner_process_identity = live_process_identity(os.getpid())
     try:
-        async for raw_msg in ws.iter_text():
+        async for raw_msg in _websocket_owned_messages(ws, command_owners):
             # DEBUG: surface the very first frame the client sends so we can
             # see whether auth arrives as text and in the expected shape.
             if not first_message_logged:
@@ -11183,7 +8128,6 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             msg_type = msg.get("type", "")
-            correlated_autonomous_abandon = False
 
             # --- Auth ---
             if msg_type == "auth":
@@ -11195,22 +8139,18 @@ async def websocket_endpoint(ws: WebSocket):
                 print(f"[WS] auth attempt received (matches={matched})")
                 if matched:
                     authenticated = True
-                    # Browser work can originate from ordinary Chat as well as
-                    # Autonomous. Capture the authenticated server loop and
-                    # install the value-free progress bridge on first auth.
-                    _autonomous["loop"] = asyncio.get_running_loop()
+                    # Browser work can originate from ordinary Chat. Capture the
+                    # authenticated server loop and install the value-free
+                    # progress bridge on first auth.
+                    global _BROWSER_PROGRESS_LOOP
+                    _BROWSER_PROGRESS_LOOP = asyncio.get_running_loop()
                     try:
                         from osia.tools.browser_controller import set_browser_progress_callback
                         set_browser_progress_callback(_on_browser_progress)
                     except Exception:
                         pass
-                    if permission_session.bind_device(msg.get("device_id")):
-                        out._permission_device_id = permission_session.device_id
-                    permission_session.activate()
-                    durable_client_material = (
-                        permission_session.device_id
-                        or permission_session.session_id
-                    )
+                    _bind_mobile_device(msg.get("device_id"))
+                    durable_client_material = mobile_device_id or connection_id
                     durable_client_id = "client_" + hashlib.sha256(
                         durable_client_material.encode("utf-8")
                     ).hexdigest()[:32]
@@ -11235,18 +8175,6 @@ async def websocket_endpoint(ws: WebSocket):
                     # funnel and the historically delicate auth handshake stays
                     # byte-for-byte as before.
                     await ws.send_json({"type": "status", "content": "done"})
-                    await ws.send_json({
-                        "type": "autonomous_authorization_context",
-                        "protocol_version": (
-                            _aauthorization.AUTHORIZATION_PROTOCOL_VERSION
-                        ),
-                        "origin_ref": authorization_origin_ref,
-                    })
-                    await ws.send_json({
-                        "type": "scheduled_task_authorization_context",
-                        "protocol_version": 1,
-                        "origin_ref": authorization_origin_ref,
-                    })
                     print("[WS] auth OK, sending: status/done")
                     try:
                         snapshot = conversations.conversation_snapshot()
@@ -11289,15 +8217,17 @@ async def websocket_endpoint(ws: WebSocket):
                         durable_client_id,
                         supplied_cursors,
                     )
+                    # A fresh mobile session hydrates completed conversations
+                    # separately and has no delivery cursor for their old runs.
+                    # Replay only streams this client can actually resume;
+                    # otherwise a new device ID floods the relay with every
+                    # historical projection in the store.
+                    resume_streams = set(server_cursors) | set(supplied_cursors)
                     for replay_frame in replay_frames:
-                        await out.send_durable_replay(replay_frame)
+                        if replay_frame.get("stream_id") in resume_streams:
+                            await out.send_durable_replay(replay_frame)
                     await out.activate_durable_delivery()
                     print("[OSIA Server] Mobile client authenticated.")
-                    _attach_confirmation_channel(
-                        permission_session.device_id,
-                        out,
-                        asyncio.get_running_loop(),
-                    )
                     # Start the live system-metrics push for this client. The
                     # loop self-gates on heartbeat_enabled; guard against a
                     # stray second auth frame spawning a duplicate loop. It
@@ -11373,12 +8303,22 @@ async def websocket_endpoint(ws: WebSocket):
             if durable_command is not None:
                 command_id, command_binding = durable_command
                 try:
-                    command_claim = await asyncio.to_thread(
+                    command_epoch = "epoch_" + secrets.token_urlsafe(24)
+                    claim_task = asyncio.create_task(asyncio.to_thread(
                         _DURABLE_TRANSPORT.claim_command,
                         command_id=command_id,
                         command_type=msg_type,
                         binding=command_binding,
-                    )
+                        execution_epoch=command_epoch,
+                        owner_id=connection_id if msg_type in {"text", "audio", "cancel_active_work"} else "",
+                        owner_pid=os.getpid() if msg_type in {"text", "audio", "cancel_active_work"} else 0,
+                        owner_process_identity=owner_process_identity if msg_type in {"text", "audio", "cancel_active_work"} else "",
+                    ), name=f"ws-command-claim:{command_id}")
+                    owner = {"command_id": command_id, "claim_task": claim_task,
+                             "execution_epoch": command_epoch, "transferred": False}
+                    if msg_type in {"text", "audio"}:
+                        command_owners.append(owner)
+                    command_claim = await asyncio.shield(claim_task)
                 except (RuntimeError, TypeError, ValueError):
                     await out.send_json({
                         "type": "command_ack",
@@ -11397,10 +8337,15 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 msg["_durable_command_id"] = command_id
                 msg["_durable_command_epoch"] = command_claim.execution_epoch
+                if (command_claim.disposition is InboxDisposition.CLAIMED
+                    and msg_type in {"text", "audio"}):
+                    msg["_durable_command_owner"] = owner
                 if (
                     command_claim.disposition
                     is InboxDisposition.DUPLICATE_COMPLETED
-                    and msg_type not in {"text", "audio"}
+                    and (msg_type not in {"text", "audio"}
+                         or (command_claim.result or {}).get("accepted") is False
+                         or (command_claim.result or {}).get("state") == "outcome_unknown")
                 ):
                     await out.send_json({
                         "type": "command_ack",
@@ -11412,8 +8357,12 @@ async def websocket_endpoint(ws: WebSocket):
                 if (
                     command_claim.disposition
                     is InboxDisposition.DUPLICATE_IN_PROGRESS
-                    and msg_type not in {"text", "audio"}
                 ):
+                    if msg_type in {"text", "audio"}:
+                        if await _send_existing_turn_status_for_request(
+                            out, command_binding.get("request_id"),
+                        ):
+                            continue
                     await out.send_json({
                         "type": "command_ack",
                         "command_id": command_id,
@@ -11421,29 +8370,29 @@ async def websocket_endpoint(ws: WebSocket):
                     })
                     continue
 
-            if msg_type == "get_permission_snapshot":
-                if msg.get("schema_version") != 1:
-                    continue
-                if not permission_session.bind_device(msg.get("device_id")):
-                    continue
-                # Direct LAN/WebRTC bridges authenticate the local server hop
-                # without forwarding an application auth frame. The first
-                # canonical snapshot request carries the same stable Mobile
-                # identity, so bind the approval presenter here as well as on
-                # direct WebSocket auth. This remains one channel and one
-                # pending request; reconnect merely reprojects that request.
-                out._permission_device_id = permission_session.device_id
-                _attach_confirmation_channel(
-                    permission_session.device_id,
+            if msg_type == "cancel_active_work":
+                accepted = await _handle_correlated_chat_cancellation(
                     out,
-                    asyncio.get_running_loop(),
+                    msg,
+                    streaming_tasks=streaming_tasks,
                 )
-                pending_ids = msg.get("pending_request_ids", [])
-                if not isinstance(pending_ids, list) or any(
-                    not isinstance(item, str) for item in pending_ids
-                ):
-                    pending_ids = []
-                await permission_session.send_snapshot(tuple(pending_ids[:64]))
+                control_result = msg.get("_cancellation_command_result")
+                if not isinstance(control_result, dict):
+                    control_result = {
+                        "accepted": bool(accepted),
+                        "state": "cancelled" if accepted else "rejected",
+                        "reason_code": (
+                            "correlated_cancellation_accepted"
+                            if accepted else "correlated_cancellation_rejected"
+                        ),
+                    }
+                    _complete_durable_command_now(msg, control_result)
+                await out.send_json({
+                    "type": "command_ack",
+                    "command_id": str(msg.get("_durable_command_id") or ""),
+                    "state": "completed",
+                    "result": control_result,
+                })
                 continue
 
             if msg_type == "get_browser_status":
@@ -11455,7 +8404,7 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "get_document_status":
                 if msg.get("schema_version") != 1:
                     continue
-                if not permission_session.bind_device(msg.get("device_id")):
+                if not _bind_mobile_device(msg.get("device_id")):
                     continue
                 requested = msg.get("scopes")
                 if not isinstance(requested, list) or len(requested) > 8:
@@ -11469,13 +8418,9 @@ async def websocket_endpoint(ws: WebSocket):
                     for frame in _document_progress_snapshot(
                         str(requested_scope.get("scope_type") or ""),
                         str(requested_scope.get("scope_id") or ""),
-                        owner_device=permission_session.device_id,
+                        owner_device=mobile_device_id,
                     ):
                         await out.send_json(frame)
-                continue
-
-            if msg_type == "permission_revocation_request":
-                await permission_session.handle_revocation(msg)
                 continue
 
             # --- Conversation management ---
@@ -12063,764 +9008,6 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 continue
 
-            # --- Autonomous agent (WOR-45 Phase 5) ---
-            # Start / interrupt / abort / observe ONE machine-global autonomous
-            # run over this WebSocket. The engine (planner/orchestrator/state) is
-            # consumed as a black box; progress frames are BROADCAST to every
-            # connected client (the run is machine-global, not per-connection).
-            if msg_type == "autonomous_release_sources":
-                raw_refs = msg.get("document_sources")
-                owner_id = _mobile_document_owner(permission_session.device_id)
-                released = False
-                if owner_id and isinstance(raw_refs, list) and len(raw_refs) <= 10:
-                    try:
-                        document_sources.get_source_store().release_owned(
-                            raw_refs, owner_id=owner_id,
-                        )
-                        released = True
-                    except document_sources.DocumentSourceError:
-                        released = False
-                await out.send_json({
-                    "type": "autonomous_sources_released",
-                    "schema_version": 1,
-                    "released": released,
-                })
-                continue
-
-            if msg_type == "autonomous_start":
-                # WOR-265 compatibility boundary: understand the historical
-                # message name, but never create another legacy Autonomous run.
-                # Existing records remain observable/resumable/cancellable via
-                # their dedicated compatibility controls below.
-                await out.send_json(
-                    _autonomous_frame({"event": "plan_failed"}, None)
-                )
-                continue
-                objective = (msg.get("objective") or "").strip()
-                model = (msg.get("model") or "").strip()
-                autonomous_context = resolve_turn_context(
-                    objective,
-                    client_locale=msg.get("locale"),
-                    saved_language=i18n.get_language(),
-                    reference=_new_turn_id(),
-                )
-                if not objective:
-                    failed_state = _autonomous_failure_state(
-                        stage=_adiagnostics.AutonomousStage.PLANNING,
-                        category=(
-                            _adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT
-                        ),
-                        reason_code="blank_objective",
-                        language=autonomous_context.language,
-                    )
-                    # Malformed request from this client — reject it directly.
-                    await out.send_json(
-                        _autonomous_frame({"event": "plan_failed"}, failed_state)
-                    )
-                    continue
-                raw_document_sources = msg.get("document_sources", [])
-                document_owner = _mobile_document_owner(
-                    permission_session.device_id
-                )
-                document_epoch = int(
-                    permission_session.store.load_state().policy_epoch
-                )
-                try:
-                    if (
-                        not isinstance(raw_document_sources, list)
-                        or len(raw_document_sources) > 10
-                        or any(
-                            not isinstance(item, str)
-                            for item in raw_document_sources
-                        )
-                        or (raw_document_sources and not document_owner)
-                    ):
-                        raise document_sources.DocumentSourceError(
-                            "invalid_source_reference"
-                        )
-                    document_inventory = (
-                        document_sources.get_source_store().inspect_for_binding(
-                            raw_document_sources,
-                            owner_id=document_owner,
-                            permission_epoch=document_epoch,
-                        )
-                        if raw_document_sources else []
-                    )
-                except document_sources.DocumentSourceError:
-                    failed_state = _autonomous_failure_state(
-                        stage=_adiagnostics.AutonomousStage.PLANNING,
-                        category=(
-                            _adiagnostics.FailureCategory.INVALID_PLANNING_OUTPUT
-                        ),
-                        reason_code="invalid_document_sources",
-                        language=autonomous_context.language,
-                    )
-                    await out.send_json(
-                        _autonomous_frame({"event": "plan_failed"}, failed_state)
-                    )
-                    continue
-                # Acquire the single-runner slot BEFORE spending LLM tokens on
-                # planning; refuse (busy) if another run already owns it. The
-                # returned generation lets the worker detect a cancel-then-
-                # reacquire during the (long) planning window.
-                _gen = _acquire_single_runner()
-                if _gen is None:
-                    await out.send_json(_autonomous_frame({"event": "busy"}))
-                    continue
-                # Capture THIS event loop so the orchestrator's daemon thread can
-                # hop progress frames back onto each connection's writer.
-                _autonomous["loop"] = asyncio.get_running_loop()
-                _autonomous["origin_ref"] = authorization_origin_ref
-                _autonomous["document_owner_device"] = permission_session.device_id
-                # Plan + start OFF the event loop (planning blocks on an LLM run).
-                threading.Thread(
-                    target=_autonomous_start_worker,
-                    args=(
-                        objective, model, _gen, autonomous_context,
-                        authorization_origin_ref,
-                        document_inventory,
-                        document_owner,
-                        document_epoch,
-                        permission_session.device_id,
-                    ),
-                    daemon=True,
-                ).start()
-                continue
-
-            if msg_type == "scheduled_task_authorization_request":
-                from osia import scheduled_tasks
-
-                result = scheduled_tasks.begin_scheduled_task_authorization(
-                    str(msg.get("task_id") or ""),
-                    origin_ref=authorization_origin_ref,
-                    mobile=True,
-                    ttl_seconds=msg.get("ttl_seconds", 30 * 24 * 60 * 60),
-                    max_executions=msg.get("max_executions"),
-                )
-                if result.get("ok") and isinstance(result.get("request"), dict):
-                    await out.send_json(result["request"])
-                else:
-                    await out.send_json({
-                        "type": "scheduled_task_authorization_state",
-                        "task_id": str(msg.get("task_id") or ""),
-                        "ok": bool(result.get("ok")),
-                        "code": str(result.get("code") or ""),
-                        "authorization_status": (
-                            "pc_local_review_required"
-                            if result.get("code") == "pc_local_review_required"
-                            else "authorization_required"
-                        ),
-                    })
-                continue
-
-            if msg_type == "scheduled_task_authorization_response":
-                from osia import scheduled_tasks
-
-                response = {
-                    key: msg.get(key) for key in (
-                        "protocol_version", "request_id", "task_id",
-                        "task_revision", "definition_hash",
-                        "authorization_revision", "policy_epoch", "expiration",
-                        "origin_ref", "action",
-                    )
-                }
-                result = scheduled_tasks.respond_scheduled_task_authorization(
-                    response,
-                    authenticated_origin=authorization_origin_ref,
-                )
-                await out.send_json({
-                    "type": "scheduled_task_authorization_state",
-                    "task_id": str(msg.get("task_id") or ""),
-                    **result,
-                })
-                await _complete_durable_command(msg, {
-                    "accepted": bool(result.get("ok")),
-                    "state": str(result.get("code") or "resolved"),
-                })
-                continue
-
-            if msg_type in {
-                "scheduled_task_authorization_revoke",
-                "scheduled_task_disable",
-            }:
-                from osia import scheduled_tasks
-
-                envelope = {
-                    key: msg.get(key) for key in (
-                        "protocol_version", "task_id", "task_revision",
-                        "definition_hash", "authorization_revision",
-                        "policy_epoch", "expiration", "origin_ref",
-                    )
-                }
-                if msg_type == "scheduled_task_authorization_revoke":
-                    result = scheduled_tasks.revoke_scheduled_task_authorization_bound(
-                        envelope,
-                        authenticated_origin=authorization_origin_ref,
-                    )
-                else:
-                    result = scheduled_tasks.disable_scheduled_task_bound(
-                        envelope,
-                        authenticated_origin=authorization_origin_ref,
-                    )
-                await out.send_json({
-                    "type": "scheduled_task_authorization_state",
-                    "task_id": str(msg.get("task_id") or ""),
-                    **result,
-                })
-                continue
-
-            if msg_type == "autonomous_authorization_response":
-                st = _autonomous.get("st")
-                if not isinstance(st, dict):
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": "run_missing",
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False, "state": "run_missing",
-                    })
-                    continue
-                response = {
-                    key: msg.get(key) for key in (
-                        "protocol_version", "request_id", "run_id",
-                        "plan_revision", "authorization_revision",
-                        "expected_policy_epoch", "origin_ref", "action",
-                    )
-                }
-                selected = msg.get("selected_capability_ids")
-                if not isinstance(selected, list) or any(
-                    not isinstance(item, str) for item in selected
-                ):
-                    selected = None
-                try:
-                    _aauthorization.authorize_and_start(
-                        st,
-                        response,
-                        selected_capability_ids=selected,
-                        origin_ref=authorization_origin_ref,
-                    )
-                    _astate.save_task_state(st)
-                    action = str(response.get("action") or "")
-                    if action == "approve" and st.get("run_state") == "ready":
-                        orch = _autonomous.get("orch")
-                        if orch is None:
-                            _ensure_autonomous_engine()
-                            orch = _autonomous.get("orch")
-                        orch.start(st)
-                        event = "running"
-                    elif action == "cancel":
-                        _aauthorization.revoke_run_authorization(st)
-                        st["status"] = "aborted"
-                        st["run_state"] = "cancelled"
-                        _astate.clear_task_state()
-                        _release_single_runner()
-                        event = "aborted"
-                    else:
-                        event = "authorization_denied"
-                except _aauthorization.AuthorizationError as exc:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": exc.code,
-                        **_autonomous_snapshot(st),
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False, "state": exc.code,
-                    })
-                    continue
-                except Exception:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected",
-                        "reason_code": "authorization_internal_failure",
-                        **_autonomous_snapshot(st),
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False,
-                        "state": "authorization_internal_failure",
-                    })
-                    continue
-                _broadcast_autonomous(_autonomous_frame({
-                    "type": "autonomous_authorization_state",
-                    "event": event,
-                }, st))
-                await _complete_durable_command(msg, {
-                    "accepted": True, "state": event,
-                })
-                continue
-
-            if msg_type == "autonomous_scope_extension_response":
-                st = _autonomous.get("st")
-                if not isinstance(st, dict):
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": "run_missing",
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False, "state": "run_missing",
-                    })
-                    continue
-                response = {
-                    key: msg.get(key) for key in (
-                        "protocol_version", "request_id", "run_id",
-                        "plan_revision", "authorization_revision",
-                        "expected_policy_epoch", "origin_ref", "action",
-                    )
-                }
-                try:
-                    _aauthorization.approve_scope_extension(
-                        st, response, origin_ref=authorization_origin_ref,
-                    )
-                    _astate.save_task_state(st)
-                    action = str(response.get("action") or "")
-                    if action == "approve_exact":
-                        orch = _autonomous.get("orch")
-                        if orch is None:
-                            _ensure_autonomous_engine()
-                            orch = _autonomous.get("orch")
-                        orch.resume(st)
-                        event = "running"
-                    elif action == "cancel":
-                        _aauthorization.revoke_run_authorization(st)
-                        st["status"] = "aborted"
-                        st["run_state"] = "cancelled"
-                        _astate.clear_task_state()
-                        _release_single_runner()
-                        event = "aborted"
-                    else:
-                        event = "scope_extension_denied"
-                except _aauthorization.AuthorizationError as exc:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": exc.code,
-                        **_autonomous_snapshot(st),
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False, "state": exc.code,
-                    })
-                    continue
-                except Exception:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected",
-                        "reason_code": "scope_extension_internal_failure",
-                        **_autonomous_snapshot(st),
-                    })
-                    await _complete_durable_command(msg, {
-                        "accepted": False,
-                        "state": "scope_extension_internal_failure",
-                    })
-                    continue
-                _broadcast_autonomous(_autonomous_frame({
-                    "type": "autonomous_authorization_state",
-                    "event": event,
-                }, st))
-                await _complete_durable_command(msg, {
-                    "accepted": True, "state": event,
-                })
-                continue
-
-            if msg_type == "autonomous_authorization_revoke":
-                st = _autonomous.get("st")
-                try:
-                    if not isinstance(st, dict):
-                        raise _aauthorization.AuthorizationError("run_missing")
-                    if msg.get("protocol_version") != (
-                        _aauthorization.AUTHORIZATION_PROTOCOL_VERSION
-                    ):
-                        raise _aauthorization.AuthorizationError(
-                            "wrong_protocol_version"
-                        )
-                    if msg.get("origin_ref") != authorization_origin_ref:
-                        raise _aauthorization.AuthorizationError("wrong_origin")
-                    if msg.get("run_id") != st.get("run_id"):
-                        raise _aauthorization.AuthorizationError("wrong_run_id")
-                    if msg.get("plan_revision") != st.get("plan_revision"):
-                        raise _aauthorization.AuthorizationError(
-                            "wrong_plan_revision"
-                        )
-                    if msg.get("authorization_revision") != st.get(
-                        "authorization_revision"
-                    ):
-                        raise _aauthorization.AuthorizationError(
-                            "wrong_authorization_revision"
-                        )
-                    from osia.action_policy import get_default_permission_policy
-
-                    current_epoch = (
-                        get_default_permission_policy().store.load_state().policy_epoch
-                    )
-                    if (
-                        msg.get("expected_policy_epoch") != current_epoch
-                        or st.get("policy_epoch") != current_epoch
-                    ):
-                        raise _aauthorization.AuthorizationError("wrong_policy_epoch")
-                    if st.get("run_state") in {"completed", "failed", "cancelled"}:
-                        raise _aauthorization.AuthorizationError("run_terminal")
-                    _aauthorization.revoke_run_authorization(st)
-                    orch = _autonomous.get("orch")
-                    if orch is not None:
-                        await asyncio.to_thread(orch.stop)
-                    _astate.save_task_state(st)
-                except _aauthorization.AuthorizationError as exc:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": exc.code,
-                        **_autonomous_snapshot(st),
-                    })
-                    continue
-                except Exception:
-                    await out.send_json({
-                        "type": "autonomous_authorization_state",
-                        "event": "rejected", "reason_code": "revocation_failure",
-                        **_autonomous_snapshot(st),
-                    })
-                    continue
-                _broadcast_autonomous(_autonomous_frame({
-                    "type": "autonomous_authorization_revoked",
-                    "event": "suspended_authorization_revoked",
-                }, st))
-                continue
-
-            if msg_type == "cancel_active_work":
-                scope = str(msg.get("scope") or "").strip().lower()
-                if msg.get("schema_version") != 1:
-                    await _send_cancellation_rejection(
-                        out, scope or "unknown", "wrong_schema_version",
-                    )
-                    continue
-                if scope == "chat":
-                    cancellation_accepted = (
-                        await _handle_correlated_chat_cancellation(out, msg)
-                    )
-                    await _complete_durable_command(msg, {
-                        "accepted": cancellation_accepted,
-                        "state": (
-                            "cancellation_requested"
-                            if cancellation_accepted else "rejected"
-                        ),
-                    })
-                    continue
-                if scope == "autonomous":
-                    if not await _prepare_correlated_autonomous_cancellation(
-                        out, msg,
-                    ):
-                        await _complete_durable_command(msg, {
-                            "accepted": False,
-                            "state": "rejected",
-                        })
-                        continue
-                    # Reuse the established abort worker after exact target
-                    # validation. The legacy name remains compatible below,
-                    # but it must now carry the same exact run correlation.
-                    correlated_autonomous_abandon = True
-                    msg_type = "autonomous_abort"
-                    await _complete_durable_command(msg, {
-                        "accepted": True,
-                        "state": "cancellation_requested",
-                    })
-                else:
-                    await _send_cancellation_rejection(
-                        out, scope or "unknown", "unsupported_scope",
-                    )
-                    continue
-
-            if msg_type == "autonomous_resume":
-                # Resume a PAUSED (interrupted) autonomous run from its cursor.
-                # interrupt already released the single-runner slot, so this
-                # re-acquire normally succeeds; if a DIFFERENT run now holds it,
-                # refuse (busy) — unicast to the requester, exactly like
-                # autonomous_start (NOT a broadcast: only this client asked).
-                resume_state = _current_autonomous_state()
-                expected_run_id = msg.get("run_id")
-                expected_task_id = msg.get("task_id")
-                expected_plan_revision = msg.get("plan_revision")
-                expected_authorization_revision = msg.get(
-                    "authorization_revision"
-                )
-                exact_task_supplied = "task_id" in msg
-                if (
-                    msg.get("schema_version") != 1
-                    or not isinstance(expected_run_id, str)
-                    or (
-                        exact_task_supplied
-                        and (
-                            not isinstance(expected_task_id, str)
-                            or not expected_task_id
-                            or expected_task_id
-                            != str((resume_state or {}).get("task_id") or "")
-                        )
-                    )
-                    or not isinstance(expected_plan_revision, int)
-                    or isinstance(expected_plan_revision, bool)
-                    or not isinstance(expected_authorization_revision, int)
-                    or isinstance(expected_authorization_revision, bool)
-                    or not _autonomous_resume_target_matches(
-                        resume_state,
-                        expected_run_id,
-                        expected_plan_revision,
-                        expected_authorization_revision,
-                    )
-                    or not _legacy_autonomous_resume_is_safe(resume_state)
-                ):
-                    await out.send_json(
-                        _autonomous_frame(
-                            {"event": "state_updated"}, resume_state,
-                        )
-                        if isinstance(resume_state, dict)
-                        else _autonomous_frame({"event": "idle"}, None)
-                    )
-                    continue
-                _gen = _acquire_single_runner(
-                    task_id=resume_state.get("task_id")
-                )
-                if _gen is None:
-                    await out.send_json(
-                        _autonomous_frame({"event": "busy"}, resume_state)
-                    )
-                    continue
-                # Capture THIS event loop so the orchestrator's daemon thread can
-                # hop progress frames back onto each connection's writer.
-                _autonomous["loop"] = asyncio.get_running_loop()
-                _autonomous["origin_ref"] = authorization_origin_ref
-                _autonomous["document_owner_device"] = permission_session.device_id
-                # Resume OFF the event loop (resume() spawns the loop thread and
-                # joins ≤2 s on its first checkpoint save — never block the loop).
-                threading.Thread(
-                    target=_autonomous_resume_worker,
-                    args=(
-                        _gen,
-                        authorization_origin_ref,
-                        expected_run_id,
-                        expected_plan_revision,
-                        expected_authorization_revision,
-                    ),
-                    daemon=True,
-                ).start()
-                continue
-
-            if msg_type == "autonomous_interrupt":
-                interrupt_state = _current_autonomous_state()
-                if (
-                    not _legacy_execution_control_target_matches(
-                        interrupt_state, msg,
-                    )
-                    or chat_routing.durable_progress_from_state(
-                        interrupt_state
-                    ).get("terminal")
-                    or interrupt_state.get("abandon_state") in {
-                        "abandon_requested", "abandoned_proven",
-                    }
-                ):
-                    await out.send_json(
-                        _autonomous_frame(
-                            {"event": "state_updated"}, interrupt_state,
-                        )
-                        if isinstance(interrupt_state, dict)
-                        else _autonomous_frame({"event": "idle"}, None)
-                    )
-                    continue
-                with _autonomous_lock:
-                    if (
-                        _autonomous.get("interrupting")
-                        or not _autonomous.get("active")
-                        or _autonomous.get("st") is not interrupt_state
-                    ):
-                        interrupt_generation = 0
-                        interrupt_orch = None
-                    else:
-                        interrupt_generation = int(
-                            _autonomous.get("gen", 0)
-                        )
-                        interrupt_orch = _autonomous.get("orch")
-                        # Raise the orphan-terminal gate before the worker can
-                        # race an exact Stop control or a late engine callback.
-                        _autonomous["interrupting"] = True
-                if not interrupt_generation:
-                    await out.send_json(
-                        _autonomous_frame(
-                            {"event": "state_updated"}, interrupt_state,
-                        )
-                    )
-                    continue
-
-                # Pause (resumable): stop() joins ≤2 s, so run it off the loop.
-                # Every mutable reference and the generation are captured now;
-                # a stale frame can never re-read or release a replacement run.
-                def _interrupt_worker(
-                    st=interrupt_state,
-                    orch=interrupt_orch,
-                    generation=interrupt_generation,
-                ):
-                    try:
-                        if orch is not None:
-                            try:
-                                orch.stop()
-                            except Exception:
-                                _adiagnostics.emit_diagnostic_log(
-                                    _adiagnostics.make_diagnostic(
-                                        st,
-                                        stage=_adiagnostics.AutonomousStage.CONTROL,
-                                        category=(
-                                            _adiagnostics.FailureCategory
-                                            .ORCHESTRATOR_FAILURE
-                                        ),
-                                        reason_code="interrupt_stop_failure",
-                                        resumable=True,
-                                        checkpoint_present=True,
-                                    )
-                                )
-                        with _autonomous_lock:
-                            still_owned = bool(
-                                int(_autonomous.get("gen", 0)) == generation
-                                and _autonomous.get("st") is st
-                            )
-                        if not still_owned:
-                            return
-                        agent = _autonomous.get("agent")
-                        provider_now, model_now = (
-                            _adiagnostics.actual_provider_model(
-                                agent,
-                                st.get("provider", ""),
-                                st.get("model", ""),
-                            )
-                        )
-                        diagnostic = _adiagnostics.make_diagnostic(
-                            st,
-                            stage=_adiagnostics.AutonomousStage.CONTROL,
-                            category=_adiagnostics.FailureCategory.INTERRUPTED,
-                            reason_code="user_interrupted",
-                            provider=provider_now,
-                            model=model_now,
-                            resumable=_astate.resume_state_is_valid(st),
-                            checkpoint_present=True,
-                        )
-                        _adiagnostics.record_diagnostic(st, diagnostic)
-                        try:
-                            _astate.save_task_state(st)
-                        except Exception:
-                            _adiagnostics.set_checkpoint_present(st, False)
-                        _broadcast_autonomous(
-                            _autonomous_frame({"event": "interrupted"}, st)
-                        )
-                    finally:
-                        _release_single_runner_if_gen(generation)
-                        # Clear only after a possibly draining orphan is dead.
-                        threading.Thread(
-                            target=_clear_interrupting_after_orphan_drained,
-                            daemon=True,
-                        ).start()
-
-                threading.Thread(
-                    target=_interrupt_worker,
-                    name="osia-legacy-execution-interrupt",
-                    daemon=True,
-                ).start()
-                continue
-
-            if msg_type == "autonomous_abort":
-                if not correlated_autonomous_abandon:
-                    if not await _prepare_correlated_autonomous_cancellation(
-                        out, msg,
-                    ):
-                        continue
-                with _autonomous_lock:
-                    abort_state = _autonomous.get("st")
-                    abort_orch = _autonomous.get("orch")
-                    abort_generation = int(
-                        _autonomous.get("cancellation_control_generation")
-                        or _autonomous.get("gen", 0)
-                    )
-                # Terminalize the workflow while retaining the exact durable
-                # receipt. A late engine callback cannot revive this run, and
-                # an external effect is never replayed to prove abandonment.
-                def _abort_worker(
-                    st=abort_state,
-                    orch=abort_orch,
-                    generation=abort_generation,
-                ):
-                    _autonomous.pop("correlated_cancellation_published", None)
-                    if isinstance(st, dict) and not st.get("abandon_state"):
-                        st["abandon_origin_status"] = str(
-                            st.get("status") or ""
-                        )[:32]
-                        st["abandon_origin_run_state"] = str(
-                            st.get("run_state") or ""
-                        )[:64]
-                        st["abandon_state"] = "abandon_requested"
-                    terminalized = _terminalize_autonomous_abandon(st, orch)
-                    if terminalized:
-                        _broadcast_autonomous(
-                            _autonomous_frame({"event": "aborted"}, st)
-                        )
-                    if generation:
-                        _release_single_runner_if_gen(generation)
-
-                threading.Thread(target=_abort_worker, daemon=True).start()
-                continue
-
-            if msg_type == "get_autonomous_status":
-                # Let a phone that (re)connects mid-run render current progress.
-                # Prefer the in-memory state; fall back to the persisted mobile
-                # file so a fresh process still reports a known run. Unicast.
-                st = _autonomous.get("st")
-                if not isinstance(st, dict):
-                    try:
-                        st = _astate.load_task_state()
-                    except Exception:
-                        st = None
-                if isinstance(st, dict):
-                    _schedule_durable_autonomous_recovery(
-                        st,
-                        origin_ref=authorization_origin_ref,
-                        loop=asyncio.get_running_loop(),
-                        document_owner_device=permission_session.device_id,
-                    )
-                    status = st.get("status", "")
-                    run_state = st.get("run_state", "")
-                    if status in {"done", "failed", "aborted"}:
-                        ev = {
-                            "done": "done",
-                            "failed": "failed",
-                            "aborted": "aborted",
-                        }[status]
-                    elif run_state in {
-                        "authorization_pending", "suspended_scope_extension",
-                        "suspended_authorization_revoked", "blocked_outcome_unknown",
-                        "waiting_tool", "verifying_tool", "resuming",
-                        "blocked_unknown_effect", "cancellation_requested",
-                        "cancelled_proven",
-                    }:
-                        ev = run_state
-                    elif status == "in_progress":
-                        # A LIVE run keeps active=True; interrupt cleared it (the
-                        # run is PAUSED but state stays in_progress ⇒ resumable),
-                        # and a fresh process recovering st from disk has no
-                        # in-memory active run either. Report "interrupted" in
-                        # both cases so a reconnecting phone can offer resume
-                        # (consistent with the GUI offering resume on launch);
-                        # only a genuinely live run (active True) is "running".
-                        ev = "running" if _autonomous.get("active") else "interrupted"
-                    else:
-                        ev = "running"
-                    frame_type = (
-                        "autonomous_plan_ready"
-                        if ev == "authorization_pending"
-                        else "autonomous_authorization_state"
-                        if ev in {
-                            "suspended_scope_extension",
-                            "suspended_authorization_revoked",
-                            "blocked_outcome_unknown",
-                        }
-                        else "autonomous_progress"
-                    )
-                    await out.send_json(_autonomous_frame({
-                        "type": frame_type, "event": ev,
-                    }, st))
-                    if st.get("abandon_state") in _AUTONOMOUS_ABANDON_STATES:
-                        await _send_autonomous_abandon_ack(out, st)
-                else:
-                    await out.send_json(_autonomous_frame({"event": "idle"}, None))
-                continue
 
             # --- API keys & settings (mobile "Configure APIs & Providers") ---
             # set_api_key persists a provider's key to the canonical key store
@@ -12979,15 +9166,14 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "set_setting":
                 setting_key = (msg.get("key") or "").strip()
                 setting_value = msg.get("value")
-                if setting_key == "permission_change_request":
-                    await permission_session.handle_change_request(setting_value)
-                    continue
                 # Whitelist: only these settings.json keys are writable from the
                 # mobile app. Anything else is rejected so a client can't poke
                 # arbitrary server state.
                 allowed_settings = {
                     "liveapi_enabled", "liveapi_provider", "liveapi_model",
                     "tts_provider", "tts_voice", "stt_provider",
+                    "stt_fallback_provider", "stt_local_model", "stt_groq_model",
+                    "ui_theme",
                     "wake_word_enabled",
                     "wake_greeting_enabled", "wake_greeting_text",
                     "cron_jobs", "ai_hierarchy_enabled",
@@ -12998,8 +9184,6 @@ async def websocket_endpoint(ws: WebSocket):
                     # desktop monitor) + seconds-granularity push cadence.
                     "heartbeat_enabled", "heartbeat_interval_seconds",
                     "heartbeat_checks",
-                    # Cooperation IA vision provider/model (WOR-25).
-                    "vision_provider", "vision_model",
                     # Shared reasoning/thinking level settings (WOR-77).
                     "reasoning",
                     # MCP / Connectors server list (WOR-44 Phase 4). The list is
@@ -13007,17 +9191,40 @@ async def websocket_endpoint(ws: WebSocket):
                     # branch below); per-server tokens live only in the
                     # gitignored api_keys.json under `mcp:<id>`.
                     "mcp_servers",
-                    # WOR-191 downgrade-compatible keys. The authoritative
-                    # config layer forces these writes to True/False, so legacy
-                    # mobile clients cannot reactivate auto-approval.
-                    "mcp_confirm_writes",
-                    "mcp_allow_unattended_writes",
                 }
                 if setting_key not in allowed_settings:
                     print(
                         f"[OSIA Server] set_setting rejected non-whitelisted "
                         f"key={setting_key!r}"
                     )
+                    await out.send_json({"type": "status", "status": "error"})
+                    continue
+                if setting_key == "stt_fallback_provider" and (
+                    not isinstance(setting_value, str)
+                    or setting_value not in {"local", "groq", "none"}
+                ):
+                    await out.send_json({"type": "status", "status": "error"})
+                    continue
+                if setting_key == "stt_local_model":
+                    try:
+                        from osia.voice.stt import available_whisper_model_sizes
+
+                        available = available_whisper_model_sizes()
+                    except Exception:
+                        available = set()
+                    if (
+                        not isinstance(setting_value, str)
+                        or setting_value not in {"small", "medium"}
+                        or setting_value not in available
+                    ):
+                        await out.send_json({"type": "status", "status": "error"})
+                        continue
+                if setting_key == "stt_groq_model" and (
+                    not isinstance(setting_value, str)
+                    or setting_value not in {
+                        "whisper-large-v3-turbo", "whisper-large-v3",
+                    }
+                ):
                     await out.send_json({"type": "status", "status": "error"})
                     continue
                 try:
@@ -13043,6 +9250,15 @@ async def websocket_endpoint(ws: WebSocket):
                         ]
                         set_setting("ai_hierarchy", hierarchy)
                         logged_detail = f"{len(hierarchy[category])} item(s)"
+                    elif setting_key == "ui_theme":
+                        set_setting(setting_key, setting_value)
+                        try:
+                            from osia.gui.theme import get_theme_manager
+
+                            get_theme_manager().set_theme(setting_value, persist=False)
+                        except Exception:
+                            # Headless/server-only mode still persists canonical state.
+                            pass
                     elif setting_key == "mcp_servers":
                         # mcp_servers is a list of NON-SECRET server configs. A
                         # token must NEVER reach the git-tracked settings.json —
@@ -13103,10 +9319,8 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             # --- Config snapshot (mobile "OSIA / Personality / Skills" screen) ---
-            # get_config returns everything the mobile config screens need in one
-            # frame: the settings.json contents (incl. api_key_fallbacks), the two
-            # hierarchy chains exposed under their flat mobile names, the
-            # personality document, and the full skill list (name/enabled/prose).
+            # get_config returns the safe PC config in one frame: settings and
+            # presence/count metadata, hierarchy chains, personality, and skills.
             if msg_type == "get_config":
                 try:
                     # Built by the shared _build_config_snapshot() so an
@@ -13158,7 +9372,6 @@ async def websocket_endpoint(ws: WebSocket):
                     store = _memory_store()
                     store.upsert_entry(raw_entry)
                     memory = store.export_snapshot()
-                    await _broadcast_memory_updated(memory)
                     print(
                         f"[OSIA Server] upsert_memory saved "
                         f"({len(memory.get('entries', []))} entries)"
@@ -13192,7 +9405,6 @@ async def websocket_endpoint(ws: WebSocket):
                         )
                         continue
                     memory = store.export_snapshot()
-                    await _broadcast_memory_updated(memory)
                     print(
                         f"[OSIA Server] delete_memory removed {entry_id!r} "
                         f"({len(memory.get('entries', []))} entries)"
@@ -13211,7 +9423,6 @@ async def websocket_endpoint(ws: WebSocket):
                     store = _memory_store()
                     store.clear()
                     memory = store.export_snapshot()
-                    await _broadcast_memory_updated(memory)
                     print("[OSIA Server] clear_memory cleared all entries")
                 except Exception as e:
                     print(f"[OSIA Server] clear_memory failed: {e}")
@@ -13222,21 +9433,20 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                 continue
 
-            # --- API keys (mobile "Configure APIs & Providers" editor) ---
-            # get_config's api_keys_set field reveals only WHICH providers have a
-            # primary key; get_api_keys returns the actual stored primary key per
-            # provider so the mobile editor can display/prefill them. (Fallback
-            # keys travel separately via get_config's api_key_fallbacks.)
-            # Authenticated-only.
+            # --- API-key status (mobile "Configure APIs & Providers" editor) ---
+            # Credential values stay on the PC. Keep the legacy response type
+            # for older clients, but return empty values plus safe status only.
             if msg_type == "get_api_keys":
                 try:
-                    from osia.config import get_api_key
+                    from osia.config import load_api_keys
                     from osia.models import API_PROVIDERS
-                    keys = {p: get_api_key(p) for p in API_PROVIDERS}
-                    await out.send_json({"type": "api_keys", "keys": keys})
+                    stored = load_api_keys()
+                    frame = _safe_api_key_status_frame(stored, API_PROVIDERS)
+                    keys_set = frame["keys_set"]
+                    await out.send_json(frame)
                     print(
                         f"[OSIA Server] get_api_keys sent "
-                        f"({sum(1 for v in keys.values() if v)}/{len(keys)} set)"
+                        f"({sum(1 for v in keys_set.values() if v)}/{len(keys_set)} set; values withheld)"
                     )
                 except Exception as e:
                     print(f"[OSIA Server] get_api_keys failed: {e}")
@@ -13598,31 +9808,6 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json({"type": "status", "status": "done"})
                 continue
 
-            # --- MCP write-tool confirmation response (WOR-44 Phase 5, 5-conf-c) ---
-            # The mobile user tapped Approve/Decline on an mcp_confirm_request we
-            # sent during a write/destructive MCP tool. Resolve the matching pending
-            # Future so the blocked agent worker thread proceeds (approve) or gets a
-            # deny. Non-blocking (just resolves a Future), so the receive loop keeps
-            # serving other frames while a confirm is pending. An unknown/expired id
-            # is ignored cleanly. Additive — mirrors the Phase-4 mcp_* handlers; the
-            # frame carries no secret.
-            if msg_type == "mcp_confirm_response":
-                raw_cid = msg.get("id")
-                cid = raw_cid.strip() if isinstance(raw_cid, str) else ""
-                approved = msg.get("approved") is True
-                if cid:
-                    resolved = _resolve_confirm(
-                        cid,
-                        approved,
-                        channel=out,
-                        response_correlation=msg,
-                    )
-                    await _complete_durable_command(msg, {
-                        "accepted": bool(resolved),
-                        "state": "resolved" if resolved else "expired",
-                    })
-                continue
-
             # --- Heartbeat config (mobile live-metrics screen) ---
             # enable flag + the seconds-granularity push cadence used by the
             # heartbeat_data stream (distinct from the desktop monitor's
@@ -13877,93 +10062,7 @@ async def websocket_endpoint(ws: WebSocket):
             # --- Transactional attachment upload ---
             if msg_type in ATTACHMENT_EVENT_TYPES:
                 responses = attachment_batches.handle(msg)
-                projected_responses = []
                 for response in responses:
-                    if (
-                        response.get("type") == "attachment_batch_commit_ack"
-                        and response.get("attachment_purpose") == "autonomous"
-                    ):
-                        batch_id = str(response.get("batch_id") or "")
-                        cached = autonomous_attachment_acks.get(batch_id)
-                        if cached is not None:
-                            projected_responses.append(dict(cached))
-                            continue
-                        owner_id = _mobile_document_owner(
-                            permission_session.device_id
-                        )
-                        created_refs = []
-                        try:
-                            if not owner_id:
-                                raise document_sources.DocumentSourceError(
-                                    "unauthorized_source"
-                                )
-                            committed = attachment_batches.consume_for_autonomous(
-                                batch_id,
-                                str(response.get("request_id") or ""),
-                            )
-                            permission_epoch = int(
-                                permission_session.store.load_state().policy_epoch
-                            )
-                            safe_sources = []
-                            for item in committed:
-                                source = document_sources.get_source_store().create(
-                                    item.path,
-                                    owner_id=owner_id,
-                                    source_kind="autonomous_mobile_attachment",
-                                    display_name=item.display_name,
-                                    declared_mime=item.detected_mime,
-                                    permission_epoch=permission_epoch,
-                                )
-                                created_refs.append(source["source_ref"])
-                                if source.get("state") != "ready":
-                                    raise document_sources.DocumentSourceError(
-                                        "failed_source"
-                                    )
-                                safe_sources.append({
-                                    "source_ref": source["source_ref"],
-                                    "type_label": source["type_label"],
-                                    "document_family": source["document_family"],
-                                    "state": source["state"],
-                                    "warnings": list(source.get("warnings") or []),
-                                    "logical_order": item.logical_order,
-                                })
-                            enriched = dict(response)
-                            enriched["autonomous_sources"] = safe_sources
-                            autonomous_attachment_acks[batch_id] = dict(enriched)
-                            projected_responses.append(enriched)
-                        except (
-                            AttachmentProtocolError,
-                            document_sources.DocumentSourceError,
-                        ):
-                            if created_refs and owner_id:
-                                try:
-                                    document_sources.get_source_store().release_owned(
-                                        created_refs, owner_id=owner_id,
-                                    )
-                                except document_sources.DocumentSourceError:
-                                    pass
-                            projected_responses.append({
-                                "type": "attachment_batch_failed",
-                                "protocol_version": response.get(
-                                    "protocol_version", 1
-                                ),
-                                "batch_id": batch_id,
-                                "conversation_id": "",
-                                "client_request_id": str(
-                                    response.get("client_request_id") or ""
-                                ),
-                                "request_id": str(
-                                    response.get("request_id") or ""
-                                ),
-                                "event_id": "event_" + secrets.token_hex(16),
-                                "sequence": int(response.get("sequence", 0)),
-                                "category": "document_validation_failed",
-                            })
-                        finally:
-                            attachment_batches.release(batch_id)
-                        continue
-                    projected_responses.append(response)
-                for response in projected_responses:
                     await out.send_json(response)
                 continue
 
@@ -14101,8 +10200,6 @@ async def websocket_endpoint(ws: WebSocket):
                                         "conversation_id": _conv,
                                     })
                                     continue
-                                await _send_conversation_busy(out, _conv)
-                                continue
                             from osia.document_sources import get_source_store
 
                             capability = get_source_store().create(
@@ -14111,9 +10208,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 source_kind="legacy_mobile_attachment",
                                 display_name=safe_name,
                                 declared_mime=image_mime,
-                                permission_epoch=int(
-                                    permission_session.store.load_state().policy_epoch
-                                ),
+                                permission_epoch=_current_policy_epoch(),
                             )
                             created_chat_source_refs.append(
                                 str(capability["source_ref"])
@@ -14125,10 +10220,8 @@ async def websocket_endpoint(ws: WebSocket):
                                 f"\n\n{display_prompt}"
                             )
                             turn_meta = _new_turn_meta(_conv, client_request_id)
-                            turn_meta["_document_owner_device"] = (
-                                permission_session.device_id
-                            )
-                            turn_meta["_autonomous_origin_ref"] = (
+                            turn_meta["_document_owner_device"] = mobile_device_id
+                            turn_meta["_execution_origin_ref"] = (
                                 authorization_origin_ref
                             )
                             turn_meta["client_locale"] = msg.get("locale")
@@ -14493,8 +10586,6 @@ async def websocket_endpoint(ws: WebSocket):
                                 "conversation_id": _conv,
                             })
                             continue
-                        await _send_conversation_busy(out, _conv)
-                        continue
                     if waiting_turn_command:
                         # The suspended turn may have reached terminal between
                         # Mobile's tap and this receive-loop iteration. Never
@@ -14508,6 +10599,7 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     committed_attachments = []
                     created_source_refs: list[str] = []
+                    turn_image_artifacts: list = []
                     if attachment_batch_id:
                         try:
                             committed_attachments = attachment_batches.consume_for_turn(
@@ -14533,10 +10625,9 @@ async def websocket_endpoint(ws: WebSocket):
                                 user_text,
                                 committed_attachments,
                                 owner_id=_conv,
-                                permission_epoch=int(
-                                    permission_session.store.load_state().policy_epoch
-                                ),
+                                permission_epoch=_current_policy_epoch(),
                                 source_refs_out=created_source_refs,
+                                image_artifacts_out=turn_image_artifacts,
                             )
                         except BaseException:
                             _release_unaccepted_source_refs(
@@ -14560,10 +10651,9 @@ async def websocket_endpoint(ws: WebSocket):
                                 list(pending_files),
                                 display_names=pending_file_display_names,
                                 owner_id=_conv,
-                                permission_epoch=int(
-                                    permission_session.store.load_state().policy_epoch
-                                ),
+                                permission_epoch=_current_policy_epoch(),
                                 source_refs_out=created_source_refs,
+                                image_artifacts_out=turn_image_artifacts,
                             )
                         except BaseException:
                             _release_unaccepted_source_refs(
@@ -14578,10 +10668,8 @@ async def websocket_endpoint(ws: WebSocket):
                             client_request_id,
                             turn_directives=turn_directives,
                         )
-                        turn_meta["_document_owner_device"] = (
-                            permission_session.device_id
-                        )
-                        turn_meta["_autonomous_origin_ref"] = (
+                        turn_meta["_document_owner_device"] = mobile_device_id
+                        turn_meta["_execution_origin_ref"] = (
                             authorization_origin_ref
                         )
                         turn_meta["client_locale"] = msg.get("locale")
@@ -14595,13 +10683,19 @@ async def websocket_endpoint(ws: WebSocket):
                         turn_meta["_durable_command_epoch"] = str(
                             msg.get("_durable_command_epoch") or ""
                         )
+                        turn_meta["_durable_command_owner"] = msg.get(
+                            "_durable_command_owner"
+                        )
                         _apply_turn_input_identity(turn_meta, input_identity)
                         if created_source_refs:
                             turn_meta["_preaccept_source_refs"] = list(
                                 created_source_refs
                             )
-                        if input_identity.get("attachment_manifest_hash"):
-                            turn_meta["_durable_agent_input_v1"] = str(agent_input)
+                        if (
+                            input_identity.get("attachment_manifest_hash")
+                            and isinstance(agent_input, str)
+                        ):
+                            turn_meta["_durable_agent_input_v1"] = agent_input
                         if turn_directives is not None:
                             turn_meta["turn_directives"] = turn_directives
                             turn_meta["_turn_directives_v1"] = (
@@ -14611,10 +10705,31 @@ async def websocket_endpoint(ws: WebSocket):
                             turn_meta["persisted_user_content"] = (
                                 persisted_user_content
                             )
-                            turn_meta["attachment_metadata"] = [
+                            attachment_metadata = [
                                 item.persistence_metadata()
                                 for item in committed_attachments
                             ]
+                            image_metadata = iter(
+                                artifact.safe_metadata()
+                                for artifact in turn_image_artifacts
+                            )
+                            for metadata_item in attachment_metadata:
+                                if metadata_item.get("category") == "image":
+                                    metadata_item.update(next(image_metadata, {}))
+                            turn_meta["attachment_metadata"] = attachment_metadata
+                        elif turn_image_artifacts and isinstance(input_manifest, list):
+                            attachment_metadata = [
+                                dict(item) for item in input_manifest
+                                if isinstance(item, dict)
+                            ]
+                            image_metadata = iter(
+                                artifact.safe_metadata()
+                                for artifact in turn_image_artifacts
+                            )
+                            for metadata_item in attachment_metadata:
+                                if metadata_item.get("category") == "image":
+                                    metadata_item.update(next(image_metadata, {}))
+                            turn_meta["attachment_metadata"] = attachment_metadata
                     except BaseException:
                         if isinstance(turn_meta, dict):
                             _release_unaccepted_turn_sources(
@@ -14729,18 +10844,19 @@ async def websocket_endpoint(ws: WebSocket):
                     path: pending_file_display_names.get(path, "")
                     for path in audio_candidate_files
                 }
+                audio_manifest = (
+                    _legacy_attachment_manifest(
+                        audio_candidate_files, audio_candidate_names,
+                    )
+                    if audio_candidate_files else None
+                )
                 audio_identity = _turn_input_identity(
                     b64_data,
                     kind=(
                         "legacy-audio-attachments"
                         if audio_candidate_files else "audio"
                     ),
-                    manifest=(
-                        _legacy_attachment_manifest(
-                            audio_candidate_files, audio_candidate_names,
-                        )
-                        if audio_candidate_files else None
-                    ),
+                    manifest=audio_manifest,
                 )
                 legacy_audio_hash = hashlib.sha256(
                     str(b64_data).encode("utf-8")
@@ -14889,8 +11005,6 @@ async def websocket_endpoint(ws: WebSocket):
                                     "conversation_id": _conv,
                                 })
                                 continue
-                        await _send_conversation_busy(out, _conv)
-                        continue
                     if legacy_audio_shape and not legacy_audio_complete:
                         _discard_replayed_audio_inputs()
                         await out.send_json({
@@ -14903,10 +11017,8 @@ async def websocket_endpoint(ws: WebSocket):
                     _pf = list(audio_candidate_files)
                     _pf_names = dict(audio_candidate_names)
                     turn_meta = _new_turn_meta(_conv, client_request_id)
-                    turn_meta["_document_owner_device"] = (
-                        permission_session.device_id
-                    )
-                    turn_meta["_autonomous_origin_ref"] = (
+                    turn_meta["_document_owner_device"] = mobile_device_id
+                    turn_meta["_execution_origin_ref"] = (
                         authorization_origin_ref
                     )
                     turn_meta["client_locale"] = msg.get("locale")
@@ -14919,7 +11031,15 @@ async def websocket_endpoint(ws: WebSocket):
                     turn_meta["_durable_command_epoch"] = str(
                         msg.get("_durable_command_epoch") or ""
                     )
+                    turn_meta["_durable_command_owner"] = msg.get(
+                        "_durable_command_owner"
+                    )
                     _apply_turn_input_identity(turn_meta, audio_identity)
+                    if isinstance(audio_manifest, list):
+                        turn_meta["_attachment_input_manifest_v1"] = [
+                            dict(item) for item in audio_manifest
+                            if isinstance(item, dict)
+                        ]
                     if legacy_audio_complete:
                         turn_meta["_legacy_audio_replay_v1"] = {
                             "legacy_audio_hash": legacy_audio_hash,
@@ -14933,9 +11053,7 @@ async def websocket_endpoint(ws: WebSocket):
                         _files=_pf,
                         _file_names=_pf_names,
                         _m=turn_meta,
-                        _epoch=int(
-                            permission_session.store.load_state().policy_epoch
-                        ),
+                        _epoch=_current_policy_epoch(),
                     ):
                         async def _operation():
                             return await _handle_audio(
@@ -14990,7 +11108,17 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
-        permission_session.close()
+        for owner in command_owners:
+            settlement = asyncio.create_task(_settle_websocket_command_owner(owner))
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                await settlement
+            except Exception:
+                # The bounded diagnostic is emitted by the settlement helper.
+                # Still close uploads/subscriptions/writer on storage failure.
+                pass
+        command_owners.clear()
         legacy_uploads.cleanup(pending_files)
         attachment_batches.cleanup_disconnected()
         attachment_cleanup_task.cancel()
@@ -15003,6 +11131,8 @@ async def websocket_endpoint(ws: WebSocket):
         _WS_CLIENTS.discard(out)
         for unsubscribe in (
             unsubscribe_api_key_changes,
+            unsubscribe_setting_changes,
+            unsubscribe_memory_changes,
             unsubscribe_account_changes,
         ):
             if unsubscribe is not None:
@@ -15022,11 +11152,6 @@ async def websocket_endpoint(ws: WebSocket):
                 unsubscribe_scheduled_tasks()
             except Exception:
                 pass
-        # Preserve an exact device-bound approval across a transient Mobile
-        # transport reconnect. Unbound requests still fail closed; every other
-        # request keeps its original id/Future/deadline and is projected once
-        # onto the same device's replacement channel.
-        _deny_confirms_for_channel(out)
         # WOR-62: DETACH any in-flight streaming turn for this connection
         # instead of cancelling it. Cancelling raised CancelledError inside the
         # turn (at the ``await asyncio.to_thread(...)`` agent run) BEFORE it
@@ -15259,9 +11384,6 @@ class _LiveAssistantChunkGuard:
         cleaned = clean_response(strip_raw_tool_tags(raw)).strip()
         if not cleaned or is_internal_tool_control_text(cleaned):
             return ""
-        candidate = _join_sent_chunks([*self._accepted, cleaned])
-        if response_language_drift(candidate, self.turn_context):
-            return ""
         self._accepted.append(cleaned)
         return cleaned
 
@@ -15306,8 +11428,9 @@ def _consume_pending_files(
     owner_id: str | None = None,
     permission_epoch: int | None = None,
     source_refs_out: list[str] | None = None,
-) -> str:
-    """Replace legacy pending paths with opaque sources before model access."""
+    image_artifacts_out: list | None = None,
+) -> str | list[dict]:
+    """Snapshot legacy images directly; keep opaque sources for documents."""
     if not pending_files:
         return user_text
     paths = list(pending_files)
@@ -15315,10 +11438,47 @@ def _consume_pending_files(
     from osia.document_sources import get_source_store
 
     capabilities = []
-    for path in paths:
+    image_artifacts = []
+    for raw_path in paths:
+        path = Path(raw_path)
         display_name = str(
-            (display_names or {}).get(str(path)) or Path(path).name
+            (display_names or {}).get(str(path)) or path.name
         )
+        declared_image_mime = _image_mime_for(path)
+        try:
+            with path.open("rb") as handle:
+                prefix = handle.read(16)
+        except OSError as exc:
+            raise AttachmentProtocolError("file_read_failed") from exc
+        from osia.attachments import detect_image_mime
+
+        actual_image_mime = detect_image_mime(prefix)
+        if declared_image_mime or actual_image_mime:
+            from osia.image_inputs import (
+                ImageInputError,
+                ImageSourceType,
+                create_image_artifact,
+            )
+
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise AttachmentProtocolError("file_read_failed") from exc
+            if declared_image_mime and actual_image_mime != declared_image_mime:
+                raise AttachmentProtocolError("invalid_image")
+            try:
+                artifact = create_image_artifact(
+                    data,
+                    str(actual_image_mime or declared_image_mime),
+                    ImageSourceType.USER_UPLOAD,
+                    maximum_bytes=MAX_ATTACHMENT_BYTES,
+                )
+            except ImageInputError as exc:
+                raise AttachmentProtocolError("invalid_image") from exc
+            image_artifacts.append(artifact)
+            if image_artifacts_out is not None:
+                image_artifacts_out.append(artifact)
+            continue
         if owner_id:
             capability = get_source_store().create(
                 path,
@@ -15342,9 +11502,22 @@ def _consume_pending_files(
         + (f" category={item['category']}" if item.get("category") else "")
         for item in capabilities
     )
-    return (
-        "[Document/media attachments available through read_document and "
-        f"query_document:\n{bullets}\n]\n\n{user_text}"
+    text = str(user_text or "").strip()
+    if capabilities:
+        text = (
+            "[Non-image document attachments available through read_document "
+            f"and query_document:\n{bullets}\n]\n\n{text}"
+        ).strip()
+    if not image_artifacts:
+        return text
+    if not text:
+        text = "Analyze the attached image or images."
+    from osia.image_inputs import content_with_images
+
+    return content_with_images(
+        text,
+        image_artifacts,
+        owner_id=str(owner_id or ""),
     )
 
 
@@ -16948,16 +13121,9 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
 
         def _tool_attempt_status(status: str, attempt_id: str) -> None:
             turn_meta["_tool_attempt_id"] = str(attempt_id or "")
-            safe_status = {
-                "action_starting": "action_starting",
-                "action_in_progress": "action_in_progress",
-                "waiting_tool_result": "waiting_tool_result",
-                "verifying_tool_result": "verifying",
-                "resuming_tool_turn": "resuming",
-                "blocked_unknown_effect": "blocked_unknown_effect",
-                "cancellation_requested": "cancellation_requested",
-                "cancelled_proven": "cancelled_proven",
-            }.get(str(status), "action_in_progress")
+            from osia.chat_routing import project_chat_tool_attempt_status
+
+            safe_status = project_chat_tool_attempt_status(status)
             if safe_status == "action_starting" and _apply_queued_tool_cancellation(
                 turn_meta, attempt_id,
             ):
@@ -17054,6 +13220,11 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             if callable(trace_binding):
                 execution_trace_binding[0] = trace_binding(stable_trace_turn_id)
         if isinstance(turn_meta, dict):
+            cancel_generation = getattr(
+                agent, "_invalidate_execution_generation", None,
+            )
+            if callable(cancel_generation):
+                turn_meta["_execution_generation_cancel"] = cancel_generation
             cancel_intent = getattr(
                 agent, "request_turn_cancellation_intent", None,
             )
@@ -17087,40 +13258,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         consume_terminal_receipt(exact_attempt_id)
 
         def _run_agent_busy_tracked():
-            # ChatGPT App Server native approvals arrive while agent.run is
-            # already executing on this worker. Bind the originating channel
-            # here instead of assuming one ContextVar survived every provider
-            # and thread bridge. MCP workers copy this same context, so native
-            # and MCP approvals share one presentation target and broker path.
-            target_token = _turn_target.set((ws, document_loop))
-            trace_correlation = (
-                execution_trace_binding[0]
-                if isinstance(execution_trace_binding[0], dict) else {}
-            )
-            correlation_token = _turn_confirmation_correlation.set({
-                "conversation_id": str(active_conv_id or ""),
-                "request_id": str((turn_meta or {}).get("request_id") or ""),
-                "turn_id": str((turn_meta or {}).get("turn_id") or ""),
-                "run_id": str(
-                    trace_correlation.get("run_id")
-                    or (turn_meta or {}).get("run_id")
-                    or (turn_meta or {}).get("turn_id")
-                    or ""
-                ),
-                "provider_id": str(
-                    trace_correlation.get("provider_id")
-                    or getattr(agent, "provider", "")
-                    or ""
-                ),
-                "model_id": str(
-                    trace_correlation.get("model_id")
-                    or getattr(agent, "model", "")
-                    or ""
-                ),
-                "effective_reasoning": str(
-                    trace_correlation.get("effective_reasoning") or ""
-                ),
-            })
             try:
                 with document_progress_scope(
                     "chat",
@@ -17151,8 +13288,6 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         turn_context=turn_context,
                     )
             finally:
-                _turn_confirmation_correlation.reset(correlation_token)
-                _turn_target.reset(target_token)
                 agent._in_use = False
 
         # Off-thread so the event loop stays free to flush response_chunks.
@@ -17173,42 +13308,76 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         from osia.tool_attempts import WAITING_TOOL_RESULT
 
         if response_text == WAITING_TOOL_RESULT:
-            await _cancel_turn_progress_task(progress_task)
-            progress_task = None
-            for future in pending_puts:
-                try:
-                    await asyncio.wrap_future(future)
-                except Exception:
-                    pass
-            provisional_chunks.clear()
-            if tts_session is not None:
-                tts_session.cancel()
-            current_task = asyncio.current_task()
-            holder = document_loop.create_future()
-            if (
-                active_conv_id
-                and current_task is not None
-                and _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is current_task
-            ):
-                _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
-                pending_turn_holder[0] = holder
-            waiting_frame = _turn_status_frame(
-                turn_meta, "waiting_tool_result",
+            pending_probe = getattr(agent, "pending_tool_attempt_record", None)
+            pending_attempt = (
+                pending_probe()
+                if callable(pending_probe) else
+                None
             )
-            await ws.send_json(waiting_frame)
-            await _broadcast_turn_status(
-                turn_meta,
-                "waiting_tool_result",
-                exclude=ws,
-                frame=waiting_frame,
-            )
-            if not agent.activate_pending_tool_attempt():
-                if pending_turn_holder[0] is holder:
-                    _clear_conversation_turn(active_conv_id, holder)
-                    if not holder.done():
-                        holder.set_result(None)
-                raise RuntimeError("pending tool attempt could not be activated")
-            return agent.exported_history(), active_conv_id
+            if not isinstance(pending_attempt, dict):
+                finalize_structural_wait = getattr(
+                    agent, "finalize_wait_without_pending_tool", None,
+                )
+                response_text = (
+                    finalize_structural_wait()
+                    if callable(finalize_structural_wait) else
+                    (
+                        "L’exécution ne peut pas progresser de façon sûre avec "
+                        "l’état actuel."
+                        if turn_context.language == "fr" else
+                        "Execution cannot safely progress from the current state."
+                    )
+                )
+            else:
+                await _cancel_turn_progress_task(progress_task)
+                progress_task = None
+                for future in pending_puts:
+                    try:
+                        await asyncio.wrap_future(future)
+                    except Exception:
+                        pass
+                provisional_chunks.clear()
+                if tts_session is not None:
+                    tts_session.cancel()
+                current_task = asyncio.current_task()
+                holder = document_loop.create_future()
+                if (
+                    active_conv_id
+                    and current_task is not None
+                    and _ACTIVE_TURNS_BY_CONV.get(active_conv_id) is current_task
+                ):
+                    _ACTIVE_TURNS_BY_CONV[active_conv_id] = holder
+                    pending_turn_holder[0] = holder
+                waiting_frame = _turn_status_frame(
+                    turn_meta, "waiting_tool_result",
+                )
+                await ws.send_json(waiting_frame)
+                await _broadcast_turn_status(
+                    turn_meta,
+                    "waiting_tool_result",
+                    exclude=ws,
+                    frame=waiting_frame,
+                )
+                if not agent.activate_pending_tool_attempt():
+                    if pending_turn_holder[0] is holder:
+                        _clear_conversation_turn(active_conv_id, holder)
+                        if not holder.done():
+                            holder.set_result(None)
+                    finalize_structural_wait = getattr(
+                        agent, "finalize_wait_without_pending_tool", None,
+                    )
+                    response_text = (
+                        finalize_structural_wait()
+                        if callable(finalize_structural_wait) else
+                        (
+                            "L’exécution ne peut pas progresser de façon sûre "
+                            "avec l’état actuel."
+                            if turn_context.language == "fr" else
+                            "Execution cannot safely progress from the current state."
+                        )
+                    )
+                else:
+                    return agent.exported_history(), active_conv_id
     except asyncio.CancelledError:
         # Turn cancelled (client disconnected, or the conversation was
         # deleted/superseded mid-stream). The agent worker thread is
@@ -17230,7 +13399,13 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         progress_task = None
         if "_drain_execution_trace" in locals():
             await _drain_execution_trace()
-        print(f"[OSIA Server] Agent error category={type(e).__name__}")
+        print(
+            f"[OSIA Server] Agent error category={type(e).__name__}"
+            + (
+                f" attribute={getattr(e, 'name', '')}"
+                if isinstance(e, AttributeError) else ""
+            )
+        )
         # Drain any in-flight puts and shut the sender down cleanly.
         for fut in pending_puts:
             try:
@@ -17281,7 +13456,13 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
             )
             if safe_trace is not None:
                 turn_meta["_execution_trace_v1"] = safe_trace
-        if await _close_committed_cancelled_projection(verified_terminal):
+        close_cancelled_projection = locals().get(
+            "_close_committed_cancelled_projection"
+        )
+        if (
+            callable(close_cancelled_projection)
+            and await close_cancelled_projection(verified_terminal)
+        ):
             return history + [
                 {"role": "user", "content": text},
             ], active_conv_id
@@ -17762,6 +13943,32 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
     run_diagnostic = getattr(agent, "last_run_diagnostic", None)
     if not isinstance(run_diagnostic, dict):
         run_diagnostic = None
+    language_diagnostic = persisted_language_drift_diagnostic(run_diagnostic)
+    if language_diagnostic is not None:
+        turn_meta["_language_validation_diagnostic_v1"] = language_diagnostic
+    from osia.tool_contracts import (
+        persisted_computer_use_argument_diagnostic,
+    )
+    argument_diagnostic = persisted_computer_use_argument_diagnostic(
+        getattr(agent, "last_tool_argument_diagnostic", None)
+    )
+    if (
+        isinstance(turn_meta, dict)
+        and argument_diagnostic is not None
+        and argument_diagnostic["conversation_id"]
+        == str(turn_meta.get("conversation_id") or "")
+        and argument_diagnostic["request_id"]
+        == str(turn_meta.get("request_id") or "")
+        and argument_diagnostic["turn_id"]
+        == str(turn_meta.get("turn_id") or "")
+        and argument_diagnostic["provider_id"]
+        == str(turn_meta.get("provider_id") or "")
+        and argument_diagnostic["model_id"]
+        == str(turn_meta.get("model_id") or "")
+    ):
+        turn_meta["_computer_use_argument_diagnostic_v1"] = (
+            argument_diagnostic
+        )
 
     # Tool-call counter for debug logging.
     new_msgs = new_history[prev_len:]
@@ -18177,6 +14384,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
         turn_meta["_pending_transcript"] = transcript
         if pending_files:
             created_source_refs: list[str] = []
+            turn_image_artifacts: list = []
             try:
                 agent_input = _consume_pending_files(
                     agent_input,
@@ -18185,6 +14393,7 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
                     owner_id=active_conv_id,
                     permission_epoch=permission_epoch,
                     source_refs_out=created_source_refs,
+                    image_artifacts_out=turn_image_artifacts,
                 )
             except BaseException:
                 _release_unaccepted_source_refs(
@@ -18193,8 +14402,25 @@ async def _handle_audio(ws: "_OutboundChannel", b64_data: str, audio_format: str
                 raise
             if created_source_refs:
                 turn_meta["_preaccept_source_refs"] = created_source_refs
-        if turn_meta.get("attachment_manifest_hash"):
-            turn_meta["_durable_agent_input_v1"] = str(agent_input)
+            manifest = turn_meta.get("_attachment_input_manifest_v1")
+            if turn_image_artifacts and isinstance(manifest, list):
+                attachment_metadata = [
+                    dict(item) for item in manifest
+                    if isinstance(item, dict)
+                ]
+                image_metadata = iter(
+                    artifact.safe_metadata()
+                    for artifact in turn_image_artifacts
+                )
+                for metadata_item in attachment_metadata:
+                    if metadata_item.get("category") == "image":
+                        metadata_item.update(next(image_metadata, {}))
+                turn_meta["attachment_metadata"] = attachment_metadata
+        if (
+            turn_meta.get("attachment_manifest_hash")
+            and isinstance(agent_input, str)
+        ):
+            turn_meta["_durable_agent_input_v1"] = agent_input
 
         return await _run_agent_and_respond(
             ws, agent_input, history, active_conv_id, t0=t0,

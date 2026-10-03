@@ -14,7 +14,7 @@ engine:
 
   * the main chat loop — ``OSIAAgent._provider_key_chain`` delegates to
     :func:`iter_keys` here (its rotation logic in ``run()`` is unchanged);
-  * screenshot vision (``agent._describe_screenshot`` + ``vision_router``);
+  * active-model multimodal turns (through the normal agent provider route);
   * TTS — OpenAI and Gemini (``voice.tts`` and the mobile server);
   * STT — Groq Whisper (``voice.stt``).
 

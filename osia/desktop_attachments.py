@@ -7,7 +7,6 @@ selected provider/model policy immediately before a turn is accepted.
 
 from __future__ import annotations
 
-import base64
 import mimetypes
 import os
 import stat
@@ -17,42 +16,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from osia.attachments import detect_image_mime, sanitize_display_name
-from osia.image_inputs import image_input_decision
+from osia.image_inputs import (
+    ImageArtifact,
+    ImageSourceType,
+    PROVIDER_IMAGE_POLICIES,
+    ProviderImagePolicy,
+    content_with_images,
+    create_image_artifact,
+    image_input_decision,
+)
 
 
 _MIB = 1024 * 1024
-_MB = 1000 * 1000
 _PREFIX_BYTES = 16
-
-
-@dataclass(frozen=True)
-class ProviderImagePolicy:
-    """Documented bounds for the exact inline-image adapter OSIA uses."""
-
-    maximum_image_bytes: int | None = None
-    maximum_encoded_payload_bytes: int | None = None
-    maximum_images: int | None = None
-
-
-# These limits belong to provider encodings, not to the PC product.  Unknown
-# limits remain ``None`` instead of being replaced with an invented OSIA cap.
-# Sources checked 2026-07-22: OpenAI image inputs, Google inline data, Groq
-# vision, Mistral known limitations, xAI image understanding, plus the existing
-# ChatGPT Account local-image decoder contract.
-PROVIDER_IMAGE_POLICIES: dict[str, ProviderImagePolicy] = {
-    "chatgpt_account": ProviderImagePolicy(maximum_image_bytes=20 * _MIB),
-    "google": ProviderImagePolicy(maximum_encoded_payload_bytes=100 * _MB),
-    "groq": ProviderImagePolicy(
-        maximum_encoded_payload_bytes=20 * _MB,
-        maximum_images=5,
-    ),
-    "mistral": ProviderImagePolicy(maximum_image_bytes=20 * _MB),
-    "openai": ProviderImagePolicy(
-        maximum_encoded_payload_bytes=512 * _MB,
-        maximum_images=1500,
-    ),
-    "xai": ProviderImagePolicy(maximum_image_bytes=20 * _MIB),
-}
+_SUPPORTED_IMAGE_MIMES = frozenset({
+    "image/gif", "image/jpeg", "image/png", "image/webp",
+})
 
 
 class DesktopAttachmentError(RuntimeError):
@@ -91,6 +70,7 @@ class DraftAttachment:
     modified_ns: int
     device: int
     inode: int
+    byte_proved_image: bool = False
     validation_state: str = "pending"
     error_code: str | None = None
 
@@ -102,6 +82,7 @@ class PreparedDesktopTurn:
     provider_content: str | list[dict]
     display_text: str
     attachment_ids: tuple[str, ...]
+    image_references: tuple[dict, ...] = ()
 
 
 def readable_file_size(size_bytes: int) -> str:
@@ -159,17 +140,22 @@ def stage_attachment(path: str | Path, logical_order: int) -> DraftAttachment:
 
     prefix = _read_prefix(source)
     image_mime = detect_image_mime(prefix)
+    declared_mime = _safe_mime(display_name)
+    is_image = bool(
+        image_mime or declared_mime in _SUPPORTED_IMAGE_MIMES
+    )
     return DraftAttachment(
         draft_id=uuid.uuid4().hex,
         source_path=source,
         display_name=display_name,
-        detected_mime=image_mime or _safe_mime(display_name),
+        detected_mime=image_mime or declared_mime,
         size_bytes=int(details.st_size),
-        attachment_type="image" if image_mime else "file",
+        attachment_type="image" if is_image else "file",
         logical_order=int(logical_order),
         modified_ns=int(details.st_mtime_ns),
         device=int(details.st_dev),
         inode=int(details.st_ino),
+        byte_proved_image=bool(image_mime),
     )
 
 
@@ -204,9 +190,21 @@ def _validate_metadata(item: DraftAttachment) -> None:
         )
     prefix = _read_prefix(item.source_path, item=item)
     image_mime = detect_image_mime(prefix)
-    current_type = "image" if image_mime else "file"
-    current_mime = image_mime or _safe_mime(item.display_name)
-    if current_type != item.attachment_type or current_mime != item.detected_mime:
+    declared_mime = _safe_mime(item.display_name)
+    current_type = (
+        "image"
+        if image_mime or declared_mime in _SUPPORTED_IMAGE_MIMES else
+        "file"
+    )
+    current_mime = image_mime or declared_mime
+    if (
+        current_type != item.attachment_type
+        or current_mime != item.detected_mime
+        or (
+            item.attachment_type == "image"
+            and bool(image_mime) != bool(item.byte_proved_image)
+        )
+    ):
         raise DesktopAttachmentError(
             "changed_file",
             attachment_id=item.draft_id,
@@ -329,13 +327,18 @@ def _read_image_snapshot(item: DraftAttachment) -> bytes:
             attachment_id=item.draft_id,
             display_name=item.display_name,
         ) from exc
+    current_image_mime = detect_image_mime(data[:_PREFIX_BYTES])
     if (
         len(data) != item.size_bytes
         or int(before.st_size) != item.size_bytes
         or int(after.st_size) != item.size_bytes
         or int(before.st_mtime_ns) != item.modified_ns
         or int(after.st_mtime_ns) != item.modified_ns
-        or detect_image_mime(data[:_PREFIX_BYTES]) != item.detected_mime
+        or (
+            item.byte_proved_image
+            and current_image_mime != item.detected_mime
+        )
+        or (not item.byte_proved_image and current_image_mime is not None)
     ):
         raise DesktopAttachmentError(
             "changed_file",
@@ -364,7 +367,34 @@ def prepare_desktop_turn(
     for item in ordered:
         _validate_metadata(item)
 
-    files = list(ordered)
+    images = [item for item in ordered if item.attachment_type == "image"]
+    files = [item for item in ordered if item.attachment_type != "image"]
+    _preflight_image_policy(images, provider, model)
+    _preflight_memory(images)
+
+    image_artifacts: list[ImageArtifact] = []
+    for item in images:
+        try:
+            image_artifacts.append(create_image_artifact(
+                _read_image_snapshot(item),
+                item.detected_mime,
+                ImageSourceType.USER_UPLOAD,
+                maximum_bytes=(
+                    PROVIDER_IMAGE_POLICIES.get(
+                        str(provider or "").lower(), ProviderImagePolicy(),
+                    ).maximum_image_bytes
+                ),
+            ))
+        except DesktopAttachmentError:
+            raise
+        except Exception as exc:
+            raise DesktopAttachmentError(
+                "invalid_image",
+                attachment_id=item.draft_id,
+                display_name=item.display_name,
+                provider=provider,
+                model=model,
+            ) from exc
 
     document_capabilities = []
     if files:
@@ -397,13 +427,7 @@ def prepare_desktop_turn(
                 display_name=item.display_name,
             ) from exc
 
-    manifest = "\n".join(
-        f"{position}. attachment ({item.attachment_type})"
-        for position, item in enumerate(ordered, start=1)
-    )
-    text_parts = [
-        "[Attachments in original order:\n" + manifest + "\n]",
-    ]
+    text_parts = []
     if files:
         source_lines = "\n".join(
             f"{ordered.index(item) + 1}. source_ref={capability['source_ref']} "
@@ -421,11 +445,20 @@ def prepare_desktop_turn(
     clean_prompt = str(prompt or "").strip()
     if clean_prompt:
         text_parts.append(clean_prompt)
-    elif files:
+    elif files and not images:
         text_parts.append("Analyze the attached document or documents.")
+    elif images:
+        text_parts.append("Analyze the attached image or images.")
     provider_text = "\n\n".join(text_parts)
 
-    provider_content: str | list[dict] = provider_text
+    provider_content: str | list[dict] = (
+        content_with_images(
+            provider_text,
+            image_artifacts,
+            owner_id=str(owner_id or ""),
+        )
+        if image_artifacts else provider_text
+    )
 
     display_lines = [clean_prompt] if clean_prompt else []
     display_lines.extend(f"📎 {item.display_name}" for item in ordered)
@@ -433,6 +466,9 @@ def prepare_desktop_turn(
         provider_content=provider_content,
         display_text="\n".join(display_lines),
         attachment_ids=tuple(item.draft_id for item in ordered),
+        image_references=tuple(
+            artifact.safe_reference() for artifact in image_artifacts
+        ),
     )
 
 

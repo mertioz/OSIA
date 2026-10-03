@@ -139,7 +139,7 @@ def test_corrupt_record_fails_closed_and_is_not_recoverable(tmp_path):
     assert store.list_recoverable_attempts() == []
 
 
-def test_cleanup_preserves_anti_replay_barrier(tmp_path):
+def test_cleanup_does_not_create_dispatch_anti_replay_authority(tmp_path):
     store = ToolAttemptStore(tmp_path)
     running = _running(store)
     terminal, _created = store.record_terminal_result(
@@ -162,7 +162,7 @@ def test_cleanup_preserves_anti_replay_barrier(tmp_path):
     )
     assert outcome == {"compacted": 1, "removed": 0}
     assert store.get_attempt(running["tool_attempt_id"]) is None
-    assert store.has_terminal_barrier(
+    assert not store.has_terminal_barrier(
         conversation_id=terminal["conversation_id"],
         turn_id=terminal["turn_id"],
         tool_name=terminal["tool_name"],

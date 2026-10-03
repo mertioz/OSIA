@@ -22,11 +22,11 @@ def report():
     return run_shadow_benchmark()
 
 
-def test_phase2_executes_43_high_signal_scenarios_and_retains_164_target(report):
-    assert len(benchmark_scenarios()) == 43
-    assert report.metrics.scenario_count == 43
-    assert report.target_scenario_count == 164
-    assert len({item.scenario_id for item in report.outcomes}) == 43
+def test_phase2_executes_40_high_signal_scenarios_and_retains_152_target(report):
+    assert len(benchmark_scenarios()) == 40
+    assert report.metrics.scenario_count == 40
+    assert report.target_scenario_count == 152
+    assert len({item.scenario_id for item in report.outcomes}) == 40
 
 
 def test_required_phase2_coverage_categories_are_present():
@@ -37,7 +37,7 @@ def test_required_phase2_coverage_categories_are_present():
     }
     assert {
         "direct_api", "mcp", "provider_native", "availability",
-        "surface_fidelity", "personal_browser", "identity",
+        "surface_fidelity", "identity",
         "desktop", "uia", "vision", "keyboard", "deep_link",
         "stale_ref", "outcome_unknown", "reconciliation",
         "permissions", "multi_step", "two_apps", "ordering",
@@ -49,7 +49,7 @@ def test_required_phase2_coverage_categories_are_present():
 
 def test_shadow_metrics_prove_semantic_and_security_gates(report):
     metrics = report.metrics
-    assert metrics.plan_found_rate == pytest.approx(37 / 43)
+    assert metrics.plan_found_rate == pytest.approx(36 / 40)
     assert metrics.semantic_fidelity_rate == 1.0
     assert metrics.false_success_rate == 0.0
     assert metrics.hard_constraint_violation_count == 0
@@ -66,11 +66,11 @@ def test_shadow_metrics_prove_semantic_and_security_gates(report):
 
 def test_legacy_shadow_comparison_counts_and_lists_are_exhaustive(report):
     metrics = report.metrics
-    assert metrics.legacy_shadow_agreement_rate == pytest.approx(23 / 43)
+    assert metrics.legacy_shadow_agreement_rate == pytest.approx(23 / 40)
     assert metrics.plausibly_better_count == 11
     assert metrics.semantically_equivalent_divergence_count == 1
     assert metrics.worse_count == 0
-    assert metrics.unresolved_count == 6
+    assert metrics.unresolved_count == 4
     assert metrics.impossible_to_compare_count == 2
     assert len(report.plausibly_better_scenario_ids) == metrics.plausibly_better_count
     assert len(report.semantically_equivalent_divergence_scenario_ids) == (
@@ -105,8 +105,6 @@ def test_every_equivalent_worse_unresolved_and_impossible_divergence_is_named(re
     )
     assert report.worse_scenario_ids == ()
     assert report.unresolved_scenario_ids == (
-        "personal_browser_wrong_tab",
-        "personal_browser_unknown_authority",
         "target_missing_nonvision",
         "stale_ref_no_direct_actuation",
         "permission_disallowed",
@@ -142,7 +140,6 @@ def test_adversarial_scenarios_all_pass_deterministic_grader(report):
         "unknown_availability_vs_proven_available",
         "outcome_unknown_blocks_mutation_replay",
         "target_missing_nonvision",
-        "personal_browser_unknown_authority",
         "stale_ref_no_direct_actuation",
         "no_plan_only_after_full_scan",
     }

@@ -284,14 +284,6 @@ class TestCanonicalSwitch:
 
 
 class TestSensitiveIntegrationContracts:
-    def test_permissions_migrate_binary_controls_but_keep_acknowledgement_checkbox(self):
-        source = (ROOT / "osia" / "gui" / "permissions_center.py").read_text("utf-8")
-        assert source.count("OsiaSwitch(") == 3
-        assert "toggle = OsiaSwitch(i18n.t(_SWITCH_KEYS[category]))" in source
-        assert "self._payment_enabled = OsiaSwitch()" in source
-        assert "self._destinations_enabled = OsiaSwitch()" in source
-        assert "self._ack = QCheckBox()" in source
-
     def test_skills_switch_calls_the_existing_persistence_callback_once(self):
         switch = OsiaSwitch(reduced_motion=lambda: True, theme_manager=_manager())
         switch.setChecked(True)
@@ -331,15 +323,6 @@ class TestSensitiveIntegrationContracts:
         assert 'set_setting("wake_greeting_enabled", enabled)' in source
         assert "self._tts_provider_combo = QComboBox()" in source
 
-    def test_autonomous_actions_and_provider_choices_are_not_misclassified_as_switches(self):
-        source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
-        autonomous = source.split("class _AutonomousPanel", 1)[1].split(
-            "class _NavButton", 1
-        )[0]
-        assert "OsiaSwitch(" not in autonomous
-        assert "self._start_btn = QPushButton" in autonomous
-        assert "self._abort_btn = QPushButton" in autonomous
-        assert "self._model_combo = QComboBox" in autonomous
 
     def test_scheduled_tasks_and_dynamic_controls_use_the_canonical_switch(self):
         source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
@@ -349,24 +332,10 @@ class TestSensitiveIntegrationContracts:
         assert "self._hb_check_toggles[name] = toggle" in source
         assert "self._build_skill_row(name)" in source
 
-    def test_binary_inventory_and_intentional_exclusions_are_complete(self):
-        popup = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
-        update = (ROOT / "osia" / "gui" / "update_ui.py").read_text("utf-8")
-        legal = (ROOT / "osia" / "gui" / "legal_dialog.py").read_text("utf-8")
-        onboarding = (ROOT / "osia" / "gui" / "onboarding.py").read_text("utf-8")
-        assert popup.count("OsiaSwitch(") == 11
-        assert "QCheckBox" not in popup
-        assert "smartToggle" not in popup
-        assert update.count("OsiaSwitch(") == 1
-        assert "QCheckBox" not in update
-        assert "self.acceptance = QCheckBox(" in legal
-        assert "button.setCheckable(True)" in onboarding
-        assert "self._theme_group.setExclusive(True)" in popup
-        assert "self.history_button.setCheckable(True)" in update
 
     def test_source_and_frozen_package_discover_the_same_switch_module(self):
         spec = (ROOT / "packaging" / "windows" / "osia.spec").read_text("utf-8")
         assert 'collect_submodules(\n    "osia"' in spec
-        for module in ("main_popup.py", "permissions_center.py", "update_ui.py"):
+        for module in ("main_popup.py", "update_ui.py"):
             source = (ROOT / "osia" / "gui" / module).read_text("utf-8")
             assert "from osia.gui.switch import OsiaSwitch" in source

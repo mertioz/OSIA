@@ -25,8 +25,10 @@ def test_new_instruction_appears_exactly_once_and_old_generic_copy_is_removed(
     _stable_personality(monkeypatch)
     english = agent.get_system_prompt("en", "model", "provider")
     french = agent.get_system_prompt("fr", "model", "provider")
-    assert english.count(EN_STYLE) == 1
-    assert french.count(EN_STYLE) == 1
+    assert EN_STYLE not in english
+    assert EN_STYLE not in french
+    assert english.count("Never expose private reasoning") == 1
+    assert french.count("Never expose private reasoning") == 1
     assert "Raisonne avec soin et en profondeur" not in french
     assert "helpful, concise, and friendly" not in english
     assert "Be concise." not in english
@@ -36,11 +38,11 @@ def test_new_instruction_appears_exactly_once_and_old_generic_copy_is_removed(
 def test_instruction_preserves_depth_accuracy_completeness_and_privacy(monkeypatch):
     _stable_personality(monkeypatch)
     prompt = agent.get_system_prompt("en", "model", "provider")
-    assert "carefully and thoroughly internally" in prompt
-    assert "concise and direct" in prompt
-    assert "without sacrificing accuracy or necessary completeness" in prompt
-    assert "Do not reveal private chain-of-thought" in prompt
-    assert "conclusions, relevant evidence" in prompt
+    assert "one truthful final response" in prompt
+    assert "Never expose private reasoning" in prompt
+    assert "supporting evidence" in prompt
+    assert "carefully and thoroughly internally" not in prompt
+    assert "avoid overthinking" not in prompt.lower()
     assert "reveal your chain-of-thought" not in prompt.lower()
 
 
@@ -48,15 +50,17 @@ def test_all_supported_providers_receive_the_same_compatible_instruction(monkeyp
     _stable_personality(monkeypatch)
     for provider in (*PROVIDERS, "chatgpt_account"):
         prompt = agent.get_system_prompt("en", "test-model", provider)
-        assert prompt.count(EN_STYLE) == 1
+        assert EN_STYLE not in prompt
+        assert prompt.count("Never expose private reasoning") == 1
 
 
 def test_tool_security_and_anti_loop_contracts_are_unchanged(monkeypatch):
     _stable_personality(monkeypatch)
     prompt = agent.get_system_prompt("en", "model", "provider")
-    assert "## How to Use Tools" in prompt
-    assert "## Honesty about tool results (CRITICAL)" in prompt
-    assert 'starts with "ERROR:"' in prompt
+    assert "## Tool call format" in prompt
+    assert "## Essential protections" in prompt
+    assert "an `ERROR:` or `TOOL FAILED` result is not success" in prompt
+    assert "do not intentionally duplicate it" in prompt
     guard_source = inspect.getsource(agent._AntiLoopGuard)
     assert "class _AntiLoopGuard" in guard_source
     assert "record" in guard_source

@@ -36,7 +36,6 @@ from osia.capability_search import (
     AttemptEffectState,
     CapabilityPermissionState,
     DeterministicRoute,
-    PersonalBrowserAuthority,
     PermissionState,
     ShadowPlanningContext,
     StaleReference,
@@ -45,6 +44,7 @@ from osia.capability_search import (
 from osia.goal_contract import (
     GOAL_CONTRACT_SCHEMA_VERSION,
     GoalContract,
+    GoalExecutionBinding,
     GoalNodeContract,
     NOT_SPECIFIED,
     ObservablePostcondition,
@@ -161,6 +161,8 @@ def fixture_node(
         forbidden_false_success_states=(),
         observable_postconditions=postconditions,
         side_effect_class=side_effect,
+        read_only=side_effect == SideEffectClass.READ_ONLY.value,
+        mutation=side_effect != SideEffectClass.READ_ONLY.value,
         source_semantic_node_fingerprint=f"fixture:{node_id}",
     )
 
@@ -177,6 +179,7 @@ def fixture_goal_contract(
         legacy_fingerprint="phase2_fixture",
         nodes=tuple(nodes),
         global_constraints=(),
+        execution_binding=GoalExecutionBinding(),
         fingerprint="",
     )
     contract = replace(
@@ -363,7 +366,7 @@ def benchmark_scenarios() -> tuple[ShadowBenchmarkScenario, ...]:
     frontier = fixture_descriptor("api:archive_frontier", direct, "act", target="archive record", application="archive", surface="records", effect="read discovered archive record", availability=RuntimeAvailability.UNKNOWN.value, exact_postcondition="archive record is returned")
     scenarios.append(_single_scenario("discover_unresolved_runtime_frontier", ("retrieval", "discover"), node, (discover, frontier), ShadowBenchmarkExpectation(True, frontier.capability_id, ("discover", "act")), legacy=_legacy(frontier.capability_id)))
 
-    # Surface and Personal Browser fidelity.
+    # Surface fidelity.
     node = fixture_node("n1", "Search Subnautica inside Steam Library", "Subnautica", "Steam", "Steam Library", postcondition="Subnautica appears in Steam Library")
     store = fixture_descriptor("browser:steam_store_search", browser, "act", target="Subnautica", application="Steam", surface="Steam Store", effect="search Subnautica", exact_postcondition="Subnautica appears in Steam Library")
     library = fixture_descriptor("uia:steam_library_search", uia, "act", target="Subnautica", application="Steam", surface="Steam Library", effect="search Subnautica Steam Library", exact_postcondition="Subnautica appears in Steam Library")
@@ -373,17 +376,6 @@ def benchmark_scenarios() -> tuple[ShadowBenchmarkScenario, ...]:
     web_settings = fixture_descriptor("browser:settings_help", browser, "act", target="Bluetooth", application="Settings", surface="web", effect="open Bluetooth help", exact_postcondition="native Bluetooth panel is open")
     native_settings = fixture_descriptor("route:native_bluetooth", CapabilityFamily.DEEP_LINK.value, "act", target="Bluetooth", application="Settings", surface="native_settings", effect="open native Bluetooth panel", exact_postcondition="native Bluetooth panel is open")
     scenarios.append(_single_scenario("native_required_vs_web_surface", ("surface_fidelity", "deep_link"), node, (web_settings, native_settings), ShadowBenchmarkExpectation(True, native_settings.capability_id, hard_rejected_capability_ids=(web_settings.capability_id,)), legacy=_legacy(web_settings.capability_id)))
-
-    node = fixture_node("n1", "Submit draft in authorized Personal Browser tab", "draft", "browser", "personal_tab", account="personal", side_effect=external, postcondition="draft is submitted")
-    personal = fixture_descriptor("personal:submit_draft", CapabilityFamily.PERSONAL_BROWSER.value, "act", target="draft", application="browser", surface="personal_tab", account="personal", effect="submit draft", side_effect=external, equivalence_class="submit_draft", exact_postcondition="draft is submitted", modalities=(ModalityRequirement.PERSONAL_BROWSER_LIVE_AUTHORITY.value,), extra_constraints=(("tab_id", "tab-1"), ("session_id", "session-1")))
-    authorized = {"personal_browser_authorities": (PersonalBrowserAuthority(personal.capability_id, "tab-1", "session-1", True),), "permission_states": (CapabilityPermissionState(personal.capability_id, PermissionState.PERMITTED.value),)}
-    scenarios.append(_single_scenario("personal_browser_exact_tab", ("personal_browser", "identity"), node, (personal,), ShadowBenchmarkExpectation(True, personal.capability_id), legacy=_legacy(personal.capability_id), context_changes=authorized))
-    wrong_authority = dict(authorized)
-    wrong_authority["personal_browser_authorities"] = (PersonalBrowserAuthority(personal.capability_id, "tab-2", "session-1", True),)
-    scenarios.append(_single_scenario("personal_browser_wrong_tab", ("personal_browser", "identity"), node, (personal,), ShadowBenchmarkExpectation(False, hard_rejected_capability_ids=(personal.capability_id,), full_scan_required=True), legacy=_legacy(personal.capability_id), context_changes=wrong_authority))
-    unknown_authority = dict(authorized)
-    unknown_authority["personal_browser_authorities"] = (PersonalBrowserAuthority(personal.capability_id, "", "", None),)
-    scenarios.append(_single_scenario("personal_browser_unknown_authority", ("personal_browser", "identity"), node, (personal,), ShadowBenchmarkExpectation(False, full_scan_required=True), legacy=_legacy(personal.capability_id), context_changes=unknown_authority))
 
     # Desktop routing, observation, accessibility, and stale references.
     node = fixture_node("n1", "Activate exact Bluetooth control", "Bluetooth control", "Settings", "native_settings", side_effect=local, postcondition="Bluetooth control is active")
@@ -648,7 +640,7 @@ def run_shadow_benchmark(
                 reasons = set(rejected.hard_rejection_reasons)
                 permission_violations += int("permission_disallowed" in reasons)
                 identity_violations += int(bool(reasons.intersection({
-                    "account_mismatch", "personal_browser_authority_mismatch",
+                    "account_mismatch",
                 })))
                 replay_violations += int("outcome_unknown_replay_blocked" in reasons)
                 modality_violations += int("modality_unavailable" in reasons)

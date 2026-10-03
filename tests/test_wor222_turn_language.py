@@ -13,9 +13,9 @@ from osia.chatgpt_account.provider import (
     ChatGPTAccountProvider,
     _sanitized_system_prompt,
 )
+from osia.tool_contracts import ExecutionOutcome, ToolExecutionRecord
 from osia.turn_context import (
     fixed_turn_context,
-    language_consistency_failure_text,
     language_instruction,
     response_language_drift,
     resolve_turn_context,
@@ -112,7 +112,7 @@ def test_chatgpt_desktop_sanitizer_keeps_turn_contract_last():
     assert "[DESKTOP PATH: C:\\Users\\fixture\\Desktop]" in sanitized
     assert sanitized.rstrip().endswith(contract)
     assert sanitized.index("[DESKTOP PATH:") < sanitized.index(
-        "[AUTHORITATIVE TURN LANGUAGE]"
+        "[TURN RESPONSE LANGUAGE]"
     )
 
 
@@ -220,7 +220,7 @@ def test_bounded_drift_check_ignores_quoted_and_labelled_source_values():
     ) is None
 
 
-def test_french_cv_skill_tool_turn_regenerates_only_drifted_final(monkeypatch):
+def test_french_cv_tool_receipts_do_not_create_a_hard_language_gate(monkeypatch):
     executions = []
     multilingual_result = (
         "CV: exp\u00e9rience enti\u00e8rement fran\u00e7aise. "
@@ -242,6 +242,21 @@ def test_french_cv_skill_tool_turn_regenerates_only_drifted_final(monkeypatch):
     monkeypatch.setattr(
         "osia.action_policy.is_final_external_tool_call", lambda *_a, **_k: False,
     )
+
+    def execute(tool_name, kwargs, **_options):
+        result = agent_module.TOOL_MAP[tool_name](**kwargs)
+        _spec, contract = agent_module._tool_spec_and_contract(tool_name, kwargs)
+        return ToolExecutionRecord(
+            result,
+            False,
+            ExecutionOutcome.SUCCESS_VERIFIED,
+            1,
+            True,
+            False,
+            contract,
+        )
+
+    monkeypatch.setattr(agent_module, "_execute_tool_with_policy", execute)
     rounds = iter((
         '<tool_call>{"tool":"get_system_info"}</tool_call>',
         (
@@ -276,24 +291,23 @@ def test_french_cv_skill_tool_turn_regenerates_only_drifted_final(monkeypatch):
         turn_context=_context("fr"),
     )
 
+    # WOR-301: unrelated read-only observers are no longer refused before
+    # dispatch; their receipts still must not affect the presentation-only
+    # repair round.
     assert executions == ["system", "volume"]
-    assert len(wire_rounds) == 4
+    assert len(wire_rounds) == 3
     assert all(
         _last_user_text(wire).rstrip().endswith(
             language_instruction(_context("fr"))
         )
         for wire in wire_rounds
     )
-    assert "Le CV est coh\u00e9rent" in final
-    assert '"Customer Support Specialist"' in final
-    assert "He detectado" not in final
+    assert "Le CV est bien r\u00e9dig\u00e9" in final
+    assert "He detectado" in final
     assert visible == [final]
-    assert "He detectado diferencias entre Indeed" not in str(
-        agent.exported_history()
-    )
 
 
-def test_second_drift_returns_one_localized_canonical_error():
+def test_second_drift_returns_the_useful_original_candidate():
     agent = OSIAAgent(lang="fr")
     rounds = iter((
         "He detectado diferencias importantes entre los dos perfiles profesionales.",
@@ -314,13 +328,28 @@ def test_second_drift_returns_one_localized_canonical_error():
     )
 
     assert len(calls) == 2
-    assert final == language_consistency_failure_text("fr")
+    assert final == (
+        "He detectado diferencias importantes entre los dos perfiles profesionales."
+    )
     assert visible == [final]
-    assert agent.last_run_diagnostic == {
-        "stage": "response_generation",
-        "error_category": "language_consistency_failure",
-        "reason_code": "language_consistency_failure",
-    }
+    assert agent.last_run_diagnostic is not None
+    assert agent.last_run_diagnostic["stage"] == "response_generation"
+    assert "error_category" not in agent.last_run_diagnostic
+    assert agent.last_run_diagnostic["reason_code"] == (
+        "language_presentation_repair_incomplete"
+    )
+    assert agent.last_run_diagnostic["analysis_scope"] == (
+        "user_facing_final_answer"
+    )
+    assert agent.last_run_diagnostic["expected_language"] == "fr"
+    assert agent.last_run_diagnostic["detected_final_answer_language"] == "es"
+    assert agent.last_run_diagnostic["analyzed_text_span"] == (
+        "La experiencia profesional no coincide con el perfil y requiere cambios."
+    )
+    assert agent.last_run_diagnostic["confidence"] >= 0.85
+    assert agent.last_run_diagnostic["reason"] == (
+        "foreign_assistant_prose_response"
+    )
 
 
 def test_regeneration_cannot_dispatch_or_replay_a_tool(monkeypatch):
@@ -348,7 +377,9 @@ def test_regeneration_cannot_dispatch_or_replay_a_tool(monkeypatch):
     )
 
     assert executions == []
-    assert final == language_consistency_failure_text("fr")
+    assert final == (
+        "He detectado diferencias importantes entre los perfiles profesionales."
+    )
     assert visible == [final]
 
 

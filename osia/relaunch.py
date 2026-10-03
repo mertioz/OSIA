@@ -265,8 +265,38 @@ def run_coordinator(
         _release_windows_mutex(coordinator_mutex)
 
 
+def launch_desktop(*, process_factory=None) -> int:
+    """Launch the canonical desktop detached from a short-lived launcher."""
+
+    if sys.platform == "win32":
+        try:
+            from osia.utils.systemd_manager import ensure_service_running
+
+            if not ensure_service_running("osia-server.service"):
+                print("[OSIA] canonical mobile server readiness failed")
+                return 6
+        except Exception as exc:
+            print(
+                "[OSIA] canonical mobile server readiness failed "
+                f"category={type(exc).__name__}"
+            )
+            return 6
+
+    factory = process_factory or subprocess.Popen
+    kwargs = _detached_kwargs()
+    try:
+        factory(desktop_command(), **kwargs)
+    except Exception:
+        return 5
+    finally:
+        _close_child_streams(kwargs)
+    return 0
+
+
 def main(args: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if args is None else args)
+    if values == ["--launch-desktop"]:
+        return launch_desktop()
     if len(values) != 2 or values[0] != "--coordinator":
         return 2
     try:

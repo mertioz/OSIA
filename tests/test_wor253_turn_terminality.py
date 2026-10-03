@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from osia.agent import OSIAAgent
-from osia.autonomous.orchestrator import Orchestrator
 from osia.execution_strategy import (
     ExecutionStrategy,
     StrategyLayer,
@@ -16,6 +15,7 @@ from osia.execution_strategy import (
     mechanism_for_tool,
     record_resumed_tool_outcome,
 )
+from osia.permission_outcome import execution_state_text
 from osia.server import server
 from osia.tool_attempts import WAITING_TOOL_RESULT
 from osia.tool_contracts import (
@@ -26,7 +26,9 @@ from osia.tool_contracts import (
 )
 from osia.turn_terminality import (
     TerminalState,
+    TerminalityDecision,
     TurnTerminalityController,
+    WaitType,
 )
 
 
@@ -40,7 +42,46 @@ def _controller(tmp, *, turn="turn-1", execution=True, postconditions=("done",))
     )
 
 
-def test_provider_completion_reinvokes_same_turn_and_exposes_one_final():
+def _completion_fixture(agent, answer, directory=None):
+    """Return the current provider protocol, using a real read for external facts."""
+    controller = agent._terminality_controller
+    requirements = controller.snapshot()["outcome_contract"]["requirements"]
+    if directory is None:
+        assert not requirements, "external requirements need an observed fixture"
+        outcomes = [{"id": "answer", "result": "requested answer", "kind": "assistant_content", "receipt_ids": []}]
+    else:
+        from osia.agent import _execute_tool_with_policy
+
+        path = Path(directory) / "verified-effect.txt"
+        declarations = [
+            {"id": requirement["id"], "result": requirement["result"],
+             "kind": "artifact", "target": {"path": str(path)},
+             "expected": {"exists": True}}
+            for requirement in requirements
+        ] or [{"id": "verified-fixture", "result": "fixture created and observed",
+               "kind": "artifact", "target": {"path": str(path)}, "expected": {"exists": True}}]
+        assert all(item["kind"] in {"unbound", "artifact"} for item in requirements)
+        controller.declare_outcomes(declarations)
+        path.write_text("verified fixture result", encoding="utf-8")
+        record = _execute_tool_with_policy("read_file", {"path": str(path)}, allow_retry=False, lang="en")
+        assert record.outcome is ExecutionOutcome.SUCCESS_VERIFIED
+        assert "verified fixture result" in str(record.result)
+        controller.record_execution_record("read_file", record, arguments={"path": str(path)})
+        receipt_id = controller.receipt_reference(record.result, record.tool_attempt_id)
+        assert receipt_id
+        outcomes = [
+            {**requirement, "receipt_ids": [receipt_id]}
+            for requirement in declarations
+        ]
+    return answer + '<osia_completion>' + json.dumps({"outcomes": outcomes}) + '</osia_completion>'
+
+
+def _fixture_summary(directory):
+    from osia.outcome_contract import normalize_fact_path
+    return "- Path " + normalize_fact_path(str(Path(directory) / "verified-effect.txt")) + " is present."
+
+
+def test_selected_model_completion_exposes_one_final_without_forced_synthesis():
     with tempfile.TemporaryDirectory() as tmp, patch(
         "osia.turn_terminality.CONFIG_DIR", tmp,
     ):
@@ -50,13 +91,9 @@ def test_provider_completion_reinvokes_same_turn_and_exposes_one_final():
 
         def fake_run(self, text, **kwargs):
             calls.append(text)
-            candidate = "premature narration" if len(calls) == 1 else "verified final"
+            candidate = "premature narration" if len(calls) == 1 else _completion_fixture(self, "verified final", tmp)
             self.messages.append({"role": "user", "content": text})
             self.messages.append({"role": "assistant", "content": candidate})
-            if len(calls) == 2:
-                self._terminality_controller.prove_postcondition(
-                    "effect verified", {"receipt": "typed-success"},
-                )
             if kwargs.get("on_sentence"):
                 kwargs["on_sentence"](candidate)
             return candidate
@@ -69,14 +106,15 @@ def test_provider_completion_reinvokes_same_turn_and_exposes_one_final():
             execution_required=True,
             on_sentence=streamed.append,
         )
-        assert final == "verified final"
-        assert len(calls) == 2
-        assert streamed == ["verified final"]
+        assert final == "premature narration"
+        assert len(calls) == 1
+        assert streamed == ["premature narration"]
         assert agent.terminality_result("same-turn")["terminal_state"] == "success_verified"
+        assert agent.terminality_result("same-turn")["reason_code"] == "selected_model_completed"
         assert [
             item["content"] for item in agent.exported_history()
             if item.get("role") == "assistant"
-        ] == ["verified final"]
+        ] == ["premature narration"]
 
 
 def test_completed_pending_receipt_gets_automatic_final_synthesis_segment():
@@ -89,14 +127,15 @@ def test_completed_pending_receipt_gets_automatic_final_synthesis_segment():
         def fake_run(self, text, **_kwargs):
             calls.append(text)
             if len(calls) == 1:
-                self._terminality_controller.prove_postcondition(
-                    "effect verified", {"receipt": "completed"},
-                )
+                # The tool receipt exists before the synthesis invocation;
+                # only that invocation's declaration can complete the turn.
+                _completion_fixture(self, "receipt ready", tmp)
                 return WAITING_TOOL_RESULT
+            candidate = _completion_fixture(self, "synthesized final", tmp)
             self.messages.append({
-                "role": "assistant", "content": "synthesized final",
+                "role": "assistant", "content": candidate,
             })
-            return "synthesized final"
+            return candidate
 
         agent.run = types.MethodType(fake_run, agent)
         final = agent.run_terminal_turn(
@@ -105,9 +144,9 @@ def test_completed_pending_receipt_gets_automatic_final_synthesis_segment():
             required_postconditions=("effect verified",),
             execution_required=True,
         )
-        assert final == "synthesized final"
+        assert final == _fixture_summary(tmp)
         assert len(calls) == 2
-        assert "final synthesis" in calls[1]
+        assert "same original objective" in calls[1]
 
 
 def test_simple_informational_answer_completes_in_one_invocation_with_streaming():
@@ -120,9 +159,10 @@ def test_simple_informational_answer_completes_in_one_invocation_with_streaming(
 
         def fake_run(self, text, **kwargs):
             calls.append(text)
-            self.messages.append({"role": "assistant", "content": "Paris."})
-            kwargs["on_sentence"]("Paris.")
-            return "Paris."
+            candidate = _completion_fixture(self, "Paris.")
+            self.messages.append({"role": "assistant", "content": candidate})
+            assert kwargs["on_sentence"] is None
+            return candidate
 
         agent.run = types.MethodType(fake_run, agent)
         assert agent.run_terminal_turn(
@@ -180,7 +220,7 @@ def test_active_provider_invocation_rejects_a_concurrent_segment():
         assert controller.evaluate(provider_route="p:m").action == "wait"
 
 
-def test_terminal_async_receipt_releases_attempt_and_permission_wait():
+def test_terminal_event_without_exact_durable_attempt_stays_fail_closed():
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp)
         controller.set_attempt_state(
@@ -192,11 +232,17 @@ def test_terminal_async_receipt_releases_attempt_and_permission_wait():
             attempt_id="attempt-failed",
         )
         snapshot = controller.snapshot()
-        assert snapshot["active_attempts"] == {}
-        assert snapshot["permission_state"] == "resolved"
+        assert "attempt-failed" in snapshot["active_attempts"]
+        assert snapshot["permission_state"] == "pending"
+        assert any(
+            item["attempt_id"] == "attempt-failed"
+            and item["outcome"] == "confirmed_failure_before_effect"
+            for item in snapshot["typed_evidence"]
+        )
+        assert controller.evaluate().wait_type == WaitType.WAIT_PENDING_TOOL.value
 
 
-def test_unverified_async_success_requires_read_only_reconciliation():
+def test_unverified_event_without_exact_durable_attempt_remains_pending():
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp)
         controller.set_attempt_state("attempt-effect", status="pending")
@@ -206,8 +252,12 @@ def test_unverified_async_success_requires_read_only_reconciliation():
             attempt_id="attempt-effect",
         )
         decision = controller.evaluate(provider_route="p:m")
-        assert controller.snapshot()["active_attempts"] == {}
-        assert decision.next_strategy == "reconcile_unknown_read_only"
+        snapshot = controller.snapshot()
+        assert "attempt-effect" in snapshot["active_attempts"]
+        assert snapshot["unknown_effects"]["attempt-effect"]["outcome"] == (
+            "success_unverified"
+        )
+        assert decision.wait_type == WaitType.WAIT_PENDING_TOOL.value
 
 
 def test_provider_invocation_is_not_persisted_as_a_strategy_attempt():
@@ -278,7 +328,10 @@ def test_unquoted_search_target_stops_at_sentence_boundary():
     assert goal.target_object == "requirements.txt"
 
 
-def test_allow_receipt_resumes_same_turn_exactly_once():
+def test_unproven_pending_receipt_never_exposes_tool_wait_sentinel():
+    # WOR-303: a structural wait without a proven correlated attempt is a
+    # stalled cycle of the SAME canonical turn.  The runtime continues and the
+    # objective completes instead of terminalizing on a false wait.
     with tempfile.TemporaryDirectory() as tmp, patch(
         "osia.turn_terminality.CONFIG_DIR", tmp,
     ):
@@ -292,8 +345,9 @@ def test_allow_receipt_resumes_same_turn_exactly_once():
                     "attempt-allow", status="pending", permission_state="pending",
                 )
                 return WAITING_TOOL_RESULT
-            self.messages.append({"role": "assistant", "content": "allowed final"})
-            return "allowed final"
+            candidate = _completion_fixture(self, "allowed final", tmp)
+            self.messages.append({"role": "assistant", "content": candidate})
+            return candidate
 
         agent.run = types.MethodType(fake_run, agent)
         first = agent.run_terminal_turn(
@@ -302,34 +356,144 @@ def test_allow_receipt_resumes_same_turn_exactly_once():
             required_postconditions=("effect verified",),
             execution_required=True,
         )
-        assert first == WAITING_TOOL_RESULT
-        controller = agent._terminality_controller
-        strategy = agent._terminality_strategy
-        controller.set_permission_state("allowed")
-        controller.set_attempt_state("attempt-allow", status="completed")
-        controller.record_typed_evidence(
-            outcome="success_verified",
-            evidence={"permit": "consumed-once"},
-            attempt_id="attempt-allow",
-        )
-        controller.prove_postcondition(
-            "effect verified", {"permit": "consumed-once"},
-        )
-        final = agent._drive_terminal_turn(
-            controller,
-            strategy,
-            initial_input="<tool_result>allowed</tool_result>",
-            initial_strategy_id="tool_receipt_continuation",
-            history=None,
-            on_sentence=None,
-            on_first_token=None,
-            current_conversation_id="conversation",
-            turn_context=None,
-            canonical_output=True,
-        )
-        assert final == "allowed final"
+        assert first != WAITING_TOOL_RESULT
+        result = agent.terminality_result("allow-turn")
+        assert result["terminal_state"] == "success_verified"
         assert len(calls) == 2
-        assert agent.terminality_result("allow-turn")["terminal_state"] == "success_verified"
+
+
+def test_non_tool_wait_types_do_not_probe_or_activate_pending_tools():
+    waits = (
+        (
+            WaitType.WAIT_PROVIDER_CONTINUATION.value,
+            "provider_continuation_active",
+            "active",
+        ),
+        (
+            WaitType.WAIT_RECONCILIATION.value,
+            "reconciliation_not_executed_frontier_preserved",
+            "unresolved",
+        ),
+    )
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "osia.turn_terminality.CONFIG_DIR", tmp,
+    ):
+        for index, (wait_type, reason_code, presentation) in enumerate(waits):
+            agent = OSIAAgent(lang="en")
+
+            def forbidden_probe(*_args, **_kwargs):
+                raise AssertionError("non-tool wait probed pending tool state")
+
+            agent.pending_tool_attempt_record = types.MethodType(
+                forbidden_probe, agent,
+            )
+            agent.activate_pending_tool_attempt = types.MethodType(
+                forbidden_probe, agent,
+            )
+            decision = TerminalityDecision(
+                "wait",
+                reason_code=reason_code,
+                wait_type=wait_type,
+            )
+            with patch.object(
+                TurnTerminalityController, "begin_invocation", return_value="",
+            ), patch.object(
+                TurnTerminalityController, "evaluate", return_value=decision,
+            ):
+                result = agent.run_terminal_turn(
+                    "Continue the exact durable operation",
+                    turn_id=f"typed-nontool-wait-{index}",
+                    required_postconditions=("effect verified",),
+                    execution_required=True,
+                )
+            assert result == execution_state_text(presentation, "en")
+
+
+def test_pending_tool_wait_exposes_sentinel_only_with_a_proven_attempt():
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "osia.turn_terminality.CONFIG_DIR", tmp,
+    ):
+        agent = OSIAAgent(lang="en")
+        agent.pending_tool_attempt_record = types.MethodType(
+            lambda _self: {"tool_attempt_id": "attempt-proven"}, agent,
+        )
+
+        def forbidden_activation(*_args, **_kwargs):
+            raise AssertionError("terminality loop activated the tool directly")
+
+        agent.activate_pending_tool_attempt = types.MethodType(
+            forbidden_activation, agent,
+        )
+        decision = TerminalityDecision(
+            "wait",
+            reason_code="correlated_tool_attempt_active",
+            wait_type=WaitType.WAIT_PENDING_TOOL.value,
+        )
+        with patch.object(
+            TurnTerminalityController, "begin_invocation", return_value="",
+        ), patch.object(
+            TurnTerminalityController, "evaluate", return_value=decision,
+        ):
+            result = agent.run_terminal_turn(
+                "Continue the exact durable operation",
+                turn_id="typed-pending-tool-wait",
+                required_postconditions=("effect verified",),
+                execution_required=True,
+            )
+        assert result == WAITING_TOOL_RESULT
+
+
+def test_structural_wait_keeps_its_typed_reason():
+    # WOR-303: the typed structural reason is recorded internally, but it is
+    # not a terminal.  The same canonical turn continues and completes.
+    with tempfile.TemporaryDirectory() as tmp, patch(
+        "osia.turn_terminality.CONFIG_DIR", tmp,
+    ):
+        agent = OSIAAgent(lang="en")
+        wait_decision = TerminalityDecision(
+            "wait",
+            reason_code="permission_pending_without_tool_attempt",
+            wait_type=WaitType.WAIT_STRUCTURAL.value,
+        )
+        original_evaluate = TurnTerminalityController.evaluate
+        original_begin = TurnTerminalityController.begin_invocation
+        status = {"evaluate_pending": True, "begin_pending": True}
+        calls = []
+
+        def evaluate(controller, **kwargs):
+            if status["evaluate_pending"]:
+                status["evaluate_pending"] = False
+                return wait_decision
+            return original_evaluate(controller, **kwargs)
+
+        def begin(controller, **kwargs):
+            if status["begin_pending"]:
+                status["begin_pending"] = False
+                return ""
+            return original_begin(controller, **kwargs)
+
+        def fake_run(self, text, **_kwargs):
+            calls.append(text)
+            candidate = _completion_fixture(self, "verified", tmp)
+            self.messages.append({"role": "assistant", "content": candidate})
+            return candidate
+
+        agent.run = types.MethodType(fake_run, agent)
+        with patch.object(
+            TurnTerminalityController, "begin_invocation", new=begin,
+        ), patch.object(
+            TurnTerminalityController, "evaluate", new=evaluate,
+        ):
+            final = agent.run_terminal_turn(
+                "Continue the exact durable operation",
+                turn_id="typed-structural-wait",
+                required_postconditions=("effect verified",),
+                execution_required=True,
+            )
+        assert final == _fixture_summary(tmp)
+        result = agent.terminality_result("typed-structural-wait")
+        assert result["terminal_state"] == "success_verified"
+        assert result["reason_code"] != "WAIT_WITHOUT_PENDING_TOOL"
 
 
 def test_resumed_verified_receipt_proves_preserved_strategy_postcondition():
@@ -415,11 +579,11 @@ def test_unknown_effect_reconciles_before_blocking_mutation_replay():
         )
         assert invocation
         controller.record_provider_invocation_completed(invocation)
-        preserved = controller.evaluate(provider_route="p:m")
-        assert preserved.action == "wait"
-        assert preserved.reason_code == (
-            "reconciliation_not_executed_frontier_preserved"
-        )
+        # WOR-303: reconciliation guidance repeats while the possible effect
+        # remains unresolved; there is no "one reconciliation" quota.
+        repeated = controller.evaluate(provider_route="p:m")
+        assert repeated.action == "continue"
+        assert repeated.next_strategy == "reconcile_unknown_read_only"
         assert not controller.reserve_final(
             "blocked_verified",
             reason_code="safe_reconciliation_frontier_exhausted",
@@ -428,7 +592,7 @@ def test_unknown_effect_reconciles_before_blocking_mutation_replay():
         )
 
 
-def test_each_unknown_effect_gets_one_read_only_reconciliation_before_blocking():
+def test_unknown_effects_keep_offering_reconciliation_without_cap():
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp)
         for attempt_id in ("attempt-a", "attempt-b"):
@@ -446,18 +610,17 @@ def test_each_unknown_effect_gets_one_read_only_reconciliation_before_blocking()
         controller.record_provider_invocation_completed(first_invocation)
         second = controller.evaluate(provider_route="p:m")
         assert second.action == "continue"
-        assert second.postcondition != first.postcondition
         second_invocation = controller.begin_invocation(
             provider_route="p:m",
             strategy_id=second.next_strategy,
             postcondition=second.postcondition,
         )
         controller.record_provider_invocation_completed(second_invocation)
-        preserved = controller.evaluate(provider_route="p:m")
-        assert preserved.action == "wait"
-        assert preserved.reason_code == (
-            "reconciliation_not_executed_frontier_preserved"
-        )
+        # WOR-303: unresolved possible effects keep receiving factual
+        # read-only reconciliation guidance; no count exhausts the offer.
+        third = controller.evaluate(provider_route="p:m")
+        assert third.action == "continue"
+        assert third.next_strategy == "reconcile_unknown_read_only"
 
 
 def test_verified_postcondition_retires_reconciled_unknown_effect():
@@ -496,34 +659,44 @@ def test_productive_long_mission_has_no_invocation_cap():
             controller.record_provider_invocation_completed(invocation)
             controller.record_typed_evidence(
                 outcome="success_unverified",
-                evidence={"progress_revision": revision},
-                useful_progress=True,
+                evidence={"revision": revision},
             )
         assert len(set(invocation_ids)) == 12
         controller.prove_postcondition("done", {"verified": True})
         assert controller.evaluate().terminal_state == "success_verified"
 
 
-def test_repeated_no_progress_provider_invocation_preserves_frontier():
+def test_repeated_provider_invocation_keeps_objective_active():
+    # WOR-303: repeated provider segments with no attempt and no evidence never
+    # terminalize an unfinished objective and never destroy the safe frontier.
+    # The same canonical turn keeps receiving the same safe continuation.
     with tempfile.TemporaryDirectory() as tmp:
         controller = _controller(tmp)
         controller.set_strategy_frontier(("only-safe-strategy",))
-        first = controller.evaluate(provider_route="p:m")
-        invocation = controller.begin_invocation(
-            provider_route="p:m",
-            strategy_id=first.next_strategy,
-            postcondition=first.postcondition,
-        )
-        assert invocation
-        controller.record_provider_invocation_completed(invocation)
-        preserved = controller.evaluate(provider_route="p:m")
-        assert preserved.action == "wait"
-        assert preserved.reason_code == (
-            "provider_no_progress_strategy_frontier_preserved"
-        )
-        assert controller.snapshot()["strategy_frontier"] == [
-            "only-safe-strategy"
-        ]
+        seen = []
+        for _round in range(8):
+            decision = controller.evaluate(provider_route="p:m")
+            assert decision.action == "continue"
+            assert decision.next_strategy == "only-safe-strategy"
+            seen.append(decision.next_strategy)
+            invocation = controller.begin_invocation(
+                provider_route="p:m",
+                strategy_id=decision.next_strategy,
+                postcondition=decision.postcondition,
+            )
+            assert invocation
+            controller.record_provider_invocation_completed(invocation)
+        snapshot = controller.snapshot()
+        assert len(seen) == 8
+        assert snapshot["strategy_frontier"] == ["only-safe-strategy"]
+        assert snapshot["terminal_state"] == ""
+        assert snapshot["remaining_work"] == ["done"]
+        # An empty frontier still continues with a factual replan instruction.
+        controller.set_strategy_frontier(())
+        replan = controller.evaluate(provider_route="p:m")
+        assert replan.action == "continue"
+        assert replan.next_strategy == "provider_replan_required"
+        assert controller.snapshot()["terminal_state"] == ""
 
 
 def test_new_correlation_id_without_new_semantic_evidence_does_not_unlock_retry():
@@ -706,6 +879,10 @@ def test_native_provider_completed_status_is_not_osia_goal_proof():
         def fake_run(self, text, **_kwargs):
             calls.append(text)
             self.messages.append({"role": "assistant", "content": "native done"})
+            if len(calls) >= 3:
+                self.request_turn_cancellation(
+                    "native-not-terminal", effect_possible=False,
+                )
             return "native done"
 
         agent.run = types.MethodType(fake_run, agent)
@@ -716,8 +893,13 @@ def test_native_provider_completed_status_is_not_osia_goal_proof():
             execution_required=True,
         )
         result = agent.terminality_result("native-not-terminal")
-        assert result is None
-        assert len(calls) > 1
+        # WOR-303: provider completion/narration is never a goal proof.  Three
+        # consecutive prose-only segments keep the same canonical turn active;
+        # only the explicit user cancellation ends it.
+        assert result["terminal_state"] != "success_verified"
+        assert result["terminal_state"] == "user_cancelled"
+        assert result["reason_code"] != "provider_cannot_progress_no_usable_path"
+        assert len(calls) >= 3
 
 
 def test_successful_tool_receipt_requires_authoritative_strategy_proof():
@@ -755,9 +937,15 @@ def test_scheduled_action_narration_alone_cannot_be_success_verified():
         "osia.turn_terminality.CONFIG_DIR", tmp,
     ):
         agent = OSIAAgent()
+        calls = []
 
         def fake_run(self, text, **_kwargs):
+            calls.append(text)
             self.messages.append({"role": "assistant", "content": "I will open it."})
+            if len(calls) >= 3:
+                self.request_turn_cancellation(
+                    "scheduled-narration", effect_possible=False,
+                )
             return "I will open it."
 
         agent.run = types.MethodType(fake_run, agent)
@@ -767,37 +955,13 @@ def test_scheduled_action_narration_alone_cannot_be_success_verified():
             required_postconditions=("application visibly open",),
             execution_required=True,
         )
-        assert agent.terminality_result("scheduled-narration") is None
+        result = agent.terminality_result("scheduled-narration")
+        # WOR-303: future-work narration continues the same canonical turn; it
+        # is neither a success proof nor a count-based blocker.
+        assert result["terminal_state"] == "user_cancelled"
+        assert len(calls) >= 3
 
 
-def test_autonomous_numeric_budget_does_not_hide_new_semantic_frontier():
-    class Agent:
-        provider = "provider"
-        model = "model"
-        last_execution_strategy_snapshot = {
-            "goal": {"requires_execution": True},
-            "attempts": [],
-            "alternatives_still_applicable": ["dom"],
-            "evidence_tokens": [],
-            "postcondition_evidence": [],
-            "succeeded": False,
-            "frozen_reason": "",
-        }
-
-    task = {
-        "id": "task-1",
-        "success_criterion": "observable result",
-        "semantic_attempt_tuples": [],
-        "semantic_evidence_tokens": [],
-        "semantic_evidence_revision": 0,
-    }
-    orchestrator = Orchestrator(Agent())
-    candidate = orchestrator._capture_semantic_frontier(task)
-    assert candidate[1] == "dom"
-    orchestrator._claim_semantic_strategy(task, candidate)
-    assert orchestrator._capture_semantic_frontier(task) is None
-    Agent.last_execution_strategy_snapshot["evidence_tokens"] = ["new evidence"]
-    assert orchestrator._capture_semantic_frontier(task)[1] == "dom"
 
 
 def test_multiple_internal_invocations_emit_one_mobile_persistence_and_tts_final():
@@ -809,13 +973,8 @@ def test_multiple_internal_invocations_emit_one_mobile_persistence_and_tts_final
 
         def fake_run(self, text, **_kwargs):
             calls.append(text)
-            candidate = "premature" if len(calls) == 1 else "canonical final"
+            candidate = "premature" if len(calls) == 1 else _completion_fixture(self, "canonical final", tmp)
             self.messages.append({"role": "assistant", "content": candidate})
-            if len(calls) == 2:
-                remaining = self._terminality_controller.snapshot()["remaining_work"]
-                self._terminality_controller.prove_postcondition(
-                    remaining[0], {"receipt": "verified"},
-                )
             return candidate
 
         agent.run = types.MethodType(fake_run, agent)
@@ -880,10 +1039,10 @@ def test_multiple_internal_invocations_emit_one_mobile_persistence_and_tts_final
             if frame.get("type") == "turn_status" and frame.get("terminal")
         ]
         assert len(calls) == 2
-        assert persisted == ["canonical final"]
+        assert persisted == [_fixture_summary(tmp)]
         assert len(responses) == 1
         assert len(terminals) == 1
-        assert tts[0].finished == ["canonical final"]
+        assert tts[0].finished == [_fixture_summary(tmp)]
         assert tts[0].marked == 1
 
     with tempfile.TemporaryDirectory() as tmp:

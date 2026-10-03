@@ -21,12 +21,39 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 from osia.config import CONFIG_DIR as _CONFIG_DIR
 
 
 SCHEMA_VERSION = 1
 MEMORY_FILE = Path(_CONFIG_DIR) / "memory.json"
+_MEMORY_CHANGE_LOCK = threading.Lock()
+_MEMORY_CHANGE_LISTENERS: set[Callable[[dict[str, Any]], None]] = set()
+
+
+def add_memory_change_listener(
+    callback: Callable[[dict[str, Any]], None],
+) -> Callable[[], None]:
+    """Subscribe to canonical memory snapshots without adding another store."""
+    with _MEMORY_CHANGE_LOCK:
+        _MEMORY_CHANGE_LISTENERS.add(callback)
+
+    def unsubscribe() -> None:
+        with _MEMORY_CHANGE_LOCK:
+            _MEMORY_CHANGE_LISTENERS.discard(callback)
+
+    return unsubscribe
+
+
+def _notify_memory_changed(snapshot: dict[str, Any]) -> None:
+    with _MEMORY_CHANGE_LOCK:
+        callbacks = tuple(_MEMORY_CHANGE_LISTENERS)
+    for callback in callbacks:
+        try:
+            callback(copy.deepcopy(snapshot))
+        except Exception:
+            pass
 
 ALLOWED_TYPES = frozenset({
     "route",
@@ -389,6 +416,7 @@ class MemoryStore:
                 self._write_json_atomic(self.backup_path, snapshot)
             except OSError:
                 pass
+            _notify_memory_changed(snapshot)
 
     def list_entries(
         self,

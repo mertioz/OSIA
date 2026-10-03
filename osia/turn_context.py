@@ -99,7 +99,7 @@ _SCRIPT_PATTERNS = (
 
 @dataclass(frozen=True)
 class TurnContext:
-    """The one authoritative language decision attached to a user turn."""
+    """One response-language preference attached only to the current user turn."""
 
     language: str
     source: str
@@ -120,7 +120,7 @@ class TurnContext:
 
     @property
     def canonical_language(self) -> str:
-        """The immutable output language owned by this turn."""
+        """The preferred output language for this turn."""
 
         return self.target_language or self.language
 
@@ -251,8 +251,9 @@ def explicit_language(text: str) -> str | None:
     if _translation_target(visible) or _multilingual_languages(visible):
         return None
     if not re.search(
-        r"\b(?:reply|respond|answer|write|speak|continue|switch|use|"
-        r"reponds|repondre|ecris|parle|passe|responde|escribe|habla|"
+        r"\b(?:reply|respond|answer|write|speak|continue|switch|use|give|"
+        r"summarize|reponds|repondre|ecris|parle|passe|donne|resume|"
+        r"responde|escribe|habla|"
         r"antworte|schreibe|sprich)\b",
         folded,
     ):
@@ -319,18 +320,15 @@ def _history_language(history) -> tuple[str | None, str | None]:
     if not isinstance(history, list):
         return None, None
     for message in reversed(history):
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or message.get("role") != "user":
             continue
         persisted = normalize_locale(message.get("_language"))
         if persisted:
-            return persisted, "persisted_previous"
-    for message in reversed(history):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
+            return persisted, "recent_user_context"
         text = _display_text(message.get("content"))
         language = explicit_language(text) or detect_request_language(text)
         if language:
-            return language, "legacy_conversation"
+            return language, "recent_user_context"
     return None, None
 
 
@@ -348,7 +346,7 @@ def resolve_turn_context(
     previous_language=None,
     reference: str | None = None,
 ) -> TurnContext:
-    """Resolve one authoritative context from the original current user text."""
+    """Resolve a lightweight response-language preference for this user turn."""
 
     text = _display_text(user_input)
     history_language, history_source = _history_language(history)
@@ -396,9 +394,7 @@ def resolve_turn_context(
         return context
     candidates = (
         (detect_request_language(text, previous_language=previous), "current_request"),
-        (previous, history_source or "previous_turn"),
-        (normalize_locale(client_locale), "client_locale"),
-        (normalize_locale(saved_language), "saved_interface"),
+        (previous, history_source or "recent_user_context"),
     )
     for language, source in candidates:
         if language:
@@ -412,7 +408,7 @@ def resolve_turn_context(
 
     context = TurnContext(
         i18n.DEFAULT_LANG,
-        "safe_default",
+        "natural_model",
         _turn_ref(reference),
         allowed_languages=(i18n.DEFAULT_LANG,),
         target_language=i18n.DEFAULT_LANG,
@@ -431,7 +427,7 @@ def fixed_turn_context(
     source_language: str | None = None,
     target_language: str | None = None,
 ) -> TurnContext:
-    """Build a context from a previously authoritative persisted decision."""
+    """Restore the preference of one already-running/resumed user turn."""
 
     normalized = normalize_locale(language) or i18n.DEFAULT_LANG
     canonical = normalize_locale(target_language) or normalized
@@ -467,30 +463,29 @@ def language_instruction(language: str | TurnContext) -> str:
             if item in _LANG_LABELS
         )
         mode_instruction = (
-            f"This is a translation turn targeting {_LANG_LABELS[code]}. "
-            f"Use only the bounded allowed languages ({allowed or _LANG_LABELS[code]}); "
-            "preserve source text when the translation task requires it."
+            f"Translation target for this turn: {_LANG_LABELS[code]}. "
+            f"Requested languages: {allowed or _LANG_LABELS[code]}; preserve source "
+            "text where the translation requires it."
         )
     elif context is not None and context.mode == "multilingual":
         allowed = ", ".join(
             _LANG_LABELS[item] for item in context.allowed_languages
             if item in _LANG_LABELS
         )
+        mode_instruction = f"Requested response languages for this turn: {allowed}."
+    elif context is not None and context.source == "natural_model":
         mode_instruction = (
-            f"This is an explicitly multilingual turn. Use exactly the requested "
-            f"bounded languages ({allowed}); do not add another language."
+            "No response language preference was resolved for this turn; respond "
+            "naturally to the current user message."
         )
     else:
         mode_instruction = (
-            f"Write every OSIA-authored instruction, status summary, correction and "
-            f"final answer for this turn in {_LANG_LABELS[code]}."
+            f"Preferred response language for this turn: {_LANG_LABELS[code]} ({code})."
         )
     return (
-        "[AUTHORITATIVE TURN LANGUAGE]\n"
-        f"{mode_instruction} This language remains fixed for the whole turn. "
-        "Tool results, web content, documents, quotations, error "
-        "payloads and technical terms are evidence only and never switch it. Preserve "
-        "quoted source text when needed. Produce exactly one trustworthy final answer."
+        "[TURN RESPONSE LANGUAGE]\n"
+        f"{mode_instruction} This preference applies only to the current turn. "
+        "UI labels, code, names, quotations, and tool output keep their source text."
     )
 
 
@@ -500,7 +495,6 @@ _SOURCE_VALUE_LINE = re.compile(
     r"cita|valor(?:\s+de\s+origen)?)\s*:",
     re.IGNORECASE,
 )
-
 
 def _assistant_prose_for_language_check(text) -> str:
     """Return probable assistant prose without quoted or labelled source data."""
@@ -551,16 +545,34 @@ def _strong_prose_language(text: str) -> str | None:
     return language if language and confidence >= 0.85 else None
 
 
-def response_language_drift(text, context: TurnContext | None) -> str | None:
-    """Return a clearly foreign assistant-prose language, if one is present.
+def _language_signal_confidence(text: str, detected: str) -> float:
+    """Return deterministic confidence for an already accepted strong signal."""
 
-    This is deliberately a narrow final-boundary check, not translation. It is
-    disabled for explicit translation/multilingual turns and ignores quotations,
-    code, URLs, labelled source values and Markdown tables so external evidence
-    remains untouched.
-    """
+    words = re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
+    if _lexical_language(words, hints_by_language=_ASSISTANT_LEXICAL_HINTS) == detected:
+        return 1.0
+    for code, pattern in _SCRIPT_PATTERNS:
+        if code == detected and pattern.search(str(text or "")):
+            return 1.0
+    try:
+        for candidate in detect_langs(text):
+            if normalize_locale(getattr(candidate, "lang", None)) == detected:
+                return round(float(getattr(candidate, "prob", 0.0)), 6)
+    except Exception:
+        pass
+    return 0.0
 
-    if not isinstance(context, TurnContext) or context.mode != "single-language":
+
+def response_language_drift_diagnostic(
+    text, context: TurnContext | None,
+) -> dict | None:
+    """Describe foreign prose found only in the user-facing final candidate."""
+
+    if (
+        not isinstance(context, TurnContext)
+        or context.mode != "single-language"
+        or context.source == "natural_model"
+    ):
         return None
     target = normalize_locale(context.canonical_language)
     if not target:
@@ -568,13 +580,68 @@ def response_language_drift(text, context: TurnContext | None) -> str | None:
     visible = _assistant_prose_for_language_check(text)
     if not visible.strip():
         return None
-    segments = re.split(r"(?<=[.!?;:])\s+|[\r\n]+", visible)
-    for segment in segments:
-        detected = _strong_prose_language(segment)
-        if detected and detected != target:
-            return detected
     detected = _strong_prose_language(visible)
-    return detected if detected and detected != target else None
+    if detected and detected != target:
+        return {
+            "analysis_scope": "user_facing_final_answer",
+            "expected_language": target,
+            "detected_final_answer_language": detected,
+            "analyzed_text_span": visible.strip(),
+            "confidence": _language_signal_confidence(visible, detected),
+            "reason": "foreign_assistant_prose_response",
+        }
+    return None
+
+
+def persisted_language_drift_diagnostic(value) -> dict | None:
+    """Return the bounded, reasoning-free diagnostic safe for turn metadata."""
+
+    if not isinstance(value, dict):
+        return None
+    expected = normalize_locale(value.get("expected_language"))
+    detected = normalize_locale(value.get("detected_final_answer_language"))
+    span = value.get("analyzed_text_span")
+    reason = str(value.get("reason") or "")
+    if (
+        value.get("analysis_scope") != "user_facing_final_answer"
+        or not expected
+        or not detected
+        or not isinstance(span, str)
+        or not span.strip()
+        or len(span) > 16_000
+        or reason != "foreign_assistant_prose_response"
+    ):
+        return None
+    try:
+        confidence = float(value.get("confidence"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0.0 <= confidence <= 1.0:
+        return None
+    return {
+        "schema_version": 1,
+        "analysis_scope": "user_facing_final_answer",
+        "expected_language": expected,
+        "detected_final_answer_language": detected,
+        "analyzed_text_span": span.strip(),
+        "confidence": round(confidence, 6),
+        "reason": reason,
+    }
+
+
+def response_language_drift(text, context: TurnContext | None) -> str | None:
+    """Return a clearly foreign assistant-prose language, if one is present.
+
+    This is a presentation-repair signal, never a terminal validity decision. It
+    is disabled for unresolved, translation and multilingual turns and ignores
+    quotations, code, URLs, labelled source values and Markdown tables so exact
+    external evidence remains untouched.
+    """
+
+    diagnostic = response_language_drift_diagnostic(text, context)
+    if diagnostic is None:
+        return None
+    return str(diagnostic["detected_final_answer_language"])
 
 
 def response_prose_language(text, context: TurnContext | None) -> str | None:
@@ -614,6 +681,14 @@ _LOCALIZED = {
         "ja": "応答プロバイダーでエラーが発生したため、この依頼を完了できませんでした。再試行してください。",
         "de": "Ich konnte diese Anfrage wegen eines Fehlers des Antwortanbieters nicht abschließen. Bitte versuchen Sie es erneut.",
         "es": "No pude completar esta solicitud porque falló el proveedor de respuesta. Inténtalo de nuevo.",
+    },
+    "capture_protected_surface": {
+        "en": "I can't read this window's content because the application asks the operating system to exclude it from screen capture. I did not bypass that protection or infer the content from accessibility-only elements.",
+        "fr": "Je ne peux pas lire le contenu de cette fenêtre, car l’application demande au système d’exploitation de l’exclure des captures d’écran. Je n’ai ni contourné cette protection ni déduit le contenu à partir des seuls éléments d’accessibilité.",
+        "zh": "我无法读取此窗口的内容，因为该应用要求操作系统将它排除在屏幕捕获之外。我没有绕过这项保护，也没有仅根据辅助功能元素推断其内容。",
+        "ja": "このアプリケーションが画面キャプチャから除外するようオペレーティングシステムに要求しているため、このウィンドウの内容を読み取れません。この保護を回避したり、アクセシビリティ要素だけから内容を推測したりはしていません。",
+        "de": "Ich kann den Inhalt dieses Fensters nicht lesen, weil die Anwendung das Betriebssystem anweist, es von Bildschirmaufnahmen auszuschließen. Ich habe diesen Schutz weder umgangen noch den Inhalt allein aus Bedienungshilfen-Elementen abgeleitet.",
+        "es": "No puedo leer el contenido de esta ventana porque la aplicación pide al sistema operativo que la excluya de las capturas de pantalla. No eludí esa protección ni deduje el contenido únicamente a partir de elementos de accesibilidad.",
     },
     "anti_loop_stop": {
         "en": "I stopped this turn because I could not confirm further progress. Please try again or rephrase your request.",
@@ -688,14 +763,6 @@ _LOCALIZED = {
         "de": "ERROR: Die Autorisierung der geplanten Aufgabe wurde vor der Ausführung ausgesetzt ({reason}). Es wurde keine Aktion ausgeführt.",
         "es": "ERROR: La autorización de la tarea programada se suspendió antes de la ejecución ({reason}). No se realizó ninguna acción.",
     },
-    "autonomous_authorization_suspended": {
-        "en": "ERROR: Autonomous authorization was suspended before dispatch ({reason}). No action was executed.",
-        "fr": "ERROR: l’autorisation autonome a été suspendue avant l’exécution ({reason}). Aucune action n’a été effectuée.",
-        "zh": "ERROR: 自主授权在执行前已暂停（{reason}）。未执行任何操作。",
-        "ja": "ERROR: 自律実行の承認は実行前に停止されました（{reason}）。操作は実行されていません。",
-        "de": "ERROR: Die autonome Autorisierung wurde vor der Ausführung ausgesetzt ({reason}). Es wurde keine Aktion ausgeführt.",
-        "es": "ERROR: La autorización autónoma se suspendió antes de la ejecución ({reason}). No se realizó ninguna acción.",
-    },
     "outcome_uncertain_banner": {
         "en": "⚠️ OUTCOME UNCERTAIN — do not assume success or failure and do not retry automatically: {payload}",
         "fr": "⚠️ RÉSULTAT INCERTAIN — ne suppose ni succès ni échec et ne relance pas automatiquement : {payload}",
@@ -729,12 +796,12 @@ _LOCALIZED = {
         "es": "ERROR: herramienta desconocida: {tool}",
     },
     "tools_complete_instruction": {
-        "en": "All tools are done. Write your complete final answer now based on everything you found. If you still need more information, call another tool instead; otherwise answer in plain text with no <tool_call> tags.",
-        "fr": "Tous les outils ont terminé. Écris maintenant ta réponse finale complète en te basant sur tout ce que tu as trouvé. Si tu as encore besoin d’informations, appelle un autre outil ; sinon, réponds en texte simple, sans balise <tool_call>.",
-        "zh": "所有工具都已完成。请根据已获得的全部信息写出完整的最终答复。如果仍需更多信息，请调用另一个工具；否则请用纯文本回答，不要包含 <tool_call> 标签。",
-        "ja": "すべてのツールが完了しました。得られた情報に基づいて、完全な最終回答を書いてください。さらに情報が必要なら別のツールを呼び出し、不要なら <tool_call> タグを使わずプレーンテキストで回答してください。",
-        "de": "Alle Werkzeuge sind abgeschlossen. Verfasse jetzt anhand aller Ergebnisse die vollständige endgültige Antwort. Falls noch Informationen fehlen, rufe ein weiteres Werkzeug auf; antworte andernfalls als Klartext ohne <tool_call>-Tags.",
-        "es": "Todas las herramientas han terminado. Escribe ahora la respuesta final completa basándote en todo lo encontrado. Si aún necesitas información, llama a otra herramienta; de lo contrario, responde en texto sin etiquetas <tool_call>.",
+        "en": "The current tool batch finished. Reassess the full objective against the evidence: if any explicit step, deliverable, constraint, or required end state remains incomplete or unverified, call the next tool. Answer in plain text with no <tool_call> tags only when the objective is complete and verified, or when you are genuinely blocked, the user cancelled, or a safety barrier stopped you.",
+        "fr": "Le lot d’outils courant est terminé. Réévalue l’objectif complet à la lumière des preuves : si une étape explicite, un livrable, une contrainte ou un état final requis reste incomplet ou non vérifié, appelle l’outil suivant. Ne réponds en texte simple, sans balise <tool_call>, que lorsque l’objectif est terminé et vérifié, ou lorsque tu es réellement bloqué, que l’utilisateur a annulé, ou qu’une barrière de sécurité t’a arrêté.",
+        "zh": "当前工具批次已完成。请根据证据重新评估完整目标：如果仍有任何明确步骤、交付物、约束或所需最终状态未完成或未验证，请调用下一个工具。仅当目标已完成并经过验证，或你确实受阻、用户已取消、或安全屏障阻止了你时，才用纯文本回答，不要包含 <tool_call> 标签。",
+        "ja": "現在のツールバッチが完了しました。証拠に照らして目標全体を再評価してください。明示された手順、成果物、制約、必要な最終状態のいずれかが未完了または未検証であれば、次のツールを呼び出してください。目標が完了し検証済みの場合、または真にブロックされた場合、ユーザーがキャンセルした場合、安全バリアに止められた場合にのみ、<tool_call> タグを使わずプレーンテキストで回答してください。",
+        "de": "Der aktuelle Werkzeug-Batch ist abgeschlossen. Bewerte das gesamte Ziel anhand der Belege neu: Wenn ein ausdrücklicher Schritt, ein Ergebnis, eine Einschränkung oder ein erforderlicher Endzustand noch unvollständig oder unbestätigt ist, rufe das nächste Werkzeug auf. Antworte erst dann in Klartext ohne <tool_call>-Tags, wenn das Ziel abgeschlossen und bestätigt ist, oder wenn du wirklich blockiert bist, der Nutzer abgebrochen hat oder eine Sicherheitsbarriere dich gestoppt hat.",
+        "es": "El lote actual de herramientas ha terminado. Reevalúa el objetivo completo a la luz de la evidencia: si algún paso explícito, entregable, restricción o estado final requerido sigue incompleto o sin verificar, llama a la siguiente herramienta. Responde en texto sin etiquetas <tool_call> solo cuando el objetivo esté completo y verificado, o cuando estés realmente bloqueado, el usuario haya cancelado o una barrera de seguridad te haya detenido.",
     },
     "schedule_ignored_instruction": {
         "en": "A scheduled-task tool call was ignored because this turn contains no explicit scheduling request. Do not mention scheduling or a scheduling failure. Answer the immediate request from the valid tool results.",
@@ -764,40 +831,24 @@ def localized_text(key: str, language: str, **values) -> str:
 _LANGUAGE_CONSISTENCY_RETRY = {
     "en": (
         "The previous candidate changed the language of OSIA-authored prose. "
-        "Regenerate the final answer in the authoritative turn language. Preserve "
+        "Rewrite the same final answer in the preferred language for this turn. Preserve "
         "proper nouns, exact source values and direct quotations unchanged. Do not "
         "call another tool or mention this correction."
     ),
     "fr": (
         "La r\u00e9ponse pr\u00e9c\u00e9dente a chang\u00e9 la langue du texte r\u00e9dig\u00e9 "
-        "par OSIA. R\u00e9g\u00e9n\u00e8re la r\u00e9ponse finale dans la langue autoritative du "
-        "tour. Conserve les noms propres, les valeurs sources exactes et les citations "
+        "par OSIA. R\u00e9cris la m\u00eame r\u00e9ponse finale dans la langue pr\u00e9f\u00e9r\u00e9e "
+        "pour ce tour. Conserve les noms propres, les valeurs sources exactes et les citations "
         "directes sans les modifier. N'appelle aucun autre outil et ne mentionne pas "
         "cette correction."
     ),
     "es": (
         "La respuesta anterior cambi\u00f3 el idioma del texto redactado por OSIA. "
-        "Regenera la respuesta final en el idioma autoritativo del turno. Conserva "
+        "Reescribe la misma respuesta final en el idioma preferido para este turno. Conserva "
         "sin cambios los nombres propios, los valores exactos de la fuente y las "
         "citas directas. No llames a otra herramienta ni menciones esta correcci\u00f3n."
     ),
 }
-
-_LANGUAGE_CONSISTENCY_FAILURE = {
-    "en": (
-        "I couldn't produce a response that stayed coherent in the language of "
-        "this request. Please try again."
-    ),
-    "fr": (
-        "Je n\u2019ai pas pu produire une r\u00e9ponse qui reste coh\u00e9rente dans la "
-        "langue de cette demande. R\u00e9essayez."
-    ),
-    "es": (
-        "No pude producir una respuesta que mantuviera de forma coherente el "
-        "idioma de esta solicitud. Int\u00e9ntalo de nuevo."
-    ),
-}
-
 
 def language_consistency_retry_text(language: str) -> str:
     code = normalize_locale(language) or i18n.DEFAULT_LANG
@@ -805,16 +856,6 @@ def language_consistency_retry_text(language: str) -> str:
         _LANGUAGE_CONSISTENCY_RETRY.get(code)
         or _LANGUAGE_CONSISTENCY_RETRY["en"]
     )
-
-
-def language_consistency_failure_text(language: str) -> str:
-    code = normalize_locale(language) or i18n.DEFAULT_LANG
-    return (
-        _LANGUAGE_CONSISTENCY_FAILURE.get(code)
-        or _LANGUAGE_CONSISTENCY_FAILURE["en"]
-    )
-
-
 def content_hash(text) -> str:
     return hashlib.sha256(_display_text(text).encode("utf-8", errors="replace")).hexdigest()[:16]
 

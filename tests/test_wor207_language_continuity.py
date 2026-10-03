@@ -72,7 +72,7 @@ def test_short_or_language_neutral_messages_preserve_previous_turn(
 ):
     context = resolve_turn_context(message, history=_history(previous))
     assert context.language == previous
-    assert context.source == "persisted_previous"
+    assert context.source == "recent_user_context"
 
 
 def test_quotes_code_technical_terms_and_tool_payloads_do_not_switch_language():
@@ -314,6 +314,10 @@ def _turn_meta(language: str, suffix: str) -> dict:
         "request_id": f"wor207-request-{suffix}",
         "client_request_id": f"wor207-request-{suffix}",
         "turn_id": f"wor207-turn-{suffix}",
+        "run_id": f"wor207-turn-{suffix}",
+        "provider_id": "ollama",
+        "model_id": "llama3",
+        "effective_reasoning": "auto",
         "user_message_id": f"wor207-user-{suffix}",
         "assistant_message_id": f"wor207-assistant-{suffix}",
         "language": language,
@@ -441,6 +445,7 @@ def test_legacy_voice_mode_reuses_history_for_ambiguous_turn_and_switches(
                 "_language": agent.turn_context.language,
             },
         ))
+        return True
 
     monkeypatch.setattr(main, "_persist_agent_delta", persist)
 
@@ -462,7 +467,13 @@ def test_mobile_reconnect_replays_exact_canonical_text_and_language(
 ):
     channel = _Channel()
     persisted = {
+        "conversation_id": f"conversation-{language}",
+        "request_id": f"request-{language}",
         "turn_id": f"turn-{language}",
+        "run_id": f"turn-{language}",
+        "provider_id": "ollama",
+        "model_id": "llama3",
+        "effective_reasoning": "auto",
         "user_message_id": f"user-{language}",
         "assistant_message_id": f"assistant-{language}",
         "response_event_id": f"response-{language}",

@@ -54,10 +54,11 @@ def test_timeout_is_pending_and_late_completion_is_reconciled_once(
     calls = []
     terminal = []
     completed = threading.Event()
+    release_worker = threading.Event()
 
     def delayed(path, content):
         calls.append((path, content))
-        time.sleep(0.08)
+        assert release_worker.wait(5.0)
         return "late synthetic success"
 
     monkeypatch.setitem(agent_module.TOOL_MAP, "write_file", delayed)
@@ -84,6 +85,7 @@ def test_timeout_is_pending_and_late_completion_is_reconciled_once(
     assert record.dispatched is True
     assert record.tool_attempt_id
     assert store.get_attempt(record.tool_attempt_id)["status"] == "pending"
+    release_worker.set()
     assert completed.wait(1.0)
     durable = store.get_attempt(record.tool_attempt_id)
     assert durable["status"] == ToolAttemptStatus.SUCCEEDED.value
@@ -512,14 +514,17 @@ def test_normal_chat_waits_then_resumes_same_turn_once(
     ) == 1
 
 
-def test_cancellation_after_dispatch_is_not_cancelled_proven(
+def test_cancellation_after_dispatch_tombstones_authority_and_keeps_late_evidence(
     isolated_attempt_runtime, monkeypatch,
 ):
     store, coordinator = isolated_attempt_runtime
     completed = threading.Event()
+    dispatched = threading.Event()
+    release = threading.Event()
 
     def delayed(path, content):
-        time.sleep(0.08)
+        dispatched.set()
+        assert release.wait(1.0)
         return "late success"
 
     monkeypatch.setitem(agent_module.TOOL_MAP, "write_file", delayed)
@@ -536,11 +541,15 @@ def test_cancellation_after_dispatch_is_not_cancelled_proven(
         lang="en",
         attempt_context=context,
     )
+    assert dispatched.wait(1.0)
     store.request_cancellation(record.tool_attempt_id)
+    release.set()
     assert completed.wait(1.0)
     durable = store.get_attempt(record.tool_attempt_id)
-    assert durable["status"] == ToolAttemptStatus.SUCCEEDED.value
-    assert durable["status"] != ToolAttemptStatus.CANCELLED_PROVEN.value
+    assert durable["status"] == ToolAttemptStatus.CANCELLED_PROVEN.value
+    assert durable["authority_state"] == "cancelled"
+    assert durable["reason_code"] == "late_result_after_cancellation"
+    assert durable["action_truth"]["effect_truth"] == "verified"
 
 
 def test_deadline_timer_wins_once_and_late_callback_is_ignored(
@@ -715,13 +724,12 @@ def test_waiting_command_requires_same_conversation_attempt_and_never_redispatch
             "conv_resume_fixture",
             "continue la recette",
         )
-        assert unrelated is True
+        assert unrelated is False
         assert coordinator.reconciliations == ["conv_resume_fixture"]
-        assert any(
+        assert not any(
             frame["type"] == "conversation_busy"
             for frame in channel.frames
         )
-        assert channel.frames[-1]["type"] == "turn_status"
 
         status = await server._handle_waiting_tool_command(
             channel,
@@ -746,7 +754,7 @@ def test_waiting_command_requires_same_conversation_attempt_and_never_redispatch
         server._ACTIVE_TURN_META_BY_CONV.pop("conv_resume_fixture", None)
 
 
-def test_reconnect_rebinds_same_waiting_turn_with_existing_messages():
+def test_reconnect_rejects_unproven_waiting_tool_metadata():
     from osia.server import server
 
     class Channel:
@@ -767,20 +775,8 @@ def test_reconnect_rebinds_same_waiting_turn_with_existing_messages():
         server._ACTIVE_CONV_BY_REQUEST[request_id] = conv_id
         try:
             channel = Channel()
-            assert await server._send_recovered_turn_state(channel, conv_id)
-            assert [frame["type"] for frame in channel.frames] == [
-                "turn_accepted",
-                "turn_status",
-                "conversation_busy_changed",
-            ]
-            assert channel.frames[1]["status"] == "waiting_tool_result"
-            assert all(frame["conversation_id"] == conv_id for frame in channel.frames)
-            assert all(frame["request_id"] == request_id for frame in channel.frames)
-            assert all(frame["turn_id"] == meta["turn_id"] for frame in channel.frames)
-            assert all(frame["recovered"] is True for frame in channel.frames)
-            assert [frame["sequence"] for frame in channel.frames] == sorted(
-                frame["sequence"] for frame in channel.frames
-            )
+            assert not await server._send_recovered_turn_state(channel, conv_id)
+            assert channel.frames == []
         finally:
             server._ACTIVE_TURNS_BY_CONV.pop(conv_id, None)
             server._ACTIVE_TURN_META_BY_CONV.pop(conv_id, None)
@@ -823,6 +819,10 @@ def test_server_persists_no_final_until_resumed_callback(tmp_path, monkeypatch):
         def configure_tool_attempts(self, **kwargs):
             self.callbacks = kwargs
 
+        def set_model(self, model, provider=None):
+            self.model = model
+            self.provider = provider or self.provider
+
         def run(self, text, **kwargs):
             self.messages.extend([
                 {"role": "user", "content": text},
@@ -833,6 +833,19 @@ def test_server_persists_no_final_until_resumed_callback(tmp_path, monkeypatch):
                 },
             ])
             return WAITING_TOOL_RESULT
+
+        def pending_tool_attempt_record(self):
+            return {
+                "tool_attempt_id": "attempt_server_fixture",
+                "status": ToolAttemptStatus.PENDING.value,
+            }
+
+        def terminality_result(self, _turn_id):
+            return {
+                "terminal_state": "success_verified",
+                "final_text": "One canonical resumed final.",
+                "reason_code": "success_verified",
+            }
 
         def activate_pending_tool_attempt(self):
             def complete():

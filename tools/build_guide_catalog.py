@@ -108,10 +108,6 @@ MASTERY_SPLITS = {
     "mastery.files-images": [
         ("mastery.attachments-vision", _l("Files and images", "Fichiers et images")),
     ],
-    "mastery.autonomous": [
-        ("mastery.autonomous-scope", _l("Set an autonomous scope", "Définir le périmètre autonome")),
-        ("mastery.autonomous-lifecycle", _l("Pause, resume or abandon", "Interrompre, reprendre ou abandonner")),
-    ],
     "advanced.personality-skills-automation": [
         ("mastery.personality", _l("Personality", "Personnalité")),
         ("mastery.skills", _l("Skills", "Compétences")),
@@ -192,19 +188,19 @@ def _settings_correction(value: Localized) -> Localized:
         "organized into ten real categories", "organized into eleven real categories"
     ).replace(
         "Memory — review and control long-term local memory.",
-        "Memory — review and control long-term local memory.\nPermissions — choose Standard or Full Access and review action approvals.",
+        "Memory — review and control long-term local memory.\nExecution — OSIA is always full-access; only system-critical destruction is blocked.",
     ).replace(
         "Memory reviews durable facts. MCP / Connectors",
-        "Memory reviews durable facts. Permissions controls Standard or Full Access and action approvals. MCP / Connectors",
+        "Memory reviews durable facts. Execution is always full-access (only system-critical destruction is blocked). MCP / Connectors",
     )
     fixed["fr"] = fixed["fr"].replace(
         "organisés en dix catégories réelles", "organisés en onze catégories réelles"
     ).replace(
         "Mémoire — consultation et contrôle de la mémoire locale durable.",
-        "Mémoire — consultation et contrôle de la mémoire locale durable.\nPermissions — choix entre Accès standard ou complet et validation des actions.",
+        "Mémoire — consultation et contrôle de la mémoire locale durable.\nExécution — OSIA est toujours en accès complet ; seule la destruction système critique est bloquée.",
     ).replace(
         "Mémoire examine les faits durables. MCP / Connecteurs",
-        "Mémoire examine les faits durables. Permissions contrôle l’Accès standard ou complet et la validation des actions. MCP / Connecteurs",
+        "Mémoire examine les faits durables. L’exécution est toujours en accès complet (seule la destruction système critique est bloquée). MCP / Connecteurs",
     )
     return fixed
 
@@ -347,7 +343,7 @@ MOBILE_ESSENTIAL_VARIANTS = {
     ),
     "essential.mobile-navigation": _mobile_variant(
         _l("Chat is the main place for active conversations and messages.", "Discussion est le lieu principal des conversations et messages actifs."),
-        [_l("Conversations manages chats; Autonomous follows longer PC tasks; Settings holds notifications and preferences; Memory shows local memories; Providers and system pages configure the PC; Connection handles pairing and recovery.", "Conversations gère les discussions ; Autonome suit les tâches PC longues ; Réglages contient notifications et préférences ; Mémoire affiche les souvenirs locaux ; Fournisseurs et les pages système configurent le PC ; Connexion gère association et récupération.")],
+        [_l("Chat continues the same conversation across PC and phone; Conversations manages chats; Settings holds notifications and preferences; Memory shows saved memories; Models and OSIA configure providers, skills and personality; Connection handles pairing and recovery.", "Chat poursuit la même conversation sur PC et téléphone ; Conversations gère les discussions ; Réglages contient les notifications et préférences ; Mémoire affiche les souvenirs enregistrés ; Modèles et OSIA configurent les fournisseurs, compétences et la personnalité ; Connexion gère l’association et la récupération.")],
         remember=_l("Conversations remain PC-authoritative when viewed from the phone.", "Les conversations restent gérées par le PC lorsqu’elles sont consultées sur le téléphone."),
     ),
     "essential.first-request": _mobile_variant(
@@ -461,7 +457,7 @@ def validate_catalog(catalog: dict) -> None:
                 if not isinstance(alias, str) or not alias:
                     raise ValueError("guide_alias")
     counts = [len(track["slides"]) for track in tracks]
-    if counts != [17, 46, 43]:
+    if counts != [17, 45, 43]:
         raise ValueError(f"guide_slide_counts:{counts}")
 
 

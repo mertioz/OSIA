@@ -126,10 +126,13 @@ ALL_TEXT_PROVIDERS = (
 )
 
 
-# The exact provider-facing surface for an Autonomous Web run.  These tools
-# either return WOR-186 opaque browser state/receipts or are the established
-# WOR-176 semantic-form operations.  Normal Chat keeps the complete registry.
-AUTONOMOUS_WEB_TOOL_NAMES = frozenset({
+
+# Persistence family for managed-browser work (WOR-186/WOR-300): these tools
+# either return opaque browser state/receipts or are the established semantic
+# form operations.  This classification gates the durable attempt release
+# policy only; the model-visible inventory is always the complete
+# runtime-available registry.
+BROWSER_FAMILY_TOOL_NAMES = frozenset({
     "get_browser_state", "navigate_browser", "inspect_browser_page",
     "wait_for_browser_condition", "activate_browser_element",
     "list_browser_tabs", "select_browser_tab", "close_browser_tab",
@@ -140,10 +143,17 @@ AUTONOMOUS_WEB_TOOL_NAMES = frozenset({
     "upload_browser_file", "download_browser_file",
     "inspect_form_fields", "fill_form_field",
 })
-AUTONOMOUS_WEB_VERIFY_TOOL_NAMES = frozenset({
+BROWSER_VERIFY_TOOL_NAMES = frozenset({
     "inspect_form_fields", "get_browser_state", "inspect_browser_page",
     "wait_for_browser_condition", "list_browser_tabs",
     "list_browser_dialogs",
+})
+
+# Legacy Vision/Mouse V3 capabilities are dormant: registered for
+# compatibility, but dispatch rejects them with a typed error.  They are
+# genuinely unavailable on every surface and therefore never model-visible.
+DORMANT_VISUAL_V3_TOOL_NAMES = frozenset({
+    "request_visual_observation", "desktop_click",
 })
 
 _FILE_PERSISTENCE_TOOLS = frozenset({
@@ -166,13 +176,18 @@ _ACTIVE_TOOL_SURFACE: ContextVar[str] = ContextVar(
 
 @contextmanager
 def effective_tool_surface_scope(surface: str):
-    """Select a bounded provider/dispatch surface for one execution turn."""
+    """Select the engine surface for one execution turn.
+
+    WOR-300: the surface gates DISPATCH eligibility
+    (``tool_is_eligible_in_current_surface``); it never reduces the
+    model-visible inventory.
+    """
 
     normalized = str(surface or "")
-    if normalized not in {
-        "", "autonomous", "autonomous_web", "autonomous_web_verify",
-        "scheduled",
-    }:
+    # WOR-303: one canonical Chat execution surface (the empty token, with
+    # "chat" accepted as its explicit alias) plus the Scheduled temporal
+    # trigger.  No other engine surface exists any more.
+    if normalized not in {"", "chat", "scheduled"}:
         raise ValueError("invalid_tool_surface")
     token = _ACTIVE_TOOL_SURFACE.set(normalized)
     try:
@@ -208,9 +223,6 @@ class ToolSpec:
     permission_category: str = "none"
     postcondition_required: bool = False
     redaction_policy: str = "bounded_model_result"
-    chat_eligible: bool = True
-    autonomous_eligible: bool = True
-    scheduled_eligible: bool = True
     dispatcher: Callable[..., Any] | None = None
     dynamic: bool = False
     connector_id: str = ""
@@ -247,6 +259,78 @@ class ToolExecutionRecord:
     tool_attempt_id: str = ""
     worker_may_be_active: bool = False
     reason_code: str = ""
+    process_facts: dict[str, Any] | None = None
+
+    def __post_init__(self):
+        facts = self.process_facts
+        if facts is None and isinstance(self.result, ProcessOutput):
+            facts = self.result.process_facts
+        if not (
+            getattr(getattr(self.contract, "spec", None), "name", "") in {"bash", "run_command"}
+            and self.dispatched
+            and not self.timed_out
+            and not self.worker_may_be_active
+            and str(getattr(self.outcome, "value", self.outcome)) in {
+                "success_verified", "success_unverified", "failed_after_effect", "command_completed",
+            }
+        ):
+            facts = None
+        object.__setattr__(self, "process_facts", normalize_process_facts(facts))
+
+
+def normalize_process_facts(value: object) -> dict[str, Any] | None:
+    """Normalize a trusted completed-process receipt, never model claims.
+
+    Native combined output is not relabelled as stdout: callers must retain
+    that distinction when verifying an exact stdout requirement.
+    """
+    if not isinstance(value, Mapping) or value.get("kind") != "process":
+        return None
+    if not isinstance(value.get("source"), str) or value["source"] not in {"local_subprocess", "provider_native"}:
+        return None
+    if not isinstance(value.get("exit_code"), int) or isinstance(value.get("exit_code"), bool):
+        return None
+    if any(not isinstance(value.get(key), str) or not value[key] for key in ("command", "cwd")):
+        return None
+    if len(value["command"]) > 32_768 or len(value["cwd"]) > 32_768:
+        return None
+    stdout, stderr, combined = (value.get(key) for key in ("stdout", "stderr", "combined_output"))
+    separate = isinstance(stdout, str) and isinstance(stderr, str) and combined is None
+    aggregate = stdout is None and stderr is None and isinstance(combined, str)
+    if not (separate or aggregate):
+        return None
+    if value.get("source") == "local_subprocess" and not separate:
+        return None
+    if not isinstance(value.get("output_truncated", False), bool):
+        return None
+    fields = {
+        "kind": "process", "source": value["source"],
+        "command": value["command"], "cwd": value["cwd"], "exit_code": value["exit_code"],
+        "stdout": stdout[:64_000] if separate else None,
+        "stderr": stderr[:64_000] if separate else None,
+        "combined_output": combined[:64_000] if aggregate else None,
+        "output_truncated": bool(value.get("output_truncated")) or any(
+            isinstance(item, str) and len(item) > 64_000 for item in (stdout, stderr, combined)
+        ),
+    }
+    return fields
+
+
+class ProcessOutput(str):
+    """Backward-compatible shell display text carrying actual subprocess facts."""
+
+    def __new__(cls, text: str, *, command: str, cwd: str, stdout: str,
+                stderr: str, exit_code: int):
+        value = super().__new__(cls, text)
+        facts = normalize_process_facts({
+            "kind": "process", "source": "local_subprocess", "command": command,
+            "cwd": cwd, "stdout": stdout, "stderr": stderr,
+            "combined_output": None, "exit_code": exit_code,
+        })
+        if facts is None:
+            raise ValueError("invalid_completed_process_facts")
+        value.process_facts = facts
+        return value
 
 
 @dataclass(frozen=True)
@@ -403,6 +487,10 @@ ABSOLUTE_DOCUMENT_PATH = _string(
 )
 URL = _string(maximum=8192, pattern=r"^\S+$")
 IDENTIFIER = _string(maximum=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@+/-]*$")
+SEMANTIC_APPLICATION_LABEL = _string(
+    maximum=512,
+    pattern=r"^[^\x00-\x1f\x7f]+$",
+)
 FIELD_REF = _string(maximum=28, pattern=r"^fld_[A-Za-z0-9_-]{24}$")
 ARTIFACT_ID = _string(maximum=36, pattern=r"^doc_[0-9a-f]{32}$")
 WEB_ARTIFACT_ID = _string(maximum=36, pattern=r"^web_[0-9a-f]{32}$")
@@ -583,9 +671,6 @@ def _spec(
     permission_category: str = "none",
     postcondition_required: bool = False,
     redaction_policy: str = "bounded_model_result",
-    chat_eligible: bool = True,
-    autonomous_eligible: bool = True,
-    scheduled_eligible: bool = True,
     attempted_effect: str = "",
     safe_reconciliation_descriptors: Iterable[str] = (),
 ) -> ToolSpec:
@@ -618,9 +703,6 @@ def _spec(
         permission_category=permission_category,
         postcondition_required=postcondition_required,
         redaction_policy=redaction_policy,
-        chat_eligible=chat_eligible,
-        autonomous_eligible=autonomous_eligible,
-        scheduled_eligible=scheduled_eligible,
         attempted_effect=str(attempted_effect or ""),
         safe_reconciliation_descriptors=tuple(
             str(item or "")
@@ -678,33 +760,9 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         "source": _string(maximum=32),
     })
     specs = [
-        _spec(
-            "start_autonomous_mission",
-            "Route one current chat request into the canonical Autonomous runner",
-            _object({
-                "reason_code": _string(
-                    enum=(
-                        "dependent_phases", "extended_research",
-                        "iterative_artifact", "sustained_computer_work",
-                        "bounded_turn_infeasible",
-                    ),
-                    maximum=48,
-                ),
-                "confidence": _number(0.0, 1.0),
-                "explicit_request": _boolean(),
-            }, required=("reason_code", "confidence", "explicit_request")),
-            PL,
-            N,
-            NC,
-            preconditions=("chat_routing_context_available",),
-            timeout=240.0,
-            retry=RetryPolicy.NEVER_AFTER_DISPATCH,
-            progress=effect,
-            real=local_real,
-            verified=True,
-            autonomous_eligible=False,
-            scheduled_eligible=False,
-        ),
+        _spec("declare_outcomes", "Optionally record high-level result notes ({id,result}); never required for tools or completion",
+              _object({"outcomes": {"type": "array", "items": {"type": "object"}}}, required=("outcomes",)),
+              R, I, NC, timeout=10.0, retry=RetryPolicy.NEVER_AFTER_DISPATCH),
         _spec("save_memory", "Persist one validated local memory", _object({
             "type": _string(enum=("route", "preference", "fact", "workflow", "contact", "shortcut"), maximum=32),
             "category": _string(enum=("app", "site", "deep_link", "folder", "file", "game", "user", "workflow", "contact", "other"), maximum=32),
@@ -754,14 +812,14 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("open_uri", "Open an allowlisted URI through the OS",
               _object({"uri": URL}, required=("uri",)), RL, N, NC,
               preconditions=("allowlisted_uri_scheme",), real=RealValidationRequirement.USER_VISIBLE),
-        _spec("take_screenshot", "Capture the desktop into a private local OCR artifact", _object(), R, I, NC,
+        _spec("take_screenshot", "Read current global desktop pixels for an explicitly requested whole-desktop or overlay context; returns bounded visual evidence and never a document artifact", _object(), R, I, NC,
               preconditions=("screen_capture_available",), timeout=30.0,
               result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "inspect_desktop_surfaces",
-              "Observe an exact foreground or background native app as opaque window/view/tab/pane/control references with per-surface actuation preconditions; use before native actuation when focus, selection, panes, dialogs, or candidates matter",
+              "Read structured native desktop state and resolve an exact foreground or background app into opaque window/view/tab/pane/control references; returns accessibility evidence and actuation preconditions, not pixels",
               _object({"target": _string(maximum=1000)}), R, I, NC,
               preconditions=("foreground_desktop_surface_available",), timeout=12.0,
               result=ResultPolicy.BOUNDED_MODEL_ONLY,
@@ -769,7 +827,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               progress=state, real=read_real),
         _spec(
               "request_visual_observation",
-              "Request one bounded window/region screenshot only when semantic desktop evidence is ambiguous, incomplete, custom-rendered, modal, small, conflicting, or needs visual verification; visual evidence never authorizes coordinate action",
+              "Observe the exact target visually using image input available to the current model. Returns one fresh frame in that model's normal reasoning loop; optionally refine a prior frame with visual_frame_id plus one normalized visual_bbox; read-only, privacy/capture restricted, maximum two refinements, and never action authority",
               _object({
                   "surface_ref": IDENTIFIER,
                   "reason": _string(enum=(
@@ -778,6 +836,16 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                       "verification",
                   ), maximum=32),
                   "target": _string(maximum=1000),
+                  "visual_frame_id": IDENTIFIER,
+                  "visual_bbox": _object({
+                      "left": _number(0.0, 1.0),
+                      "top": _number(0.0, 1.0),
+                      "right": _number(0.0, 1.0),
+                      "bottom": _number(0.0, 1.0),
+                  }, required=("left", "top", "right", "bottom")),
+                  "expected_application": SEMANTIC_APPLICATION_LABEL,
+                  "expected_window_generation": IDENTIFIER,
+                  "expected_native_window_id": IDENTIFIER,
               }, required=("surface_ref", "reason")), R, I, NC,
               preconditions=("effective_model_native_vision", "fresh_desktop_surface_ref"),
               timeout=30.0, result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
@@ -808,8 +876,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               progress=ProgressEvidencePolicy.DOCUMENT_ARTIFACT, real=read_real,
-              verified=True, redaction_policy="document_private_bounded",
-              scheduled_eligible=False),
+              verified=True, redaction_policy="document_private_bounded"),
         _spec("read_document_artifact", "Read one bounded private artifact chunk",
               _object({"artifact_id": ARTIFACT_ID, "offset": _integer(0, 2_000_000),
                        "chunk_chars": _nullable(_integer(1, 8_000))}, required=("artifact_id",)),
@@ -878,7 +945,6 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
             permission_category="files_modify",
             postcondition_required=True,
             observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
-            scheduled_eligible=False,
         ),
         _spec("list_files", "List one local directory", _object({"path": PATH}, required=("path",)),
               R, I, NC, preconditions=("readable_directory",), progress=state, real=read_real,
@@ -1013,8 +1079,17 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                        "url": _nullable(URL)}, required=("name",)), RL, C, NC,
               preconditions=("supported_browser_installed",), progress=state,
               real=RealValidationRequirement.USER_VISIBLE, verified=True),
-        _spec("desktop_click", "Click one described native desktop target",
-              _object({"description": _string(maximum=1000)}, required=("description",)),
+        _spec("desktop_click", "Click one described native desktop target; when the current model selected a target from request_visual_observation, pass that exact visual_frame_id and one normalized visual_bbox",
+              _object({
+                  "description": _string(maximum=1000),
+                  "visual_frame_id": IDENTIFIER,
+                  "visual_bbox": _object({
+                      "left": _number(0.0, 1.0),
+                      "top": _number(0.0, 1.0),
+                      "right": _number(0.0, 1.0),
+                      "bottom": _number(0.0, 1.0),
+                  }, required=("left", "top", "right", "bottom")),
+              }, required=("description",)),
               DY, D, FC, timeout=120.0, result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               real=RealValidationRequirement.USER_VISIBLE),
@@ -1092,6 +1167,139 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               _object({"direction": _string(enum=("up", "down"), maximum=8),
                        "amount": _integer(1, 1000)}), RL, C, NC,
               real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_screenshot",
+              "Capture one exact native window for the same active multimodal model; omit window for the current foreground window, or provide one exact window title. Returns a fresh frame_id and attached pixels. This is read-only and does not focus or click the target",
+              _object({"window": _string(maximum=240)}),
+              R, I, NC,
+              result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.CONTROLLED_READ_ONLY),
+        _spec(
+              "computer_zoom",
+              "Create one read-only crop of the current Computer Use frame and attach those exact pixels to the same active model. Coordinates are pixels in the referenced image",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "left": _number(0, 1_000_000),
+                  "top": _number(0, 1_000_000),
+                  "right": _number(0, 1_000_000),
+                  "bottom": _number(0, 1_000_000),
+              }, required=("frame_id", "left", "top", "right", "bottom")),
+              R, I, NC,
+              result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.CONTROLLED_READ_ONLY),
+        _spec(
+              "computer_observation",
+              "After inspecting a fresh Computer Use V4 image, optionally report the selected model's interpretation as satisfied, not satisfied, or inconclusive. Reuse frame_id exactly. This is a read-only frame-bound model report, not independent verification or proof that a requested effect occurred. Use the current pixels or an authoritative structured source to support a factual visual claim",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "status": _string(enum=(
+                      "satisfied", "not_satisfied", "inconclusive",
+                  ), maximum=32),
+                  "observed_state": _string(maximum=512),
+              }, required=("frame_id", "status", "observed_state")),
+              R, I, NC,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.CONTROLLED_READ_ONLY),
+        _spec(
+              "computer_click",
+              "Click once at x/y pixels in the exact image identified by frame_id. Coordinates are never repaired. V4 checks bounds, target identity, foreground, geometry, stale client pixels, permission, and ActionTruth immediately before dispatch. Call computer_screenshot after the result",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "x": _number(0, 1_000_000),
+                  "y": _number(0, 1_000_000),
+                  "intent": _string(maximum=160),
+              }, required=("frame_id", "x", "y")),
+              DY, D, FC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_double_click",
+              "Double-click once at x/y pixels in the exact image identified by frame_id through the same V4 stale, permission, and exactly-once boundary. Call computer_screenshot after the result",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "x": _number(0, 1_000_000),
+                  "y": _number(0, 1_000_000),
+                  "intent": _string(maximum=160),
+              }, required=("frame_id", "x", "y")),
+              DY, D, FC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_type",
+              "Type text into the focused element of the exact window bound to frame_id. V4 revalidates the frame and ActionTruth before the existing native keyboard primitive. Call computer_screenshot after an unbatched action",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "text": TEXT,
+                  "intent": _string(maximum=160),
+              }, required=("frame_id", "text")),
+              EM, N, NC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_keypress",
+              "Press one key or shortcut in the exact window bound to frame_id. Enter/Return and other commit-like keys retain the existing final-action permission classification. Call computer_screenshot after the result",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "key": _string(maximum=80),
+                  "intent": _string(maximum=160),
+                  "observe_after": _boolean(),
+              }, required=("frame_id", "key")),
+              DY, D, FC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_scroll",
+              "Scroll the exact foreground window bound to frame_id through the V4 stale and ActionTruth boundary. Call computer_screenshot when the new pixels are needed",
+              _object({
+                  "frame_id": IDENTIFIER,
+                  "direction": _string(
+                      enum=("up", "down", "left", "right"), maximum=8,
+                  ),
+                  "amount": _integer(1, 50),
+                  "intent": _string(maximum=160),
+                  "observe_after": _boolean(),
+              }, required=("frame_id",)),
+              RL, C, NC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
+        _spec(
+              "computer_actions",
+              "Execute a bounded list of 1-3 branch-independent Computer Use actions from one current frame when no intermediate screenshot is needed. Stop on stale, failure, uncertainty, or observe_after. Use separate screenshot/action calls when the next action depends on seeing a result",
+              _object({
+                  "actions": {**_array(_object({
+                      "kind": _string(enum=(
+                          "click", "double_click", "type", "keypress", "scroll",
+                      ), maximum=24),
+                      "frame_id": IDENTIFIER,
+                      "x": _nullable(_number(0, 1_000_000)),
+                      "y": _nullable(_number(0, 1_000_000)),
+                      "text": _string(maximum=1_000_000),
+                      "key": _string(maximum=80),
+                      "direction": _string(
+                          enum=("up", "down", "left", "right"), maximum=8,
+                      ),
+                      "amount": _integer(1, 50),
+                      "observe_after": _boolean(),
+                      "effect_id": _string(maximum=160),
+                  }, required=("kind", "frame_id")), maximum=3), "minItems": 1},
+              }, required=("actions",)),
+              DY, D, FC,
+              timeout=120.0,
+              verified=True,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
         _spec("is_running", "Check whether an application process is running",
               _object({"app": _string(maximum=260)}, required=("app",)), R, I, NC,
               progress=state, real=read_real),
@@ -1114,7 +1322,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               _object(), R, I, NC, preconditions=("managed_browser",),
               progress=state, real=read_real,
               observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("navigate_browser", "Navigate from an optional authoritative browser state",
               _object({"url": URL, "state_ref": _nullable(BROWSER_STATE_REF),
                        "wait_spec": _nullable(WAIT_SPEC)}, required=("url",)),
@@ -1122,7 +1330,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("inspect_browser_page", "Inspect bounded structured rendered page content",
               _object({
                   "state_ref": _nullable(BROWSER_STATE_REF),
@@ -1137,8 +1345,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               }), R, I, NC, preconditions=("managed_browser",), progress=state,
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
-              real=read_real, redaction_policy="browser_private_bounded",
-              scheduled_eligible=False),
+              real=read_real, redaction_policy="browser_private_bounded"),
         _spec("wait_for_browser_condition", "Wait for one bounded browser condition",
               _object({"state_ref": BROWSER_STATE_REF, "wait_spec": WAIT_SPEC},
                       required=("state_ref", "wait_spec")), R, I, NC,
@@ -1146,7 +1353,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               progress=state, real=read_real,
               observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
               postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("activate_browser_element", "Activate one opaque browser element exactly once",
               _object({
                   "state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF,
@@ -1159,55 +1366,55 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               progress=effect, real=RealValidationRequirement.USER_VISIBLE,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("list_browser_tabs", "List authoritative managed-browser tabs",
               _object({"state_ref": _nullable(BROWSER_STATE_REF)}), R, I, NC,
               preconditions=("managed_browser",), progress=state, real=read_real,
               observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("select_browser_tab", "Select one authoritative managed-browser tab",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, I, NC, preconditions=("fresh_browser_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("close_browser_tab", "Close one authoritative managed-browser tab",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, I, NC, preconditions=("fresh_browser_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("reload_browser_page", "Reload one authoritative browser page",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("browser_back", "Navigate backward from an authoritative browser state",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("browser_forward", "Navigate forward from an authoritative browser state",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, C, NC, preconditions=("fresh_browser_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("open_new_browser_tab", "Open and verify one new managed-browser tab",
               _object({"url": URL, "state_ref": _nullable(BROWSER_STATE_REF)},
                       required=("url",)), RL, N, NC,
               preconditions=("managed_browser",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("return_to_browser_opener", "Return from a popup to its opener",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               RL, I, NC, preconditions=("popup_with_live_opener",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("search_web", "Execute the current step's structured search query and return opaque structured result references; inspecting existing links is not a search",
               _object({"query": _string(minimum=1, maximum=300),
                        "state_ref": _nullable(BROWSER_STATE_REF)}, required=("query",)),
@@ -1216,14 +1423,14 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("open_search_result", "Open one opaque result_ref returned by search_web; use this instead of generic element activation for a structured search result",
               _object({"state_ref": BROWSER_STATE_REF, "result_ref": ELEMENT_REF},
                       required=("state_ref", "result_ref")), RL, N, NC,
               preconditions=("fresh_search_result_reference",), progress=effect,
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("paginate_browser", "Activate one fresh opaque next-page control per bounded page and return the verified current page state",
               _object({"state_ref": BROWSER_STATE_REF, "next_ref": ELEMENT_REF,
                        "max_pages": _integer(1, 20)},
@@ -1231,19 +1438,19 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               preconditions=("fresh_pagination_reference",), timeout=450.0,
               progress=effect, real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("scroll_infinite", "Perform bounded infinite-scroll observations",
               _object({"state_ref": BROWSER_STATE_REF, "max_steps": _integer(1, 20)},
                       required=("state_ref",)), RL, C, NC,
               preconditions=("fresh_browser_reference",), timeout=150.0,
               progress=effect, real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("list_browser_dialogs", "List pending browser dialogs without message content",
               _object({"state_ref": BROWSER_STATE_REF}, required=("state_ref",)),
               R, I, NC, preconditions=("fresh_browser_reference",), progress=state,
               real=read_real, observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("handle_browser_dialog", "Accept or dismiss one exact browser dialog",
               _object({"state_ref": BROWSER_STATE_REF, "dialog_ref": ELEMENT_REF,
                        "action": _string(enum=("accept", "dismiss"), maximum=16),
@@ -1253,7 +1460,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_private_bounded", scheduled_eligible=False),
+              redaction_policy="browser_private_bounded"),
         _spec("upload_browser_file", "Select one exact private file for one exact browser target",
               _object({
                   "state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF,
@@ -1274,7 +1481,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
               permission_category="send_publish_submit", postcondition_required=True,
-              redaction_policy="browser_upload_private", scheduled_eligible=False),
+              redaction_policy="browser_upload_private"),
         _spec("download_browser_file", "Download one exact target into a private opaque artifact",
               _object({"state_ref": BROWSER_STATE_REF, "element_ref": ELEMENT_REF},
                       required=("state_ref", "element_ref")), EM, N, NC,
@@ -1283,7 +1490,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.PRIVATE_MODEL_ONLY,
               observability=ObservabilityPolicy.IDENTIFIERS_ONLY,
               permission_category="browser_account", postcondition_required=True,
-              redaction_policy="browser_download_private", scheduled_eligible=False),
+              redaction_policy="browser_download_private"),
         _spec("gmail_list_labels", "List Gmail labels", _object(), R, I, NC,
               preconditions=("gmail_read_connected",), progress=state, real=read_real,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
@@ -1352,6 +1559,10 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         "open_search_result", "paginate_browser", "scroll_infinite",
         "list_browser_dialogs", "handle_browser_dialog",
         "upload_browser_file", "download_browser_file",
+        "computer_screenshot", "computer_zoom", "computer_observation",
+        "computer_click",
+        "computer_double_click", "computer_type", "computer_keypress",
+        "computer_scroll", "computer_actions",
     }
     legacy_browser_tools = {
         "navigate", "click", "fill", "read_page", "get_current_url",
@@ -1380,8 +1591,6 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
                 if spec.redaction_policy != "bounded_model_result"
                 else "browser_private_bounded"
             ),
-            autonomous_eligible=(spec.name not in legacy_browser_tools),
-            scheduled_eligible=False,
         ))
     return tuple(normalized)
 
@@ -1705,7 +1914,36 @@ def validate_arguments(schema: dict, arguments: Any) -> dict:
 def validate_tool_arguments(spec: ToolSpec, arguments: Any) -> dict:
     """Validate a call plus browser wait semantics before any dispatch gate."""
 
-    clean = validate_arguments(spec.input_schema, arguments)
+    normalized = arguments
+    if spec.name == "request_visual_observation" and isinstance(arguments, dict):
+        reason = arguments.get("reason")
+        reason_schema = (
+            spec.input_schema.get("properties", {}).get("reason", {})
+        )
+        canonical_reasons = set(reason_schema.get("enum", ()))
+        if (
+            isinstance(reason, str)
+            and reason.strip()
+            and len(reason) <= 1000
+            and reason not in canonical_reasons
+        ):
+            # Provider-generated prose is harmless metadata, but rejecting it
+            # costs the freshness of the exact opaque surface reference.  Keep
+            # the public enum strict and conservatively canonicalize prose to
+            # the read-only verification reason before schema validation.
+            normalized = dict(arguments)
+            normalized["reason"] = "verification"
+    clean = validate_arguments(spec.input_schema, normalized)
+    if (
+        spec.name == "request_visual_observation"
+        and clean.get("surface_ref")
+        and clean.get("expected_native_window_id") == clean.get("surface_ref")
+    ):
+        # An opaque surface ref is already the authority needed to recover the
+        # private native identity.  Treat an exact copy in the optional native
+        # assertion as an unambiguous category error, never as contradictory
+        # ActionTruth identity.  Any distinct mismatch remains fail-closed.
+        clean.pop("expected_native_window_id", None)
     wait_spec = clean.get("wait_spec")
     if wait_spec is None:
         return clean
@@ -1756,6 +1994,266 @@ def validation_error_details(error: ToolValidationError, repair_count: int = 0) 
             for issue in getattr(error, "issues", ())[:16]
         ],
     }
+
+
+def computer_use_argument_shape(arguments: Any, schema: Mapping | None = None) -> dict:
+    """Return a value-free structural shape for Computer Use diagnostics.
+
+    String contents and numeric values are omitted. A string is represented by
+    its length, except that a value matching an enum from the supplied registry
+    schema is retained so action-kind mismatches can be diagnosed safely.
+    """
+
+    safe_key = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+    safe_enum = re.compile(r"[A-Za-z0-9_.:-]{1,32}\Z")
+
+    def _enum_values(current: Any) -> set[str]:
+        if not isinstance(current, Mapping):
+            return set()
+        values = {
+            value for value in current.get("enum", ())
+            if isinstance(value, str) and safe_enum.fullmatch(value)
+        }
+        for key in ("anyOf", "oneOf", "allOf"):
+            for branch in current.get(key, ()) if isinstance(current.get(key), list) else ():
+                values.update(_enum_values(branch))
+        return values
+
+    def _shape(value: Any, current_schema: Any, depth: int) -> dict:
+        if depth >= 7:
+            return {"type": "truncated"}
+        if value is None:
+            return {"type": "null"}
+        if isinstance(value, bool):
+            return {"type": "boolean"}
+        if isinstance(value, str):
+            result = {"type": "string", "length": len(value)}
+            if value in _enum_values(current_schema):
+                result["schema_enum"] = value
+            return result
+        if isinstance(value, (int, float)):
+            return {"type": "number"}
+        if isinstance(value, Mapping):
+            properties = (
+                current_schema.get("properties", {})
+                if isinstance(current_schema, Mapping) else {}
+            )
+            properties = properties if isinstance(properties, Mapping) else {}
+            fields: dict[str, dict] = {}
+            entries = sorted(value.items(), key=lambda item: str(item[0]))
+            for key, item in entries[:24]:
+                name = str(key)
+                safe_name = name if safe_key.fullmatch(name) else "<other>"
+                if safe_name in fields:
+                    safe_name = f"<other_{len(fields)}>"
+                fields[safe_name] = _shape(
+                    item, properties.get(name), depth + 1,
+                )
+            result = {"type": "object", "fields": fields}
+            if len(entries) > 24:
+                result["omitted_fields"] = len(entries) - 24
+            return result
+        if isinstance(value, (list, tuple)):
+            item_schema = (
+                current_schema.get("items")
+                if isinstance(current_schema, Mapping) else None
+            )
+            result = {
+                "type": "array",
+                "length": len(value),
+                "items": [
+                    _shape(item, item_schema, depth + 1)
+                    for item in value[:8]
+                ],
+            }
+            if len(value) > 8:
+                result["omitted_items"] = len(value) - 8
+            return result
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return {"type": "bytes", "length": len(value)}
+        return {"type": "other"}
+
+    return _shape(arguments, schema, 0)
+
+
+def tool_schema_fingerprint(schema: Mapping) -> str:
+    """Return a stable SHA-256 identity for one JSON-compatible tool schema."""
+
+    canonical = json.dumps(
+        schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def persisted_computer_use_argument_diagnostic(value: Any) -> dict | None:
+    """Project one bounded value-free Computer Use validation diagnostic.
+
+    The final projection is intentionally limited to correlation IDs, provider
+    and model labels, tool/schema identity, structural types/lengths, enum
+    labels, validation paths/codes, and dispatch state.
+    """
+
+    if (
+        not isinstance(value, Mapping)
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or type(value.get("dispatch_started")) is not bool
+    ):
+        return None
+    safe_id_pattern = re.compile(r"[A-Za-z0-9._:/-]{1,192}\Z")
+    safe_name_pattern = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}\Z")
+    safe_model_pattern = re.compile(r"[A-Za-z][A-Za-z0-9_./:-]{0,159}\Z")
+    safe_code_pattern = re.compile(r"[A-Za-z0-9_.:-]{1,80}\Z")
+    safe_path_pattern = re.compile(r"\$[A-Za-z0-9_.$\[\]-]{0,180}\Z")
+    safe_enum_pattern = re.compile(r"[A-Za-z0-9_.:-]{1,32}\Z")
+
+    def _label(raw: Any, pattern, *, maximum: int = 192) -> str:
+        if not isinstance(raw, str) or len(raw) > maximum:
+            return ""
+        return raw if pattern.fullmatch(raw) else ""
+
+    def _shape(raw: Any, depth: int = 0) -> dict | None:
+        if not isinstance(raw, Mapping):
+            return None
+        kind = raw.get("type")
+        if kind not in {
+            "object", "array", "string", "boolean", "number", "null",
+            "bytes", "other", "truncated",
+        }:
+            return None
+        if kind == "truncated":
+            return {"type": "truncated"}
+        if depth >= 7:
+            return None
+        result = {"type": kind}
+        if kind == "string" or kind in {"array", "bytes"}:
+            length = raw.get("length")
+            if type(length) is not int or not 0 <= length <= 1_000_000:
+                return None
+            result["length"] = length
+        if kind == "string" and raw.get("schema_enum") is not None:
+            enum_value = _label(raw.get("schema_enum"), safe_enum_pattern, maximum=32)
+            if not enum_value:
+                return None
+            result["schema_enum"] = enum_value
+        if kind == "object":
+            raw_fields = raw.get("fields")
+            if not isinstance(raw_fields, Mapping) or len(raw_fields) > 24:
+                return None
+            fields = {}
+            for raw_name, raw_shape in raw_fields.items():
+                name = str(raw_name)
+                if name != "<other>" and not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]{0,63}", name,
+                ) and not re.fullmatch(r"<other_[0-9]{1,2}>", name):
+                    name = "<other>"
+                child = _shape(raw_shape, depth + 1)
+                if child is None:
+                    return None
+                fields[name] = child
+            result["fields"] = fields
+        if kind == "array":
+            raw_items = raw.get("items")
+            if not isinstance(raw_items, list) or len(raw_items) > 8:
+                return None
+            items = [_shape(item, depth + 1) for item in raw_items]
+            if any(item is None for item in items):
+                return None
+            result["items"] = items
+        for key in ("omitted_fields", "omitted_items"):
+            if key in raw:
+                count = raw[key]
+                if type(count) is not int or not 0 <= count <= 1_000_000:
+                    return None
+                result[key] = count
+        return result
+
+    def _issues(raw: Any) -> list[dict] | None:
+        if not isinstance(raw, list) or len(raw) > 16:
+            return None
+        output = []
+        for issue in raw:
+            if not isinstance(issue, Mapping):
+                return None
+            path = _label(issue.get("path"), safe_path_pattern, maximum=181)
+            code = _label(issue.get("code"), safe_code_pattern, maximum=80)
+            if not path or not code:
+                return None
+            output.append({"path": path, "code": code})
+        return output
+
+    correlation = {}
+    for field in ("conversation_id", "request_id", "turn_id"):
+        label = _label(value.get(field), safe_id_pattern)
+        if not label:
+            return None
+        correlation[field] = label
+    provider = _label(value.get("provider_id"), safe_name_pattern)
+    model = _label(value.get("model_id"), safe_model_pattern, maximum=160)
+    first_call = value.get("first_call")
+    if not provider or not model or not isinstance(first_call, Mapping):
+        return None
+
+    def _call(raw: Mapping, *, repair: bool) -> dict | None:
+        tool = _label(raw.get("tool_name"), safe_name_pattern)
+        schema_hash = str(raw.get("schema_sha256") or "").lower()
+        shape = _shape(raw.get("argument_shape"))
+        validation = raw.get("validation")
+        if (
+            not tool
+            or not tool.startswith("computer_")
+            or not re.fullmatch(r"[0-9a-f]{64}", schema_hash)
+            or shape is None
+            or not isinstance(validation, Mapping)
+            or type(validation.get("passed")) is not bool
+        ):
+            return None
+        issues = _issues(validation.get("issues"))
+        if issues is None:
+            return None
+        output = {
+            "tool_name": tool,
+            "schema_sha256": schema_hash,
+            "argument_shape": shape,
+            "validation": {
+                "passed": validation["passed"],
+                "issues": issues,
+            },
+        }
+        if repair:
+            repair_provider = _label(raw.get("provider_id"), safe_name_pattern)
+            repair_model = _label(raw.get("model_id"), safe_model_pattern, maximum=160)
+            if not repair_provider or not repair_model:
+                return None
+            output["provider_id"] = repair_provider
+            output["model_id"] = repair_model
+        return output
+
+    safe_first = _call(first_call, repair=False)
+    if safe_first is None:
+        return None
+    result = {
+        "schema_version": 1,
+        **correlation,
+        "provider_id": provider,
+        "model_id": model,
+        "first_call": safe_first,
+        "repair": None,
+        "dispatch_started": bool(value.get("dispatch_started")),
+    }
+    repair_data = value.get("repair")
+    if repair_data is not None:
+        if (
+            not isinstance(repair_data, Mapping)
+            or type(repair_data.get("attempt")) is not int
+            or repair_data.get("attempt") != 1
+        ):
+            return None
+        safe_repair = _call(repair_data, repair=True)
+        if safe_repair is None:
+            return None
+        result["repair"] = {"attempt": 1, **safe_repair}
+    return result
 
 
 def validation_error_text(lang: str = "en") -> str:
@@ -1815,11 +2313,29 @@ def is_final_browser_commit(tool_name: str, arguments: Mapping[str, Any]) -> boo
     values = arguments if isinstance(arguments, Mapping) else {}
     if name == "activate_browser_element":
         return values.get("trusted_final_action") is True
-    if name in {"press_key", "desktop_press"}:
+    if name in {"press_key", "desktop_press", "computer_keypress"}:
         return str(values.get("key") or "").strip().lower() in {"enter", "return"}
+    if name == "computer_actions":
+        actions = values.get("actions")
+        return bool(
+            isinstance(actions, list)
+            and any(
+                isinstance(item, Mapping)
+                and (
+                    (
+                        str(item.get("kind") or "") == "keypress"
+                        and str(item.get("key") or "").strip().lower()
+                        in {"enter", "return"}
+                    )
+                    or _FINAL_COMMIT_RE.search(str(item.get("effect_id") or ""))
+                )
+                for item in actions
+            )
+        )
     field = {
         "click": "selector", "find_and_click": "text",
         "desktop_click": "description",
+        "computer_click": "intent", "computer_double_click": "intent",
         "activate_desktop_surface": "objective",
     }.get(name)
     return bool(field and _FINAL_COMMIT_RE.search(str(values.get(field) or "")))
@@ -1881,7 +2397,7 @@ def persistence_contract(
         except (TypeError, ValueError, OverflowError):
             wait_timeout = 0.0
 
-    if name in AUTONOMOUS_WEB_TOOL_NAMES or any(
+    if name in BROWSER_FAMILY_TOOL_NAMES or any(
         "browser" in str(item) for item in spec.preconditions
     ):
         family = ToolPersistenceFamily.BROWSER
@@ -1906,6 +2422,13 @@ def persistence_contract(
         inactivity = owner_timeout + 5.0
         hard = max(inactivity + 20.0, owner_timeout * 1.25)
         delays = (1.0, 2.0, 5.0, 10.0, 15.0)
+        alternatives = ()
+    elif name.startswith("computer_"):
+        family = ToolPersistenceFamily.GENERIC
+        release_after = min(owner_timeout, 10.0)
+        inactivity = owner_timeout + 5.0
+        hard = max(inactivity + 15.0, owner_timeout * 1.25)
+        delays = (1.0, 2.0, 5.0, 10.0)
         alternatives = ()
     elif name in _SYSTEM_PERSISTENCE_TOOLS:
         family = ToolPersistenceFamily.SYSTEM
@@ -2057,71 +2580,97 @@ def bounded_model_result(result: Any, *, limit: int = 64_000) -> Any:
             )
         return clean
     text = "" if result is None else str(result)
-    return text if len(text) <= limit else text[:limit] + "\n... [TRUNCATED]"
+    display = text if len(text) <= limit else text[:limit] + "\n... [TRUNCATED]"
+    if isinstance(result, ProcessOutput):
+        preserved = str.__new__(ProcessOutput, display)
+        preserved.process_facts = dict(result.process_facts)
+        return preserved
+    return display
 
 
-def tool_is_eligible_in_current_surface(spec_or_name: ToolSpec | str) -> bool:
-    """Return whether one static tool belongs to the active execution surface."""
+def static_tool_inventory_specs() -> tuple[ToolSpec, ...]:
+    """Return the complete runtime-available static inventory.
+
+    WOR-300: the model-visible inventory is composed from genuine runtime
+    availability alone and never depends on the request, the execution
+    strategy, the semantic domain or the engine surface.  The engine surface
+    still gates dispatch through ``tool_is_eligible_in_current_surface``; an
+    internal engine restriction never reduces the visible inventory.
+    """
+
+    return tuple(
+        spec for spec in get_static_registry().values()
+        if _static_tool_runtime_available(spec)
+    )
+
+
+def _static_tool_runtime_available(spec: ToolSpec) -> bool:
+    """Return only genuine runtime availability for one static capability.
+
+    WOR-300 exposure invariant: the model-visible surface is composed from
+    runtime availability alone.  Request wording, semantic classification,
+    GoalContract/ExecutionStrategy state, semantic domain, estimated relevance
+    and execution-frontier progress are never consulted here.  At dispatch, only technical availability/argument validation,
+    BLOCK_SYSTEM_DESTRUCTION, current target freshness, exact request/attempt
+    ownership, and correlated cancellation may constrain execution. Semantic
+    relevance, historical ActionTruth, and OUTCOME_UNKNOWN do not veto a fresh
+    model-requested call; seeing a capability does not override real technical
+    availability or integrity checks.
+    """
+
+    if spec.name in DORMANT_VISUAL_V3_TOOL_NAMES:
+        # Retired/dormant capability: dispatch fails with a typed error.
+        return False
+    if spec.name.startswith("computer_"):
+        import sys
+
+        if sys.platform != "win32":
+            # Computer Use V4 exact-window capture/actuation is win32-only.
+            return False
+        try:
+            from osia.computer_use_v4_integration import (
+                COMPUTER_USE_V4_TOOL_NAMES,
+                computer_use_v4_tools_available,
+            )
+        except Exception:
+            return False
+        if spec.name not in COMPUTER_USE_V4_TOOL_NAMES:
+            return False
+        # Genuine runtime capability: the active turn must exist and the
+        # selected provider/model must accept image input.
+        return bool(computer_use_v4_tools_available())
+    return True
+
+
+def tool_is_runtime_available(spec_or_name: ToolSpec | str) -> bool:
+    """Return genuine runtime availability for one capability (WOR-300).
+
+    Registered dynamic (MCP) tools are available by their registration alone;
+    static tools follow platform/provider/turn availability.  Surface state,
+    request wording and execution strategy are never consulted.
+    """
 
     spec = (
-        spec_or_name
-        if isinstance(spec_or_name, ToolSpec)
-        else get_tool_spec(str(spec_or_name or ""))
+        get_tool_spec(spec_or_name)
+        if isinstance(spec_or_name, str) else spec_or_name
     )
     if spec is None:
         return False
-    surface = current_tool_surface()
-    if surface == "autonomous_web":
-        return bool(
-            spec.autonomous_eligible
-            and spec.name in AUTONOMOUS_WEB_TOOL_NAMES
-        )
-    if surface == "autonomous_web_verify":
-        return bool(
-            spec.autonomous_eligible
-            and spec.name in AUTONOMOUS_WEB_VERIFY_TOOL_NAMES
-        )
-    if surface == "autonomous":
-        return bool(spec.autonomous_eligible)
-    if surface == "scheduled":
-        return bool(spec.scheduled_eligible)
-    return bool(spec.chat_eligible)
+    if spec.dynamic:
+        return True
+    return _static_tool_runtime_available(spec)
 
 
 def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
-    """Return the exact ordered static specs exposed in the current turn."""
+    """Return the exact ordered static specs exposed in the current turn.
 
-    specs = tuple(
-        spec for spec in get_static_registry().values()
-        if tool_is_eligible_in_current_surface(spec)
-    )
-    try:
-        from osia.execution_strategy import (
-            current_execution_strategy,
-            tool_applicability,
-        )
+    Every registered capability available in the current runtime is exposed
+    on every turn, identically for a trivial question and a broad coding
+    request, with or without an active GoalContract or ExecutionStrategy, and
+    identically across engine surfaces.
+    """
 
-        strategy = current_execution_strategy()
-    except Exception:
-        strategy = None
-    if strategy is None:
-        return specs
-    filtered = []
-    for spec in specs:
-        if (
-            strategy.available_tools
-            and spec.name not in strategy.available_tools
-        ):
-            continue
-        try:
-            applicable, _reason = tool_applicability(
-                strategy, spec.name, {},
-            )
-        except Exception:
-            applicable = False
-        if applicable:
-            filtered.append(spec)
-    return tuple(filtered)
+    return static_tool_inventory_specs()
 
 
 def static_tool_prompt_block(lang: str = "en") -> str:
@@ -2129,9 +2678,8 @@ def static_tool_prompt_block(lang: str = "en") -> str:
 
     del lang
     lines = [
-        "## Available OSIA tools (authoritative signatures)",
-        "Only these OSIA tools exist on this turn's surface. Required and optional "
-        "top-level arguments must match the signatures; unknown fields are rejected.",
+        "## Available OSIA capabilities",
+        "Only these turn capabilities exist. Arguments are top-level; unknown fields are rejected.",
     ]
     for spec in effective_static_tool_specs():
         schema = spec.input_schema
@@ -2156,10 +2704,39 @@ def static_tool_prompt_block(lang: str = "en") -> str:
         )
         optional = [key for key in props if key not in required]
         if optional:
+            shown = optional[:3]
             signature += ("; " if signature else "") + "optional:" + ",".join(
-                f"{key}:{_prompt_schema_type(props[key])}" for key in optional
+                shown
             )
-        lines.append(f"- {spec.name}: ({signature}) {spec.capability}")
+            if len(optional) > len(shown):
+                signature += ",..."
+        capability = " ".join(str(spec.capability or "").split())[:75]
+        if spec.name == "render_pdf":
+            # ``blocks:list`` alone is not callable: retain the bounded nested
+            # discriminators while omitting the former prose examples.
+            capability = (
+                "Create/export PDF; blocks="
+                "heading{text,level?}|paragraph{text}|"
+                "bullet_list{items}|numbered_list{items}|"
+                "table{headers,rows}|page_break|"
+                "flow_diagram{nodes,edges}"
+            )
+        output = {
+            ResultPolicy.BOUNDED_MODEL_ONLY: "model",
+            ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT: "model+image",
+            ResultPolicy.PRIVATE_MODEL_ONLY: "private-model",
+        }[spec.result_policy]
+        contract = [
+            f"out={output}",
+            f"effect={spec.side_effect.name}",
+        ]
+        if spec.preconditions:
+            contract.append("pre=" + spec.preconditions[0])
+        # WOR-301: confirmation policies no longer gate dispatch, so the
+        # catalogue must not advertise one to the model.
+        lines.append(
+            f"- {spec.name}({signature}): {capability}; " + "; ".join(contract)
+        )
     return "\n".join(lines)
 
 
@@ -2194,8 +2771,16 @@ def _prompt_schema_type(schema: Any) -> str:
 
 def replace_static_tool_prompt_section(body: str, lang: str = "en") -> str:
     del lang
-    start = "## Available Tools"
-    end = "## How to Use Tools"
+    start = (
+        "## Available Capabilities"
+        if "## Available Capabilities" in body else
+        "## Available Tools"
+    )
+    end = (
+        "## Tool call format"
+        if "## Tool call format" in body else
+        "## How to Use Tools"
+    )
     start_index = body.find(start)
     end_index = body.find(end)
     if start_index < 0 or end_index <= start_index:
@@ -2267,9 +2852,6 @@ def matrix_rows(
             "permission_category": "connectors",
             "postcondition_required": True,
             "redaction_policy": "private_connector_metadata",
-            "chat_eligible": True,
-            "autonomous_eligible": True,
-            "scheduled_eligible": False,
             "supported_providers": list(ALL_TEXT_PROVIDERS),
             "deterministic_test_status": EvidenceClassification.METADATA_ONLY.value,
             "controlled_integration_status": EvidenceClassification.UNAVAILABLE_IN_ENVIRONMENT.value,
@@ -2305,9 +2887,6 @@ def _matrix_row(spec: ToolSpec, *, executable: bool) -> dict[str, Any]:
         "permission_category": spec.permission_category,
         "postcondition_required": spec.postcondition_required,
         "redaction_policy": spec.redaction_policy,
-        "chat_eligible": spec.chat_eligible,
-        "autonomous_eligible": spec.autonomous_eligible,
-        "scheduled_eligible": spec.scheduled_eligible,
         "supported_providers": list(spec.providers),
         "deterministic_test_status": spec.deterministic_test_status.value,
         "controlled_integration_status": spec.controlled_integration_status.value,
@@ -2318,8 +2897,8 @@ def _matrix_row(spec: ToolSpec, *, executable: bool) -> dict[str, Any]:
 
 
 __all__ = [
-    "ALL_TEXT_PROVIDERS", "AUTONOMOUS_WEB_TOOL_NAMES",
-    "AUTONOMOUS_WEB_VERIFY_TOOL_NAMES", "CONFIRMATION_LEDGER",
+    "ALL_TEXT_PROVIDERS", "BROWSER_FAMILY_TOOL_NAMES",
+    "BROWSER_VERIFY_TOOL_NAMES", "CONFIRMATION_LEDGER",
     "ConfirmationLedger",
     "ConfirmationPolicy", "EffectiveToolContract", "EvidenceClassification",
     "ExecutionOutcome", "IdempotencyClass", "ObservabilityPolicy",
@@ -2327,6 +2906,7 @@ __all__ = [
     "RetryPolicy", "STATIC_TOOL_REGISTRY", "STATIC_TOOL_SPECS",
     "SideEffectClass", "ToolRegistry", "ToolRegistryError", "ToolSpec",
     "ToolExecutionRecord", "ToolPersistenceContract", "ToolPersistenceFamily",
+    "ProcessOutput", "normalize_process_facts",
     "ToolValidationError", "ToolValidationIssue",
     "assert_prompt_tool_examples_compatible",
     "bind_static_registry", "bounded_model_result",
@@ -2337,8 +2917,10 @@ __all__ = [
     "harden_input_schema", "is_final_browser_commit", "matrix_rows",
     "normalized_call_hash", "persistence_contract", "register_dynamic_tool",
     "replace_static_tool_prompt_section", "safe_confirmation_summary",
-    "shell_command_is_proven_read_only", "static_tool_prompt_block",
-    "tool_is_eligible_in_current_surface",
+    "shell_command_is_proven_read_only", "static_tool_inventory_specs",
+    "static_tool_prompt_block",
+    "tool_is_eligible_in_current_surface", "tool_is_runtime_available",
     "unregister_dynamic_tools", "validate_arguments", "validation_error_details",
-    "validation_error_text",
+    "validation_error_text", "computer_use_argument_shape",
+    "tool_schema_fingerprint", "persisted_computer_use_argument_diagnostic",
 ]

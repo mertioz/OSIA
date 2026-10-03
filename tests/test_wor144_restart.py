@@ -210,6 +210,103 @@ def test_prepare_relaunch_failure_clears_marker_and_pending(
     assert relaunch._request_pending is False
 
 
+def test_launch_desktop_uses_detached_canonical_command(monkeypatch):
+    from osia.utils import systemd_manager
+
+    monkeypatch.setattr(relaunch.sys, "platform", "win32")
+    launched = []
+    closed = []
+    readiness = []
+    monkeypatch.setattr(
+        systemd_manager,
+        "ensure_service_running",
+        lambda name: readiness.append(name) or True,
+    )
+    monkeypatch.setattr(
+        relaunch,
+        "desktop_command",
+        lambda: ["desktop", "--wake"],
+    )
+    monkeypatch.setattr(
+        relaunch,
+        "_detached_kwargs",
+        lambda: {"detached": True},
+    )
+    monkeypatch.setattr(
+        relaunch,
+        "_close_child_streams",
+        lambda kwargs: closed.append(kwargs),
+    )
+
+    result = relaunch.launch_desktop(
+        process_factory=lambda command, **kwargs: launched.append(
+            (command, kwargs)
+        ),
+    )
+
+    assert result == 0
+    assert readiness == ["osia-server.service"]
+    assert launched == [(["desktop", "--wake"], {"detached": True})]
+    assert closed == [{"detached": True}]
+
+
+def test_launch_desktop_failure_is_nonzero_and_closes_streams(monkeypatch):
+    from osia.utils import systemd_manager
+
+    monkeypatch.setattr(relaunch.sys, "platform", "win32")
+    closed = []
+    monkeypatch.setattr(
+        systemd_manager, "ensure_service_running", lambda _name: True,
+    )
+    monkeypatch.setattr(relaunch, "desktop_command", lambda: ["desktop"])
+    monkeypatch.setattr(relaunch, "_detached_kwargs", lambda: {"stream": "log"})
+    monkeypatch.setattr(
+        relaunch,
+        "_close_child_streams",
+        lambda kwargs: closed.append(kwargs),
+    )
+
+    result = relaunch.launch_desktop(
+        process_factory=lambda *_a, **_k: (_ for _ in ()).throw(
+            OSError("spawn failed")
+        ),
+    )
+
+    assert result == 5
+    assert closed == [{"stream": "log"}]
+
+
+def test_launch_desktop_fails_before_gui_spawn_when_server_is_not_ready(monkeypatch):
+    from osia.utils import systemd_manager
+
+    monkeypatch.setattr(relaunch.sys, "platform", "win32")
+    launched = []
+    monkeypatch.setattr(
+        systemd_manager, "ensure_service_running", lambda _name: False,
+    )
+    monkeypatch.setattr(relaunch, "_detached_kwargs", lambda: {})
+
+    result = relaunch.launch_desktop(
+        process_factory=lambda *args, **kwargs: launched.append((args, kwargs)),
+    )
+
+    assert result == 6
+    assert launched == []
+
+
+def test_launch_desktop_cli_dispatch(monkeypatch):
+    monkeypatch.setattr(relaunch, "launch_desktop", lambda: 7)
+
+    assert relaunch.main(["--launch-desktop"]) == 7
+
+
+def test_source_start_batch_uses_detached_desktop_launcher():
+    script = (ROOT / "start.bat").read_text(encoding="utf-8")
+
+    assert '"%VENV_PY%" -m osia.relaunch --launch-desktop' in script
+    assert '"%VENV_PY%" "%PROJECT_DIR%osia\\main.py" --wake' not in script
+
+
 def _coordinator_fakes(monkeypatch, tmp_path, events, launched):
     monkeypatch.setattr(relaunch, "RELAUNCH_MARKER", tmp_path / "marker.json")
     monkeypatch.setattr(relaunch, "_acquire_windows_mutex", lambda *_a, **_k: "mutex")

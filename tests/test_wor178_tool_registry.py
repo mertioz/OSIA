@@ -15,6 +15,7 @@ from osia.tool_contracts import (
     ToolValidationError,
     assert_prompt_tool_examples_compatible,
     dynamic_tool_specs,
+    effective_static_tool_specs,
     get_static_registry,
     get_tool_spec,
     static_tool_prompt_block,
@@ -28,13 +29,15 @@ def test_static_registry_is_complete_unique_and_provider_prompt_derived():
         name: dispatcher for name, dispatcher in agent_module.TOOL_MAP.items()
         if not name.startswith("mcp__")
     }
-    assert len(executable) == 95
-    assert len(registry.names()) == 95
+    # The registry is exactly the executable static surface (no golden count:
+    # WOR-300/WOR-303 removed the Autonomous routing tool from that surface).
+    assert set(registry.names()) == set(executable)
     registry.assert_complete(executable)
     prompt = static_tool_prompt_block("en")
     for spec in registry.values():
         Draft202012Validator.check_schema(spec.input_schema)
-        assert prompt.count(f"- {spec.name}:") == 1
+    for spec in effective_static_tool_specs():
+        assert prompt.count(f"- {spec.name}(") == 1
 
 
 def test_duplicate_registry_name_is_rejected():

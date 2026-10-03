@@ -53,7 +53,6 @@ ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
 # do not replace it with a version allowlist (WOR-66 C13).
 ALLOW_UNSIGNED_STABLE_BUILD = True
 UPDATER_SCHEMA_VERSION = 1
-PERSONAL_BROWSER_ID_RE = re.compile(r"^[a-p]{32}$")
 
 _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
     "app",
@@ -445,48 +444,6 @@ VSVersionInfo(
     (GENERATED / "version_info.txt").write_text(version_info, encoding="utf-8")
 
 
-def _stage_personal_browser_metadata() -> Path:
-    """Fail closed until both real production store identities are supplied."""
-    chrome_id = os.environ.get("OSIA_CHROME_EXTENSION_ID", "").strip()
-    edge_id = os.environ.get("OSIA_EDGE_EXTENSION_ID", "").strip()
-    if not PERSONAL_BROWSER_ID_RE.fullmatch(chrome_id):
-        raise RuntimeError("OSIA_CHROME_EXTENSION_ID must be an exact production store ID")
-    if not PERSONAL_BROWSER_ID_RE.fullmatch(edge_id):
-        raise RuntimeError("OSIA_EDGE_EXTENSION_ID must be an exact production store ID")
-    target = GENERATED / "personal_browser_metadata.json"
-    target.write_text(json.dumps({
-        "schema_version": 1,
-        "development_extension_id": None,
-        "chrome_store_id": chrome_id,
-        "edge_store_id": edge_id,
-    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return target
-
-
-def _build_native_host() -> Path:
-    dist_root = STAGE / "native-host-dist"
-    work_root = STAGE / "native-host-work"
-    _run([
-        sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
-        "--distpath", str(dist_root), "--workpath", str(work_root),
-        str(ROOT / "packaging" / "windows" / "native_host.spec"),
-    ])
-    source = dist_root / "OSIA-NativeHost"
-    executable = source / "OSIA-NativeHost.exe"
-    if not executable.is_file():
-        raise FileNotFoundError(executable)
-    destination = DIST / "native_host"
-    shutil.copytree(source, destination)
-    probe = subprocess.run(
-        [str(destination / "OSIA-NativeHost.exe"), "--self-test"],
-        timeout=15,
-        check=False,
-    )
-    if probe.returncode != 0:
-        raise RuntimeError("packaged Native Messaging host self-test failed")
-    return destination / "OSIA-NativeHost.exe"
-
-
 def _build_timestamp() -> str:
     epoch = os.environ.get("SOURCE_DATE_EPOCH")
     if epoch:
@@ -787,13 +744,11 @@ def build(
     codex_runtime = _stage_codex_runtime()
     dependencies = _stage_legal()
     _generate_branding(version)
-    _stage_personal_browser_metadata()
     _write_app_metadata(identity)
     _write_manifest(models, dependencies, codex_runtime, identity)
 
     _run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
           str(ROOT / "packaging" / "windows" / "osia.spec")])
-    _build_native_host()
     _write_bundle_file_manifest()
     _validate_release_payload(DIST)
     _secret_scan(DIST)

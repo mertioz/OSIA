@@ -69,7 +69,7 @@ def wait_and_verify(
             elapsed = now - started
             if description:
                 print(
-                    f"[task_wait] ✗ {description} not ready after "
+                    f"[task_wait] {description} not ready after "
                     f"{elapsed:.1f}s (timeout {timeout_s:.0f}s)"
                 )
             return False, elapsed

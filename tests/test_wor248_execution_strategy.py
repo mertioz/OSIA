@@ -104,9 +104,11 @@ def test_deep_link_succeeds_before_ui_navigation():
     )
     strategy = ExecutionStrategy(goal, (deep_link, uia))
 
-    premature_uia = _select(strategy, uia)
-    assert premature_uia.allowed is False
-    assert premature_uia.reason_code.startswith("higher_strategy_still_applicable")
+    # WOR-301: a lower mechanism is never refused because a higher one exists;
+    # the model decides which available capability to use.
+    lower_first = _select(strategy, uia)
+    assert lower_first.allowed is True
+    strategy.record(lower_first, "failed", failure_reason="controlled_failure")
 
     route = _select(strategy, deep_link, {"uri": "steam://open/games"})
     assert route.allowed is True
@@ -179,13 +181,15 @@ def test_uia_and_keyboard_fail_then_local_zoomed_vision_succeeds():
     assert strategy.attempts[-1].mechanism == "local_or_zoomed_vision"
 
 
-def test_zoomed_local_vision_is_enabled_before_global_coordinates_by_default():
+def test_zoomed_local_vision_does_not_depend_on_legacy_refinement_switch():
     from osia import agent
 
-    assert agent._REFINE_DEFAULT is True
+    assert not hasattr(agent, "_REFINE_DEFAULT")
+    assert not hasattr(agent, "_vision_locate")
+    assert not hasattr(agent, "_refine_click_target")
 
 
-def test_global_vision_is_blocked_until_every_higher_applicable_level_fails():
+def test_global_vision_is_never_blocked_by_higher_applicable_levels():
     goal = _steam_goal()
     uia = _mechanism("native_accessibility", StrategyLayer.NATIVE_ACCESSIBILITY)
     keyboard = _mechanism("keyboard_focus", StrategyLayer.KEYBOARD)
@@ -193,20 +197,22 @@ def test_global_vision_is_blocked_until_every_higher_applicable_level_fails():
     global_vision = _mechanism("global_vision", StrategyLayer.GLOBAL_VISION)
     strategy = ExecutionStrategy(goal, (uia, keyboard, local, global_vision))
 
-    blocked = _select(strategy, global_vision)
-    assert blocked.allowed is False
-    assert "native_accessibility" in blocked.reason_code
+    # WOR-301: mechanism ranking never refuses an available capability.
+    first = _select(strategy, global_vision)
+    assert first.allowed is True
+    strategy.record(first, "failed", failure_reason="controlled_failure")
 
-    for mechanism in (uia, keyboard):
+    for mechanism in (uia, keyboard, local):
         decision = _select(strategy, mechanism)
+        assert decision.allowed is True
         strategy.record(decision, "failed", failure_reason="controlled_failure")
 
-    still_blocked = _select(strategy, global_vision)
-    assert still_blocked.allowed is False
-    assert "local_vision" in still_blocked.reason_code
-
-    local_decision = _select(strategy, local)
-    strategy.record(local_decision, "failed", failure_reason="zoom_target_not_found")
+    # The retry loop guard still requires new evidence before a replay
+    # (execution-integrity), so observe one fresh revision first.
+    strategy.observe(
+        "fresh desktop state after failed attempts",
+        evidence_token="state_revision_2",
+    )
     last_resort = _select(strategy, global_vision)
     assert last_resort.allowed is True
     strategy.record(
@@ -261,7 +267,7 @@ def test_dom_store_fallback_is_rejected_for_native_library_goal():
     assert strategy.attempts[-1].status == "blocked"
 
 
-def test_unknown_web_identity_is_rejected_for_constrained_native_goal():
+def test_unknown_web_identity_is_not_refused_for_constrained_native_goal():
     request = "Open Steam, go to my Library and search for Subnautica"
     with execution_strategy_scope(request, {"navigate_browser"}) as strategy:
         decision = tool_preflight(
@@ -269,29 +275,25 @@ def test_unknown_web_identity_is_rejected_for_constrained_native_goal():
             {"url": "https://example.test/search?q=Subnautica"},
         )
 
-    assert decision is not None
-    assert decision.allowed is False
-    assert decision.reason_code == "required_application_changed"
+    # WOR-301: navigating to a different web identity is the model's decision;
+    # the strategy must not refuse an available browser capability for it.
+    assert decision is None or decision.allowed is True
 
 
-def test_live_adapter_rejects_steam_library_to_store_and_requires_deep_link_first():
+def test_live_adapter_allows_lower_levels_and_keeps_freshness_gate():
     request = "Open Steam, go to my Library and search for Subnautica"
     with execution_strategy_scope(
         request,
         {"open_uri", "desktop_click", "search_web", "navigate_browser"},
     ) as strategy:
         desktop_first = tool_preflight("desktop_click", {"description": "Library"})
-        assert desktop_first is not None
-        assert desktop_first.allowed is False
-        assert "deep_link:steam:library" in desktop_first.reason_code
+        assert desktop_first is None or desktop_first.allowed is True
 
-        false_equivalent = tool_preflight(
+        cross_surface = tool_preflight(
             "navigate_browser",
             {"url": "https://store.steampowered.com/search/?term=Subnautica"},
         )
-        assert false_equivalent is not None
-        assert false_equivalent.allowed is False
-        assert false_equivalent.reason_code == "required_surface_changed"
+        assert cross_surface is None or cross_surface.allowed is True
 
         route = tool_preflight("open_uri", {"uri": "steam://open/games"})
         assert route is not None and route.allowed is True
@@ -309,7 +311,8 @@ def test_live_adapter_rejects_steam_library_to_store_and_requires_deep_link_firs
             "desktop_click", {"description": "Library search field"},
         )
         assert desktop_after_route is not None
-        assert desktop_after_route.allowed is True
+        assert desktop_after_route.allowed is False
+        assert desktop_after_route.reason_code == "exact_desktop_target_observation_required"
 
 
 def test_stale_target_must_be_reresolved_before_retry():
@@ -376,8 +379,10 @@ def test_same_failed_action_cannot_loop_without_new_evidence():
     strategy.observe("same snapshot", evidence_token="enabled_revision_2")
     duplicate_evidence_retry = _select(strategy, dom, action)
     assert duplicate_evidence_retry.allowed is False
+    # WOR-303: the refusal is factual (same failed action, no new evidence),
+    # never a count of attempts.
     assert duplicate_evidence_retry.reason_code == (
-        "identical_action_retry_budget_exhausted"
+        "identical_failed_action_without_new_evidence"
     )
 
 
@@ -450,6 +455,15 @@ def test_all_valid_strategies_exhausted_returns_precise_failure_contract():
         "code": "all_semantically_valid_strategies_exhausted",
         "goal_fingerprint": goal.fingerprint,
         "remaining": [],
+        "uia_candidate_exhaustion": {
+            "tier_state": "unknown",
+            "pending_substep": {},
+            "candidate_count": 0,
+            "candidate_pattern_pair_count": 0,
+            "retired_candidate_count": 0,
+            "remaining_candidate_count": 0,
+            "remaining_candidates": [],
+        },
         "failure_reasons": [
             "uia_tree_did_not_expose_target",
             "focus_cycle_completed_without_target",
