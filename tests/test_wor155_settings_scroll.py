@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import types
+from unittest.mock import patch
 
 import pytest
 from PyQt6.QtCore import QPoint, QPointF, Qt
@@ -119,6 +120,44 @@ def _show_category(panel, key: str) -> None:
     panel.show_category(key)
     QApplication.processEvents()
     assert panel._settings_pages[panel._settings_nav.currentRow()][0] == key
+
+
+def test_rapid_settings_section_changes_coalesce_extent_recalculation(
+    qt_app, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    monkeypatch.setattr(
+        main_popup,
+        "threading",
+        types.SimpleNamespace(Thread=_DormantThread),
+    )
+    controller = UpdateController(
+        store=updater.UpdateStateStore(tmp_path / "extent-state.json")
+    )
+    panel = main_popup._SettingsPanel(controller)
+    panel.resize(640, 560)
+    panel.show()
+    qt_app.processEvents()
+    qt_app.processEvents()
+    panel._settings_extent_refresh_scheduled = False
+
+    with patch.object(
+        panel,
+        "_sync_settings_detail_extent",
+        wraps=panel._sync_settings_detail_extent,
+    ) as sync_extent:
+        panel.show_category("settings.cat.general")
+        panel.show_category("settings.cat.models")
+        panel.show_category("settings.cat.wake")
+
+        assert sync_extent.call_count == 0
+        qt_app.processEvents()
+        assert sync_extent.call_count == 1
+
+    panel.close()
+    panel.deleteLater()
+    controller.deleteLater()
+    qt_app.processEvents()
 
 
 @pytest.mark.parametrize(
@@ -407,6 +446,128 @@ def test_late_retry_restore_does_not_reopen_a_previous_category(settings_panel):
     assert panel._settings_nav.currentRow() == current_row
     assert panel._settings_scroll.verticalScrollBar().value() == 0
     assert panel._chatgpt_retry_view_state is None
+
+
+def test_main_popup_keeps_settings_shell_fixed_and_bounds_full_content(
+    qt_app, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    monkeypatch.setattr(
+        main_popup,
+        "threading",
+        types.SimpleNamespace(Thread=_DormantThread),
+    )
+    controller = UpdateController(
+        store=updater.UpdateStateStore(tmp_path / "settings-update-state.json")
+    )
+    monkeypatch.setattr(
+        main_popup,
+        "UpdateController",
+        lambda _parent: controller,
+    )
+    monkeypatch.setattr(
+        main_popup.MainPopup,
+        "_refresh_model_inventory",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        main_popup.MainPopup,
+        "_request_local_models_refresh",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        main_popup._SettingsPanel,
+        "_probe_chatgpt_account",
+        lambda _self, force=False: None,
+    )
+    monkeypatch.setattr(
+        main_popup._SettingsPanel,
+        "_refresh_startup_status",
+        lambda _self, force=False: None,
+    )
+    monkeypatch.setattr(
+        main_popup._SettingsPanel,
+        "_refresh_mcp_status",
+        lambda _self: None,
+    )
+
+    popup = main_popup.MainPopup()
+    popup.resize(640, 560)
+    popup._stack.setCurrentIndex(popup.PAGE_SETTINGS)
+    popup._settings.show_category("settings.cat.models")
+    popup.show()
+    qt_app.processEvents()
+
+    panel = popup._settings
+    nav = panel._settings_nav
+    scroll = panel._settings_scroll
+    bar = scroll.verticalScrollBar()
+    shell_geometry = popup.geometry()
+    header_geometry = panel._settings_title.geometry()
+    nav_geometry = nav.geometry()
+    scroll_geometry = scroll.geometry()
+    viewport_geometry = scroll.viewport().geometry()
+
+    assert bar.maximum() > 0
+    bar.setValue(bar.maximum())
+    qt_app.processEvents()
+
+    assert bar.value() == bar.maximum()
+    assert bar.maximum() == max(
+        0,
+        panel._settings_stack.height() - scroll.viewport().height(),
+    )
+    assert popup.geometry() == shell_geometry
+    assert panel._settings_title.geometry() == header_geometry
+    assert nav.geometry() == nav_geometry
+    assert scroll.geometry() == scroll_geometry
+    assert scroll.viewport().geometry() == viewport_geometry
+
+    last_section = panel._settings_pages[
+        panel._settings_nav.currentRow()
+    ][1][-1]
+    last_section_bottom = last_section.mapTo(
+        scroll.viewport(),
+        last_section.rect().bottomLeft(),
+    ).y()
+    assert last_section_bottom <= scroll.viewport().height()
+    assert scroll.viewport().height() - last_section_bottom <= 18
+
+    for _ in range(20):
+        _send_wheel(
+            panel,
+            scroll.viewport(),
+            angle_y=-120,
+        )
+    assert bar.value() == bar.maximum()
+    assert popup.geometry() == shell_geometry
+    assert panel._settings_title.geometry() == header_geometry
+    assert nav.geometry() == nav_geometry
+    assert scroll.geometry() == scroll_geometry
+    assert scroll.viewport().geometry() == viewport_geometry
+
+    panel.show_category("settings.cat.wake")
+    qt_app.processEvents()
+    assert bar.value() == 0
+    assert bar.maximum() == 0
+    assert popup.geometry() == shell_geometry
+    assert nav.geometry() == nav_geometry
+    assert scroll.geometry() == scroll_geometry
+    assert scroll.viewport().geometry() == viewport_geometry
+
+    panel.show_category("settings.cat.models")
+    qt_app.processEvents()
+    assert bar.value() == 0
+    assert bar.maximum() > 0
+    assert popup.geometry() == shell_geometry
+    assert nav.geometry() == nav_geometry
+    assert scroll.geometry() == scroll_geometry
+    assert scroll.viewport().geometry() == viewport_geometry
+
+    popup.close()
+    popup.deleteLater()
+    controller.deleteLater()
+    qt_app.processEvents()
 
 
 def test_keyboard_navigation_and_focus_keep_native_pane_ownership(

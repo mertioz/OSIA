@@ -1168,7 +1168,7 @@ class _ChatPage(QWidget):
         outer.addWidget(self._scroll, 1)
 
         # Empty-state placeholder, swapped out as soon as a message arrives.
-        self._empty = self._build_empty_label()
+        self._empty = self._build_empty_label(self._messages_host)
         self._empty_idx = self._messages_layout.count() - 1
         self._messages_layout.insertWidget(self._empty_idx, self._empty)
 
@@ -1583,28 +1583,18 @@ class _ChatPage(QWidget):
         self._motion.settle()
         self._thinking_widgets.clear()
         self._active_thinking_key = None
-        # Remove every widget except the trailing stretch + empty label.
-        # Every Qt access is guarded: widgets can already be deleted on the
-        # C++ side (e.g. when the last conversation is removed), and touching
-        # them raises RuntimeError ("wrapped C/C++ object ... deleted").
-        try:
-            while self._messages_layout.count() > 1:
-                item = self._messages_layout.takeAt(0)
-                w = item.widget()
-                # Never delete the placeholder itself — deleting it would
-                # leave self._empty wrapping a dead C++ object.
-                if w is not None and w is not self._empty:
-                    w.deleteLater()
-        except RuntimeError:
-            pass
+        # Keep the trailing stretch and the owned empty label. Removed message
+        # widgets are hidden immediately so queued input cannot reach them.
+        while self._messages_layout.count() > 1:
+            item = self._messages_layout.takeAt(0)
+            w = item.widget()
+            if w is not None and w is not self._empty:
+                w.hide()
+                w.deleteLater()
         if _is_deleted(self._empty):
-            # The placeholder was destroyed earlier — build a fresh one.
-            self._empty = self._build_empty_label()
-        try:
-            self._empty.show()
-            self._messages_layout.insertWidget(0, self._empty)
-        except RuntimeError:
-            pass
+            self._empty = self._build_empty_label(self._messages_host)
+        self._messages_layout.insertWidget(0, self._empty)
+        self._empty.show()
 
     def set_messages(self, messages: list[dict]) -> None:
         self.clear_messages()
@@ -1938,8 +1928,8 @@ class _ChatPage(QWidget):
         self._notice_timer.start(max(0, int(duration_ms)))
 
     @staticmethod
-    def _build_empty_label() -> QLabel:
-        label = QLabel(i18n.t("chat.empty"))
+    def _build_empty_label(parent: QWidget | None = None) -> QLabel:
+        label = QLabel(i18n.t("chat.empty"), parent)
         label.setObjectName("chatEmpty")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
@@ -2330,6 +2320,7 @@ class _FolderRow(QFrame):
         )
         count_label = QLabel(str(count))
         count_label.setObjectName("folderCount")
+        self._count_label = count_label
         settings = QPushButton("⋯")
         settings.setObjectName("folderMenu")
         settings.setFixedSize(28, 26)
@@ -2341,6 +2332,9 @@ class _FolderRow(QFrame):
         row.addWidget(title, 1)
         row.addWidget(count_label)
         row.addWidget(settings)
+
+    def set_member_count(self, count: int) -> None:
+        self._count_label.setText(str(count))
 
     def _show_settings(self, anchor: QWidget, index: int, total: int) -> None:
         menu = QMenu(self)
@@ -2448,6 +2442,9 @@ class _ConversationsPanel(QWidget):
         self._rendered_active_id: str | None = None
         self._last_signature = None
         self._last_snapshot: dict | None = None
+        self._row_widgets: dict[str, _ConvRow] = {}
+        self._folder_widgets: dict[str, _FolderRow] = {}
+        self._empty_label: QLabel | None = None
         self._optimistic_hidden_ids: set[str] = set()
         self._optimistic_restore_items: dict[str, dict] = {}
         self._optimistic_restore_order: dict[str, int] = {}
@@ -2477,6 +2474,15 @@ class _ConversationsPanel(QWidget):
         header.addWidget(self._new_btn)
         header.addWidget(self._more_btn)
         outer.addLayout(header)
+
+        self._delete_notice = QLabel(self)
+        self._delete_notice.setObjectName("chatNotice")
+        self._delete_notice.setWordWrap(True)
+        self._delete_notice.hide()
+        outer.addWidget(self._delete_notice)
+        self._delete_notice_timer = QTimer(self)
+        self._delete_notice_timer.setSingleShot(True)
+        self._delete_notice_timer.timeout.connect(self._delete_notice.hide)
 
         scroll = QScrollArea()
         scroll.setObjectName("panelScroll")
@@ -2515,12 +2521,42 @@ class _ConversationsPanel(QWidget):
         self._new_btn.setText("＋ " + i18n.t("conversations.new_chat"))
         self.refresh()
 
+    def show_notice(self, message: str) -> None:
+        self._delete_notice.setText(message)
+        self._delete_notice.show()
+        self._delete_notice_timer.start(5000)
+
     def set_active(self, conv_id: str | None) -> None:
+        if conv_id == self._active_id and self._last_snapshot is not None:
+            return
         self._active_id = conv_id
-        self.refresh()
+        if self._last_snapshot is None:
+            self.refresh()
+            return
+        # Selection only changes the previous and next rows. Looking through
+        # every constructed row here makes conversation switching scale with
+        # the entire history even though the rest of the panel is unchanged.
+        for row_id, active in (
+            (self._rendered_active_id, False),
+            (conv_id, True),
+        ):
+            if row_id is None:
+                continue
+            row = self._row_widgets.get(row_id)
+            if row is None:
+                continue
+            if bool(row.property("active")) == active:
+                continue
+            row.setProperty("active", active)
+            row.style().unpolish(row)
+            row.style().polish(row)
+            if active:
+                self._motion.fade_in(row, MOTION.state_ms)
+        self._rendered_active_id = conv_id
 
     def set_optimistic_hidden(
         self, conv_ids, hidden: bool, *, snapshot: dict | None = None,
+        revision: int = 0,
     ) -> None:
         ids = {str(conv_id or "") for conv_id in conv_ids if str(conv_id or "")}
         if hidden:
@@ -2528,6 +2564,15 @@ class _ConversationsPanel(QWidget):
             for conv_id in ids:
                 self._optimistic_restore_items.pop(conv_id, None)
                 self._optimistic_restore_order.pop(conv_id, None)
+                row = self._row_widgets.pop(conv_id, None)
+                if row is not None:
+                    row.setEnabled(False)
+                    row.hide()
+                    self._host_layout.removeWidget(row)
+                    row.deleteLater()
+            if not self._row_widgets and not (self._last_snapshot or {}).get("folders"):
+                self._show_empty_label()
+            self._update_folder_counts()
         else:
             self._optimistic_hidden_ids.difference_update(ids)
             if isinstance(snapshot, dict):
@@ -2540,7 +2585,39 @@ class _ConversationsPanel(QWidget):
                 if not isinstance(snapshot, dict):
                     self._optimistic_restore_items.pop(conv_id, None)
                     self._optimistic_restore_order.pop(conv_id, None)
-        self.refresh()
+            if snapshot is None and self._last_snapshot is not None:
+                self._last_snapshot["items"] = [
+                    item for item in self._last_snapshot["items"]
+                    if str(item.get("id") or "") not in ids
+                ]
+                self._last_snapshot["snapshot_revision"] = max(
+                    int(self._last_snapshot.get("snapshot_revision") or 0),
+                    int(revision or 0),
+                )
+                self._last_signature = self._snapshot_signature(self._last_snapshot)
+                self._update_folder_counts()
+        if isinstance(snapshot, dict):
+            self.refresh(snapshot=snapshot)
+
+    def _update_folder_counts(self) -> None:
+        counts = {folder_id: 0 for folder_id in self._folder_widgets}
+        for item in (self._last_snapshot or {}).get("items") or []:
+            conv_id = str(item.get("id") or "")
+            folder_id = str(item.get("folder_id") or "")
+            if folder_id in counts and conv_id not in self._optimistic_hidden_ids:
+                counts[folder_id] += 1
+        for folder_id, count in counts.items():
+            self._folder_widgets[folder_id].set_member_count(count)
+
+    def _show_empty_label(self) -> None:
+        if self._empty_label is not None:
+            return
+        label = QLabel(i18n.t("conversations.empty"), self._host)
+        label.setObjectName("panelEmpty")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._host_layout.insertStretch(0, 1)
+        self._host_layout.insertWidget(1, label)
+        self._empty_label = label
 
     @staticmethod
     def _snapshot_signature(snapshot: dict):
@@ -2567,6 +2644,10 @@ class _ConversationsPanel(QWidget):
         if not self.isVisible():
             return
         snapshot = conversations.conversation_snapshot()
+        if int(snapshot.get("snapshot_revision") or 0) < int(
+            (self._last_snapshot or {}).get("snapshot_revision") or 0
+        ):
+            return
         if self._snapshot_signature(snapshot) != self._last_signature:
             self.refresh(snapshot=snapshot)
 
@@ -2577,6 +2658,9 @@ class _ConversationsPanel(QWidget):
             "folders": [dict(item) for item in snapshot.get("folders") or []],
             "snapshot_revision": snapshot.get("snapshot_revision", 0),
         }
+
+    def visible_conversation_ids(self) -> list[str]:
+        return list(self._row_widgets)
 
     def _show_more_menu(self) -> None:
         menu = QMenu(self)
@@ -2693,8 +2777,18 @@ class _ConversationsPanel(QWidget):
             item = self._host_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.deleteLater()
+        self._row_widgets.clear()
+        self._folder_widgets.clear()
+        self._empty_label = None
         snapshot = snapshot or conversations.conversation_snapshot()
+        if (
+            self._last_snapshot is not None
+            and int(snapshot.get("snapshot_revision") or 0)
+            < int(self._last_snapshot.get("snapshot_revision") or 0)
+        ):
+            snapshot = self._last_snapshot
         self._last_snapshot = {
             "items": [dict(item) for item in snapshot.get("items") or []],
             "folders": [dict(item) for item in snapshot.get("folders") or []],
@@ -2723,13 +2817,7 @@ class _ConversationsPanel(QWidget):
             # An empty list is a valid state — never auto-create here. A new
             # conversation is created only when the user clicks "New chat"
             # or sends a first message.
-            placeholder = QLabel(i18n.t("conversations.empty"))
-            placeholder.setObjectName("panelEmpty")
-            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Stretch above + the host's trailing stretch below keep the
-            # label vertically centered in the panel.
-            self._host_layout.insertStretch(0, 1)
-            self._host_layout.insertWidget(1, placeholder)
+            self._show_empty_label()
             self._rendered_active_id = self._active_id
             return
         insert_at = 0
@@ -2747,6 +2835,7 @@ class _ConversationsPanel(QWidget):
             row.delete_clicked.connect(self.delete_conversation.emit)
             row.move_clicked.connect(self._emit_move)
             self._host_layout.insertWidget(insert_at, row)
+            self._row_widgets[str(conv.get("id") or "")] = row
             if active_changed and row.property("active"):
                 row.show()
                 self._motion.fade_in(row, MOTION.state_ms)
@@ -2772,6 +2861,7 @@ class _ConversationsPanel(QWidget):
             folder_row.reorder_clicked.connect(self._emit_folder_reorder)
             folder_row.delete_clicked.connect(self._emit_delete_folder)
             self._host_layout.insertWidget(insert_at, folder_row)
+            self._folder_widgets[folder_id] = folder_row
             insert_at += 1
             if not folder.get("collapsed", False):
                 for conv in members:
@@ -3416,6 +3506,18 @@ class _SettingsDetailStack(QStackedWidget):
         if current is not None:
             return current.sizeHint()
         return super().sizeHint()
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt method name)
+        current = self.currentWidget()
+        if current is not None:
+            return current.hasHeightForWidth()
+        return super().hasHeightForWidth()
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 (Qt method name)
+        current = self.currentWidget()
+        if current is not None and current.hasHeightForWidth():
+            return current.heightForWidth(width)
+        return super().heightForWidth(width)
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt method name)
         return QSize(0, 0)
@@ -4430,6 +4532,8 @@ class _SettingsPanel(QWidget):
 
         self._settings_stack = _SettingsDetailStack()
         self._settings_stack.setObjectName("settingsStack")
+        self._settings_extent_refresh_scheduled = False
+        self._settings_extent_watchers: set[QWidget] = set()
 
         # Build every section ONCE, in the original column order, so any
         # construction-time ordering assumptions are preserved unchanged.
@@ -4479,11 +4583,15 @@ class _SettingsPanel(QWidget):
             # Keep each stack page transparent like the old panelHost so the
             # sections sit on the app's dark glass, not the grey palette.
             page.setObjectName("panelHost")
+            page.installEventFilter(self)
+            self._settings_extent_watchers.add(page)
             pv = QVBoxLayout(page)
             pv.setContentsMargins(0, 0, 6, 0)
             pv.setSpacing(11)
             for _sec in _sections:
                 pv.addWidget(_sec)
+                _sec.installEventFilter(self)
+                self._settings_extent_watchers.add(_sec)
             pv.addStretch(1)
             self._settings_stack.addWidget(page)
             self._settings_nav.addItem(i18n.t(_key))
@@ -4543,6 +4651,7 @@ class _SettingsPanel(QWidget):
         if row < 0:
             return
         self._settings_stack.setCurrentIndex(row)
+        self._schedule_settings_detail_extent()
         # WOR-198: reset only the independently owned right detail pane.
         self._settings_scroll.verticalScrollBar().setValue(0)
         page = self._settings_stack.currentWidget()
@@ -4554,6 +4663,60 @@ class _SettingsPanel(QWidget):
             return
         if key == "settings.cat.memory":
             self._refresh_memory_entries()
+
+    def _schedule_settings_detail_extent(self) -> None:
+        if (
+            self._settings_extent_refresh_scheduled
+            or not hasattr(self, "_settings_stack")
+        ):
+            return
+        self._settings_extent_refresh_scheduled = True
+        QTimer.singleShot(0, self._sync_settings_detail_extent)
+
+    def _sync_settings_detail_extent(self) -> None:
+        if not hasattr(self, "_settings_stack"):
+            return
+        self._settings_extent_refresh_scheduled = False
+        page = self._settings_stack.currentWidget()
+        if page is None:
+            return
+        width = self._settings_scroll.viewport().width()
+        if width <= 0:
+            return
+        layout = page.layout()
+        if layout is not None:
+            layout.activate()
+        if page.hasHeightForWidth():
+            content_height = page.heightForWidth(width)
+        else:
+            content_height = page.sizeHint().height()
+        content_height = max(0, int(content_height))
+        desired_height = max(
+            content_height,
+            self._settings_scroll.viewport().height(),
+        )
+        if self._settings_stack.minimumHeight() != content_height:
+            self._settings_stack.setMinimumHeight(content_height)
+            self._settings_stack.updateGeometry()
+        if (
+            self._settings_stack.width() != width
+            or self._settings_stack.height() != desired_height
+        ):
+            # QScrollArea may retain the old maximum-page geometry after a
+            # hidden Settings stack is first exposed by MainPopup. The current
+            # page's size hint alone does not shrink that cached child size.
+            # Resize the one content widget to the current page's real extent;
+            # the minimum keeps long pages scrollable and short pages fit the
+            # viewport without leaving a blank tail from another category.
+            self._settings_stack.resize(width, desired_height)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        super().resizeEvent(event)
+        self._schedule_settings_detail_extent()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt method name)
+        super().showEvent(event)
+        self._schedule_settings_detail_extent()
 
     def show_category(self, category_key: str) -> None:
         for row, (key, _sections) in enumerate(self._settings_pages):
@@ -4597,6 +4760,11 @@ class _SettingsPanel(QWidget):
         return True
 
     def eventFilter(self, watched, event):  # noqa: N802 (Qt method name)
+        if (
+            event.type() == QEvent.Type.LayoutRequest
+            and watched in getattr(self, "_settings_extent_watchers", ())
+        ):
+            self._schedule_settings_detail_extent()
         if event.type() == QEvent.Type.Wheel:
             if isinstance(watched, QComboBox):
                 # An explicitly opened popup remains a normal Qt item view.
@@ -11127,6 +11295,9 @@ class MainPopup(QWidget):
         self._convs.set_active(active_id)
         self._apply_current_busy()
 
+    def reload_conversations(self) -> None:
+        self._convs.refresh()
+
     def set_conversation_busy(self, conv_id: str, busy: bool) -> None:
         if not conv_id:
             return
@@ -11320,21 +11491,52 @@ class MainPopup(QWidget):
     def show_conversation_busy_notice(self) -> None:
         self._chat.show_notice(_ChatPage._BUSY_TEXT)
 
+    def _show_conversation_delete_notice(self, message: str) -> None:
+        if self._stack.currentIndex() == self.PAGE_CONVS:
+            self._convs.show_notice(message)
+        else:
+            self._chat.show_notice(message)
+
+    def show_conversation_delete_busy(
+        self, *, count: int = 1, bulk: bool = False,
+    ) -> None:
+        key = (
+            "conversations.bulk_delete_busy" if bulk
+            else "conversations.delete_busy"
+        )
+        self._show_conversation_delete_notice(i18n.t(key, count=count))
+
     def set_optimistic_conversation_deletions(
         self, conv_ids, hidden: bool, *, snapshot: dict | None = None,
+        revision: int = 0,
     ) -> None:
         self._convs.set_optimistic_hidden(
-            conv_ids, hidden, snapshot=snapshot,
+            conv_ids, hidden, snapshot=snapshot, revision=revision,
         )
 
     def conversation_snapshot(self) -> dict:
         return self._convs.conversation_snapshot()
 
-    def show_conversation_delete_failed(self) -> None:
-        self._chat.show_notice(i18n.t("conversations.delete_failed"))
+    def visible_conversation_ids(self) -> list[str]:
+        return self._convs.visible_conversation_ids()
+
+    def show_conversation_delete_failed(self, error: str = "") -> None:
+        key = {
+            "conversation_not_found": "conversations.delete_missing",
+            "conversation_id_ambiguous": "conversations.delete_identity_conflict",
+            "conversation_identity_mismatch": "conversations.delete_identity_conflict",
+        }.get(error, "conversations.delete_failed")
+        self._show_conversation_delete_notice(i18n.t(key))
 
     def show_conversation_delete_in_progress(self) -> None:
-        self._chat.show_notice(i18n.t("conversations.delete_in_progress"))
+        self._show_conversation_delete_notice(
+            i18n.t("conversations.delete_in_progress")
+        )
+
+    def show_conversation_delete_none(self) -> None:
+        self._show_conversation_delete_notice(
+            i18n.t("conversations.bulk_delete_none")
+        )
 
     def set_current_model(
         self,

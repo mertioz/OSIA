@@ -188,6 +188,43 @@ def _path_for(conv_id: str) -> Path:
     return CONVERSATIONS_DIR / f"{conv_id}.json"
 
 
+def _deletion_path_unlocked(conv_id: str) -> tuple[Path | None, str]:
+    """Resolve the unique file represented by one catalogue ID.
+
+    Current files use their ID as the filename. A few older files expose an
+    embedded ID with a different filename, while the catalogue uses that
+    embedded ID. Only scan the store when the direct path does not identify
+    that same conversation; ambiguity must never delete an arbitrary file.
+    """
+    if not conv_id or any(char in conv_id for char in ("/", "\\")):
+        return None, "invalid_conversation_id"
+    direct = _path_for(conv_id)
+    if direct.exists():
+        try:
+            data = json.loads(direct.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            # The lease check below will fail closed on unreadable data.
+            return direct, ""
+        if isinstance(data, dict) and str(data.get("id") or "") == conv_id:
+            return direct, ""
+    matches = []
+    for path in CONVERSATIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and str(data.get("id") or "") == conv_id:
+            matches.append(path)
+            if len(matches) > 1:
+                return None, "conversation_id_ambiguous"
+    if matches:
+        return matches[0], ""
+    return None, (
+        "conversation_identity_mismatch" if direct.exists()
+        else "conversation_not_found"
+    )
+
+
 _CANONICAL_CHAT_BINDING_FIELDS = (
     "conversation_id", "request_id", "turn_id", "run_id",
     "provider_id", "model_id", "effective_reasoning",
@@ -245,9 +282,8 @@ def _assistant_targets_exact_user_cancelled_terminal(
     )
 
 
-def _has_active_canonical_chat_lease(conversation: dict) -> bool:
-    """Protect accepted canonical turns until their exact final is durable."""
-
+def _unresolved_canonical_chat_users(conversation: dict):
+    """Yield accepted user turns without an exact final or Stop tombstone."""
     messages = list((conversation or {}).get("messages") or [])
     for index, user_message in enumerate(messages):
         if not isinstance(user_message, dict) or user_message.get("role") != "user":
@@ -288,8 +324,13 @@ def _has_active_canonical_chat_lease(conversation: dict) -> bool:
             not final_committed
             and not _has_exact_user_cancelled_terminal(user_message)
         ):
-            return True
-    return False
+            yield user_message, binding
+
+
+def _has_active_canonical_chat_lease(conversation: dict) -> bool:
+    """Protect accepted canonical turns until their exact final is durable."""
+
+    return next(_unresolved_canonical_chat_users(conversation), None) is not None
 
 
 def _background_execution_lease_active(conversation: dict) -> bool:
@@ -459,6 +500,78 @@ def _path_has_active_canonical_chat_lease(path: Path) -> bool:
         or _background_execution_lease_active(conversation)
         or _post_turn_media_lease_active(conversation)
     )
+
+
+def _cancel_dead_owner_turns_for_deletion(path: Path) -> bool:
+    """Install exact Stop tombstones for orphaned turns before user deletion.
+
+    A live or unproven owner remains protected. The file is rechecked by the
+    caller after cancellation; this never treats an unknown tool effect as a
+    verified success or invents an assistant response.
+    """
+    try:
+        conversation = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(conversation, dict):
+        return False
+    unresolved = list(_unresolved_canonical_chat_users(conversation))
+    if not unresolved:
+        return not _path_has_active_canonical_chat_lease(path)
+    from osia.turn_terminality import (
+        TurnTerminalityController,
+        live_process_identity,
+        persisted_turn_state_exists,
+    )
+
+    controllers = []
+    for message, binding in unresolved:
+        try:
+            owner_pid = int(message.get("_execution_owner_pid") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if owner_pid <= 0:
+            return False
+        alive, current_identity = live_process_identity(owner_pid)
+        expected_identity = str(
+            message.get("_execution_owner_process_identity") or ""
+        )
+        if alive and (
+            not expected_identity
+            or not current_identity
+            or expected_identity == current_identity
+        ):
+            return False
+        turn_id = binding["turn_id"]
+        objective = str(message.get("_terminality_objective") or "")
+        if not persisted_turn_state_exists(turn_id):
+            return False
+        try:
+            controller = TurnTerminalityController(
+                turn_id=turn_id,
+                objective=objective,
+                execution_required=True,
+            )
+            state = controller.snapshot()
+        except (OSError, TypeError, ValueError):
+            return False
+        durable_binding = state.get("execution_binding") or {}
+        if (
+            state.get("terminal_state") not in (None, "", "user_cancelled")
+            or any(
+                str(durable_binding.get(field) or "") != value
+                for field, value in binding.items()
+            )
+        ):
+            return False
+        controllers.append(controller)
+    for controller in controllers:
+        if not controller.try_request_cancellation(
+            effect_possible=True,
+            reason_code="conversation_delete",
+        ):
+            return False
+    return not _path_has_active_canonical_chat_lease(path)
 
 
 def _folder_state_path() -> Path:
@@ -699,11 +812,13 @@ def _folder_receipt(
     result: dict,
     replayed: bool,
 ) -> dict:
+    revision = int(state.get("revision") or 0)
     return {
         **dict(result),
         "success": bool(result.get("success", True)),
         "operation_id": operation_id,
-        "revision": int(state.get("revision") or 0),
+        "revision": revision,
+        "snapshot_revision": revision,
         "replayed": replayed,
     }
 
@@ -1521,6 +1636,7 @@ def delete_folder_with_conversations(
         busy_ids = [
             conv_id for conv_id, path in candidates
             if _path_has_active_canonical_chat_lease(path)
+            and not _cancel_dead_owner_turns_for_deletion(path)
         ]
         if busy_ids:
             return _folder_receipt(
@@ -1675,6 +1791,7 @@ def _delete_all_ungrouped_conversations(
         busy_ids = [
             conv_id for conv_id, path in candidates
             if _path_has_active_canonical_chat_lease(path)
+            and not _cancel_dead_owner_turns_for_deletion(path)
         ]
         if busy_ids:
             return _folder_receipt(
@@ -2357,39 +2474,82 @@ def find_correlated_turn(conv_id: str, request_id: str) -> dict | None:
         }
 
 
-def delete_conversation(conv_id: str) -> bool:
-    """Delete a conversation file. Returns True if the file existed and
-    was removed; False if it didn't exist or couldn't be removed.
+def delete_conversation_with_receipt(
+    conv_id: str,
+    *,
+    operation_id: str | None = None,
+) -> dict:
+    """Delete one conversation and durably advance the list revision.
+
+    The versioned receipt is shared by the Desktop and WebSocket callers so a
+    success acknowledgement can be tied to the file removal and metadata
+    commit that completed under the canonical store lock.
     """
-    if not conv_id:
-        return False
+    stable_id = str(conv_id or "")
+    op_id = str(operation_id or "").strip()[:200]
+    if not op_id:
+        op_id = f"op_{uuid.uuid4().hex}"
     with _store_lock():
-        path = _path_for(conv_id)
-        if not path.exists():
-            return False
-        if _path_has_active_canonical_chat_lease(path):
-            return False
         state = _load_folder_state_unlocked()
+        path, lookup_error = _deletion_path_unlocked(stable_id)
+        if path is None:
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": lookup_error,
+                    "deleted_ids": [],
+                },
+                replayed=False,
+            )
+        if (
+            _path_has_active_canonical_chat_lease(path)
+            and not _cancel_dead_owner_turns_for_deletion(path)
+        ):
+            return _folder_receipt(
+                state,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "conversation_busy",
+                    "deleted_ids": [],
+                },
+                replayed=False,
+            )
         memberships = state.get("memberships") or {}
         staged = (
             _folder_state_path().parent
-            / f"delete-{conv_id}-{uuid.uuid4().hex}.json"
+            / f"delete-{uuid.uuid4().hex}.json"
         )
         try:
             staged.parent.mkdir(parents=True, exist_ok=True)
             os.replace(path, staged)
-            if conv_id in memberships:
-                memberships.pop(conv_id, None)
-                state["revision"] = int(state.get("revision") or 0) + 1
-                state["last_operation_id"] = f"op_{uuid.uuid4().hex}"
-                _write_folder_state_unlocked(state)
+            memberships.pop(stable_id, None)
+            # This revision orders complete list snapshots, including an
+            # ungrouped single delete. Previously that common path left the
+            # revision unchanged, allowing Mobile to accept an older snapshot
+            # after it had reconciled a newer deletion event.
+            state["revision"] = int(state.get("revision") or 0) + 1
+            state["last_operation_id"] = op_id
+            _write_folder_state_unlocked(state)
         except OSError:
             if staged.exists() and not path.exists():
                 try:
                     os.replace(staged, path)
                 except OSError:
                     pass
-            return False
+            current = _load_folder_state_unlocked()
+            return _folder_receipt(
+                current,
+                operation_id=op_id,
+                result={
+                    "success": False,
+                    "error": "conversation_delete_failed",
+                    "deleted_ids": [],
+                },
+                replayed=False,
+            )
         try:
             staged.unlink(missing_ok=True)
         except OSError:
@@ -2397,10 +2557,20 @@ def delete_conversation(conv_id: str) -> bool:
         try:
             from osia.image_inputs import release_media_owner
 
-            release_media_owner(conv_id)
+            release_media_owner(stable_id)
         except Exception:
             pass
-        return True
+        return _folder_receipt(
+            state,
+            operation_id=op_id,
+            result={"success": True, "deleted_ids": [stable_id]},
+            replayed=False,
+        )
+
+
+def delete_conversation(conv_id: str) -> bool:
+    """Compatibility boolean wrapper for the canonical deletion receipt."""
+    return bool(delete_conversation_with_receipt(conv_id).get("success"))
 
 
 def rename_conversation(conv_id: str, title: str) -> bool:

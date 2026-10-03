@@ -988,6 +988,22 @@ async def _broadcast_new_chat(exclude: "_OutboundChannel | None" = None) -> None
             _WS_CLIENTS.discard(client)
 
 
+async def _broadcast_conversation_snapshot(
+    frame: dict,
+    *,
+    exclude: "_OutboundChannel | None" = None,
+) -> None:
+    """Queue one already-read canonical list snapshot to connected clients."""
+
+    for client in list(_WS_CLIENTS):
+        if client is exclude:
+            continue
+        try:
+            await client.send_json(frame)
+        except Exception:
+            _WS_CLIENTS.discard(client)
+
+
 async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) -> None:
     """Best-effort fan-out of the refreshed conversation LIST to every connected
     client (WOR-76). Used after a rename so all devices' sidebars update.
@@ -999,13 +1015,14 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
     the sidebar.
     """
     frame = conversations.conversation_snapshot()
-    for client in list(_WS_CLIENTS):
-        if client is exclude:
-            continue
-        try:
-            await client.send_json(frame)
-        except Exception:
-            _WS_CLIENTS.discard(client)
+    print(
+        "[OSIA DeleteTrace] origin=server phase=list_snapshot "
+        f"source=broadcast snapshot_revision={int(frame.get('snapshot_revision') or 0)} "
+        f"operation_id={str(frame.get('operation_id') or '')!r} "
+        f"conversation_count={len(frame.get('items') or [])}",
+        flush=True,
+    )
+    await _broadcast_conversation_snapshot(frame, exclude=exclude)
 
 
 # ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
@@ -1128,7 +1145,19 @@ async def _broadcast_canonical_conversation_change(
         _CONVERSATION_BROADCAST_LOCK = asyncio.Lock()
     async with _CONVERSATION_BROADCAST_LOCK:
         if action == "delete":
-            if conversations.get_conversation(conv_id) is not None:
+            snapshot = conversations.conversation_snapshot()
+            if any(
+                str(item.get("id") or "") == str(conv_id)
+                for item in snapshot.get("items") or []
+            ):
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=notification_rejected "
+                    f"conversation_id={str(conv_id)!r} "
+                    f"operation_id={str(operation_id or '')!r} "
+                    f"reason=canonical_id_still_present "
+                    f"snapshot_revision={int(snapshot.get('snapshot_revision') or 0)}",
+                    flush=True,
+                )
                 return False
             _LAST_BROADCAST_REVISIONS.pop(conv_id, None)
             await _send_conversation_frame(
@@ -1137,10 +1166,21 @@ async def _broadcast_canonical_conversation_change(
                     "id": conv_id,
                     "success": True,
                     "operation_id": str(operation_id or ""),
+                    "snapshot_revision": int(
+                        snapshot.get("snapshot_revision") or 0
+                    ),
                 },
                 exclude=exclude,
             )
-            await _broadcast_conversations(exclude=exclude)
+            print(
+                "[OSIA DeleteTrace] origin=PC phase=ack_queued "
+                f"conversation_id={str(conv_id)!r} "
+                f"operation_id={str(operation_id or '')!r} "
+                f"snapshot_revision={int(snapshot.get('snapshot_revision') or 0)} "
+                "success=true",
+                flush=True,
+            )
+            await _broadcast_conversation_snapshot(snapshot, exclude=exclude)
             return True
 
         conv = conversations.get_conversation(conv_id)
@@ -5671,7 +5711,9 @@ async def internal_conversation_changed(request: Request):
         body = {}
     conv_id = str(body.get("conversation_id") or "").strip()
     action = str(body.get("action") or "upsert").strip().lower()
-    if action not in {"upsert", "rename", "delete", "folders"}:
+    if action not in {
+        "upsert", "rename", "delete", "folders", "bulk_delete",
+    }:
         action = "upsert"
     try:
         revision = max(0, int(body.get("revision") or 0))
@@ -5680,6 +5722,58 @@ async def internal_conversation_changed(request: Request):
     if action == "folders":
         await _broadcast_conversations()
         broadcast = True
+    elif action == "bulk_delete":
+        raw_ids = body.get("deleted_ids")
+        deleted_ids = list(dict.fromkeys(
+            str(item or "")
+            for item in raw_ids
+            if isinstance(raw_ids, list) and str(item or "")
+        )) if isinstance(raw_ids, list) else []
+        if deleted_ids:
+            snapshot = conversations.conversation_snapshot()
+            present_ids = {
+                str(item.get("id") or "")
+                for item in snapshot.get("items") or []
+            }
+            missing = [item for item in deleted_ids if item in present_ids]
+            if missing:
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=bulk_notification_rejected "
+                    f"operation_id={str(body.get('operation_id') or '')!r} "
+                    f"requested_count={len(deleted_ids)} "
+                    f"canonical_present_count={len(missing)} "
+                    f"snapshot_revision={int(snapshot.get('snapshot_revision') or 0)}",
+                    flush=True,
+                )
+                broadcast = False
+            else:
+                frame = {
+                    "type": "conversations_bulk_deleted",
+                    "success": True,
+                    "operation_id": str(body.get("operation_id") or ""),
+                    "deleted_ids": deleted_ids,
+                    "revision": int(snapshot.get("snapshot_revision") or 0),
+                    "snapshot_revision": int(
+                        snapshot.get("snapshot_revision") or 0
+                    ),
+                }
+                for client in list(_WS_CLIENTS):
+                    try:
+                        await client.send_json(frame)
+                        await client.send_json(snapshot)
+                    except Exception:
+                        _WS_CLIENTS.discard(client)
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=bulk_ack_queued "
+                    f"operation_id={str(body.get('operation_id') or '')!r} "
+                    f"deleted_count={len(deleted_ids)} "
+                    f"snapshot_revision={int(snapshot.get('snapshot_revision') or 0)} "
+                    "success=true",
+                    flush=True,
+                )
+                broadcast = True
+        else:
+            broadcast = False
     else:
         broadcast = await _broadcast_canonical_conversation_change(
             conv_id,
@@ -5688,7 +5782,11 @@ async def internal_conversation_changed(request: Request):
             action=action,
         )
     return {
-        "ok": bool(conv_id) or action == "folders",
+        "ok": (
+            bool(conv_id)
+            or action == "folders"
+            or (action == "bulk_delete" and bool(broadcast))
+        ),
         "broadcast": broadcast,
         "clients": len(_WS_CLIENTS),
     }
@@ -8629,23 +8727,75 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "delete_conversation":
-                conv_id = msg.get("id", "")
+                conv_id = str(msg.get("id") or "")
+                operation_id = str(msg.get("operation_id") or "").strip()[:200]
+                if not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", operation_id):
+                    operation_id = f"mobile_delete_{secrets.token_hex(16)}"
+                print(
+                    "[OSIA DeleteTrace] origin=Mobile phase=canonical_start "
+                    f"conversation_id={conv_id!r} operation_id={operation_id!r} "
+                    f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
+                    f"started_at_unix_ns={time.time_ns()}",
+                    flush=True,
+                )
                 if (
                     conv_id in streaming_tasks
                     or _is_conversation_busy(conv_id)
                 ):
+                    snapshot = conversations.conversation_snapshot()
+                    snapshot_revision = int(
+                        snapshot.get("snapshot_revision") or 0
+                    )
+                    print(
+                        "[OSIA DeleteTrace] origin=Mobile phase=canonical_result "
+                        f"conversation_id={conv_id!r} operation_id={operation_id!r} "
+                        "success=false error=conversation_busy "
+                        f"snapshot_revision={snapshot_revision} "
+                        f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
+                        f"completed_at_unix_ns={time.time_ns()}",
+                        flush=True,
+                    )
                     await out.send_json({
                         "type": "conversation_deleted",
                         "id": conv_id,
                         "success": False,
                         "error": "conversation_busy",
+                        "operation_id": operation_id,
+                        "snapshot_revision": snapshot_revision,
                     })
+                    await out.send_json(snapshot)
                     await _send_recovered_turn_state(out, conv_id)
                     continue
-                existed_before_delete = (
-                    conversations.get_conversation(conv_id) is not None
+                receipt = conversations.delete_conversation_with_receipt(
+                    conv_id,
+                    operation_id=operation_id,
                 )
-                ok = conversations.delete_conversation(conv_id)
+                ok = bool(receipt.get("success"))
+                snapshot = conversations.conversation_snapshot()
+                snapshot_revision = int(
+                    snapshot.get("snapshot_revision")
+                    or receipt.get("snapshot_revision")
+                    or receipt.get("revision")
+                    or 0
+                )
+                if ok and any(
+                    str(item.get("id") or "") == conv_id
+                    for item in snapshot.get("items") or []
+                ):
+                    ok = False
+                    receipt = {
+                        **receipt,
+                        "error": "canonical_state_changed",
+                    }
+                print(
+                    "[OSIA DeleteTrace] origin=Mobile phase=canonical_result "
+                    f"conversation_id={conv_id!r} operation_id={operation_id!r} "
+                    f"success={ok} error={str(receipt.get('error') or '')!r} "
+                    f"snapshot_revision={snapshot_revision} "
+                    f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
+                    f"completed_at_unix_ns={time.time_ns()}",
+                    flush=True,
+                )
                 if ok:
                     # The atomic store lease has now proved that no canonical
                     # turn owns this conversation. Clear only local projections
@@ -8671,21 +8821,29 @@ async def websocket_endpoint(ws: WebSocket):
                     "type": "conversation_deleted",
                     "id": conv_id,
                     "success": ok,
-                    **(
-                        {}
-                        if ok else
-                        {
-                            "error": (
-                                "conversation_busy"
-                                if existed_before_delete else
-                                "conversation_not_found"
-                            )
-                        }
-                    ),
+                    "operation_id": operation_id,
+                    "snapshot_revision": snapshot_revision,
+                    **({} if ok else {
+                        "error": str(
+                            receipt.get("error") or "conversation_delete_failed"
+                        ),
+                    }),
                 })
+                print(
+                    "[OSIA DeleteTrace] origin=Mobile phase=ack_queued "
+                    f"conversation_id={conv_id!r} operation_id={operation_id!r} "
+                    f"success={ok} snapshot_revision={snapshot_revision}",
+                    flush=True,
+                )
+                # Reconcile the initiating client from the same canonical disk
+                # state used for this acknowledgement; no local tombstone is
+                # needed to conceal an older full list.
+                await out.send_json(snapshot)
                 if ok:
                     await _broadcast_canonical_conversation_change(
                         conv_id,
+                        revision=snapshot_revision,
+                        operation_id=operation_id,
                         action="delete",
                         exclude=out,
                     )

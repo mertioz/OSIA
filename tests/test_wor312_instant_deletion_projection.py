@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import importlib.util
 import urllib.request
 from types import SimpleNamespace
 
@@ -81,6 +82,49 @@ def test_single_delete_failure_keeps_canonical_row_and_history(tmp_path, monkeyp
     assert conversations.conversation_snapshot()["items"][0]["id"] == conversation["id"]
 
 
+def test_ungrouped_single_delete_advances_revision_and_survives_new_store(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    conversation = conversations.create_conversation("Persisted delete")
+    operation_id = "delete-revision-1"
+
+    before = conversations.conversation_snapshot()
+    receipt = conversations.delete_conversation_with_receipt(
+        conversation["id"],
+        operation_id=operation_id,
+    )
+
+    assert receipt["success"] is True
+    assert receipt["deleted_ids"] == [conversation["id"]]
+    assert receipt["snapshot_revision"] == before["snapshot_revision"] + 1
+    assert not (tmp_path / f"{conversation['id']}.json").exists()
+
+    # Load the store module afresh, as the Desktop and server do after restart.
+    spec = importlib.util.spec_from_file_location(
+        "osia._wor312_store_reload",
+        conversations.__file__,
+    )
+    assert spec is not None and spec.loader is not None
+    reloaded_store = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reloaded_store)
+    reloaded_store.CONVERSATIONS_DIR = tmp_path
+
+    snapshot = reloaded_store.conversation_snapshot()
+    assert snapshot["snapshot_revision"] == receipt["snapshot_revision"]
+    assert snapshot["operation_id"] == operation_id
+    assert conversation["id"] not in {
+        item["id"] for item in snapshot["items"]
+    }
+    assert reloaded_store.get_conversation(conversation["id"]) is None
+    assert reloaded_store.create_conversation("Catalogue rebuild")["id"] != (
+        conversation["id"]
+    )
+    assert conversation["id"] not in {
+        item["id"] for item in reloaded_store.conversation_snapshot()["items"]
+    }
+
+
 def test_single_delete_releases_existing_media_ownership(tmp_path, monkeypatch):
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
     import osia.image_inputs as image_inputs
@@ -107,8 +151,19 @@ def test_desktop_delete_uses_existing_mobile_invalidation_path(monkeypatch):
             self._target()
 
     class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
         def close(self):
             return None
+
+        def read(self):
+            return b'{"broadcast":true}'
 
     def fake_urlopen(request, *, timeout):
         requests.append((request, timeout))
@@ -133,6 +188,7 @@ def test_desktop_delete_uses_existing_mobile_invalidation_path(monkeypatch):
         "revision": 9,
         "operation_id": "desktop-delete-9",
         "action": "delete",
+        "deleted_ids": [],
     }
 
 

@@ -159,12 +159,30 @@ def _notify_mobile_state_changed(url: str, label: str) -> None:
     ).start()
 
 
+def _deletion_fallback_ids(
+    items: list[dict], selected_id: str, excluded_ids: set[str],
+) -> list[str]:
+    """Prefer the next visible row, then earlier rows in reverse order."""
+    index = next(
+        (pos for pos, item in enumerate(items)
+         if str(item.get("id") or "") == selected_id),
+        len(items),
+    )
+    ordered = items[index + 1:] + list(reversed(items[:index]))
+    return [
+        conv_id for item in ordered
+        if (conv_id := str(item.get("id") or ""))
+        and conv_id not in excluded_ids
+    ]
+
+
 def _notify_mobile_conversation_changed(
     conv_id: str,
     *,
     revision: int = 0,
     operation_id: str = "",
     action: str = "upsert",
+    deleted_ids: list[str] | None = None,
 ) -> None:
     """Best-effort canonical-store invalidation; carries no chat content."""
 
@@ -176,6 +194,7 @@ def _notify_mobile_conversation_changed(
         "revision": max(0, int(revision or 0)),
         "operation_id": str(operation_id or ""),
         "action": str(action or "upsert"),
+        "deleted_ids": [str(item or "") for item in (deleted_ids or [])],
     }).encode("utf-8")
 
     def worker() -> None:
@@ -186,7 +205,21 @@ def _notify_mobile_conversation_changed(
                 method="POST",
                 headers={"Content-Type": "application/json"},
             )
-            urllib.request.urlopen(request, timeout=1.5).close()
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                try:
+                    result = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    result = {}
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=notification_result "
+                    f"conversation_id={str(conv_id or '')!r} "
+                    f"operation_id={str(operation_id or '')!r} "
+                    f"action={str(action or 'upsert')} "
+                    f"revision={max(0, int(revision or 0))} "
+                    f"broadcast={bool(result.get('broadcast'))} "
+                    f"http_status={getattr(response, 'status', 0)}",
+                    flush=True,
+                )
         except Exception as exc:
             print(
                 "[OSIA] mobile conversation notify skipped: "
@@ -547,6 +580,14 @@ def _incomplete_desktop_chat_turns() -> list[dict]:
                     for key, value in message_route.items()
                 )
             )
+            if (
+                terminal_binding_exact
+                and persisted_terminal.get("terminal_state") == "user_cancelled"
+            ):
+                # Stop is already the durable terminal for this exact turn.
+                # There is no assistant final to project, and reattaching it
+                # would leave the conversation falsely busy after restart.
+                continue
             if terminal_binding_exact:
                 continuation_attempt_id = ""
                 if isinstance(suspended, dict):
@@ -4052,16 +4093,38 @@ def wake_mode():
             "agent_messages": copy.deepcopy(agent.messages) if selected else None,
             "selection_epoch": selection_epoch[0],
             "snapshot": popup.conversation_snapshot(),
+            "visible_ids": popup.visible_conversation_ids(),
         }
         pending_delete_contexts[request_id] = context
         pending_delete_ids.update(conv_ids)
         popup.set_optimistic_conversation_deletions(conv_ids, True)
         if selected:
             tts_stop()
-            agent.reset()
-            active_conv = None
-            popup.set_messages([])
-        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+            next_conv = None
+            for candidate_id in _deletion_fallback_ids(
+                [{"id": conv_id} for conv_id in context["visible_ids"]],
+                str(selected.get("id") or ""),
+                pending_delete_ids,
+            ):
+                next_conv = conversations.get_conversation(candidate_id)
+                if next_conv is not None:
+                    break
+            if next_conv is not None:
+                _activate_conversation(next_conv)
+            else:
+                selection_epoch[0] += 1
+                agent.reset()
+                active_conv = None
+                popup.refresh_conversations(None)
+                popup.set_messages([])
+            context["selection_epoch"] = selection_epoch[0]
+        print(
+            "[OSIA DeleteTrace] origin=PC phase=ui_removed "
+            f"request_id={request_id!r} action={action} "
+            f"conversation_ids={sorted(conv_ids)!r} "
+            f"ui_removed_at_unix_ns={time.time_ns()}",
+            flush=True,
+        )
         return context
 
     def _start_conversation_delete_worker(
@@ -4072,6 +4135,15 @@ def wake_mode():
         operation_id: str = "",
     ) -> None:
         def worker() -> None:
+            for conv_id in sorted(conv_ids):
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=canonical_start "
+                    f"conversation_id={conv_id!r} request_id={request_id!r} "
+                    f"operation_id={operation_id!r} "
+                    f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
+                    f"started_at_unix_ns={time.time_ns()}",
+                    flush=True,
+                )
             result = {
                 "request_id": request_id,
                 "action": "bulk" if expected_count is not None else "single",
@@ -4083,11 +4155,22 @@ def wake_mode():
             try:
                 if expected_count is None:
                     conv_id = next(iter(conv_ids), "")
-                    result["success"] = bool(
-                        conv_id and conversations.delete_conversation(conv_id)
+                    deletion = conversations.delete_conversation_with_receipt(
+                        conv_id,
+                        operation_id=operation_id,
                     )
-                    result["deleted_ids"] = (
-                        [conv_id] if result["success"] else []
+                    result.update(deletion)
+                    result["success"] = bool(deletion.get("success"))
+                    result["deleted_ids"] = list(
+                        deletion.get("deleted_ids") or []
+                    )
+                    result["revision"] = int(
+                        deletion.get("snapshot_revision")
+                        or deletion.get("revision")
+                        or 0
+                    )
+                    result["operation_id"] = str(
+                        deletion.get("operation_id") or operation_id
                     )
                 else:
                     deletion = conversations.delete_confirmed_ungrouped_conversations(
@@ -4108,6 +4191,17 @@ def wake_mode():
                 print(
                     "[OSIA] Conversation deletion failed: "
                     f"{type(exc).__name__}",
+                    flush=True,
+                )
+            for conv_id in sorted(result.get("deleted_ids") or conv_ids):
+                print(
+                    "[OSIA DeleteTrace] origin=PC phase=canonical_result "
+                    f"conversation_id={conv_id!r} request_id={request_id!r} "
+                    f"operation_id={result.get('operation_id')!r} "
+                    f"success={bool(result.get('success'))} "
+                    f"snapshot_revision={int(result.get('revision') or 0)} "
+                    f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
+                    f"completed_at_unix_ns={time.time_ns()}",
                     flush=True,
                 )
             try:
@@ -4173,7 +4267,14 @@ def wake_mode():
                     )
                     popup.refresh_conversations(active_id)
                     popup.set_messages(restored.get("messages") or [])
-            popup.show_conversation_delete_failed()
+            error = str(result.get("error") or "")
+            if error == "conversation_busy":
+                popup.show_conversation_delete_busy(
+                    count=max(1, len(result.get("busy_ids") or conv_ids)),
+                    bulk=context.get("action") == "bulk",
+                )
+            else:
+                popup.show_conversation_delete_failed(error)
             popup.refresh_conversations(
                 active_conv["id"] if active_conv else None
             )
@@ -4184,7 +4285,9 @@ def wake_mode():
             )
             return
 
-        popup.set_optimistic_conversation_deletions(conv_ids, False)
+        popup.set_optimistic_conversation_deletions(
+            conv_ids, False, revision=int(result.get("revision") or 0),
+        )
         deleted_ids = {
             str(conv_id or "")
             for conv_id in result.get("deleted_ids") or ()
@@ -4197,12 +4300,19 @@ def wake_mode():
                 "",
                 revision=result.get("revision", 0),
                 operation_id=result.get("operation_id", ""),
-                action="folders",
+                action="bulk_delete",
+                deleted_ids=sorted(deleted_ids),
             )
         else:
             for conv_id in deleted_ids:
-                _notify_mobile_conversation_changed(conv_id, action="delete")
-        popup.refresh_conversations(active_conv["id"] if active_conv else None)
+                _notify_mobile_conversation_changed(
+                    conv_id,
+                    revision=result.get("revision", 0),
+                    operation_id=result.get("operation_id", ""),
+                    action="delete",
+                )
+        # The row was removed synchronously. The canonical receipt only
+        # advances the local revision; polling handles unrelated store edits.
 
     def handle_new_conversation():
         nonlocal active_conv
@@ -4237,11 +4347,8 @@ def wake_mode():
         popup.reset_conversation()
         print(f"ðŸ†• New conversation (voice): {active_conv['id']}")
 
-    def handle_open_conversation(conv_id: str):
+    def _activate_conversation(conv: dict) -> None:
         nonlocal active_conv
-        conv = conversations.get_conversation(conv_id)
-        if not conv:
-            return
         selection_epoch[0] += 1
         tts_stop()
         agent.reset()
@@ -4262,32 +4369,41 @@ def wake_mode():
         active_conv = conv
         popup.refresh_conversations(active_conv["id"])
         popup.set_messages(msgs)
+
+    def handle_open_conversation(conv_id: str):
+        conv = conversations.get_conversation(conv_id)
+        if not conv:
+            return
+        _activate_conversation(conv)
         print(f"ðŸ“‚ Loaded conversation: {conv_id}")
 
     def handle_delete_conversation(conv_id: str):
         nonlocal active_conv
-        if pending_delete_ids:
+        if str(conv_id) in pending_delete_ids:
             popup.show_conversation_delete_in_progress()
             return
         if _is_conversation_busy(conv_id):
-            popup.show_conversation_busy_notice()
+            popup.show_conversation_delete_busy()
             print(
                 f"Delete rejected while conversation {conv_id} is active."
             )
             return
         cached_items = popup.conversation_snapshot().get("items") or []
         if not any(str(item.get("id") or "") == str(conv_id) for item in cached_items):
-            popup.show_conversation_delete_failed()
-            popup.refresh_conversations(
-                active_conv["id"] if active_conv else None
-            )
+            popup.show_conversation_delete_failed("conversation_not_found")
+            popup.reload_conversations()
             return
         request_id = f"desktop_delete_{uuid.uuid4().hex}"
+        operation_id = f"desktop_delete_{uuid.uuid4().hex}"
         conv_ids = {str(conv_id)}
         _begin_conversation_delete_projection(
             request_id, conv_ids, action="single",
         )
-        _start_conversation_delete_worker(request_id, conv_ids)
+        _start_conversation_delete_worker(
+            request_id,
+            conv_ids,
+            operation_id=operation_id,
+        )
 
     def handle_rename_conversation(conv_id: str, title: str):
         # WOR-76: PC rename. Persist to disk (trim + non-empty + TITLE_MAX_LEN
@@ -4366,7 +4482,7 @@ def wake_mode():
                 if str(item.get("folder_id") or "") == folder_id
             }
             if any(_is_conversation_busy(conv_id) for conv_id in deleting_ids):
-                popup.show_conversation_busy_notice()
+                popup.show_conversation_delete_busy()
                 print(
                     f"Project delete rejected while {folder_id} has active work."
                 )
@@ -4416,13 +4532,19 @@ def wake_mode():
             for item in snapshot.get("items") or []
             if not str(item.get("folder_id") or "")
         }
-        if any(_is_conversation_busy(conv_id) for conv_id in deleting_ids):
-            popup.show_conversation_busy_notice()
+        busy_ids = {
+            conv_id for conv_id in deleting_ids
+            if _is_conversation_busy(conv_id)
+        }
+        if busy_ids:
+            popup.show_conversation_delete_busy(
+                count=len(busy_ids), bulk=True,
+            )
             print("Bulk delete rejected while an ungrouped chat is active.")
             return
         if not deleting_ids:
-            popup.show_conversation_delete_failed()
-            popup.refresh_conversations(active_conv["id"] if active_conv else None)
+            popup.show_conversation_delete_none()
+            popup.reload_conversations()
             return
         request_id = f"desktop_bulk_delete_{uuid.uuid4().hex}"
         operation_id = f"desktop_bulk_{uuid.uuid4().hex}"
