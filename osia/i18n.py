@@ -222,27 +222,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "fr": "Versions intégrées et documents canoniques",
     },
     "settings.legal_desc": {
-        "en": "Legal acceptance is stored only on this PC. Draft documents never block developer or test workflows.",
-        "fr": "L’acceptation juridique reste stockée uniquement sur ce PC. Les projets ne bloquent jamais les parcours de développement ou de test.",
+        "en": "The full Terms and Privacy Policy are included for offline reading. Startup acceptance is controlled separately.",
+        "fr": "Les textes intégraux des Conditions et de la Politique sont disponibles hors ligne. L’acceptation au démarrage est gérée séparément.",
     },
-    "legal.review_status": {
-        "en": "Draft for legal review — not in force",
-        "fr": "Projet pour revue juridique — non en vigueur",
+    "legal.offline_summary": {
+        "en": "The complete English and French legal texts are bundled with OSIA.",
+        "fr": "Les textes juridiques complets en anglais et en français sont intégrés à OSIA.",
     },
     "legal.terms_version": {"en": "Terms: {version}", "fr": "Conditions : {version}"},
     "legal.privacy_version": {"en": "Privacy: {version}", "fr": "Confidentialité : {version}"},
-    "legal.effective_year": {
-        "en": "Planned effective year: {year}; no exact date is set",
-        "fr": "Entrée en vigueur prévue en {year} ; aucune date exacte n’est fixée",
+    "legal.updated_date": {
+        "en": "Last updated: {date}",
+        "fr": "Dernière mise à jour : {date}",
     },
     "legal.contact": {"en": "Public contact: {email}", "fr": "Contact public : {email}"},
     "legal.governing_law": {
         "en": "French law applies, subject to mandatory consumer protections",
         "fr": "Le droit français s’applique, sous réserve des protections impératives des consommateurs",
     },
-    "legal.open_terms": {"en": "Open Terms", "fr": "Ouvrir les Conditions"},
-    "legal.open_privacy": {"en": "Open Privacy Policy", "fr": "Ouvrir la Politique"},
-    "legal.open_manifest": {"en": "Version manifest", "fr": "Manifeste des versions"},
+    "legal.open_terms": {"en": "Read Terms offline", "fr": "Lire les Conditions hors ligne"},
+    "legal.open_privacy": {"en": "Read Privacy Policy offline", "fr": "Lire la Politique hors ligne"},
+    "legal.open_manifest": {"en": "Online legal manifest", "fr": "Manifeste juridique en ligne"},
     "legal.gate_title": {"en": "Before continuing", "fr": "Avant de continuer"},
     "legal.gate_desc": {
         "en": "Read the Terms and Privacy Policy. Accepting the Terms does not turn every privacy processing operation into consent.",

@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "version": "2026-10-05.4",
+  "termsVersion": "2026-10-05.4",
+  "privacyVersion": "2026-10-05.4",
+  "lastUpdated": "2026-10-05",
+  "effectiveDate": "2026-10-06",
+  "languages": [
+    "en",
+    "fr"
+  ],
+  "futureLanguages": [
+    "es",
+    "de",
+    "ja",
+    "zh-CN"
+  ],
+  "publicContactEmail": "contact@osia.space",
+  "operatorIdentity": "OSIA is the trade and project name used by Aymen Gherbi, entrepreneur individuel (EI). OSIA is not a separate legal person.",
+  "operatorLegalIdentity": "Aymen Gherbi — Entrepreneur individuel (EI)",
+  "tradeName": "OSIA",
+  "governingLaw": "France",
+  "agePolicy": "OSIA is not specifically directed at children. Minors may use it subject to applicable law; parental or legal-guardian authorization or supervision may be required. OSIA does not independently verify age unless a feature expressly says that it does.",
+  "minimumAge": null,
+  "termsAcceptanceRequired": false,
+  "privacyNoticeRequired": false,
+  "materialChange": true,
+  "canonicalUrls": {
+    "fr": {
+      "terms": "https://osia.space/legal/terms",
+      "privacy": "https://osia.space/legal/privacy",
+      "legalNotice": "https://osia.space/legal/mentions-legales",
+      "thirdParty": "https://osia.space/legal/third-party",
+      "licenses": "https://osia.space/legal/licenses",
+      "manifest": "https://osia.space/legal-manifest.json"
+    },
+    "en": {
+      "terms": "https://osia.space/en/legal/terms",
+      "privacy": "https://osia.space/en/legal/privacy",
+      "legalNotice": "https://osia.space/en/legal/legal-notice",
+      "thirdParty": "https://osia.space/en/legal/third-party",
+      "licenses": "https://osia.space/en/legal/licenses",
+      "manifest": "https://osia.space/legal-manifest.json"
+    }
+  },
+  "contentSha256": "80a13b01fad30ce9ef8b7974f4452fd0a2f653f78dc49ed75db54a7e921427a6"
+}

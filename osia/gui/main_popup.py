@@ -85,6 +85,7 @@ from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
 from osia.gui.thinking_orbs import ThinkingOrbs
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
+from osia.gui.legal_viewer import LegalDocumentDialog
 from osia.desktop_attachments import (
     DesktopAttachmentError,
     DraftAttachment,
@@ -8608,8 +8609,8 @@ class _SettingsPanel(QWidget):
         self._legal_desc = QLabel(i18n.t("settings.legal_desc"))
         self._legal_desc.setObjectName("sectionDesc")
         self._legal_desc.setWordWrap(True)
-        self._legal_status = QLabel(i18n.t("legal.review_status"))
-        self._legal_status.setObjectName("warnLabel")
+        self._legal_status = QLabel(i18n.t("legal.offline_summary"))
+        self._legal_status.setObjectName("sectionDesc")
         self._legal_status.setWordWrap(True)
         self._legal_terms_version = QLabel(
             i18n.t("legal.terms_version", version=legal.TERMS_VERSION)
@@ -8620,7 +8621,7 @@ class _SettingsPanel(QWidget):
         )
         self._legal_privacy_version.setWordWrap(True)
         self._legal_effective_year = QLabel(
-            i18n.t("legal.effective_year", year=legal.PLANNED_EFFECTIVE_YEAR)
+            i18n.t("legal.updated_date", date=legal.LAST_UPDATED)
         )
         self._legal_effective_year.setWordWrap(True)
         self._legal_contact = QLabel(
@@ -8643,13 +8644,13 @@ class _SettingsPanel(QWidget):
         self._legal_terms_btn.setObjectName("ghostBtn")
         self._legal_terms_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._legal_terms_btn.clicked.connect(
-            lambda: webbrowser.open(legal.TERMS_URL)
+            lambda: LegalDocumentDialog(self, "terms").exec()
         )
         self._legal_privacy_btn = QPushButton(i18n.t("legal.open_privacy"))
         self._legal_privacy_btn.setObjectName("ghostBtn")
         self._legal_privacy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._legal_privacy_btn.clicked.connect(
-            lambda: webbrowser.open(legal.PRIVACY_URL)
+            lambda: LegalDocumentDialog(self, "privacy").exec()
         )
         self._legal_manifest_btn = QPushButton(i18n.t("legal.open_manifest"))
         self._legal_manifest_btn.setObjectName("ghostBtn")
@@ -9828,7 +9829,7 @@ class _SettingsPanel(QWidget):
         self._legal_title.setText(i18n.t("settings.legal"))
         self._legal_sub.setText(i18n.t("settings.legal_sub"))
         self._legal_desc.setText(i18n.t("settings.legal_desc"))
-        self._legal_status.setText(i18n.t("legal.review_status"))
+        self._legal_status.setText(i18n.t("legal.offline_summary"))
         self._legal_terms_version.setText(
             i18n.t("legal.terms_version", version=legal.TERMS_VERSION)
         )
@@ -9836,7 +9837,7 @@ class _SettingsPanel(QWidget):
             i18n.t("legal.privacy_version", version=legal.PRIVACY_VERSION)
         )
         self._legal_effective_year.setText(
-            i18n.t("legal.effective_year", year=legal.PLANNED_EFFECTIVE_YEAR)
+            i18n.t("legal.updated_date", date=legal.LAST_UPDATED)
         )
         self._legal_contact.setText(
             i18n.t("legal.contact", email=legal.PUBLIC_CONTACT_EMAIL)

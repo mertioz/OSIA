@@ -18,6 +18,7 @@ GENERATED = STAGE / "generated"
 
 datas = [
     (str(ROOT / "assets"), "assets"),
+    (str(ROOT / "osia" / "legal_documents"), "osia/legal_documents"),
     (str(ROOT / "windows" / "configure_lan_firewall.ps1"), "windows"),
     (str(STAGE / "models"), "models"),
     (str(STAGE / "runtimes"), "runtimes"),

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import webbrowser
-
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -14,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import i18n, legal
+from osia.gui.legal_viewer import LegalDocumentDialog
 
 
 class LegalAcceptanceDialog(QDialog):
@@ -29,9 +28,13 @@ class LegalAcceptanceDialog(QDialog):
         layout.addWidget(intro)
 
         terms = QPushButton(i18n.t("legal.open_terms"))
-        terms.clicked.connect(lambda: webbrowser.open(legal.TERMS_URL))
+        terms.clicked.connect(
+            lambda: LegalDocumentDialog(self, "terms").exec()
+        )
         privacy = QPushButton(i18n.t("legal.open_privacy"))
-        privacy.clicked.connect(lambda: webbrowser.open(legal.PRIVACY_URL))
+        privacy.clicked.connect(
+            lambda: LegalDocumentDialog(self, "privacy").exec()
+        )
         layout.addWidget(terms)
         layout.addWidget(privacy)
 
