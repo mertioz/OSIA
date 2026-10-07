@@ -29,6 +29,31 @@ def _load_launcher():
     return module
 
 
+def test_frozen_launcher_registers_bundled_qt_dll_directory(
+    tmp_path, monkeypatch,
+):
+    launcher = _load_launcher()
+    qt_bin = tmp_path / "PyQt6" / "Qt6" / "bin"
+    qt_bin.mkdir(parents=True)
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+    monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(launcher.sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(launcher, "_FROZEN_QT_DLL_DIRECTORY_HANDLE", None)
+    registered = []
+    handle = object()
+    monkeypatch.setattr(
+        launcher.os,
+        "add_dll_directory",
+        lambda path: registered.append(path) or handle,
+        raising=False,
+    )
+
+    launcher._register_frozen_qt_dll_directory()
+
+    assert registered == [str(qt_bin)]
+    assert launcher._FROZEN_QT_DLL_DIRECTORY_HANDLE is handle
+
+
 def _load_windows_build():
     path = ROOT / "packaging" / "windows" / "build_windows.py"
     spec = importlib.util.spec_from_file_location("osia_windows_build", path)

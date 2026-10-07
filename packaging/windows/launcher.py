@@ -8,6 +8,27 @@ import sys
 import tempfile
 from pathlib import Path
 
+
+_FROZEN_QT_DLL_DIRECTORY_HANDLE = None
+
+
+def _register_frozen_qt_dll_directory() -> None:
+    """Make the packaged PyQt6 wheel DLLs visible before any Qt import."""
+
+    global _FROZEN_QT_DLL_DIRECTORY_HANDLE
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    frozen_root = str(getattr(sys, "_MEIPASS", "") or "")
+    if not frozen_root:
+        return
+    qt_bin = Path(frozen_root) / "PyQt6" / "Qt6" / "bin"
+    if qt_bin.is_dir():
+        _FROZEN_QT_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(qt_bin))
+
+
+_register_frozen_qt_dll_directory()
+
+
 from osia.runtime import (
     DOCUMENT_WORKER_MODE,
     INSTALL_INTEGRATION_MODE,
