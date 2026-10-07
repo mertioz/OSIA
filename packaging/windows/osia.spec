@@ -87,7 +87,9 @@ a = Analysis(
     hiddenimports=sorted(set(hiddenimports)),
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[
+        str(ROOT / "packaging" / "windows" / "qt_dll_runtime_hook.py"),
+    ],
     excludes=[
         "IPython",
         "jupyter",

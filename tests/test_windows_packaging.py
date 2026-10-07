@@ -29,32 +29,6 @@ def _load_launcher():
     return module
 
 
-def test_frozen_launcher_registers_bundled_qt_dll_directory(
-    tmp_path, monkeypatch,
-):
-    launcher = _load_launcher()
-    qt_bin = tmp_path / "PyQt6" / "Qt6" / "bin"
-    qt_bin.mkdir(parents=True)
-    monkeypatch.setattr(launcher.sys, "platform", "win32")
-    monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(launcher.sys, "_MEIPASS", str(tmp_path), raising=False)
-    monkeypatch.setattr(launcher, "_FROZEN_QT_DLL_DIRECTORY_HANDLE", None)
-    monkeypatch.setenv("PATH", "existing-path")
-    registered = []
-    handle = object()
-    monkeypatch.setattr(
-        launcher.os,
-        "add_dll_directory",
-        lambda path: registered.append(path) or handle,
-        raising=False,
-    )
-
-    launcher._register_frozen_qt_dll_directory()
-
-    assert registered == [str(qt_bin)]
-    assert launcher.os.environ["PATH"].split(launcher.os.pathsep)[0] == str(qt_bin)
-    assert launcher._FROZEN_QT_DLL_DIRECTORY_HANDLE is handle
-
 
 def _load_windows_build():
     path = ROOT / "packaging" / "windows" / "build_windows.py"
@@ -72,6 +46,38 @@ def _load_source_module(name: str, relative_path: str):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def test_frozen_qt_runtime_hook_registers_bundled_dll_directory(
+    tmp_path, monkeypatch,
+):
+    hook = _load_source_module(
+        "osia_qt_dll_runtime_hook_test",
+        "packaging/windows/qt_dll_runtime_hook.py",
+    )
+    qt_bin = tmp_path / "PyQt6" / "Qt6" / "bin"
+    qt_bin.mkdir(parents=True)
+    monkeypatch.setattr(hook.sys, "platform", "win32")
+    monkeypatch.setattr(hook.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(hook.sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(hook, "_QT_DLL_DIRECTORY_HANDLE", None)
+    monkeypatch.setenv("PATH", "existing-path")
+    registered = []
+    handle = object()
+    monkeypatch.setattr(
+        hook.os,
+        "add_dll_directory",
+        lambda path: registered.append(path) or handle,
+        raising=False,
+    )
+
+    hook.register_frozen_qt_dll_directory()
+
+    assert registered == [str(qt_bin)]
+    assert hook.os.environ["PATH"].split(hook.os.pathsep)[0] == str(qt_bin)
+    assert hook._QT_DLL_DIRECTORY_HANDLE is handle
+    spec = (ROOT / "packaging" / "windows" / "osia.spec").read_text("utf-8")
+    assert "qt_dll_runtime_hook.py" in spec
 
 
 def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
