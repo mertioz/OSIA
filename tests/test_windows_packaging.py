@@ -39,6 +39,7 @@ def test_frozen_launcher_registers_bundled_qt_dll_directory(
     monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
     monkeypatch.setattr(launcher.sys, "_MEIPASS", str(tmp_path), raising=False)
     monkeypatch.setattr(launcher, "_FROZEN_QT_DLL_DIRECTORY_HANDLE", None)
+    monkeypatch.setenv("PATH", "existing-path")
     registered = []
     handle = object()
     monkeypatch.setattr(
@@ -51,6 +52,7 @@ def test_frozen_launcher_registers_bundled_qt_dll_directory(
     launcher._register_frozen_qt_dll_directory()
 
     assert registered == [str(qt_bin)]
+    assert launcher.os.environ["PATH"].split(launcher.os.pathsep)[0] == str(qt_bin)
     assert launcher._FROZEN_QT_DLL_DIRECTORY_HANDLE is handle
 
 

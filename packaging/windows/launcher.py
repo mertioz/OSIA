@@ -23,7 +23,13 @@ def _register_frozen_qt_dll_directory() -> None:
         return
     qt_bin = Path(frozen_root) / "PyQt6" / "Qt6" / "bin"
     if qt_bin.is_dir():
-        _FROZEN_QT_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(qt_bin))
+        qt_bin_path = str(qt_bin)
+        search_path = os.environ.get("PATH", "")
+        if qt_bin_path not in search_path.split(os.pathsep):
+            os.environ["PATH"] = (
+                qt_bin_path + (os.pathsep + search_path if search_path else "")
+            )
+        _FROZEN_QT_DLL_DIRECTORY_HANDLE = os.add_dll_directory(qt_bin_path)
 
 
 _register_frozen_qt_dll_directory()
