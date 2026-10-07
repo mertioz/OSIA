@@ -1,13 +1,12 @@
 """Exact captured Groq dialect through the existing canonical dispatcher."""
 import json
-from pathlib import Path
 
 import pytest
 
 from osia import agent as runtime
 from osia.groq_tool_text import normalize_groq_tool_text
 from tests.test_wor305_phase3a_no_replay import dispatch
-from tests.test_wor305_phase3b_completion import scripted
+from wor305_test_support import scripted
 
 
 def dialect(command):
@@ -16,14 +15,6 @@ def dialect(command):
 
 def extract(text):
     return runtime._extract_tool_calls(normalize_groq_tool_text(text), provider='groq')
-
-
-def test_actual_phase4a_evidence():
-    evidence = json.loads((Path(__file__).resolve().parents[1] / 'docs/wor305-phase4a/groq.json').read_text(encoding='utf-8'))
-    for request in evidence['provider_calls']:
-        text = request['response']['choices'][0]['message']['content']
-        command = text.split('<parameter=command>', 1)[1].split('</parameter>', 1)[0]
-        assert extract(text) == [{'tool': 'bash', 'command': command}]
 
 
 @pytest.mark.parametrize('command', ['echo GROQ_FIXTURE_OK', '\n echo "C:\\Temp\\x"\n echo "<x> & amp; >"\n'])

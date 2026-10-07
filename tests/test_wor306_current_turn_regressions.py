@@ -26,17 +26,16 @@ from osia.tool_contracts import (
 def test_prompt_stops_after_conclusive_current_evidence_without_weakening_truth():
     prompt = SYSTEM_PROMPT_CORE
 
-    assert (
-        "Once the requested outcome is sufficiently established by current, "
-        "direct evidence, stop verifying and complete the task."
-    ) in prompt
-    assert "ambiguous, contradictory, or stale evidence" in prompt
-    assert "an unresolved required postcondition" in prompt
-    assert "user-requested extra verification" in prompt
+    assert "continue until its end state is verified or a factual blocker is established" in prompt
+    assert "The selected provider/model remains the semantic authority through the turn." in prompt
+    assert "OUTCOME_UNKNOWN is not success" in prompt
+    assert "does not block a distinct fresh model-requested call" in prompt
+    assert "Use current evidence for each next decision" in prompt
     assert "Never claim an action or postcondition without supporting evidence." in prompt
     assert "Respect cancellation, target identity, and stale-state rejection." in prompt
     assert "resolve conflicts by observing further or stating uncertainty" in prompt
-    assert "An unchanged screenshot is inconclusive: it proves neither failure nor success." in prompt
+    assert "An unchanged screenshot proves neither failure nor success." in prompt
+    assert "reconcile an uncertain effect before retrying" not in prompt
 
 
 def test_argument_shape_keeps_only_structure_lengths_and_schema_enum_labels():
@@ -323,6 +322,11 @@ def test_invalid_second_computer_call_stays_non_dispatched_and_truthful(
             status="done",
             observed_state="Steam shows Running and Stop.",
         ),
+        (
+            "L'écran n'a pas été observé : aucun des appels invalides n'a été envoyé."
+            if lang == "fr" else
+            "The screen was not observed: neither invalid call was dispatched."
+        ),
     ])
     agent.client = SimpleNamespace(
         chat=SimpleNamespace(completions=completions),
@@ -350,17 +354,24 @@ def test_invalid_second_computer_call_stays_non_dispatched_and_truthful(
             ),
         )
 
-    assert len(completions.calls) == 2
+    assert len(completions.calls) == 3
     assert dispatches == []
-    if lang == "fr":
-        assert final.startswith("ERROR: Les arguments de l'outil restent invalides")
-        assert "l'outil n'a pas été exécuté" in final
-    else:
-        assert final.startswith("ERROR: The tool arguments remain invalid")
-        assert "the tool was not executed" in final
+    assert final == (
+        "L'écran n'a pas été observé : aucun des appels invalides n'a été envoyé."
+        if lang == "fr" else
+        "The screen was not observed: neither invalid call was dispatched."
+    )
+    assert all(call["model"] == "deepseek-flash" for call in completions.calls)
+    third_round = "\n".join(
+        str(item.get("content") or "")
+        for item in completions.calls[2]["messages"]
+    )
+    assert "rejected by argument validation before dispatch" in third_round
+    assert "Current tool JSON Schema:" in third_round
+    assert "$.status" in third_round
     result = agent.terminality_result("turn-invalid-repair") or {}
-    assert result["terminal_state"] == "blocked_verified"
-    assert result["reason_code"] == "selected_model_error"
+    assert result["terminal_state"] == "success_verified"
+    assert result["reason_code"] == "selected_model_completed"
     diagnostic = agent.last_tool_argument_diagnostic
     assert diagnostic["first_call"]["tool_name"] == "computer_observation"
     assert diagnostic["first_call"]["validation"]["issues"] == [{
@@ -388,7 +399,7 @@ def test_invalid_second_computer_call_stays_non_dispatched_and_truthful(
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
     assert "Current tool JSON Schema: " + schema_text in repair_wire
-    assert "($.status)" in final
+    assert "$.status" in third_round
 
 
 def test_new_turn_binding_clears_prior_execution_state():

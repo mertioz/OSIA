@@ -7,7 +7,7 @@ from osia import agent as runtime
 from osia.tool_contracts import ExecutionOutcome
 from osia.turn_terminality import TurnTerminalityController
 from tests.test_wor305_phase3a_no_replay import dispatch
-from tests.test_wor305_phase3b_completion import scripted
+from wor305_test_support import scripted
 
 
 def _synthetic_barrier(monkeypatch):

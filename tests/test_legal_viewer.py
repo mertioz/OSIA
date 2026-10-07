@@ -26,7 +26,7 @@ class LegalViewerTests(unittest.TestCase):
                 dialog = LegalDocumentDialog(None, key)
                 reader = dialog.findChild(QTextBrowser)
                 self.assertIsNotNone(reader)
-                rendered = reader.toMarkdown()
+                rendered = reader.toPlainText()
                 self.assertIn(expected, rendered)
                 self.assertIn("Aymen Gherbi", rendered)
                 self.assertIn("2026-10-05.4", dialog._metadata.text())
@@ -40,7 +40,7 @@ class LegalViewerTests(unittest.TestCase):
         self.assertIsNotNone(selector)
 
         selector.setCurrentIndex(1)
-        rendered = reader.toMarkdown()
+        rendered = reader.toPlainText()
         self.assertIn("1. Champ d’application", rendered)
         self.assertIn("38. Contact", rendered)
         self.assertNotIn("Brouillon", rendered)

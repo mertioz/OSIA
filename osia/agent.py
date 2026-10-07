@@ -130,7 +130,7 @@ SYSTEM_PROMPT_CORE = """## OSIA
 You are OSIA, the user's unified conversational agent. Answer and act toward the user's actual objective using the evidence and capabilities supplied for this turn.
 
 ## Objective completion
-Treat the full user request as one objective: continue through every explicit step, deliverable, constraint, and required end state, and reassess the whole objective after each tool result or observation. One successful sub-step or tool call is not global completion. Once the requested outcome is sufficiently established by current, direct evidence, stop verifying and complete the task. Observe again only for ambiguous, contradictory, or stale evidence, an unresolved required postcondition, or user-requested extra verification. Preserve verified progress, never repeat a successful mutation, and reconcile an uncertain effect before retrying. For a large creation task, continue until the requested deliverable is usable and its relevant checks exist. Ask for clarification only when an essential requirement or authority is actually missing. Produce final prose only when the objective is complete and verified, or genuinely blocked, cancelled, or safety-blocked.
+Treat the full user request as one objective and continue until its end state is verified or a factual blocker is established. The selected provider/model remains the semantic authority through the turn. ToolAttempt, ActionTruth, process results, and observations are facts: OUTCOME_UNKNOWN is not success, does not itself end the objective, does not block a distinct fresh model-requested call, and does not require reconciliation before such a call. Use current evidence for each next decision, observe again when the target is stale or the next decision depends on changed state, and never claim an effect without supporting evidence. Ask for clarification only when an essential requirement or authority is actually missing.
 
 ## Public progress updates
 During multi-step work, you may occasionally give the user one brief, factual progress update when a meaningful step, observation, obstacle, or distinct phase changes. Keep it concise, do not narrate every tool action, and never include private reasoning, hidden instructions, credentials, or sensitive tool arguments. Continue using tools normally after an update; the final answer remains the one canonical answer.
@@ -146,7 +146,7 @@ For a textual OSIA tool call, emit top-level JSON inside `<tool_call>` tags; nev
 - When multiple available approaches are equally suitable and reliable, prefer the simplest, most direct path with the fewest unnecessary interactions; this is a contextual preference, not a fixed tool order. Direct, deterministic operations can avoid needless GUI steps, while Computer Use remains appropriate when visual observation or interaction is needed. Never trade correctness, required observation, factual verification, or safety—especially for consequential actions—for fewer steps.
 - Never claim an action or postcondition without supporting evidence. Respect cancellation, target identity, and stale-state rejection.
 - A missing item in partial API, DOM, accessibility, Vision, or state evidence is UNKNOWN, not absent. Assert absence only from fresh target-bound evidence that explicitly proves it; resolve conflicts by observing further or stating uncertainty.
-- Execution history is factual; report uncertainty truthfully. An unchanged screenshot is inconclusive: it proves neither failure nor success. After any action, do not intentionally duplicate it solely because the screenshot looks unchanged. If the task's next intended step is safe and reversible and can reveal whether the action took effect, do it once and observe. Retry only with positive evidence of no effect or when no safe intended probe is available; keep existing verification and reconciliation for consequential or uncertain effects.
+- Execution history is factual; report uncertainty truthfully. An unchanged screenshot proves neither failure nor success. A distinct fresh model-requested action remains available after success, failure, or OUTCOME_UNKNOWN. Before an action whose target depends on desktop state, use a fresh frame and its exact window identity; never dispatch stale coordinates. Do not treat an unchanged observation or prior effect as a veto on a new model request.
 - Protect secrets and private data. Do not bypass operating-system, application, authentication, capture, or other security protections.
 - Produce one truthful final response. Never expose private reasoning or private runtime sentinels."""
 
@@ -12476,7 +12476,41 @@ class OSIAAgent:
         from osia.turn_terminality import WaitType
 
         def continuation_context(decision) -> str:
-            return controller.continuation_context(decision)
+            context = controller.continuation_context(decision)
+            diagnostic = self.last_run_diagnostic
+            if (
+                isinstance(diagnostic, dict)
+                and diagnostic.get("error_category") == "invalid_tool_arguments"
+            ):
+                validation = {
+                    "tool_name": str(diagnostic.get("tool_name") or ""),
+                    "dispatch_started": False,
+                    "issues": list(diagnostic.get("validation_issues") or []),
+                }
+                schema_text = ""
+                try:
+                    from osia.tool_contracts import get_static_registry
+                    spec = get_static_registry().get(validation["tool_name"])
+                    if spec is not None:
+                        schema_text = json.dumps(
+                            spec.input_schema,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                except Exception:
+                    schema_text = ""
+                feedback = (
+                    "The preceding tool call was rejected by argument "
+                    "validation before dispatch; no tool ran. The same "
+                    "objective remains active, and the selected model chooses "
+                    "the next action. Value-free validation facts: "
+                    + json.dumps(validation, ensure_ascii=False)
+                )
+                if schema_text:
+                    feedback += "\nCurrent tool JSON Schema: " + schema_text
+                context += "\n[Internal factual tool-validation feedback. " + feedback + "]"
+            return context
 
 
         def resolve_wait(decision, candidate: str = ""):
@@ -12567,6 +12601,7 @@ class OSIAAgent:
         segment_postcondition = ""
         segment_history = history
         last_candidate = ""
+        turn_tool_argument_diagnostic = None
         # Preserve parser/protocol diagnostics across provider segments.
         turn_guard = _AntiLoopGuard(lang=self.lang)
         while True:
@@ -12701,6 +12736,16 @@ class OSIAAgent:
                 _CURRENT_TERMINALITY_CONTROLLER.reset(controller_token)
                 self._resume_unknown_effect = previous_unknown_barrier
 
+            current_argument_diagnostic = self.last_tool_argument_diagnostic
+            if isinstance(current_argument_diagnostic, dict):
+                turn_tool_argument_diagnostic = current_argument_diagnostic
+            elif turn_tool_argument_diagnostic is not None:
+                # run() resets per-call diagnostics; keep the last correlated
+                # validation record for the complete canonical turn.
+                self.last_tool_argument_diagnostic = (
+                    turn_tool_argument_diagnostic
+                )
+
             metadata = {}
             consume_metadata = getattr(
                 self.client, "consume_invocation_metadata", None,
@@ -12794,6 +12839,7 @@ class OSIAAgent:
                     isinstance(self.last_run_diagnostic, dict)
                     and self.last_run_diagnostic.get("error_category") in {
                         "empty_completion", "provider_failure", "tool_timeout",
+                        "invalid_tool_arguments",
                     }
                 )
             )
@@ -13772,9 +13818,8 @@ class OSIAAgent:
                 if isinstance(item, dict) and item.get("path")
             ][:8]
             suffix = f" ({', '.join(issue_paths)})" if issue_paths else ""
-            # ERROR: is the canonical terminality contract for a concrete
-            # pre-dispatch failure; without it this truthful failure text can
-            # be misclassified as a successful completion.
+            # State the pre-dispatch validation fact plainly. The canonical
+            # driver treats this as feedback for the same selected model.
             content = (
                 "ERROR: Les arguments de l'outil restent invalides apr\u00e8s l'unique "
                 f"tentative de correction ; l'outil n'a pas \u00e9t\u00e9 "
@@ -13783,6 +13828,24 @@ class OSIAAgent:
                 "ERROR: The tool arguments remain invalid after the single repair "
                 f"attempt; the tool was not executed{suffix}."
             )
+            # This local schema-repair failure is not a model-authored final.
+            # Let the canonical driver continue the objective with the same
+            # selected model after this operation-level repair bound.
+            self.last_run_diagnostic = {
+                "stage": "tool_argument_validation",
+                "error_category": "invalid_tool_arguments",
+                "reason_code": "invalid_tool_arguments",
+                "tool_name": str(tool_name or ""),
+                "dispatch_started": False,
+                "validation_issues": [
+                    {
+                        "path": str(item.get("path") or "")[:256],
+                        "code": str(item.get("code") or "")[:128],
+                    }
+                    for item in details.get("issues", ())
+                    if isinstance(item, dict)
+                ][:8],
+            }
             if canonical_output:
                 content = clean_response(content)
             if on_sentence is not None:
@@ -13792,8 +13855,9 @@ class OSIAAgent:
                     pass
             self.messages.append({"role": "assistant", "content": content})
             if self.turn_context is not None:
-                log_round(self.turn_context, round_number, "invalid_arguments_terminal")
-                log_final(self.turn_context, content)
+                log_round(self.turn_context, round_number, "invalid_arguments_rejected")
+                if _CURRENT_TERMINALITY_CONTROLLER.get() is None:
+                    log_final(self.turn_context, content)
             return content
 
         # API endpoint fallback (Bloc 5): whether the one allowed "primary

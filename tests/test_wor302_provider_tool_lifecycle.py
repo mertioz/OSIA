@@ -89,6 +89,61 @@ def _agent(monkeypatch, responses, *, provider="deepseek",
     return agent
 
 
+def test_legacy_run_wrapper_does_not_import_goal_contract_v2(monkeypatch):
+    agent = _agent(monkeypatch, ["Bonjour."])
+    real_import = __import__
+
+    def reject_goal_contract_v2(name, *args, **kwargs):
+        if name == "osia.goal_contract_v2":
+            raise AssertionError("GoalContract V2 is not a runtime dependency")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=reject_goal_contract_v2):
+        final = agent.run("Bonjour.", history=[])
+
+    assert final == "Bonjour."
+    assert len(agent.client.chat.completions.calls) == 1
+    assert agent.client.chat.completions.calls[0]["model"] == agent.model
+
+
+def test_canonical_turn_dispatches_and_reinjects_without_strategy(
+    monkeypatch, tmp_path,
+):
+    dispatched = []
+    _patch_tool(
+        monkeypatch,
+        "read_file",
+        lambda path: dispatched.append(path) or "fixture file contents",
+    )
+    agent = _agent(
+        monkeypatch,
+        [
+            _dsml_response(_dsml_invoke("read_file", path="C:\\Temp\\wor335.txt")),
+            "The file says fixture file contents.",
+        ],
+    )
+    monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path))
+
+    with patch(
+        "osia.execution_strategy.build_execution_strategy",
+        side_effect=AssertionError("canonical Chat must not build a strategy"),
+    ):
+        final = agent.run_terminal_turn(
+            "Read C:\\Temp\\wor335.txt and report its contents.",
+            turn_id="wor335-canonical-tool-loop",
+            history=[],
+        )
+
+    calls = agent.client.chat.completions.calls
+    assert final == "The file says fixture file contents."
+    assert dispatched == ["C:\\Temp\\wor335.txt"]
+    assert len(calls) == 2
+    assert all(call["model"] == agent.model for call in calls)
+    assert any(
+        "fixture file contents" in str(message.get("content") or "")
+        for message in calls[1]["messages"]
+    )
+
 def _fake_stream(agent, items):
     remaining = iter(items)
     calls = []

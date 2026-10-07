@@ -1,6 +1,9 @@
 """Catalog, migration and actual serialized HTTP image-transport sentinels."""
 
+import base64
 import copy
+import io
+import threading
 import hashlib
 import json
 from pathlib import Path
@@ -8,16 +11,127 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from PIL import Image
 from openai import OpenAI
 
 from osia import config, image_inputs, mobile_model_catalogue as mobile, models, reasoning
 from osia.agent import OSIAAgent
+from osia.attachments import CommittedAttachment, build_agent_input
 from osia.deepseek import LEGACY_API_IDS, MODEL_ID, migrate_model_id, migrate_settings
+from osia.desktop_attachments import prepare_desktop_turn, stage_attachment
 from osia.image_inputs import ImageInputError, ensure_image_input_supported, release_media_owner
 from osia.model_capabilities import effective_route_capabilities
-from tools.wor298_deepseek_probe import probe_agent, staged_input, synthetic_image, wire_evidence
 
 
+
+
+def synthetic_image() -> bytes:
+    picture = Image.new("RGB", (96, 64), "red")
+    picture.paste("blue", (48, 0, 96, 64))
+    output = io.BytesIO()
+    picture.save(output, format="PNG")
+    return output.getvalue()
+
+
+def staged_input(path: Path, prompt: str, surface: str, owner: str):
+    if surface == "desktop":
+        return prepare_desktop_turn(
+            prompt, [stage_attachment(path, 0)], provider="deepseek",
+            model=MODEL_ID, owner_id=owner,
+        ).provider_content
+    data = path.read_bytes()
+    return build_agent_input(prompt, [CommittedAttachment(
+        attachment_id="att_wor298", file_id="file_wor298", logical_order=0,
+        display_name=path.name, path=path, byte_size=len(data),
+        sha256=hashlib.sha256(data).hexdigest(), detected_category="image",
+        detected_mime="image/png",
+    )], owner_id=owner)
+
+
+def probe_agent(content, client, mode="auto", owner="wor298"):
+    """Use production message/reasoning/stream builders with a fake client."""
+    agent = OSIAAgent.__new__(OSIAAgent)
+    agent.provider, agent.model = "deepseek", MODEL_ID
+    agent.messages = [{"role": "user", "content": content}]
+    agent.turn_context, agent.lang = None, "en"
+    agent._chatgpt_conversation_id = owner
+    agent._execution_generation_local = threading.local()
+    agent._trace_reasoning_binding = mode
+    agent.client = client
+    return agent
+
+
+def wire_evidence(request: httpx.Request, *, mode: str, surface: str) -> dict:
+    body = json.loads(request.content)
+    parts = [
+        part
+        for message in body["messages"]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    ]
+    images = [part for part in parts if part.get("type") == "image_url"]
+    has_text = any(
+        part.get("type") == "text" and part.get("text") for part in parts
+    ) or any(
+        isinstance(message.get("content"), str) and message["content"]
+        for message in body["messages"]
+    )
+    image_hashes = [
+        hashlib.sha256(
+            base64.b64decode(part["image_url"]["url"].split(",", 1)[1])
+        ).hexdigest()
+        for part in images
+    ]
+    return {
+        "requested_provider": "deepseek",
+        "requested_model": MODEL_ID,
+        "effective_provider": (
+            "deepseek" if request.url.host == "api.deepseek.com"
+            else "unverified_endpoint"
+        ),
+        "effective_model": body["model"],
+        "endpoint_host": request.url.host,
+        "endpoint_path": request.url.path,
+        "surface": surface,
+        "image_parts_present": bool(images),
+        "image_part_count": len(images),
+        "text_present": bool(has_text),
+        "text_and_image": bool(has_text and images),
+        "image_sha256": image_hashes,
+        "reasoning_requested": mode,
+        "reasoning_effective": "high (native default)" if mode == "auto" else mode,
+        "thinking": body.get("thinking"),
+        "reasoning_effort": body.get("reasoning_effort"),
+        "compatibility_transformations": (
+            (["image_ref -> image_url data URL"] if images else [])
+            + (["SDK extra_body -> top-level JSON"] if "thinking" in body else [])
+        ),
+        "sanitized_request": {
+            "model": body["model"],
+            "stream": body.get("stream", False),
+            "messages": [
+                {
+                    "role": message["role"],
+                    "content": [
+                        {
+                            "type": part.get("type"),
+                            **(
+                                {"image_url": {"url": "data:image/png;base64,<redacted>"}}
+                                if part.get("type") == "image_url"
+                                else {"text": "<redacted>"}
+                            ),
+                        }
+                        for part in message["content"]
+                    ]
+                    if isinstance(message.get("content"), list) else "<redacted>"
+                }
+                for message in body["messages"]
+            ],
+            **({"thinking": body["thinking"]} if "thinking" in body else {}),
+            **({"reasoning_effort": body["reasoning_effort"]}
+               if "reasoning_effort" in body else {}),
+        },
+    }
 MODES = {"auto": {}, "off": {"thinking": {"type": "disabled"}}, **{
     mode: {"thinking": {"type": "enabled"}, "reasoning_effort": mode}
     for mode in ("low", "high", "max")

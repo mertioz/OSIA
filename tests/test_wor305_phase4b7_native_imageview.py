@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
-import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -11,9 +10,6 @@ import unittest
 from PIL import Image
 
 from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
-
-
-CAPTURE = Path(__file__).resolve().parents[1] / "docs/wor305-phase4b7/imageview-before.json"
 
 
 class NativeImageViewTests(unittest.TestCase):
@@ -44,8 +40,16 @@ class NativeImageViewTests(unittest.TestCase):
     def image_events(self):
         return [event for event in self.attempt.capability_events if event.identity == "imageView"]
 
-    def test_exact_captured_provider_shape_is_supported(self):
-        captured = json.loads(CAPTURE.read_text(encoding="utf-8"))["events"]
+    def test_supported_provider_image_view_shape_is_correlated(self):
+        # Keep the provider item shape synthetic and local to this regression;
+        # the original capture has machine-specific paths and is release evidence.
+        captured = [
+            {"method": "item/started", "params": self.payload()[1]},
+            {
+                "method": "item/completed",
+                "params": self.payload("item/completed")[1],
+            },
+        ]
         self.assertEqual([row["method"] for row in captured], ["item/started", "item/completed"])
         self.assertEqual(set(captured[0]["params"]["item"]), {"type", "id", "path"})
         self.assertEqual(captured[0]["params"]["item"], captured[1]["params"]["item"])

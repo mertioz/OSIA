@@ -254,7 +254,7 @@ def test_startup_recovery_persists_one_correlated_final_without_replay(
     assert len(after_second["messages"]) == 2
 
 
-def test_startup_recovery_targets_actual_unverified_mutation_without_redispatch(
+def test_startup_recovery_preserves_unverified_mutation_without_redispatch(
     tmp_path, monkeypatch,
 ):
     from osia import agent as agent_module
@@ -310,54 +310,37 @@ def test_startup_recovery_targets_actual_unverified_mutation_without_redispatch(
         attempt_context=context,
     )
 
-    assert pending.outcome == ExecutionOutcome.PENDING
+    assert pending.outcome == ExecutionOutcome.SUCCESS_UNVERIFIED
     assert dispatches == ["Activate controlled fixture"]
     before = store.get_attempt(pending.tool_attempt_id)
     assert before["tool_name"] == "find_and_click"
-    assert before["status"] == ToolAttemptStatus.WAITING_VERIFICATION.value
+    assert before["terminal_outcome"] == "success_unverified"
     assert before["provider_id"] == "provider_restart_fixture"
     assert before["model_id"] == "model_restart_fixture"
     assert before["turn_id"] == "turn_restart_fixture"
+    assert before["action_truth"]["effect_truth"] != "verified"
     assert len(list(store.attempts_dir.glob("attempt_*.json"))) == 1
 
-    recovered = tool_attempts.recover_orphaned_tool_attempts()
-
-    assert recovered == []
-    waiting = store.get_attempt(pending.tool_attempt_id)
-    assert waiting["status"] == ToolAttemptStatus.WAITING_VERIFICATION.value
-    assert waiting["reason_code"] == "restart_reconciliation_pending"
-    assert conversations.get_conversation(conversation["id"])["messages"][-1][
-        "role"
-    ] == "user"
-
-    store.mark_waiting_verification(
-        pending.tool_attempt_id,
-        next_check_at=time.time() - 1.0,
-        deadline_at=time.time() - 0.5,
-        reason_code="restart_reconciliation_pending",
-        owner_settled=True,
-    )
-    recovered = tool_attempts.recover_orphaned_tool_attempts()
-    assert len(recovered) == 1
-    assert recovered[0]["tool_attempt_id"] == pending.tool_attempt_id
-    assert dispatches == ["Activate controlled fixture"]
+    # Startup recovery delivers the lost turn response from the recorded
+    # unverified fact; it neither upgrades that fact nor redispatches the action.
+    recovered_attempts = tool_attempts.recover_orphaned_tool_attempts()
+    assert len(recovered_attempts) == 1
+    assert recovered_attempts[0]["tool_attempt_id"] == pending.tool_attempt_id
     terminal = store.get_attempt(pending.tool_attempt_id)
-    assert terminal["tool_name"] == "find_and_click"
-    assert terminal["status"] == ToolAttemptStatus.UNKNOWN_AFTER_START.value
-    assert terminal["reason_code"] == "reconciliation_hard_deadline"
-    assert terminal["dispatch_state"] == "effect_unknown"
-    assert terminal["provider_id"] == "provider_restart_fixture"
-    assert terminal["model_id"] == "model_restart_fixture"
-    assert terminal["turn_id"] == "turn_restart_fixture"
+    assert terminal["status"] == ToolAttemptStatus.SUCCEEDED.value
+    assert terminal["terminal_outcome"] == "success_unverified"
+    assert terminal["action_truth"]["effect_truth"] != "verified"
     assert terminal["continuation_state"] == "complete"
-    assert len(list(store.attempts_dir.glob("attempt_*.json"))) == 1
-    stored = conversations.get_conversation(conversation["id"])["messages"]
-    assert [(item["role"], item["content"]) for item in stored] == [
+    assert dispatches == ["Activate controlled fixture"]
+    assert [
+        (item["role"], item["content"])
+        for item in conversations.get_conversation(conversation["id"])["messages"]
+    ] == [
         ("user", "Activate the controlled fixture once"),
         (
             "assistant",
-            "Read-only verification reached its hard limit. OSIA did not "
-            "repeat the action.",
+            "The action receipt was recorded, but turn continuation was lost. "
+            "OSIA did not repeat the action.",
         ),
     ]
 

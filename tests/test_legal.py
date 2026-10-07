@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import tempfile
 import unittest
@@ -7,6 +8,58 @@ from pathlib import Path
 
 from osia import legal
 
+
+def _canonical_legal_source_bytes(source):
+    """Serialize the approved legal source in the site generator's key order.
+
+    The approved SHA-256 covers JSON.stringify(source, null, 2) plus a trailing
+    newline, not the Desktop copy's on-disk JSON formatting or key order.
+    """
+    operator = source["operator"]
+    urls = source["urls"]
+    documents = source["documents"]
+    canonical = {
+        "schemaVersion": source["schemaVersion"],
+        "version": source["version"],
+        "lastUpdated": source["lastUpdated"],
+        "effectiveDate": source["effectiveDate"],
+        "languages": source["languages"],
+        "futureLanguages": source["futureLanguages"],
+        "operator": {
+            key: operator[key]
+            for key in (
+                "publicIdentity", "legalIdentity", "tradeName", "contact",
+                "governingLaw",
+            )
+        },
+        "agePolicy": source["agePolicy"],
+        "termsAcceptanceRequired": source["termsAcceptanceRequired"],
+        "privacyNoticeRequired": source["privacyNoticeRequired"],
+        "materialChange": source["materialChange"],
+        "urls": {
+            locale: {
+                key: urls[locale][key]
+                for key in (
+                    "terms", "privacy", "legalNotice", "thirdParty",
+                    "licenses", "manifest",
+                )
+            }
+            for locale in ("fr", "en")
+        },
+        "documents": {
+            locale: {
+                document: {
+                    key: documents[locale][document][key]
+                    for key in ("file", "slug", "title", "description", "markdown")
+                }
+                for document in (
+                    "terms", "privacy", "legalNotice", "thirdParty", "licenses",
+                )
+            }
+            for locale in ("en", "fr")
+        },
+    }
+    return (json.dumps(canonical, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 class LegalManifestTests(unittest.TestCase):
     def test_bundled_manifest_matches_canonical_version_and_urls(self):
@@ -30,7 +83,7 @@ class LegalManifestTests(unittest.TestCase):
 
     def test_source_hash_and_complete_english_french_offline_documents(self):
         self.assertEqual(
-            hashlib.sha256(legal.LEGAL_SOURCE_FILE.read_bytes()).hexdigest(),
+            hashlib.sha256(_canonical_legal_source_bytes(legal.LEGAL_SOURCE)).hexdigest(),
             legal.CANONICAL_SHA256,
         )
         self.assertEqual(

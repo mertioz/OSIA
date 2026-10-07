@@ -194,6 +194,12 @@ def test_80_second_wait_contract_can_complete_once_without_replay(
     assert durable["deadline_at"] - durable["accepted_at"] >= 88.0
 
 
+@pytest.mark.skip(
+    reason=(
+        "WOR-305 removed mandatory reconciliation suspension before a fresh "
+        "same-model decision; canonical continuation is covered by WOR-305 tests."
+    ),
+)
 def test_unverified_postcondition_mutation_suspends_before_provider_continuation(
     isolated_attempt_runtime, monkeypatch,
 ):
@@ -360,7 +366,7 @@ def test_semantic_fill_owner_callback_outlives_outer_wait_without_value_leak(
     assert private_value not in persisted
 
 
-def test_uncertain_semantic_fill_enters_reconciliation_and_cannot_replay(
+def test_fresh_model_attempt_can_dispatch_after_unknown_without_reconciliation(
     isolated_attempt_runtime, monkeypatch,
 ):
     store, coordinator = isolated_attempt_runtime
@@ -387,16 +393,25 @@ def test_uncertain_semantic_fill_enters_reconciliation_and_cannot_replay(
     first = agent_module._execute_tool_with_policy(
         "fill_form_field", arguments, lang="en", attempt_context=context,
     )
+    fresh_context = dict(context)
+    fresh_context["tool_call_id"] = "toolcall_wait_fixture_fresh_unknown"
     second = agent_module._execute_tool_with_policy(
-        "fill_form_field", arguments, lang="en", attempt_context=context,
+        "fill_form_field", arguments, lang="en", attempt_context=fresh_context,
     )
 
-    assert first.outcome == ExecutionOutcome.PENDING
+    assert first.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
     assert store.get_attempt(first.tool_attempt_id)["status"] == (
-        ToolAttemptStatus.WAITING_VERIFICATION.value
+        ToolAttemptStatus.UNKNOWN_AFTER_START.value
     )
-    assert second.outcome == ExecutionOutcome.REJECTED_BEFORE_EXECUTION
-    assert calls == ["fld_AAAAAAAAAAAAAAAAAAAAAAAA"]
+    assert second.outcome == ExecutionOutcome.OUTCOME_UNKNOWN
+    assert second.tool_attempt_id != first.tool_attempt_id
+    assert store.get_attempt(second.tool_attempt_id)["status"] == (
+        ToolAttemptStatus.UNKNOWN_AFTER_START.value
+    )
+    assert calls == [
+        "fld_AAAAAAAAAAAAAAAAAAAAAAAA",
+        "fld_AAAAAAAAAAAAAAAAAAAAAAAA",
+    ]
     persisted = "\n".join(
         path.read_text(encoding="utf-8")
         for path in store.attempts_dir.glob("*.json")
@@ -496,11 +511,13 @@ def test_normal_chat_waits_then_resumes_same_turn_once(
         turn_context.turn_ref
     }
     continuation_messages = provider_rounds[1][3]
-    assert any(
-        "tool_attempt_terminal" in str(message.get("content"))
-        and "must_not_replay" in str(message.get("content"))
+    continuation_text = "\\n".join(
+        str(message.get("content") or "")
         for message in continuation_messages
     )
+    assert "tool_attempt_terminal" in continuation_text
+    assert "OUTCOME_UNKNOWN is not success" in continuation_text
+    assert "must_not_replay" not in continuation_text
     deadline = time.time() + 1.0
     attempt = store.get_attempt(finals[0][0])
     while attempt["continuation_state"] != "complete" and time.time() < deadline:
@@ -602,7 +619,7 @@ def test_deadline_timer_wins_once_and_late_callback_is_ignored(
     assert len(resumes) == 1
 
 
-def test_durable_barrier_blocks_equivalent_mutation_in_same_turn(
+def test_distinct_model_attempt_may_repeat_an_equivalent_mutation(
     isolated_attempt_runtime, monkeypatch,
 ):
     store, coordinator = isolated_attempt_runtime
@@ -618,16 +635,25 @@ def test_durable_barrier_blocks_equivalent_mutation_in_same_turn(
     first = agent_module._execute_tool_with_policy(
         "write_file", arguments, lang="en", attempt_context=context,
     )
+    fresh_context = dict(context)
+    fresh_context["tool_call_id"] = "toolcall_wait_fixture_distinct"
     second = agent_module._execute_tool_with_policy(
-        "write_file", arguments, lang="en", attempt_context=context,
+        "write_file", arguments, lang="en", attempt_context=fresh_context,
     )
 
     assert first.outcome in {
         ExecutionOutcome.SUCCESS_VERIFIED,
         ExecutionOutcome.SUCCESS_UNVERIFIED,
     }
-    assert second.outcome == ExecutionOutcome.REJECTED_BEFORE_EXECUTION
-    assert calls == [("synthetic.txt", "synthetic")]
+    assert second.outcome in {
+        ExecutionOutcome.SUCCESS_VERIFIED,
+        ExecutionOutcome.SUCCESS_UNVERIFIED,
+    }
+    assert second.tool_attempt_id != first.tool_attempt_id
+    assert calls == [
+        ("synthetic.txt", "synthetic"),
+        ("synthetic.txt", "synthetic"),
+    ]
 
 
 @pytest.mark.parametrize("command", [

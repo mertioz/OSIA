@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import sys
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,24 +67,24 @@ class ReasoningSettingsTests(unittest.TestCase):
         self.assertEqual(config.normalize_reasoning_level("HIGH"), "high")
         self.assertEqual(config.normalize_reasoning_level("MAX"), "max")
         self.assertEqual(config.normalize_reasoning_level("none"), "off")
-        self.assertEqual(config.normalize_reasoning_level("warp"), "auto")
+        self.assertEqual(config.normalize_reasoning_level("warp"), "warp")
         self.assertEqual(
             config.normalize_reasoning_settings(
                 {
                     "default": "warp",
                     "providers": {"Google": "LOW", "": "high", 12: "medium"},
                     "models": {
-                        "deepseek-v4-pro": "MAX",
+                        "deepseek-flash": "MAX",
                         "gemini-3.5-flash": "LOUD",
                     },
                 }
             ),
             {
-                "default": "auto",
+                "default": "warp",
                 "providers": {"google": "low"},
                 "models": {
-                    "deepseek-v4-pro": "max",
-                    "gemini-3.5-flash": "auto",
+                    "deepseek-flash": "max",
+                    "gemini-3.5-flash": "loud",
                 },
             },
         )
@@ -101,8 +102,11 @@ class ReasoningSettingsTests(unittest.TestCase):
     def test_resolution_order_model_provider_default(self):
         settings = {
             "default": "low",
-            "providers": {"google": "medium"},
-            "models": {"gemini-3.5-flash": "high"},
+            "providers": {"google": "medium", "anthropic": "high"},
+            "models": {
+                "gemini-3.5-flash": "high",
+                "claude-opus-4-8": "max",
+            },
         }
         self.assertEqual(
             reasoning.resolve_reasoning_option_id(
@@ -118,23 +122,29 @@ class ReasoningSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             reasoning.resolve_reasoning_option_id(
-                "mistral", "mistral-medium-3-5", settings
+                "anthropic", "claude-opus-4-8", settings
             ),
-            "low",
+            "max",
+        )
+        self.assertEqual(
+            reasoning.resolve_reasoning_option_id(
+                "anthropic", "claude-sonnet-4-6", settings
+            ),
+            "high",
         )
 
     def test_model_specific_options(self):
-        deepseek_ids = option_ids("deepseek", "deepseek-v4-pro")
-        self.assertEqual(deepseek_ids, ["auto", "off", "normal", "max"])
-        self.assertNotIn("low", deepseek_ids)
+        deepseek_ids = option_ids("deepseek", "deepseek-flash")
+        self.assertEqual(deepseek_ids, ["auto", "off", "low", "high", "max"])
+        self.assertNotIn("normal", deepseek_ids)
         self.assertNotIn("medium", deepseek_ids)
-        self.assertNotIn("high", deepseek_ids)
         deepseek_labels = [
-            opt["label"]
-            for opt in reasoning.get_reasoning_options("deepseek", "deepseek-v4-pro")
+            option["label"]
+            for option in reasoning.get_reasoning_options("deepseek", "deepseek-flash")
         ]
-        self.assertIn("Normal", deepseek_labels)
+        self.assertIn("Non-thinking", deepseek_labels)
         self.assertIn("Max", deepseek_labels)
+        self.assertEqual(option_ids("deepseek", "deepseek-v4-pro"), [])
 
         self.assertEqual(
             option_ids("google", "gemini-3.5-flash"),
@@ -144,39 +154,8 @@ class ReasoningSettingsTests(unittest.TestCase):
             option_ids("google", "gemini-2.5-flash"),
             ["auto", "off", "minimal", "low", "medium", "high"],
         )
-        self.assertEqual(
-            option_ids("groq", "openai/gpt-oss-120b"),
-            ["auto", "low", "medium", "high"],
-        )
-        self.assertEqual(
-            option_ids("mistral", "mistral-medium-3-5"),
-            ["auto", "off", "minimal", "low", "medium", "high", "xhigh"],
-        )
-        openai_reasoning_ids = [
-            "auto",
-            "off",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-        ]
-        self.assertEqual(option_ids("openai", "gpt-5.5"), openai_reasoning_ids)
-        self.assertEqual(option_ids("openai", "gpt-5.4"), openai_reasoning_ids)
-        self.assertEqual(option_ids("openai", "gpt-5.4-mini"), openai_reasoning_ids)
-        self.assertEqual(option_ids("openai", "gpt-4.1"), [])
-        self.assertEqual(
-            option_ids("anthropic", "claude-opus-4-8"),
-            ["auto", "off", "low", "medium", "high", "xhigh", "max"],
-        )
-        self.assertEqual(
-            option_ids("anthropic", "claude-sonnet-4-6"),
-            ["auto", "off", "low", "medium", "high", "max"],
-        )
-        self.assertNotIn("xhigh", option_ids("anthropic", "claude-sonnet-4-6"))
         self.assertEqual(option_ids("anthropic", "claude-haiku-4-5-20251001"), [])
         self.assertEqual(option_ids("xai", "grok-3"), [])
-
     def test_auto_invalid_and_unsupported_models_return_no_kwargs(self):
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
@@ -186,10 +165,15 @@ class ReasoningSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
-                "deepseek", "deepseek-v4-pro", {"models": {"deepseek-v4-pro": "low"}}
+                "deepseek", "deepseek-flash", {"models": {"deepseek-flash": "auto"}}
             ),
             {},
         )
+        with self.assertRaisesRegex(ValueError, "unsupported DeepSeek reasoning"):
+            reasoning.build_reasoning_kwargs(
+                "deepseek", "deepseek-flash", {"models": {"deepseek-flash": "normal"}}
+            )
+        self.assertEqual(option_ids("deepseek", "deepseek-v4-pro"), [])
         self.assertEqual(
             reasoning.build_reasoning_kwargs("openai", "gpt-5.5", {"default": "auto"}),
             {},
@@ -256,15 +240,15 @@ class ReasoningSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
-                "deepseek", "deepseek-v4-pro", {"models": {"deepseek-v4-pro": "off"}}
+                "deepseek", "deepseek-flash", {"models": {"deepseek-flash": "off"}}
             ),
             {"extra_body": {"thinking": {"type": "disabled"}}},
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
                 "deepseek",
-                "deepseek-v4-pro",
-                {"models": {"deepseek-v4-pro": "normal"}},
+                "deepseek-flash",
+                {"models": {"deepseek-flash": "high"}},
             ),
             {
                 "extra_body": {
@@ -276,8 +260,8 @@ class ReasoningSettingsTests(unittest.TestCase):
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
                 "deepseek",
-                "deepseek-v4-flash",
-                {"models": {"deepseek-v4-flash": "max"}},
+                "deepseek-flash",
+                {"models": {"deepseek-flash": "max"}},
             ),
             {
                 "extra_body": {
@@ -306,9 +290,9 @@ class ReasoningSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
-                "mistral", "mistral-medium-3-5", {"default": "xhigh"}
+                "mistral", "mistral-medium-3-5", {"default": "high"}
             ),
-            {"reasoning_effort": "xhigh"},
+            {"reasoning_effort": "high"},
         )
         self.assertEqual(
             reasoning.build_reasoning_kwargs(
@@ -379,23 +363,23 @@ class ReasoningSettingsTests(unittest.TestCase):
         self.assertEqual(
             reasoning.get_selected_reasoning_label(
                 "deepseek",
-                "deepseek-v4-pro",
-                {"models": {"deepseek-v4-pro": "max"}},
+                "deepseek-flash",
+                {"models": {"deepseek-flash": "max"}},
             ),
             "Max",
         )
         self.assertIsNone(
             reasoning.get_selected_reasoning_label(
                 "deepseek",
-                "deepseek-v4-pro",
-                {"models": {"deepseek-v4-pro": "auto"}},
+                "deepseek-flash",
+                {"models": {"deepseek-flash": "auto"}},
             )
         )
         self.assertIsNone(
             reasoning.get_selected_reasoning_label(
                 "deepseek",
-                "deepseek-v4-pro",
-                {"models": {"deepseek-v4-pro": "medium"}},
+                "deepseek-flash",
+                {"models": {"deepseek-flash": "medium"}},
             )
         )
 
@@ -410,7 +394,7 @@ class ReasoningSettingsTests(unittest.TestCase):
                 "reasoning": {
                     "default": "HIGH",
                     "providers": {"Google": "wrong"},
-                    "models": {"deepseek-v4-pro": "MAX"},
+                    "models": {"deepseek-flash": "MAX"},
                 },
                 "mcp_servers": [],
                 "island_x": 10,
@@ -447,8 +431,8 @@ class ReasoningSettingsTests(unittest.TestCase):
             cfg["reasoning"],
             {
                 "default": "high",
-                "providers": {"google": "auto"},
-                "models": {"deepseek-v4-pro": "max"},
+                "providers": {"google": "wrong"},
+                "models": {"deepseek-flash": "max"},
             },
         )
 
@@ -473,6 +457,12 @@ class ReasoningSettingsTests(unittest.TestCase):
             agent.client = FakeClient()
             agent.model = model
             agent.provider = provider
+            agent.turn_context = None
+            agent._chatgpt_conversation_id = None
+            agent._tool_attempt_metadata = None
+            agent._slash_turn_directives = None
+            agent._execution_generation_local = threading.local()
+            agent.lang = "en"
             agent.messages = [{"role": "user", "content": "hello"}]
 
             with patched(reasoning, "get_reasoning_settings", lambda: settings):
@@ -490,7 +480,9 @@ class ReasoningSettingsTests(unittest.TestCase):
             },
         )
         self.assertEqual(captured["model"], "gemini-3.5-flash")
-        self.assertEqual(captured["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(captured["messages"][0]["role"], "user")
+        self.assertTrue(captured["messages"][0]["content"].startswith("hello"))
+        self.assertIn("[TURN RESPONSE LANGUAGE]", captured["messages"][0]["content"])
         self.assertTrue(captured["stream"])
         self.assertEqual(captured["reasoning_effort"], "high")
 

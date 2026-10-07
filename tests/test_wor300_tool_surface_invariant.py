@@ -1,9 +1,9 @@
 """WOR-300: complete, request-independent OSIA tool exposure.
 
 The model-visible static surface is composed from genuine runtime
-availability only.  Request wording, semantic classification, GoalContract,
-ExecutionStrategy, domain and execution-frontier state never remove an
-available capability; they remain execution-time gates.
+availability only. Request wording and legacy strategy state do not remove an
+available capability from canonical Chat; factual validation and
+BLOCK_SYSTEM_DESTRUCTION remain dispatch-time integrity checks.
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ from osia import agent as agent_module
 from osia import execution_strategy as es
 from osia.chatgpt_account.app_server_client import _canonical_native_tools
 from osia.computer_use_v4_integration import computer_use_v4_turn_scope
-from osia.goal_contract_v2 import (
-    goal_contract_v2_evaluation_scope,
-    goal_contract_v2_from_model_proposal,
-)
+
 from osia.mcp_client import registry as mcp_registry
 from osia.tool_contracts import (
     DORMANT_VISUAL_V3_TOOL_NAMES,
@@ -143,43 +140,6 @@ def test_text_only_questions_keep_desktop_and_browser_tools_visible():
     assert BROWSER_TOOLS <= names
     assert SYSTEM_TOOLS <= names
     assert GMAIL_TOOLS <= names
-
-
-def test_active_goal_contract_does_not_reduce_the_surface():
-    proposal = {
-        "goals": [{
-            "goal_id": "build-app",
-            "intent_family": "create_target",
-            "semantic_target": "nouvelle application sur le Bureau",
-            "required_application": "not_specified",
-            "required_surface": "not_specified",
-            "required_account": "not_specified",
-            "desired_state": (
-                "Une application complete existe dans un nouveau dossier "
-                "sur le Bureau"
-            ),
-            "observable_postcondition": (
-                "Le dossier et les fichiers de l'application existent"
-            ),
-            "explicit_constraints": [],
-            "side_effect_class": "external_mutation",
-            "depends_on": "",
-            "conditional_mode": "",
-            "branches": [],
-            "completion_mode": "effect_event",
-        }],
-    }
-    contract = goal_contract_v2_from_model_proposal(CODING, proposal)
-    baseline = _surface_for(CODING)
-
-    with goal_contract_v2_evaluation_scope(contract):
-        with es.execution_strategy_scope(CODING, CHAT_TOOLS) as strategy:
-            names = {spec.name for spec in effective_static_tool_specs()}
-
-    assert strategy.mission.objective == CODING
-    assert names == baseline
-    assert FILESYSTEM_TOOLS <= names
-    assert SHELL_TOOLS <= names
 
 
 def test_active_execution_strategy_does_not_reduce_the_surface():

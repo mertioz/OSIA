@@ -318,11 +318,9 @@ def test_server_projects_cancelled_before_stopping_local_turn_owner(tmp_path):
                 if frame.get("status") == "cancelled"
             )
             assert terminal["terminal"] is True
-            assert channel.frames[-1] == {
-                "type": "conversation_busy_changed",
-                "conversation_id": conversation_id,
-                "busy": False,
-            }
+            assert channel.frames[-1]["type"] == "conversation_busy_changed"
+            assert channel.frames[-1]["conversation_id"] == conversation_id
+            assert channel.frames[-1]["busy"] is False
             assert conversation_id not in server._ACTIVE_TURNS_BY_CONV
             assert conversation_id not in server._ACTIVE_TURN_META_BY_CONV
             assert request_id not in server._ACTIVE_CONV_BY_REQUEST

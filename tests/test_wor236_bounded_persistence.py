@@ -138,11 +138,14 @@ def test_slow_owner_releases_chat_and_late_success_is_verified_once(
     store = ToolAttemptStore(tmp_path / "attempts")
     coordinator = ToolAttemptCoordinator(store)
     completed = threading.Event()
+    owner_started = threading.Event()
+    release_owner = threading.Event()
     calls = []
 
     def slow_success(**_kwargs):
         calls.append(1)
-        time.sleep(0.2)
+        owner_started.set()
+        assert release_owner.wait(1.0)
         completed.set()
         return "slow verified success"
 
@@ -155,16 +158,17 @@ def test_slow_owner_releases_chat_and_late_success_is_verified_once(
             0.02 if name == "write_file" else original_timeout(spec, name, kwargs)
         ),
     )
-    started = time.monotonic()
     record = agent_module._execute_tool_with_policy(
         "write_file",
         {"path": "fixture.txt", "content": "fixture"},
         lang="en",
         attempt_context=_attempt_context(store, coordinator),
     )
-    elapsed = time.monotonic() - started
     assert record.outcome is ExecutionOutcome.PENDING
-    assert elapsed < 0.15
+    assert record.worker_may_be_active is True
+    assert owner_started.wait(1.0)
+    assert not completed.is_set()
+    release_owner.set()
     assert completed.wait(1.0)
     deadline = time.monotonic() + 1.0
     durable = store.get_attempt(record.tool_attempt_id)
@@ -176,7 +180,7 @@ def test_slow_owner_releases_chat_and_late_success_is_verified_once(
     assert calls == [1]
 
 
-def test_late_unverified_owner_completion_enables_read_only_postcondition(
+def test_late_unverified_owner_completion_remains_unverified(
     tmp_path, monkeypatch,
 ):
     store = ToolAttemptStore(tmp_path / "attempts")
@@ -219,18 +223,18 @@ def test_late_unverified_owner_completion_enables_read_only_postcondition(
     deadline = time.monotonic() + 1.0
     durable = store.get_attempt(record.tool_attempt_id)
     while (
-        durable["dispatch_state"] != "owner_settled_unverified"
+        durable["status"] != ToolAttemptStatus.SUCCEEDED.value
         and time.monotonic() < deadline
     ):
         time.sleep(0.01)
         durable = store.get_attempt(record.tool_attempt_id)
-    assert durable["status"] == "waiting_verification"
-    assert durable["dispatch_state"] == "owner_settled_unverified"
-    assert durable["reason_code"] == "postcondition_required_unverified"
+    assert durable["status"] == ToolAttemptStatus.SUCCEEDED.value
+    assert durable["terminal_outcome"] == ExecutionOutcome.SUCCESS_UNVERIFIED.value
+    assert durable["dispatch_state"] == "effect_confirmed"
     assert calls == [1]
 
 
-def test_late_ambiguous_effect_waits_without_replay_or_hard_limit_extension(
+def test_late_ambiguous_effect_stays_unknown_without_replay_or_deadline_extension(
     tmp_path, monkeypatch,
 ):
     store = ToolAttemptStore(tmp_path / "attempts")
@@ -269,13 +273,13 @@ def test_late_ambiguous_effect_waits_without_replay_or_hard_limit_extension(
     deadline = time.monotonic() + 1.0
     durable = initial
     while (
-        durable["reason_code"] != "effect_possible_unverified"
+        durable["status"] != ToolAttemptStatus.UNKNOWN_AFTER_START.value
         and time.monotonic() < deadline
     ):
         time.sleep(0.01)
         durable = store.get_attempt(record.tool_attempt_id)
-    assert durable["status"] == "waiting_verification"
-    assert durable["dispatch_state"] == "owner_settled_unverified"
+    assert durable["status"] == ToolAttemptStatus.UNKNOWN_AFTER_START.value
+    assert durable["dispatch_state"] == "effect_unknown"
     assert durable["hard_deadline_at"] == hard_deadline
     assert calls == [1]
 
@@ -394,6 +398,12 @@ def test_blocked_command_is_proven_before_effect(monkeypatch):
     assert calls == [1]
 
 
+@pytest.mark.skip(
+    reason=(
+        "Legacy safe-alternative verification is superseded by WOR-305: the "
+        "selected model chooses read-only follow-up tools in the canonical loop."
+    ),
+)
 def test_fresh_browser_state_reresolves_delayed_postcondition_read_only(
     tmp_path, monkeypatch,
 ):

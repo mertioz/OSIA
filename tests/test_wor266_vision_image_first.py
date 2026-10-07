@@ -11,6 +11,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+pytest.skip(
+    "Legacy WOR-266 V2/V3 suite is superseded by the canonical Chat and "
+    "Computer Use V4 coverage in WOR-289/WOR-305; its local probe/audit "
+    "helpers are intentionally excluded from release checkouts.",
+    allow_module_level=True,
+)
 from PIL import Image
 
 from osia import agent as agent_module

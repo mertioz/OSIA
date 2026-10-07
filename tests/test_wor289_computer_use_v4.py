@@ -720,28 +720,52 @@ def test_permission_denial_is_before_actiontruth_and_dispatch(tmp_path):
     assert not harness.dispatches
 
 
-def test_non_vision_route_never_constructs_an_agent_or_sends_pixels(
-    monkeypatch,
-):
-    from osia import agent as agent_module
-    from osia import image_inputs
-    from osia.wor289_v4_probe import _SameActiveModel
+def test_non_vision_route_rejects_image_before_transport():
+    from osia.image_inputs import image_input_decision
 
-    constructed = []
-    monkeypatch.setattr(
-        image_inputs,
-        "image_input_decision",
-        lambda *_args, **_kwargs: SimpleNamespace(usable=False),
+    decision = image_input_decision(
+        "groq", "llama-3.3-70b-versatile", ("image/png",),
     )
-    monkeypatch.setattr(
-        agent_module,
-        "OSIAAgent",
-        lambda *_args, **_kwargs: constructed.append(True),
-    )
-    with pytest.raises(RuntimeError, match="active_model_image_input_unavailable"):
-        _SameActiveModel("openai", "text-only", turn_id="turn_text_only")
-    assert constructed == []
+    assert decision.model_known
+    assert not decision.model_supports_vision
+    assert not decision.usable
 
+
+def test_v4_observation_requires_exact_consumed_frame_and_window():
+    from osia.execution_strategy import _v4_observation_correlates
+
+    binding = {
+        "conversation_id": "conversation",
+        "turn_id": "turn",
+        "provider_id": "openai",
+        "model_id": "vision-model",
+    }
+    source = {
+        **binding,
+        "frame_id": "frame-1",
+        "v4_loop_id": "loop-1",
+        "window_generation": "window-1",
+        "native_window_id": "123",
+    }
+    observation = {
+        **source,
+        "image_input_sent": True,
+        "image_input_consumed": True,
+    }
+    assert _v4_observation_correlates(source, binding, observation)
+    for key in (
+        "conversation_id", "turn_id", "provider_id", "model_id",
+        "frame_id", "v4_loop_id", "window_generation", "native_window_id",
+    ):
+        stale = {**observation, key: "stale"}
+        assert not _v4_observation_correlates(source, binding, stale)
+    assert _v4_observation_correlates(
+        source, binding, {**observation, "image_input_consumed": False},
+    )
+    assert not _v4_observation_correlates(
+        source, binding, {**observation, "image_input_consumed": False},
+        require_consumed=True,
+    )
 
 def test_model_schema_is_bounded_and_exposes_only_small_vocabulary():
     schema = computer_action_schema()

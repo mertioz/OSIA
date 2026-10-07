@@ -49,12 +49,9 @@ def test_synthetic_tool_choice_scenarios_remain_contextual_and_model_facing():
 def test_existing_screenshot_and_redundant_verification_guidance_is_preserved():
     prompt = SYSTEM_PROMPT_CORE
 
-    assert "An unchanged screenshot is inconclusive: it proves neither failure nor success." in prompt
+    assert "An unchanged screenshot proves neither failure nor success." in prompt
     assert (
-        "If the task's next intended step is safe and reversible and can reveal whether the action took effect, do it once and observe."
+        "A distinct fresh model-requested action remains available after success, failure, or OUTCOME_UNKNOWN."
         in prompt
     )
-    assert (
-        "Once the requested outcome is sufficiently established by current, direct evidence, stop verifying and complete the task."
-        in prompt
-    )
+    assert "never repeat a successful mutation" not in prompt

@@ -6,7 +6,7 @@ from osia import agent as runtime
 from osia import execution_strategy as legacy
 from osia.tool_contracts import ExecutionOutcome
 from tests.test_wor305_phase3a_no_replay import dispatch
-from tests.test_wor305_phase3b_completion import call, controller, scripted
+from wor305_test_support import call, controller, scripted
 
 
 def test_canonical_chat_receipt_continuation_is_factual_and_repeats_remain_legal(

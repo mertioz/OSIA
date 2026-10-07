@@ -5,8 +5,19 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from osia import config
 from osia.tools.browser_controller import BrowserController
+
+
+def _optional_mobile_source(relative_path: str) -> Path:
+    """Find a sibling Mobile checkout without assuming a normal PC layout."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "osia-mobile" / relative_path
+        if candidate.is_file():
+            return candidate
+    pytest.skip("Mobile source checkout is not available beside this PC checkout")
 
 
 class _RegistryKey:
@@ -105,8 +116,8 @@ def test_retired_session_files_are_absent_and_isolated_browser_remains():
     assert "remove_legacy_browser_registration" in launcher
     assert "repair_owned_registration" not in launcher
 
-    mobile_settings = Path(
-        "../osia-mobile/lib/screens/providers_screen.dart"
+    mobile_settings = _optional_mobile_source(
+        "lib/screens/providers_screen.dart",
     ).read_text(encoding="utf-8")
     assert "_BrowserPreferenceScreen" not in mobile_settings
     assert "personal_browser_preference" not in mobile_settings

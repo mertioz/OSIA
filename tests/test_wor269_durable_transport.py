@@ -56,6 +56,15 @@ from tests.fixtures.wor269_action_truth import (
 )
 
 
+def _optional_mobile_source(relative_path: str) -> Path:
+    """Find a sibling Mobile checkout without assuming a normal PC layout."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "osia-mobile" / relative_path
+        if candidate.is_file():
+            return candidate
+    pytest.skip("Mobile source checkout is not available beside this PC checkout")
+
+
 CONVERSATION_ID = "conversation_wor269b"
 REQUEST_ID = "request_wor269b"
 TURN_ID = "turn_wor269b"
@@ -739,9 +748,8 @@ def test_28_pc_reconnect_during_reconciliation_projects_once(tmp_path):
 
 
 def test_29_mobile_reconnect_contract_has_cursor_ack_and_gap_replay():
-    mobile = (
-        Path(__file__).resolve().parents[2]
-        / "osia-mobile" / "lib" / "services" / "websocket_service.dart"
+    mobile = _optional_mobile_source(
+        "lib/services/websocket_service.dart",
     ).read_text(encoding="utf-8")
     assert "'event_cursors': Map<String, int>.from(_lastApplicationSequence)" in mobile
     assert "'type': 'event_ack'" in mobile

@@ -216,7 +216,7 @@ def test_real_executor_receipt_returns_to_the_same_selected_model(
     dispatch, monkeypatch,
 ):
     from osia import agent as runtime
-    from tests.test_wor305_phase3b_completion import call, scripted
+    from wor305_test_support import call, scripted
 
     marker = "WOR305_RUN_COMMAND_TEST_OK"
     command = f"echo {marker}"

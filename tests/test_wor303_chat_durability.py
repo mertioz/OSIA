@@ -91,11 +91,12 @@ def test_runtime_sources_contain_no_numeric_objective_authority():
         source = (_ROOT / "osia" / name).read_text(encoding="utf-8")
         for symbol in _FORBIDDEN_AUTHORITY:
             assert symbol not in source, (name, symbol)
-    v2_source = (
-        _ROOT / "osia" / "semantic_execution_loop_v2.py"
+    strategy_source = (
+        _ROOT / "osia" / "execution_strategy.py"
     ).read_text(encoding="utf-8")
-    for symbol in _V2_FORBIDDEN:
-        assert symbol not in v2_source, symbol
+    assert "from osia.goal_contract_v2 import" not in strategy_source
+    assert "current_goal_contract_v2(" not in strategy_source
+    assert "semantic_mission_from_goal_contract_v2(" not in strategy_source
 
 
 def test_no_max_execution_ceilings_remain():

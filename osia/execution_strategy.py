@@ -2438,6 +2438,31 @@ _TERMINAL_FOR_ESCALATION = frozenset({
 })
 
 
+def _v4_observation_correlates(
+    source: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    *,
+    require_consumed: bool = False,
+) -> bool:
+    """Match a visual receipt to its exact frame, turn, model, and window."""
+    if (
+        not isinstance(observation, Mapping)
+        or observation.get("image_input_sent") is not True
+    ):
+        return False
+    if require_consumed and observation.get("image_input_consumed") is not True:
+        return False
+    if observation.get("frame_id") != source.get("frame_id"):
+        return False
+    for key in ("conversation_id", "turn_id", "provider_id", "model_id"):
+        if observation.get(key) != binding.get(key):
+            return False
+    for key in ("v4_loop_id", "window_generation", "native_window_id"):
+        if source.get(key) and observation.get(key) != source.get(key):
+            return False
+    return True
+
 class ExecutionStrategy:
     """Bounded strategy state for one ordered semantic mission."""
 
@@ -3595,10 +3620,12 @@ class ExecutionStrategy:
             "visual_evidence_history"
         )
         history = history if isinstance(history, list) else []
-        from osia.grounded_v4_claims import v4_observation_correlates
         visual_input = next((
             item for item in reversed(history)
-            if isinstance(item, dict) and v4_observation_correlates({**source, "frame_id": frame_id}, binding, item)
+            if isinstance(item, dict)
+            and _v4_observation_correlates(
+                {**source, "frame_id": frame_id}, binding, item,
+            )
         ), None)
         if visual_input is None:
             return False
@@ -10092,33 +10119,28 @@ def build_execution_strategy(
     postconditions: Iterable[str] = (),
     semantic_context: str = "",
 ) -> ExecutionStrategy:
-    explicit_postconditions = tuple(postconditions)
-    from osia.goal_contract_v2 import (
-        current_goal_contract_v2,
-        semantic_mission_from_goal_contract_v2,
-    )
+    """Build a legacy compatibility strategy without V2 admission.
 
-    v2_contract = current_goal_contract_v2(request)
-    if v2_contract is not None:
-        mission = semantic_mission_from_goal_contract_v2(v2_contract)
-        target_hint = TargetHint()
-        application_hint = ""
-    else:
-        mission = derive_semantic_mission(
-            request,
-            postcondition=postcondition,
-            postconditions=explicit_postconditions,
-        )
-        target_hint = _request_target_hint(
-            request, semantic_context, postcondition,
-        )
-        application_hint = target_hint.normalized_value
-        mission = _mission_with_application_hint(
-            mission,
-            application_hint,
-            target_hint=target_hint,
-        )
-    if v2_contract is None and _desktop_visual_read_text(
+    Canonical Chat never calls this compiler for a new turn. Compatibility
+    callers can still request the older desktop/recovery structure, but it
+    does not depend on GoalContract V2 or compile a second semantic proposal.
+    """
+    explicit_postconditions = tuple(postconditions)
+    mission = derive_semantic_mission(
+        request,
+        postcondition=postcondition,
+        postconditions=explicit_postconditions,
+    )
+    target_hint = _request_target_hint(
+        request, semantic_context, postcondition,
+    )
+    application_hint = target_hint.normalized_value
+    mission = _mission_with_application_hint(
+        mission,
+        application_hint,
+        target_hint=target_hint,
+    )
+    if _desktop_visual_read_text(
         request, application=application_hint,
     ):
         visual_node = _derive_semantic_node(
@@ -10162,11 +10184,7 @@ def build_execution_strategy(
             tools,
             multiple_nodes=len(mission.action_nodes) > 1,
         ))
-    strategy = ExecutionStrategy(mission, mechanisms, available_tools=tools)
-    if v2_contract is not None:
-        strategy.enable_semantic_goal_v2_runtime(v2_contract)
-    return strategy
-
+    return ExecutionStrategy(mission, mechanisms, available_tools=tools)
 
 def mechanism_for_tool(
     strategy: ExecutionStrategy,

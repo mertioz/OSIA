@@ -316,9 +316,13 @@ def test_actual_navigation_item_target_cannot_leak_to_detail(settings_panel):
     _show_category(panel, "settings.cat.models")
     left = _make_nav_scrollable(panel)
     nav = panel._settings_nav
-    item_rect = nav.visualItemRect(nav.item(nav.currentRow()))
-    target = QApplication.widgetAt(nav.viewport().mapToGlobal(item_rect.center()))
-    assert target is nav.viewport()
+    current_item = nav.item(nav.currentRow())
+    item_rect = nav.visualItemRect(current_item)
+    assert item_rect.isValid()
+    assert nav.itemAt(item_rect.center()) is current_item
+    # QListWidget items are painted in their viewport, which is the wheel
+    # event target. QApplication.widgetAt is unavailable in Qt offscreen mode.
+    target = nav.viewport()
     left.setValue(left.maximum())
     right = panel._settings_scroll.verticalScrollBar()
     right.setValue(right.maximum() // 2)

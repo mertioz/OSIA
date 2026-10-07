@@ -7,7 +7,7 @@ import pytest
 
 from osia import agent as runtime, execution_strategy as legacy
 from tests.test_wor305_phase3a_no_replay import dispatch
-from tests.test_wor305_phase3b_completion import call, controller, scripted
+from wor305_test_support import call, controller, scripted
 
 
 @pytest.fixture
