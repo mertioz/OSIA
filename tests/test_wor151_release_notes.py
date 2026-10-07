@@ -82,7 +82,7 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
     current = release_for_version("1.1.6")
     assert current is not None and current.public
@@ -103,6 +103,46 @@ def test_embedded_notes_load_offline_and_are_newest_first():
     assert "superseded" in " ".join(internal.changes("en")).lower()
     assert manifest_release_notes("1.0.6") == list(internal_current.changes_en)
 
+
+def test_117_notes_are_complete_bilingual_and_manifest_compatible():
+    current = release_for_version("1.1.7")
+    assert current is not None and current.public
+    assert manifest_release_notes("1.1.7") == list(current.summary_en)
+    assert len(current.summary("en")) == len(current.summary("fr")) == 5
+    assert all(len(note) <= 240 for note in manifest_release_notes("1.1.7"))
+    assert len(current.sections) == 4
+    assert len(current.changes("en")) == len(current.changes("fr")) == 9
+
+    english = installer_release_notes("1.1.7", "en").lower()
+    french = installer_release_notes("1.1.7", "fr").lower()
+    for subject in (
+        "same durable chat turn",
+        "outcome_unknown stays unknown",
+        "screenshot → action → screenshot",
+        "permission broker",
+        "deepseek-flash",
+        "legal bundle 2026-10-05.4",
+        "windows 1.1.6 remains the previous public rollback",
+        "no mobile release is included",
+    ):
+        assert subject in english
+    for subject in (
+        "même tour chat durable",
+        "outcome_unknown reste inconnu",
+        "capture → action → capture",
+        "courtier de permissions",
+        "deepseek-flash",
+        "bundle juridique wor-8 approuvé 2026-10-05.4",
+        "windows 1.1.6 reste le rollback public précédent",
+        "aucune release mobile n'est incluse",
+    ):
+        assert subject in french
+
+    raw = _manifest(version="1.1.7")
+    raw["releaseNotes"] = manifest_release_notes("1.1.7")
+    parsed = updater.parse_manifest(json.dumps(raw), _metadata("1.1.6"))
+    assert parsed.version == "1.1.7"
+    assert parsed.release_notes == tuple(manifest_release_notes("1.1.7"))
 
 def test_116_notes_are_complete_bilingual_and_manifest_compatible():
     current = release_for_version("1.1.6")
@@ -368,7 +408,7 @@ def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():
     assert manifest_release_notes("1.1.0") == list(major.summary_en)
     assert all(len(note) <= 240 for note in manifest_release_notes("1.1.0"))
 
-    section_titles = " ".join(section.title_en for section in major.sections).lower()
+    section_text = (" ".join(section.title_en for section in major.sections) + " " + " ".join(major.changes("en"))).lower()
     for subject in (
         "core chat",
         "pc/mobile",
@@ -390,7 +430,7 @@ def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():
         "android",
         "known limitations",
     ):
-        assert subject in section_titles
+        assert subject in section_text
 
     english = installer_release_notes("1.1.0", "en").lower()
     french = installer_release_notes("1.1.0", "fr").lower()

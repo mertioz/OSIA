@@ -63,6 +63,79 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.7",
+        released_on="2026-10-07",
+        public=True,
+        changes_en=(),
+        changes_fr=(),
+        summary_en=(
+            "Short and multi-step requests stay in one durable Chat runtime, with no handoff to a separate Autonomous engine.",
+            "The selected provider/model remains the turn's semantic authority; dispatch and observed outcomes stay explicit, and unknown remains unknown.",
+            "Computer Use V4 checks fresh surfaces and verifies through screenshot → action → screenshot; OUTCOME_UNKNOWN stays factual and a distinct fresh model request remains available.",
+            "Desktop conversations gain project/folder actions and simpler settings; Thinking uses selected-model narration, and DeepSeek offers only deepseek-flash.",
+            "Windows-only, NotSigned, no Mobile publication; approved legal bundle 2026-10-05.4 is included and Windows 1.1.6 remains rollback.",
+        ),
+        summary_fr=(
+            "Les demandes simples ou longues restent dans un runtime Chat durable, sans transfert vers un moteur Autonomous distinct.",
+            "Le fournisseur/modèle sélectionné garde l'autorité sémantique du tour ; les résultats observés restent explicites et unknown reste inconnu.",
+            "Computer Use V4 vérifie les surfaces récentes puis suit capture → action → capture ; OUTCOME_UNKNOWN reste factuel et un nouvel appel distinct du modèle reste possible.",
+            "Les conversations gagnent les actions projet/dossier et des réglages simplifiés ; Thinking reprend le modèle sélectionné et DeepSeek expose deepseek-flash.",
+            "Windows uniquement, NotSigned, sans publication Mobile ; le bundle juridique 2026-10-05.4 est inclus et 1.1.6 reste le rollback.",
+        ),
+        sections=(
+            ReleaseSection(
+                "One canonical Chat runtime",
+                "Un runtime Chat canonique",
+                (
+                    "Short and multi-step requests stay in the same durable Chat turn; a separate Autonomous runtime does not take over the work.",
+                    "The selected provider and model remain the semantic authority. ToolAttempt and ActionTruth record dispatch and observed outcomes; OUTCOME_UNKNOWN stays unknown.",
+                ),
+                (
+                    "Les demandes simples ou en plusieurs étapes restent dans le même tour Chat durable ; aucun runtime Autonomous distinct ne reprend le travail.",
+                    "Le fournisseur et le modèle sélectionnés gardent l'autorité sémantique. ToolAttempt et ActionTruth consignent le dispatch et les résultats observés ; OUTCOME_UNKNOWN reste inconnu.",
+                ),
+            ),
+            ReleaseSection(
+                "Reliable tools and Computer Use V4",
+                "Outils fiables et Computer Use V4",
+                (
+                    "Computer Use V4 checks target and surface freshness, then verifies through screenshot → action → screenshot; stale frames and windows are rejected.",
+                    "Cancellation stays correlated to the exact turn. OUTCOME_UNKNOWN remains factual; a distinct fresh model-requested call remains allowed without a required reconciliation step.",
+                ),
+                (
+                    "Computer Use V4 vérifie l'actualité de la cible et de la surface, puis confirme par capture → action → capture ; les fenêtres et images obsolètes sont rejetées.",
+                    "L'annulation reste corrélée au tour exact. OUTCOME_UNKNOWN reste factuel ; un nouvel appel distinct du modèle reste possible sans étape obligatoire de réconciliation.",
+                ),
+            ),
+            ReleaseSection(
+                "Desktop experience and providers",
+                "Expérience Bureau et fournisseurs",
+                (
+                    "Ordinary available tools remain usable without a permission broker, while protection for destructive operations against critical system paths remains narrowly scoped.",
+                    "Conversation project/folder actions, typed slash commands, guide improvements, contained settings scrolling, and deletion rollback refine the desktop experience.",
+                    "Thinking narration comes from the selected model response; the local continuous-learning path remains in the canonical runtime, and DeepSeek exposes only deepseek-flash.",
+                ),
+                (
+                    "Les outils disponibles restent utilisables sans courtier de permissions ; la protection contre les opérations destructrices sur les chemins système critiques reste étroitement limitée.",
+                    "Les actions projet/dossier, commandes slash typées, améliorations du guide, défilement contenu des réglages et retour arrière de suppression affinent l'expérience Bureau.",
+                    "La narration Thinking provient de la réponse du modèle sélectionné ; l'apprentissage continu local reste dans le runtime canonique et DeepSeek expose uniquement deepseek-flash.",
+                ),
+            ),
+            ReleaseSection(
+                "Legal and Windows release state",
+                "État juridique et release Windows",
+                (
+                    "Includes the approved WOR-8 legal bundle 2026-10-05.4, effective 2026-10-06; the approved legal text is unchanged.",
+                    "Windows-only and NotSigned under the current code-signing status; Windows 1.1.6 remains the previous public rollback and no Mobile release is included.",
+                ),
+                (
+                    "Inclut le bundle juridique WOR-8 approuvé 2026-10-05.4, en vigueur le 2026-10-06 ; le texte juridique approuvé reste inchangé.",
+                    "Windows uniquement et NotSigned selon le statut actuel de signature ; Windows 1.1.6 reste le rollback public précédent et aucune release Mobile n'est incluse.",
+                ),
+            ),
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.6",
         released_on="2026-08-07",
         public=True,
