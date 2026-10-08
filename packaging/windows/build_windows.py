@@ -100,6 +100,23 @@ def _run(args: list[str], **kwargs) -> None:
     subprocess.run(args, cwd=ROOT, check=True, **kwargs)
 
 
+def _pyinstaller_environment() -> dict[str, str]:
+    """Keep Codex-host native runtimes out of the packaged dependency search."""
+
+    environment = os.environ.copy()
+    path_entries = environment.get("PATH", "").split(os.pathsep)
+    environment["PATH"] = os.pathsep.join(
+        entry
+        for entry in path_entries
+        if not (
+            "codex-runtimes" in entry.replace("/", "\\").casefold()
+            and "\\dependencies\\native\\"
+            in entry.replace("/", "\\").casefold()
+        )
+    )
+    return environment
+
+
 def _run_package_smoke(executable: Path) -> None:
     """Run the windowed executable with one sanitized temporary report."""
 
@@ -748,7 +765,8 @@ def build(
     _write_manifest(models, dependencies, codex_runtime, identity)
 
     _run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
-          str(ROOT / "packaging" / "windows" / "osia.spec")])
+          str(ROOT / "packaging" / "windows" / "osia.spec")],
+         env=_pyinstaller_environment())
     _write_bundle_file_manifest()
     _validate_release_payload(DIST)
     _secret_scan(DIST)

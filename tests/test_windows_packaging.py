@@ -80,6 +80,27 @@ def test_frozen_qt_runtime_hook_registers_bundled_dll_directory(
     assert "qt_dll_runtime_hook.py" in spec
 
 
+def test_pyinstaller_environment_excludes_codex_host_native_dependencies(
+    tmp_path, monkeypatch,
+):
+    build = _load_windows_build()
+    project_python = tmp_path / "venv" / "Scripts"
+    system = tmp_path / "Windows" / "System32"
+    host_native = (
+        tmp_path / ".cache" / "codex-runtimes" / "primary"
+        / "dependencies" / "native" / "poppler" / "Library" / "bin"
+    )
+    path_entries = [project_python, host_native, system]
+    monkeypatch.setenv("PATH", os.pathsep.join(map(str, path_entries)))
+
+    environment = build._pyinstaller_environment()
+
+    assert environment["PATH"].split(os.pathsep) == [
+        str(project_python),
+        str(system),
+    ]
+
+
 def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():
     from osia.windows_release_policy import filter_pyinstaller_data_toc
 
