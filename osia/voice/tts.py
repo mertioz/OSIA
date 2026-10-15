@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 
+from osia.utils.diagnostics import diagnostic_print as print
+
 import numpy as np
 import soundfile as sf
 from langdetect import detect, DetectorFactory

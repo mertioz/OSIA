@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+from osia.utils.diagnostics import diagnostic_print as print
 # The Qt GUI must run under the X11 (xcb) platform plugin on Linux. On Windows
 # Qt uses its native "windows" plugin automatically, so xcb must NOT be forced
 # (it would fail to start). Guard it to Linux only â€” WOR-11 (Windows port).

@@ -1000,10 +1000,15 @@ class _ChatThinkingTrace(QFrame):
         self._refresh_toggle()
         return True
 
+    def set_active(self, active: bool) -> None:
+        """Project activity without reviving a terminal or cancelled turn."""
+        cancellable = bool(active) and not self.terminal and not self._cancel_pending
+        self._stop.setVisible(cancellable)
+        self._stop.setEnabled(cancellable)
+        self._orbs.set_active(cancellable and not self._final_stream_started)
+
     def mark_inactive(self) -> None:
-        self._stop.hide()
-        self._stop.setEnabled(False)
-        self._orbs.set_active(False)
+        self.set_active(False)
 
     def mark_final_stream_started(self) -> None:
         if self._final_stream_started:
