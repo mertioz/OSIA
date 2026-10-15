@@ -48,9 +48,6 @@ _DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE = ((0, 144, 1), (0, 145, 0))
 # contract; unreviewed releases stay fail-closed.
 _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1)})
 CLIENT_VERSION = "1.0.0"
-_MAX_PUBLIC_REASONING_SUMMARY_PARTS = 32
-_MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS = 8_192
-_PUBLIC_REASONING_SUMMARY_EMIT_STEP = 160
 _IMAGE_LOG_REDACTION_POLL_SECONDS = 0.5
 
 _SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
@@ -1350,7 +1347,7 @@ class AppServerClient:
             part_index = int(index)
         except (TypeError, ValueError):
             return ""
-        if part_index < 0 or part_index >= _MAX_PUBLIC_REASONING_SUMMARY_PARTS:
+        if part_index < 0:
             return ""
         return f"{item_id}:{part_index}"
 
@@ -1388,13 +1385,6 @@ class AppServerClient:
                 parts.append(text)
         return self._sanitize_public_reasoning_summary("\n".join(parts))
 
-    @staticmethod
-    def _public_reasoning_input_size(attempt: _TurnAttempt) -> int:
-        return sum(
-            len(str(part.get("raw_delta") or part.get("seed") or ""))
-            for part in attempt.public_reasoning_summary_parts.values()
-        )
-
     def _capture_public_reasoning_summary(
         self,
         attempt: _TurnAttempt,
@@ -1406,10 +1396,6 @@ class AppServerClient:
             return
         part = attempt.public_reasoning_summary_parts.get(key)
         if part is None:
-            if len(attempt.public_reasoning_summary_order) >= (
-                _MAX_PUBLIC_REASONING_SUMMARY_PARTS
-            ):
-                return
             part = {"seed": "", "raw_delta": "", "delta": ""}
             attempt.public_reasoning_summary_parts[key] = part
             attempt.public_reasoning_summary_order.append(key)
@@ -1424,40 +1410,27 @@ class AppServerClient:
             raw_part = raw_part.get("text")
             seed = self._sanitize_public_reasoning_summary(raw_part)
             if seed and not part.get("delta"):
-                used = self._public_reasoning_input_size(attempt) - len(
-                    str(part.get("seed") or "")
-                )
-                part["seed"] = seed[:max(
-                    0, _MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS - used,
-                )]
+                part["seed"] = seed
+                part["raw_seed"] = raw_part
+                self._publish_public_reasoning_summary(attempt)
             return
 
         delta = params.get("delta")
         if not isinstance(delta, str) or not delta:
             return
-        used = self._public_reasoning_input_size(attempt) - len(
-            str(part.get("raw_delta") or "")
-        )
-        remaining = max(0, _MAX_PUBLIC_REASONING_SUMMARY_INPUT_CHARS - used)
-        raw_delta = (str(part.get("raw_delta") or "") + delta)[:remaining]
+        raw_delta = str(part.get("raw_delta") or part.get("raw_seed") or "") + delta
         part["raw_delta"] = raw_delta
         combined = self._sanitize_public_reasoning_summary(raw_delta)
         if not combined or combined == part.get("delta"):
             return
         part["delta"] = combined
+        self._publish_public_reasoning_summary(attempt)
+
+    def _publish_public_reasoning_summary(self, attempt: _TurnAttempt) -> None:
+        """Forward each genuine public update at receipt, without a size gate."""
         aggregate = self._public_reasoning_summary(attempt)
         emitted = attempt.public_reasoning_summary_emitted
-        should_emit = bool(
-            aggregate
-            and aggregate != emitted
-            and (
-                not emitted
-                or len(aggregate) >= len(emitted) + (
-                    _PUBLIC_REASONING_SUMMARY_EMIT_STEP
-                )
-            )
-        )
-        if should_emit:
+        if aggregate and aggregate != emitted:
             attempt.public_reasoning_summary = aggregate
             attempt.public_reasoning_summary_emitted = aggregate
             attempt.events.put((
@@ -1608,6 +1581,13 @@ class AppServerClient:
         state["delta_chars"] = int(state.get("delta_chars") or 0) + len(text)
         state["delta_text"] = str(state.get("delta_text") or "") + text
         attempt.output_started = True
+        if state.get("message_phase") == "commentary":
+            wording = AppServerClient._sanitize_public_reasoning_summary(state["delta_text"])
+            if wording:
+                payload = AppServerClient._public_reasoning_summary_payload(attempt, wording)
+                payload["native_item_id"] = str(item_id)
+                attempt.events.put(("public_reasoning_summary", payload))
+            return True
         attempt.text_parts.append(text)
         if item_id:
             attempt.final_output_item_id = str(item_id)[:160]
@@ -3735,6 +3715,11 @@ class AppServerClient:
                             "completed": False,
                         },
                     )
+                    # Use the provider's explicit public phase, never inferred
+                    # intent or private reasoning, to distinguish commentary.
+                    phase = item.get("phase")
+                    if phase in {"commentary", "final_answer"}:
+                        state["message_phase"] = phase
                     if method == "item/started":
                         if item_id:
                             attempt.pending_agent_message_items.add(item_id)
@@ -3742,7 +3727,11 @@ class AppServerClient:
                         completed_text = self._agent_message_text(item)
                         if correlated_visual and completed_text:
                             attempt.post_visual_agent_items.add(item_id)
-                        assembled_text = "".join(attempt.text_parts)
+                        assembled_text = (
+                            str(state.get("delta_text") or "")
+                            if state.get("message_phase") == "commentary"
+                            else "".join(attempt.text_parts)
+                        )
                         streamed_text = str(state.get("delta_text") or "")
                         missing_text = ""
                         if completed_text and completed_text not in assembled_text:
@@ -3770,7 +3759,8 @@ class AppServerClient:
                         state["completed"] = True
                         if item_id:
                             attempt.pending_agent_message_items.discard(item_id)
-                            attempt.final_output_item_id = item_id[:160]
+                            if state.get("message_phase") != "commentary":
+                                attempt.final_output_item_id = item_id[:160]
                     self._release_deferred_done(attempt)
                 return
             if item_type == "webSearch":

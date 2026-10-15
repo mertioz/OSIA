@@ -688,39 +688,44 @@ class _DirectiveChip(QFrame):
         row.addWidget(remove)
 
 
+def _thinking_display_text(text: str) -> str:
+    """Render simple public bold headings without changing stored wording.
+
+    Keep inline/complex Markdown and fenced code literal. This is only used
+    by the Thinking detail widget, never by storage, transport or final prose.
+    """
+    fence = ""
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if marker:
+            token = marker.group(1)
+            if not fence:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not stripped[len(token):].strip():
+                fence = ""
+            lines.append(line)
+            continue
+        heading = None if fence else re.fullmatch(
+            r"( {0,3})\*\*([^*`\[\]<>\\_#~\n]+)\*\*([ \t]*)", line,
+        )
+        lines.append("".join(heading.groups()) if heading else line)
+    return "\n".join(lines)
+
+
 class _ChatThinkingTrace(QFrame):
     """Compact, real-only public trace bound to one exact Chat run."""
 
     cancel_requested = pyqtSignal(dict)
     _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
-    _DISPLAY_KEYS = {
-        "execution.action.browser": "chat.thinking.action_browser",
-        "execution.action.document": "chat.thinking.action_document",
-        "execution.action.filesystem": "chat.thinking.action_filesystem",
-        "execution.action.shell": "chat.thinking.action_shell",
-        "execution.action.connector": "chat.thinking.action_connector",
-        "execution.action.memory": "chat.thinking.action_memory",
-        "execution.action.scheduled_task": "chat.thinking.action_scheduled",
-        "execution.action.capability": "chat.thinking.action_capability",
-        "execution.permission.waiting": "chat.thinking.permission_waiting",
-        "execution.result.completed": "chat.thinking.result_completed",
-        "execution.result.observed": "chat.thinking.result_observed",
-        "execution.result.needs_attention": "chat.thinking.result_attention",
-        "execution.result.cancelled": "chat.thinking.result_cancelled",
-        "execution.continuation.new_strategy": "chat.thinking.recovering",
-        "execution.reconciliation.verifying": "chat.thinking.verifying",
-        "execution.terminal.success": "chat.thinking.terminal_success",
-        "execution.terminal.blocked": "chat.thinking.terminal_blocked",
-        "execution.terminal.cancelled": "chat.thinking.terminal_cancelled",
-        "execution.terminal.safety_block": "chat.thinking.terminal_safety",
-    }
 
-    def __init__(self) -> None:
+    def __init__(self, *, auto_expand: bool = True) -> None:
         super().__init__()
         self._binding: dict[str, object] = {}
         self._source_payload: dict[str, object] = {}
         self._cancel_pending = False
-        self._expanded = False
+        self._expanded = auto_expand
         self._final_stream_started = False
         self._auto_collapsed_for_final = False
         self.setObjectName("chatThinkingTrace")
@@ -735,6 +740,7 @@ class _ChatThinkingTrace(QFrame):
         self._toggle = QPushButton()
         self._toggle.setObjectName("chatThinkingToggle")
         self._toggle.setFlat(True)
+        self._toggle.setCheckable(True)
         self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._toggle.clicked.connect(self._toggle_expanded)
         self._orbs = ThinkingOrbs(self)
@@ -863,9 +869,11 @@ class _ChatThinkingTrace(QFrame):
         if not isinstance(events, list):
             events = raw.get("events")
         if isinstance(events, list):
-            latest: dict[str, tuple[int, int, str]] = {}
+            from osia.execution_trace import DISPLAY_SPECS
+
+            latest: dict[str, tuple[int, int, str, bool]] = {}
             terminal = False
-            for item in events[:32]:
+            for item in events:
                 if not isinstance(item, dict):
                     continue
                 if any(
@@ -889,30 +897,36 @@ class _ChatThinkingTrace(QFrame):
                 kind = str(item.get("kind") or "")
                 if not event_id or sequence < 1 or revision < 1:
                     continue
+                display = item.get("display")
+                display_key = (
+                    str(display.get("key") or "")
+                    if isinstance(display, dict) else ""
+                )
+                spec = DISPLAY_SPECS.get(display_key)
+                if (
+                    item.get("schema_version") != 1
+                    or item.get("redaction_class") != "public_ui"
+                    or not isinstance(display, dict)
+                    or display.get("args") != {}
+                    or spec is None or spec[0] != kind
+                    or bool(item.get("terminal")) != (kind == "terminal")
+                ):
+                    continue
                 line = ""
                 if kind == "public_reasoning_summary":
                     line = cls._safe_summary(item.get("summary"))
                 else:
-                    display = item.get("display")
-                    display_key = (
-                        str(display.get("key") or "")
-                        if isinstance(display, dict) else ""
-                    )
-                    text_key = cls._DISPLAY_KEYS.get(display_key, "")
-                    if text_key:
-                        line = i18n.t(text_key)
                     if display_key == "execution.terminal.cancelled":
                         safe["cancelled_terminal"] = True
-                if line:
-                    previous = latest.get(event_id)
-                    if previous is None or revision > previous[1]:
-                        latest[event_id] = (sequence, revision, line)
-                terminal = terminal or bool(item.get("terminal"))
-            safe["lines"] = [
-                value[2] for value in sorted(
-                    latest.values(), key=lambda value: value[0],
-                )
-            ]
+                previous = latest.get(event_id)
+                if previous is None or revision > previous[1]:
+                    latest[event_id] = (sequence, revision, line, kind == "terminal")
+            for value in sorted(latest.values(), key=lambda value: value[0]):
+                if value[2]:
+                    safe["lines"].append(value[2])
+                if value[3]:
+                    terminal = True
+                    break
             safe["event_revisions"] = {
                 event_id: value[1] for event_id, value in latest.items()
             }
@@ -922,6 +936,36 @@ class _ChatThinkingTrace(QFrame):
             safe["terminal"] = bool(safe["terminal"] or terminal)
             return safe
         return {}
+
+    @classmethod
+    def merge_payload(cls, previous: dict, incoming: dict) -> dict:
+        """Retain validated entries omitted by a compact/recovery snapshot."""
+        old = cls._safe_payload(previous)
+        new = cls._safe_payload(incoming)
+        names = (
+            "conversation_id", "request_id", "turn_id", "run_id",
+            "provider_id", "model_id", "effective_reasoning",
+        )
+        if not old or not new or any(old.get(name) != new.get(name) for name in names):
+            return incoming
+        retained = {}
+        for raw, safe in ((previous, old), (incoming, new)):
+            for event in raw.get("snapshot", raw.get("events", [])):
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("event_id")
+                if safe["event_revisions"].get(event_id) != event.get("revision"):
+                    continue
+                prior = retained.get(event_id)
+                if prior and prior.get("kind") == "public_reasoning_summary":
+                    summary = cls._safe_summary(event.get("summary"))
+                    if event.get("kind") != prior["kind"] or not summary.startswith(prior.get("summary", "")):
+                        continue
+                if prior is None or event["revision"] > prior["revision"]:
+                    retained[event_id] = dict(event)
+        merged = dict(incoming)
+        merged["snapshot"] = sorted(retained.values(), key=lambda event: event["sequence"])
+        return merged
 
     def apply_trace(self, payload: dict) -> bool:
         safe = self._safe_payload(payload)
@@ -969,6 +1013,8 @@ class _ChatThinkingTrace(QFrame):
             for event_id, revision in (safe.get("event_revisions") or {}).items():
                 if int(revision) < int(prior_revisions.get(event_id) or 0):
                     return False
+        payload = self.merge_payload(self._source_payload, payload)
+        safe = self._safe_payload(payload)
         safe["cancel_requested"] = bool(
             safe.get("cancel_requested") or self._cancel_pending
         )
@@ -983,38 +1029,67 @@ class _ChatThinkingTrace(QFrame):
             and not self._auto_collapsed_for_final
         ):
             self._auto_collapse_for_final()
-        detail = "\n".join(str(line) for line in safe.get("lines") or ())
-        self._detail.setPlainText(detail)
-        self._toggle.setEnabled(bool(detail))
-        if not detail and self._expanded:
-            self._expanded = False
-            self._detail.hide()
-            self._detail.setMaximumHeight(0)
-        elif detail and self._expanded:
+        detail = _thinking_display_text(
+            "\n".join(str(line) for line in safe.get("lines") or ())
+        )
+        previous_detail = self._detail.toPlainText()
+        if detail != previous_detail:
+            scrollbar = self._detail.verticalScrollBar()
+            previous_scroll = scrollbar.value()
+            following = previous_scroll >= scrollbar.maximum() - 4
+            if detail.startswith(previous_detail):
+                cursor = QTextCursor(self._detail.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText(detail[len(previous_detail):])
+            else:
+                self._detail.setPlainText(detail)
+            scrollbar.setValue(scrollbar.maximum() if following else previous_scroll)
+        self._toggle.setEnabled(bool(detail) or not self._auto_collapsed_for_final)
+        # Height alone does not undo QTextEdit.hide(). The empty trace starts
+        # explicitly hidden; every live update must project visibility too.
+        # Update the existing document/widget, without recreating the trace.
+        detail_visible = bool(detail and self._expanded)
+        if detail != previous_detail or self._detail.isHidden() == detail_visible:
+            self._detail_anim.stop()
+            self._detail.setVisible(detail_visible)
             self._detail.setMaximumHeight(
                 min(180, max(1, self._detail.sizeHint().height()))
+                if detail and self._expanded else 0
             )
-        cancellable = not self.terminal and not self._cancel_pending
+        cancellable = not self.terminal and not self._cancel_pending and not self._auto_collapsed_for_final
         self._stop.setVisible(cancellable)
         self._stop.setEnabled(cancellable)
         self._refresh_toggle()
         return True
 
     def set_active(self, active: bool) -> None:
-        """Project activity without reviving a terminal or cancelled turn."""
-        cancellable = bool(active) and not self.terminal and not self._cancel_pending
+        """Project this turn's activity without reviving terminal/cancelled UI."""
+        cancellable = (
+            bool(active) and not self.terminal and not self._cancel_pending
+            and not self._auto_collapsed_for_final
+        )
         self._stop.setVisible(cancellable)
         self._stop.setEnabled(cancellable)
-        self._orbs.set_active(cancellable and not self._final_stream_started)
+        self._orbs.set_active(cancellable)
+        self.setVisible(
+            (not self._auto_collapsed_for_final and not self.terminal)
+            or bool(self._detail.toPlainText())
+        )
+        self._refresh_toggle()
 
     def mark_inactive(self) -> None:
+        self._auto_collapse_for_final()
         self.set_active(False)
 
     def mark_final_stream_started(self) -> None:
         if self._final_stream_started:
             return
         self._final_stream_started = True
+
+    def mark_completed(self) -> None:
+        """Collapse on canonical completion, never on an answer delta."""
         self._auto_collapse_for_final()
+        self.set_active(False)
 
     def _auto_collapse_for_final(self) -> None:
         if self._auto_collapsed_for_final:
@@ -1031,24 +1106,34 @@ class _ChatThinkingTrace(QFrame):
         self._refresh_toggle()
 
     def _refresh_toggle(self) -> None:
-        chevron = "⌄" if self._expanded else "›"
+        chevron = "▾" if self._expanded else "▸"
         self._toggle.setText(f"{i18n.t('chat.thinking.title')} {chevron}")
         self._toggle.setAccessibleName(i18n.t("chat.thinking.title"))
-        self._toggle.setAccessibleDescription(
-            i18n.t(
-                "chat.thinking.collapse"
-                if self._expanded else "chat.thinking.expand"
-            )
+        description = i18n.t(
+            "chat.thinking.collapse"
+            if self._expanded else "chat.thinking.expand"
         )
+        settled = self.terminal or self._auto_collapsed_for_final
+        self._toggle.setVisible(settled and bool(self._detail.toPlainText()))
+        self._orbs.setVisible(not settled)
+        for control in (self._toggle, self._orbs):
+            control.setChecked(self._expanded)
+            control.setAccessibleDescription(description)
+        self._orbs.setAccessibleName(i18n.t("chat.thinking.title"))
 
     def _toggle_expanded(self) -> None:
         self._set_expanded(not self._expanded)
 
     def _set_expanded(self, expanded: bool) -> None:
-        if not self._detail.toPlainText() or self._expanded == expanded:
+        if self._expanded == expanded:
             return
         self._expanded = expanded
         self._detail_anim.stop()
+        if not self._detail.toPlainText():
+            self._detail.hide()
+            self._detail.setMaximumHeight(0)
+            self._refresh_toggle()
+            return
         self._detail.show()
         start = self._detail.maximumHeight()
         end = min(180, max(1, self._detail.sizeHint().height())) if self._expanded else 0
@@ -1073,11 +1158,7 @@ class _ChatThinkingTrace(QFrame):
         self._cancel_pending = True
         self._binding["cancel_requested"] = True
         self._stop.hide()
-        lines = list(self._binding.get("lines") or ())
-        lines.append(i18n.t("chat.thinking.cancelling"))
-        self._binding["lines"] = lines
         self._source_payload["cancel_requested"] = True
-        self._detail.setPlainText("\n".join(str(line) for line in lines))
         self.cancel_requested.emit(dict(self._binding))
 
 
@@ -1731,6 +1812,8 @@ class _ChatPage(QWidget):
         safe = _ChatThinkingTrace._safe_payload(payload)
         if not safe:
             return False
+        scroll_bar = self._scroll.verticalScrollBar()
+        following = scroll_bar.value() >= scroll_bar.maximum() - 24
         key = tuple(
             str(safe[name])
             for name in ("conversation_id", "request_id", "turn_id", "run_id")
@@ -1741,7 +1824,7 @@ class _ChatPage(QWidget):
         if widget is None:
             if historical is False and self._active_thinking_key is None:
                 self._active_thinking_key = key
-            widget = _ChatThinkingTrace()
+            widget = _ChatThinkingTrace(auto_expand=not historical)
             if not widget.apply_trace(payload):
                 widget.deleteLater()
                 return False
@@ -1762,7 +1845,8 @@ class _ChatPage(QWidget):
         else:
             widget.set_active(not bool(safe.get("cancel_requested")))
             self._active_thinking_key = key
-        self._scroll_timer.start(0)
+        if following:
+            self._scroll_timer.start(0)
         return True
 
     def _accept_stream_binding(self, binding: dict | None) -> bool:
@@ -1819,6 +1903,9 @@ class _ChatPage(QWidget):
         if not self._accept_stream_binding(binding):
             return False
         final = _display_text(text)
+        trace = self._thinking_widgets.get(self._binding_key(binding))
+        if trace is not None:
+            trace.mark_completed()
         self._stream_finish_error = False
         self._discard_stream_on_complete = not bool(final)
         if not final:
@@ -1836,6 +1923,9 @@ class _ChatPage(QWidget):
         if not self._accept_stream_binding(binding):
             return False
         error = _display_text(text)
+        trace = self._thinking_widgets.get(self._binding_key(binding))
+        if trace is not None:
+            trace.mark_completed()
         if not error:
             self.cancel_assistant_stream(flush=True)
             return True
@@ -1860,7 +1950,6 @@ class _ChatPage(QWidget):
         trace = self._thinking_widgets.get(key)
         if trace is not None:
             trace.mark_inactive()
-            trace.hide()
         if self._active_thinking_key == key:
             self._active_thinking_key = None
         return True
@@ -11411,7 +11500,10 @@ class MainPopup(QWidget):
         if bool(safe.get("cancel_requested")):
             self._cancelled_thinking_keys.add(key)
             self._chat.tombstone_cancelled_turn(safe)
-        projected = dict(payload)
+        projected = _ChatThinkingTrace.merge_payload(
+            self._thinking_by_key.get(key) or {}, dict(payload),
+        )
+        safe = _ChatThinkingTrace._safe_payload(projected)
         if key in self._cancelled_thinking_keys:
             projected["cancel_requested"] = True
             safe["cancel_requested"] = True
@@ -11931,8 +12023,8 @@ class MainPopup(QWidget):
             }
             QTextEdit#chatThinkingDetail {
                 color: rgba(192, 189, 202, 0.76);
-                background: rgba(196, 181, 245, 0.025);
-                border-left: 1px solid rgba(196, 181, 245, 0.20);
+                background: transparent;
+                border: none;
                 padding: 3px 7px;
                 font-size: 10px;
             }

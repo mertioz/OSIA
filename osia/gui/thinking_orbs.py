@@ -4,24 +4,26 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QElapsedTimer, QPointF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QElapsedTimer, QPointF, Qt, QTimer
 from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QPushButton, QStyle, QStyleOptionFocusRect, QWidget
 
 from osia.gui.motion import reduced_motion_requested
 from osia.gui.theme import get_theme_manager
 
 
-class ThinkingOrbs(QWidget):
+class ThinkingOrbs(QPushButton):
     """Draw six deterministic accent orbs and animate only while visible."""
 
-    clicked = pyqtSignal()
     ORB_COUNT = 6
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("thinkingOrbs")
-        self.setFixedSize(54, 20)
+        self.setFixedSize(54, 28)
+        self.setFlat(True)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("Thinking progress")
         self._active = False
@@ -95,12 +97,19 @@ class ThinkingOrbs(QWidget):
         self._timer.stop()
         super().hideEvent(event)
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    @staticmethod
+    def orb_positions(
+        phase: float, center_x: float, center_y: float,
+    ) -> list[tuple[float, float, float, float, int]]:
+        """One true periodic orbit: position and velocity match at 0/2π."""
+        positions = []
+        for index in range(ThinkingOrbs.ORB_COUNT):
+            angle = phase + index * math.tau / ThinkingOrbs.ORB_COUNT
+            x = center_x + math.cos(angle) * 15.4
+            y = center_y + math.sin(angle) * 3.7
+            radius = 3.1 + 0.4 * math.sin(angle)
+            positions.append((y, x, y, radius, index))
+        return positions
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         del event
@@ -113,20 +122,7 @@ class ThinkingOrbs(QWidget):
             cycle = (
                 (self._elapsed.elapsed() % 1_800) / 1_800.0
             ) * (math.pi * 2)
-            speeds = (0.82, 1.06, 1.19, 0.91, 1.13, 0.76)
-            offsets = (0.0, 1.05, 2.20, 3.18, 4.17, 5.23)
-            positions = []
-            for index, (speed, offset) in enumerate(zip(speeds, offsets)):
-                phase = cycle * speed + offset
-                x = center_x + math.cos(phase) * 15.4
-                y = (
-                    center_y
-                    + math.sin(phase * 1.21 + offset * 0.23) * 3.7
-                    + math.sin(phase * 0.57 + index) * 1.0
-                )
-                radius = 2.7 + 0.8 * (0.5 + 0.5 * math.sin(phase * 0.83))
-                depth = y + math.sin(phase) * 0.25
-                positions.append((depth, x, y, radius, index))
+            positions = self.orb_positions(cycle, center_x, center_y)
         else:
             positions = [
                 (
@@ -147,3 +143,10 @@ class ThinkingOrbs(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(orb)
             painter.drawEllipse(QPointF(x, y), radius, radius)
+        if self.hasFocus():
+            focus = QStyleOptionFocusRect()
+            focus.initFrom(self)
+            focus.rect = self.rect().adjusted(1, 1, -1, -1)
+            self.style().drawPrimitive(
+                QStyle.PrimitiveElement.PE_FrameFocusRect, focus, painter, self,
+            )

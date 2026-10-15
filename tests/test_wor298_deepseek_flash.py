@@ -281,14 +281,23 @@ def test_legacy_missing_provider_only_infers_unambiguous_official_api_aliases():
     assert migrate_model_id("openai", "deepseek-chat") == "deepseek-chat"
 
 
-def test_old_mobile_selection_does_not_fall_back_to_another_provider():
+def test_old_mobile_selection_does_not_fall_back_to_another_provider(monkeypatch):
     # WOR-303: the dedicated Autonomous model resolution is gone.  The existing
     # Chat model validation still accepts the migrated DeepSeek identity and
     # never silently falls back to another provider.
+    # Supply configured-provider facts explicitly; never depend on or write the
+    # operator's credentials/settings, or probe a live account/local runtime.
+    monkeypatch.setattr(mobile, "load_api_keys", lambda: {"deepseek": "test-only"})
+    monkeypatch.setattr(mobile, "get_all_models", lambda **_kw: models.HARDCODED_MODELS)
+    monkeypatch.setattr(mobile, "account_snapshot", lambda **_kw: {})
+    monkeypatch.setattr(mobile, "load_settings", lambda: {})
+    selected = {}
+    monkeypatch.setattr(mobile, "set_setting", lambda key, value: selected.update({key: value}))
     inventory = mobile.build_model_inventory(models.HARDCODED_MODELS, models.API_PROVIDERS)
     assert inventory
     assert mobile.validate_and_select("deepseek", MODEL_ID) is True
     assert mobile.validate_and_select("deepseek", "deepseek-does-not-exist") is False
+    assert selected == {"selected_model": MODEL_ID, "selected_model_provider": "deepseek"}
 
 
 def test_settings_read_migrates_in_memory_and_save_persists_atomically(tmp_path, monkeypatch):

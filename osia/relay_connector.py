@@ -438,6 +438,12 @@ class RelayBridge:
             return compact
         if frame.get("terminal") is True or state["incremental"] >= MAX_RELAY_TRACE_INCREMENTAL:
             return None
+        # Canonical commentary is retained in full; Relay keeps its existing
+        # per-frame traffic bound independently of canonical storage.
+        from osia.execution_trace import MAX_SERIALIZED_BYTES
+
+        if len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > MAX_SERIALIZED_BYTES:
+            return None
         display = frame.get("display")
         signature = (
             str(frame.get("kind") or ""),

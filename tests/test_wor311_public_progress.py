@@ -91,7 +91,7 @@ def test_xml_local_and_groq_paths_keep_surrounding_public_text(provider):
 
     assert calls == [{"tool": "open_application", "name": "calculator"}]
     assert narration == (
-        "The upload finished. The site needs one confirmation. "
+        "The upload finished. The site needs one confirmation.  "
         "I’ll verify the result after that."
     )
 
@@ -172,16 +172,16 @@ def test_model_narration_does_not_append_a_canonical_assistant_message():
     ]
 
 
-def test_public_narration_is_bounded_private_data_filtered_and_cancellation_safe():
+def test_public_narration_is_retained_private_data_filtered_and_cancellation_safe():
     assert sanitize_public_model_narration("Planning...") == ""
     assert sanitize_public_model_narration("password: hunter2") == ""
     assert sanitize_public_model_narration("Reach me at person@example.com") == ""
-    assert sanitize_public_model_narration("x" * 501) == ""
+    assert sanitize_public_model_narration("x" * 501) == "x" * 501
 
     bounded = _ledger()
     for index in range(9):
         bounded.record_public_narration(f"A useful stage changed: {index}.")
-    assert len(bounded.snapshot()["events"]) == 8
+    assert len(bounded.snapshot()["events"]) == 9
 
     ledger = _ledger()
     ledger.record(
@@ -234,11 +234,13 @@ def test_desktop_thinking_auto_collapses_once_and_can_reopen(qapp, monkeypatch):
 
     assert widget.apply_trace(payload)
     assert widget._orbs.orb_count == 6
-    widget._orbs.clicked.emit()
-    assert widget._expanded
+    assert widget._expanded  # V5 opens new active turns without a click
     widget.mark_final_stream_started()
+    assert widget._expanded  # a delta is not completion
+    widget._toggle.click()
     assert not widget._expanded
-
+    assert widget.apply_trace(payload)
+    assert not widget._expanded  # updates respect manual collapse
     widget._toggle.click()
     assert widget._expanded
     terminal = _summary_event(
@@ -252,7 +254,11 @@ def test_desktop_thinking_auto_collapses_once_and_can_reopen(qapp, monkeypatch):
     terminal.pop("summary")
     updated = {**payload, "terminal": True, "snapshot": [payload["snapshot"][0], terminal]}
     assert widget.apply_trace(updated)
+    assert not widget._expanded
+    widget._toggle.click()
     assert widget._expanded
+    assert widget.apply_trace(updated)
+    assert widget._expanded  # duplicate completion does not close manual reopen
 
     widget.close()
     widget.deleteLater()

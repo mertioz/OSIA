@@ -138,14 +138,12 @@ def test_real_activity_is_sanitized_and_rendered_as_one_compact_trace(app):
         assert len(traces) == 1
         trace = traces[0]
         assert trace.objectName() == "chatThinkingTrace"
-        assert trace._detail.toPlainText() == i18n.t(
-            "chat.thinking.action_shell"
-        )
+        assert trace._detail.toPlainText() == ""
         assert not ({
             "objective", "reasoning", "diagnostic", "plan",
             "tasks_done", "tasks_total",
         } & set(trace._binding))
-        assert trace._detail.isHidden()
+        assert trace._expanded
     finally:
         chat.deleteLater()
 
@@ -157,7 +155,7 @@ def test_no_real_event_keeps_thinking_empty_instead_of_inventing_progress(app):
         app.processEvents()
 
         assert trace._detail.toPlainText() == ""
-        assert not trace._toggle.isEnabled()
+        assert trace._toggle.isEnabled()
         assert "Planning" not in trace._toggle.text()
         assert "Working" not in trace._toggle.text()
         assert "Analyzing" not in trace._toggle.text()
@@ -174,9 +172,11 @@ def test_begin_turn_shows_minimal_thinking_before_detailed_activity(app):
         assert len(traces) == 1
         trace = traces[0]
         assert trace._detail.toPlainText() == ""
-        assert trace._toggle.isEnabled() is False
+        assert trace._toggle.isEnabled() is True
+        assert trace._expanded
         assert trace._stop.isHidden() is False
-        assert trace._toggle.text().startswith(i18n.t("chat.thinking.title"))
+        assert trace._toggle.isHidden()
+        assert not trace._orbs.isHidden()
     finally:
         chat.deleteLater()
 
@@ -194,7 +194,7 @@ def test_only_fully_correlated_trace_events_contribute_thinking_detail(app):
         trace.deleteLater()
 
 
-def test_permission_waiting_is_projected_from_a_real_trace_event(app):
+def test_removed_permission_state_is_not_presented_as_model_thinking(app):
     ledger = _ledger(suffix="permission_wait")
     ledger.record(
         kind="waiting_permission",
@@ -204,9 +204,7 @@ def test_permission_waiting_is_projected_from_a_real_trace_event(app):
     trace = main_popup._ChatThinkingTrace()
     try:
         assert trace.apply_trace(_payload(ledger))
-        assert trace._detail.toPlainText() == i18n.t(
-            "chat.thinking.permission_waiting"
-        )
+        assert trace._detail.toPlainText() == ""
     finally:
         trace.deleteLater()
 
@@ -251,28 +249,19 @@ def test_provider_public_summary_is_displayed_but_raw_reasoning_is_rejected(app)
 
 def test_thinking_expands_and_collapses_without_a_large_card(app):
     ledger = _ledger(suffix="expand")
-    ledger.record(
-        kind="reconciliation",
-        display_key="execution.reconciliation.verifying",
-    )
+    ledger.record_public_reasoning_summary("I checked the visible result.")
     trace = main_popup._ChatThinkingTrace()
     try:
-        assert trace.apply_trace(_payload(ledger))
-        assert trace._detail.isHidden()
-
-        with patch.object(
-            main_popup, "reduced_motion_requested", return_value=True,
-        ):
-            trace._toggle.click()
-            app.processEvents()
-            assert trace._expanded is True
-            assert not trace._detail.isHidden()
+        with patch.object(main_popup, "reduced_motion_requested", return_value=True):
+            assert trace.apply_trace(_payload(ledger))
+            assert trace._expanded
             assert trace._detail.maximumHeight() > 0
-
             trace._toggle.click()
-            app.processEvents()
-            assert trace._expanded is False
+            assert not trace._expanded
             assert trace._detail.isHidden()
+            trace._toggle.click()
+            assert trace._expanded
+            assert not trace._detail.isHidden()
     finally:
         trace.deleteLater()
 
@@ -342,7 +331,8 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
 
         assert popup.confirm_chat_execution_cancellation(binding)
         app.processEvents()
-        assert trace.isHidden()
+        assert not trace._expanded
+        assert trace._stop.isHidden()
         assert popup._chat._active_thinking_key is None
         assert binding["conversation_id"] not in (
             popup._active_thinking_key_by_conversation
@@ -360,7 +350,8 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
 
         ledger.record_public_reasoning_summary("Late summary")
         assert not popup.update_chat_execution_activity(_payload(ledger))
-        assert trace.isHidden()
+        assert not trace._expanded
+        assert trace._stop.isHidden()
     finally:
         popup._busy_conversation_ids.discard(binding["conversation_id"])
 
@@ -497,13 +488,11 @@ def test_chunked_turns_keep_thinking_and_stream_buffers_strictly_isolated(app):
         assert rendered == ["question A", old, "question B", new]
         traces = chat.findChildren(main_popup._ChatThinkingTrace)
         assert len(traces) == 2
-        assert traces[0]._detail.toPlainText() == i18n.t(
-            "chat.thinking.action_shell"
-        )
+        assert traces[0]._detail.toPlainText() == ""
         assert traces[1]._detail.toPlainText() == "Public summary for turn B."
         assert traces[0]._stop.isHidden()
-        assert not traces[1]._stop.isHidden()
-        assert traces[1]._stop.isEnabled()
+        assert traces[1]._stop.isHidden()
+        assert not traces[1]._stop.isEnabled()
     finally:
         chat.deleteLater()
 
@@ -622,11 +611,9 @@ def test_cancelled_turn_stop_and_projection_state_do_not_leak_to_next_turn(app):
         traces = chat.findChildren(main_popup._ChatThinkingTrace)
         trace_b = next(trace for trace in traces if trace.key == key_b)
         assert key_b not in chat._cancelled_stream_keys
-        assert not trace_b._stop.isHidden()
-        assert trace_b._stop.isEnabled()
-        assert trace_b._detail.toPlainText() == i18n.t(
-            "chat.thinking.action_browser"
-        )
+        assert trace_b._stop.isHidden()  # canonical completion disables Stop
+        assert not trace_b._stop.isEnabled()
+        assert trace_b._detail.toPlainText() == ""
         assert _bubble_texts(chat).count("NEW_UNIQUE_TOKEN") == 1
     finally:
         chat.deleteLater()

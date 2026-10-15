@@ -5696,6 +5696,44 @@ async def internal_new_chat(request: Request):
     return {"ok": True, "clients": len(_WS_CLIENTS)}
 
 
+@app.post("/internal/execution_trace")
+async def internal_execution_trace(request: Request):
+    """Mirror Desktop's canonical public feed through the existing WS events."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": False, "error": "forbidden"}
+    from osia.execution_trace import validate_execution_trace_frame
+    from osia.turn_terminality import load_persisted_execution_binding
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid_trace"}
+    if not isinstance(body, dict) or set(body) != {"frame", "announce"} or type(body["announce"]) is not bool:
+        return {"ok": False, "error": "invalid_trace"}
+    frame = validate_execution_trace_frame(body["frame"])
+    if frame is None:
+        return {"ok": False, "error": "invalid_trace"}
+    binding = load_persisted_execution_binding(frame["turn_id"])
+    if binding is None or any(frame.get(name) != item for name, item in binding.items()):
+        return {"ok": False, "error": "stale_binding"}
+    if body["announce"]:
+        accepted = _turn_accepted_frame(dict(binding))
+        for client in list(_WS_CLIENTS):
+            try:
+                await client.send_json(accepted)
+            except Exception:
+                _WS_CLIENTS.discard(client)
+    await _broadcast_execution_trace(frame)
+    if frame["terminal"]:
+        status = {
+            "execution.terminal.success": "done",
+            "execution.terminal.cancelled": "cancelled",
+        }.get(frame["display"]["key"], "error")
+        await _broadcast_turn_status(dict(binding), status)
+    return {"ok": True}
+
+
 @app.post("/internal/conversation_changed")
 async def internal_conversation_changed(request: Request):
     """Loopback-only invalidation from the desktop canonical writer."""
@@ -12950,8 +12988,12 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                 _broadcast_execution_trace(frame, primary=ws),
                 document_loop,
             )
-            if len(execution_trace_futures) < 32:
-                execution_trace_futures.append(future)
+            # Track pending deliveries, including public-text revisions beyond
+            # the activity budget, so completion drains the same ordered feed.
+            execution_trace_futures[:] = [
+                pending for pending in execution_trace_futures if not pending.done()
+            ]
+            execution_trace_futures.append(future)
 
         async def _drain_execution_trace() -> None:
             pending = list(execution_trace_futures)

@@ -121,6 +121,52 @@ _SERVER_MCP_OAUTH_CANCEL_URL = "http://127.0.0.1:8765/internal/mcp_oauth_cancel"
 # next Connect re-runs DCR + a fresh login, then rebroadcasts the reset.
 _SERVER_MCP_OAUTH_SWITCH_URL = "http://127.0.0.1:8765/internal/mcp_oauth_switch"
 _SERVER_CRON_NOTIFICATION_URL = "http://127.0.0.1:8765/internal/cron_notification"
+_MOBILE_TRACE_FORWARDER = None
+_MOBILE_TRACE_FORWARDER_LOCK = threading.Lock()
+_MOBILE_TRACE_ANNOUNCED = {}
+
+
+def _notify_mobile_execution_trace(frame: dict):
+    """Forward public Desktop events in order without blocking Qt/provider work."""
+    from concurrent.futures import ThreadPoolExecutor
+    from osia.execution_trace import validate_execution_trace_frame
+
+    safe = validate_execution_trace_frame(frame)
+    if safe is None:
+        return None
+
+    def worker():
+        import json
+        import urllib.request
+
+        key = tuple(safe[name] for name in (
+            "conversation_id", "request_id", "turn_id", "run_id",
+        ))
+        try:
+            request = urllib.request.Request(
+                "http://127.0.0.1:8765/internal/execution_trace",
+                data=json.dumps({
+                    "frame": safe, "announce": key not in _MOBILE_TRACE_ANNOUNCED,
+                }).encode("utf-8"),
+                method="POST", headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if result.get("ok"):
+                _MOBILE_TRACE_ANNOUNCED[key] = True
+                while len(_MOBILE_TRACE_ANNOUNCED) > 64:
+                    _MOBILE_TRACE_ANNOUNCED.pop(next(iter(_MOBILE_TRACE_ANNOUNCED)))
+        except Exception:
+            # Optional projection delivery never changes canonical execution.
+            pass
+
+    global _MOBILE_TRACE_FORWARDER
+    with _MOBILE_TRACE_FORWARDER_LOCK:
+        if _MOBILE_TRACE_FORWARDER is None:
+            _MOBILE_TRACE_FORWARDER = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="osia-thinking-mirror",
+            )
+        return _MOBILE_TRACE_FORWARDER.submit(worker)
 
 
 def _notify_mobile_new_chat() -> None:
@@ -2742,6 +2788,7 @@ def wake_mode():
             if isinstance(frame, dict) and frame.get("type") == "execution_trace":
                 _project_chat_island_trace(frame)
                 bridge.execution_trace.emit(dict(frame))
+                _notify_mobile_execution_trace(frame)
 
         def on_tool_attempt_status(status: str, attempt_id: str) -> None:
             del attempt_id

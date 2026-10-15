@@ -1,8 +1,8 @@
-"""Bounded public execution-status projection for Mobile (WOR-254).
+"""Canonical public commentary and structured execution facts (WOR-254/340).
 
 This module never accepts raw reasoning, tool arguments/results, paths,
 provider payloads, or exception text. Producers select one deterministic
-display key from the allowlist below. Bounded public assistant progress and a
+display key from the allowlist below. Public assistant commentary and a
 provider-designated public summary use the same dedicated text sanitizer rather
 than the general event API.
 """
@@ -25,9 +25,6 @@ MAX_LIVE_FRAMES = 32
 MAX_SERIALIZED_BYTES = 12 * 1024
 MAX_RELAY_SNAPSHOT_EVENTS = 8
 MAX_RELAY_SNAPSHOT_BYTES = 4 * 1024
-MAX_PUBLIC_REASONING_SUMMARY_CHARS = 1_600
-MAX_PUBLIC_NARRATION_CHARS = 500
-MAX_PUBLIC_NARRATION_EVENTS = 8
 
 _SENSITIVE_PUBLIC_TEXT_PATTERNS = (
     re.compile(
@@ -168,7 +165,7 @@ def _safe_binding_label(
 
 
 def sanitize_public_reasoning_summary(value: object) -> str:
-    """Return one bounded provider-designated public summary, never raw CoT."""
+    """Sanitize a provider-designated public summary, never raw CoT."""
 
     if not isinstance(value, str):
         return ""
@@ -184,6 +181,8 @@ def sanitize_public_reasoning_summary(value: object) -> str:
         text,
         flags=re.IGNORECASE,
     ):
+        return ""
+    if re.search(r"<[|｜]|[|｜]DSML[|｜]", text, flags=re.IGNORECASE):
         return ""
     if any(pattern.search(text) for pattern in _SENSITIVE_PUBLIC_TEXT_PATTERNS):
         return ""
@@ -207,15 +206,13 @@ def sanitize_public_reasoning_summary(value: object) -> str:
             continue
         compacted.append(line)
     text = "\n".join(compacted)
-    return text[:MAX_PUBLIC_REASONING_SUMMARY_CHARS].rstrip()
+    return text
 
 
 def sanitize_public_model_narration(value: object) -> str:
-    """Bound optional public progress text before it enters a turn trace."""
+    """Sanitize optional public progress text before it enters a turn trace."""
 
     text = sanitize_public_reasoning_summary(value)
-    if len(text) > MAX_PUBLIC_NARRATION_CHARS:
-        return ""
     normalized = re.sub(r"[.!…]+$", "", text.strip()).casefold()
     if normalized in {
         "thinking", "planning", "analyzing", "analysing", "working",
@@ -325,7 +322,7 @@ class SafeExecutionTraceEvent:
 
 
 class ExecutionTraceLedger:
-    """One authoritative, bounded trace for one correlated user turn."""
+    """One canonical public trace with compact diagnostics for an exact turn."""
 
     def __init__(
         self,
@@ -422,6 +419,15 @@ class ExecutionTraceLedger:
 
             slot = str(dedupe_key or "")
             existing_index = self._by_slot.get(slot) if slot else None
+            if existing_index is not None and kind == "public_reasoning_summary":
+                prior_summary = self._events[existing_index].summary
+                if prior_summary and not summary.startswith(prior_summary):
+                    if prior_summary.startswith(summary):
+                        return self._events[existing_index]
+                    # A distinct public statement is an append, never a rewrite
+                    # of wording that was already shown to the user.
+                    slot += ":" + hashlib.sha256(summary.encode("utf-8")).hexdigest()
+                    existing_index = self._by_slot.get(slot)
             if existing_index is not None:
                 previous = self._events[existing_index]
                 if (
@@ -495,13 +501,15 @@ class ExecutionTraceLedger:
     def record_public_reasoning_summary(
         self,
         summary: str,
+        *,
+        source_id: str = "",
     ) -> SafeExecutionTraceEvent | None:
         """Record only an explicit provider public-summary aggregate."""
 
         return self.record(
             kind="public_reasoning_summary",
             display_key="execution.reasoning.summary",
-            dedupe_key="provider_public_reasoning_summary",
+            dedupe_key="provider_public_reasoning_summary:" + source_id,
             _public_reasoning_summary=summary,
         )
 
@@ -509,7 +517,7 @@ class ExecutionTraceLedger:
         self,
         narration: str,
     ) -> SafeExecutionTraceEvent | None:
-        """Append one bounded, deduplicated public model progress statement."""
+        """Append a deduplicated public model statement without shortening it."""
 
         summary = sanitize_public_model_narration(narration)
         if not summary:
@@ -524,11 +532,6 @@ class ExecutionTraceLedger:
                     and event.summary == summary
                 ):
                     return event
-            if sum(
-                event.kind == "public_reasoning_summary"
-                for event in self._events
-            ) >= MAX_PUBLIC_NARRATION_EVENTS:
-                return None
             return self.record(
                 kind="public_reasoning_summary",
                 display_key="execution.reasoning.summary",
@@ -539,17 +542,21 @@ class ExecutionTraceLedger:
     def _publish(self, event: SafeExecutionTraceEvent) -> None:
         if self._callback is None:
             return
-        # Reserve the final live slot for the terminal tombstone.
+        # Reserve the final activity slot for the terminal tombstone. Revisions
+        # of public model text must not freeze when an activity
+        # budget is exhausted. Relay applies its own coalescing/budget later.
         if event.terminal:
             if self._live_frames >= MAX_LIVE_FRAMES:
                 return
-        elif self._live_frames >= MAX_LIVE_FRAMES - 1:
+        elif (
+            event.kind != "public_reasoning_summary"
+            and self._live_frames >= MAX_LIVE_FRAMES - 1
+        ):
             return
         frame = {"type": "execution_trace", **event.public_dict()}
         frame["snapshot"] = self.snapshot()["events"]
-        if len(json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > MAX_SERIALIZED_BYTES:
-            return
-        self._live_frames += 1
+        if event.kind != "public_reasoning_summary":
+            self._live_frames += 1
         try:
             self._callback(frame)
         except Exception:
@@ -558,12 +565,14 @@ class ExecutionTraceLedger:
 
     def _compacted_events(self) -> list[SafeExecutionTraceEvent]:
         events = list(self._events)
+        commentary = [item for item in events if item.kind == "public_reasoning_summary"]
+        diagnostics = [item for item in events if item.kind != "public_reasoning_summary"]
         if len(events) > MAX_PERSISTED_EVENTS:
             selected = sorted(
-                events,
+                diagnostics,
                 key=lambda item: (_PRIORITY[item.kind], -item.sequence),
-            )[:MAX_PERSISTED_EVENTS]
-            events = sorted(selected, key=lambda item: item.sequence)
+            )[:max(1, MAX_PERSISTED_EVENTS - len(commentary))]
+            events = sorted(commentary + selected, key=lambda item: item.sequence)
         while events:
             payload = {
                 "schema_version": SCHEMA_VERSION,
@@ -582,8 +591,14 @@ class ExecutionTraceLedger:
             ).encode("utf-8")
             if len(encoded) <= MAX_SERIALIZED_BYTES:
                 return events
+            removable_indexes = [
+                index for index, item in enumerate(events)
+                if item.kind not in {"public_reasoning_summary", "terminal"}
+            ]
+            if not removable_indexes:
+                return events
             removable = max(
-                range(len(events)),
+                removable_indexes,
                 key=lambda index: (_PRIORITY[events[index].kind], -events[index].sequence),
             )
             events.pop(removable)
@@ -608,7 +623,7 @@ class ExecutionTraceLedger:
 
 
 def validate_persisted_trace(value: object) -> dict | None:
-    """Fail-closed validator used before exposing stored trace metadata."""
+    """Validate canonical metadata without applying transport retention limits."""
 
     if not isinstance(value, Mapping):
         return None
@@ -625,10 +640,7 @@ def validate_persisted_trace(value: object) -> dict | None:
     ):
         return None
     events = value.get("events")
-    if not isinstance(events, list) or len(events) > MAX_PERSISTED_EVENTS:
-        return None
-    encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    if len(encoded) > MAX_SERIALIZED_BYTES:
+    if not isinstance(events, list):
         return None
     extended_envelope = _TRACE_BINDING_FIELDS.issubset(value_keys)
     try:
@@ -771,3 +783,26 @@ def validate_persisted_trace(value: object) -> dict | None:
     if binding is not None:
         result.update(binding)
     return result
+
+
+def validate_execution_trace_frame(value: object) -> dict | None:
+    """Validate an existing public wire event and its correlated snapshot."""
+    if not isinstance(value, Mapping) or value.get("type") != "execution_trace":
+        return None
+    snapshot = validate_persisted_trace({
+        name: value.get(name)
+        for name in _LEGACY_SNAPSHOT_FIELDS | _TRACE_BINDING_FIELDS
+        if name != "events"
+    } | {"events": value.get("snapshot")})
+    if snapshot is None:
+        return None
+    event = next((
+        item for item in snapshot["events"]
+        if item["event_id"] == value.get("event_id")
+        and item["revision"] == value.get("revision")
+    ), None)
+    if event is None or set(value) != set(event) | {"type", "snapshot"}:
+        return None
+    if any(value.get(name) != item for name, item in event.items()):
+        return None
+    return {"type": "execution_trace", **event, "snapshot": snapshot["events"]}

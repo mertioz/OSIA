@@ -6204,7 +6204,6 @@ def _extract_public_progress_narration(text: object) -> str:
     cleaned = cleaned.replace(
         "Please continue with your response based on these results.", "",
     ).strip()
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
     from osia.execution_trace import sanitize_public_model_narration
 
     return sanitize_public_model_narration(cleaned)
@@ -6219,6 +6218,18 @@ def _public_progress_from_tool_response(
     if not tool_calls:
         return ""
     return _extract_public_progress_narration(text)
+
+
+def _live_public_progress_narration(text: str) -> str:
+    """Public prefix only; incomplete protocol/JSON must wait for parsing."""
+    visible = strip_reasoning_blocks(text)
+    visible = strip_raw_tool_tags(visible)
+    visible = strip_bare_tool_json(visible)
+    boundaries = [visible.find(char) for char in ("<", "{", "`")]
+    boundaries = [index for index in boundaries if index >= 0]
+    if boundaries:
+        visible = visible[:min(boundaries)]
+    return _extract_public_progress_narration(visible)
 
 
 def _extract_tool_calls(text: str, message=None, provider: str = None) -> list:
@@ -7305,10 +7316,15 @@ class OSIAAgent:
         ledger = self._execution_trace_ledger
         if ledger is None or not isinstance(payload, dict):
             return
-        if set(payload) != {
+        expected_fields = {
             "summary", "conversation_id", "request_id", "turn_id", "run_id",
             "provider_id", "model_id", "native_thread_id", "native_turn_id",
-        }:
+        }
+        if set(payload) not in (expected_fields, expected_fields | {"native_item_id"}):
+            return
+        if "native_item_id" in payload and not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,160}", str(payload["native_item_id"]),
+        ):
             return
         binding = ledger.binding_dict()
         if any(
@@ -7335,9 +7351,17 @@ class OSIAAgent:
                 generation=generation,
             ):
                 return
-        ledger.record_public_reasoning_summary(payload.get("summary"))
+        # A canonical Chat turn can contain several native provider turns.
+        # Only revisions of the SAME native summary may replace that entry.
+        source_id = json.dumps([
+            payload["native_thread_id"], payload["native_turn_id"],
+            *([payload["native_item_id"]] if "native_item_id" in payload else []),
+        ], separators=(",", ":"))
+        ledger.record_public_reasoning_summary(
+            payload.get("summary"), source_id=source_id,
+        )
 
-    def _emit_public_model_narration(self, narration: str) -> None:
+    def _emit_public_model_narration(self, narration: str, source_id: str = "") -> None:
         """Project public assistant text into this exact run's trace only."""
 
         ledger = self._execution_trace_ledger
@@ -7353,7 +7377,13 @@ class OSIAAgent:
                 generation=generation,
             ):
                 return
-        ledger.record_public_narration(narration)
+        if source_id:
+            from osia.execution_trace import sanitize_public_model_narration
+            ledger.record_public_reasoning_summary(
+                sanitize_public_model_narration(narration), source_id=source_id,
+            )
+        else:
+            ledger.record_public_narration(narration)
 
     def _emit_execution_trace(
         self,
@@ -10491,6 +10521,18 @@ class OSIAAgent:
         Responses are never token-limited: no ``max_tokens`` is sent, so
         each provider applies its own native limit.
         """
+        from osia.public_commentary import PublicCommentaryStream
+
+        commentary = PublicCommentaryStream(
+            provider=self.provider, model=self.model,
+            turn_id=str((getattr(self, "_tool_attempt_metadata", None) or {}).get("turn_id") or ""),
+            round_id=getattr(self, "_provider_commentary_source", "") or secrets.token_hex(16),
+            parse=lambda text, message: _extract_tool_calls(text, message, self.provider),
+            clean=lambda text: _extract_public_progress_narration(strip_reasoning_blocks(text)),
+            clean_live=_live_public_progress_narration,
+            emit=self._emit_public_model_narration,
+        )
+        self._streamed_provider_message = None
         create_kwargs = {
             "model": self.model,
             "messages": self._wire_messages(),
@@ -10535,12 +10577,16 @@ class OSIAAgent:
                     )
                     outcome_recorded = True
                 try:
-                    yield chunk.choices[0].delta.content or ""
+                    delta = chunk.choices[0].delta
                 except (IndexError, AttributeError):
                     yield ""
+                    continue
+                yield commentary.observe(delta)
             self._raise_if_execution_generation_cancelled()
             if finish_reason == "length":
                 raise ProviderOutputTruncatedError()
+            commentary.finish()
+            self._streamed_provider_message = commentary.message
             if not outcome_recorded:
                 from osia.reasoning import record_reasoning_outcome
                 record_reasoning_outcome(
@@ -13890,6 +13936,7 @@ class OSIAAgent:
 
         while True:
             round_number += 1
+            self._provider_commentary_source = "assistant:" + secrets.token_hex(16)
             self._mark_document_private_history()
             provisional_sentences.clear()
             visible_round_sentences.clear()
@@ -13909,16 +13956,23 @@ class OSIAAgent:
                     user_input,
                     owner_id=str(current_conversation_id or ""),
                 )
-                if on_sentence is not None:
+                if on_sentence is not None or (
+                    getattr(self, "_execution_trace_ledger", None) is not None
+                    and self.provider != "chatgpt_account"
+                ):
                     # on_first_token only fires the first time a delta arrives
                     # in this round. The server-side flag dedupes across rounds.
-                    # Streaming aggregates text only — no native message object.
+                    # Preserve native deltas as a message for the same parser
+                    # used by non-streamed responses. Commentary has its own
+                    # sink even while canonical final sentences are buffered.
                     message = None
+                    self._streamed_provider_message = None
                     _stream_emitted["v"] = False  # reset per attempt
                     content = self._stream_with_sentences(
-                        _on_sentence_cb,
+                        _on_sentence_cb if on_sentence is not None else lambda _text: None,
                         on_first_token=on_first_token,
                     )
+                    message = self._streamed_provider_message
                 else:
                     create_kwargs = {
                         "model": self.model,
@@ -13942,7 +13996,8 @@ class OSIAAgent:
                     if getattr(choice, "finish_reason", None) == "length":
                         raise ProviderOutputTruncatedError()
                     message = choice.message
-                    content = message.content or ""
+                    from osia.public_commentary import public_assistant_text
+                    content = public_assistant_text(message.content)
                 event_summary = self._consume_provider_capability_events()
                 consume_native_handoff = getattr(
                     self.client, "consume_native_tool_handoff", None,
