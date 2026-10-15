@@ -471,7 +471,9 @@ def test_agent_model_feedback_includes_typed_browser_data_only_inside_turn():
     ambiguous_projection = json.loads(
         agent_module._model_result_text(ambiguous, "paginate_browser")
     )
-    assert ambiguous_projection["must_not_replay"] is True
+    # WOR-305: uncertainty is factual feedback, never a veto on a distinct
+    # fresh selected-model request.
+    assert "must_not_replay" not in ambiguous_projection
     assert "safe_retry" not in ambiguous_projection
 
     stale = action_result(

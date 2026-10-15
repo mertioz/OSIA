@@ -69,6 +69,11 @@ class _SequenceCompletions:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
+        if kwargs.get("stream"):
+            return iter([SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content=outcome, tool_calls=None),
+                finish_reason="stop",
+            )])])
         message = SimpleNamespace(content=outcome, tool_calls=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
@@ -115,6 +120,7 @@ def _native_error(tool, arguments, *, call_id="call-wor200"):
     ("tool", "arguments"),
     (
         ("write_file", {"path": r"C:\synthetic\fixture.txt", "content": "safe"}),
+        ("open_application", {"name": "FixtureApp"}),
         ("navigate_browser", {"url": "http://127.0.0.1:8765/"}),
         ("read_document", {"path": r"C:\synthetic\fixture.pdf"}),
     ),
@@ -147,6 +153,12 @@ def test_advertised_native_surface_uses_authoritative_exact_schemas_only():
     assert [tool["name"] for tool in tools] == [
         "declare_outcomes",
         "read_file",
+        "run_command",
+        "open_application",
+        "open_uri",
+        "is_installed",
+        "is_running",
+        "has_window",
         "write_file",
         "navigate",
         "open_browser",
@@ -306,7 +318,7 @@ def test_mapped_action_dispatches_once_without_a_permission_permit(
     assert len(client.completions.calls) == 2
 
 
-def test_unsupported_native_intent_reformulates_once_then_warns_once():
+def test_unsupported_native_intent_remains_same_model_feedback():
     refusal = (
         "OSIA could not translate this native action safely. No action was "
         "performed, and no exact OSIA tool is available."
@@ -319,7 +331,7 @@ def test_unsupported_native_intent_reformulates_once_then_warns_once():
         allow_fallback=False,
         category="native_item:commandExecution",
     ))
-    agent, client = _agent_with_account_outcomes([unsupported, unsupported])
+    agent, client = _agent_with_account_outcomes([unsupported, unsupported, refusal])
     finals = []
 
     result = agent.run(
@@ -330,27 +342,27 @@ def test_unsupported_native_intent_reformulates_once_then_warns_once():
     )
 
     assert result == refusal
-    assert finals == [refusal]
-    assert len(client.completions.calls) == 2
+    assert " ".join(finals) == refusal
+    assert len(client.completions.calls) == 3
     correction_frames = [
         message for message in agent.messages
         if message.get("_internal")
-        and "single allowed reformulation attempt" in str(message.get("content"))
+        and "This rejected proposal was not executed" in str(message.get("content"))
     ]
-    assert len(correction_frames) == 1
+    assert len(correction_frames) == 2
     assert sum(
         message.get("role") == "assistant" and message.get("content") == refusal
         for message in agent.messages
     ) == 1
 
 
-def test_mapped_outcome_unknown_stops_before_provider_continuation():
+def test_mapped_outcome_unknown_continues_without_replaying_action():
     calls = []
     tool_xml = (
         '<tool_call>{"tool":"navigate_browser",'
         '"url":"http://127.0.0.1:8765/"}</tool_call>'
     )
-    agent, client = _agent_with_account_outcomes([tool_xml, "must not run"])
+    agent, client = _agent_with_account_outcomes([tool_xml, "The navigation outcome remains uncertain."])
 
     def unknown_browser(**kwargs):
         calls.append(kwargs)
@@ -374,7 +386,7 @@ def test_mapped_outcome_unknown_stops_before_provider_continuation():
         )
 
     assert calls == [{"url": "http://127.0.0.1:8765/"}]
-    assert len(client.completions.calls) == 1
+    assert len(client.completions.calls) == 2
     assert "uncertain" in result.lower()
 
 

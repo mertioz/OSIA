@@ -240,7 +240,7 @@ def test_invalid_high_risk_call_is_rejected_before_confirmation(monkeypatch):
         "The invalid call was rejected.",
     ], rounds)
     final = agent.run("Run a fixture.", history=[], on_sentence=lambda _x: None)
-    assert "single repair attempt" in final
+    assert final == "The invalid call was rejected."
     assert dispatches == []
     assert confirmations == []
 
@@ -353,7 +353,7 @@ def test_provider_fallback_is_blocked_after_side_effect_dispatch(
     assert agent.last_run_diagnostic["reason_code"] == "provider_timeout"
 
 
-def test_unknown_tool_outcome_stops_before_a_second_provider_round(monkeypatch):
+def test_unknown_tool_outcome_continues_without_replay(monkeypatch):
     calls = []
     completed = threading.Event()
 
@@ -378,10 +378,11 @@ def test_unknown_tool_outcome_stops_before_a_second_provider_round(monkeypatch):
     rounds = []
     _install_stream(agent, [
         '<tool_call>{"tool":"write_file","path":"opaque","content":"private"}</tool_call>',
+        'Le résultat reste incertain.',
     ], rounds)
     visible = []
     final = agent.run("Écris le fichier isolé.", history=[], on_sentence=visible.append)
-    assert len(rounds) == 1
+    assert len(rounds) == 2
     assert len(calls) == 1
     assert completed.wait(1.0)
     assert len(calls) == 1
@@ -404,8 +405,9 @@ def test_ambiguous_effect_error_keeps_non_timeout_diagnostic(monkeypatch):
     rounds = []
     _install_stream(agent, [
         '<tool_call>{"tool":"write_file","path":"opaque","content":"private"}</tool_call>',
+        'The outcome remains uncertain.',
     ], rounds)
     final = agent.run("Write the isolated fixture.", history=[], on_sentence=lambda _x: None)
-    assert len(rounds) == 1
+    assert len(rounds) == 2
     assert "uncertain" in final.lower()
     assert agent.last_run_diagnostic["reason_code"] == "task_execution_failure"

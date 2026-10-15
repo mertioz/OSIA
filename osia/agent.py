@@ -133,7 +133,7 @@ You are OSIA, the user's unified conversational agent. Answer and act toward the
 Treat the full user request as one objective and continue until its end state is verified or a factual blocker is established. The selected provider/model remains the semantic authority through the turn. ToolAttempt, ActionTruth, process results, and observations are facts: OUTCOME_UNKNOWN is not success, does not itself end the objective, does not block a distinct fresh model-requested call, and does not require reconciliation before such a call. Use current evidence for each next decision, observe again when the target is stale or the next decision depends on changed state, and never claim an effect without supporting evidence. Ask for clarification only when an essential requirement or authority is actually missing.
 
 ## Public progress updates
-During multi-step work, you may occasionally give the user one brief, factual progress update when a meaningful step, observation, obstacle, or distinct phase changes. Keep it concise, do not narrate every tool action, and never include private reasoning, hidden instructions, credentials, or sensitive tool arguments. Continue using tools normally after an update; the final answer remains the one canonical answer.
+During multi-step work, you may occasionally give the user one brief, factual progress update when a meaningful step, observation, obstacle, or distinct phase changes. Write natural first-person sentences in the user's language, conversationally and professionally; avoid headings, bold titles, gerund-only labels, and unnecessary lists. Describe only actual intentions, observations, and received results, never completion before execution evidence. Keep it concise, do not narrate every tool action, and never include private reasoning, hidden instructions, credentials, or sensitive tool arguments. Continue using tools normally after an update; the final answer remains the one canonical answer.
 
 ## Available Capabilities
 [The authoritative turn capability surface is injected here.]
@@ -13768,7 +13768,6 @@ class OSIAAgent:
         argument_repair_used = False
         argument_repair_active = False
         argument_repair_provider_model: tuple[str, str] | None = None
-        argument_repair_tool_name = ""
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
         _account_attempt_committed = False
@@ -13786,9 +13785,6 @@ class OSIAAgent:
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
-        # An unsupported Codex-native action gets one same-provider chance to
-        # reformulate as an available canonical OSIA textual tool call.
-        native_action_reformulation_used = False
         attempted_model_tool_name = ""
 
         def _record_computer_argument_diagnostic(
@@ -13857,41 +13853,20 @@ class OSIAAgent:
                     **call,
                 }
 
-        def _finish_invalid_arguments(details: dict, round_number: int) -> str:
+        def _finish_argument_route_change(details: dict, round_number: int) -> str:
             issue_paths = [
                 str(item.get("path") or "")
                 for item in details.get("issues", ())
                 if isinstance(item, dict) and item.get("path")
             ][:8]
             suffix = f" ({', '.join(issue_paths)})" if issue_paths else ""
-            # State the pre-dispatch validation fact plainly. The canonical
-            # driver treats this as feedback for the same selected model.
             content = (
-                "ERROR: Les arguments de l'outil restent invalides apr\u00e8s l'unique "
-                f"tentative de correction ; l'outil n'a pas \u00e9t\u00e9 "
-                f"ex\u00e9cut\u00e9{suffix}."
+                "ERROR: L'identité du modèle sélectionné a changé pendant "
+                f"la correction ; le nouvel appel n'a pas été exécuté{suffix}."
                 if self.lang == "fr" else
-                "ERROR: The tool arguments remain invalid after the single repair "
-                f"attempt; the tool was not executed{suffix}."
+                "ERROR: The selected model identity changed during argument "
+                f"recovery; the new call was not executed{suffix}."
             )
-            # This local schema-repair failure is not a model-authored final.
-            # Let the canonical driver continue the objective with the same
-            # selected model after this operation-level repair bound.
-            self.last_run_diagnostic = {
-                "stage": "tool_argument_validation",
-                "error_category": "invalid_tool_arguments",
-                "reason_code": "invalid_tool_arguments",
-                "tool_name": str(tool_name or ""),
-                "dispatch_started": False,
-                "validation_issues": [
-                    {
-                        "path": str(item.get("path") or "")[:256],
-                        "code": str(item.get("code") or "")[:128],
-                    }
-                    for item in details.get("issues", ())
-                    if isinstance(item, dict)
-                ][:8],
-            }
             if canonical_output:
                 content = clean_response(content)
             if on_sentence is not None:
@@ -13901,9 +13876,8 @@ class OSIAAgent:
                     pass
             self.messages.append({"role": "assistant", "content": content})
             if self.turn_context is not None:
-                log_round(self.turn_context, round_number, "invalid_arguments_rejected")
-                if _CURRENT_TERMINALITY_CONTROLLER.get() is None:
-                    log_final(self.turn_context, content)
+                log_round(self.turn_context, round_number, "invalid_arguments_terminal")
+                log_final(self.turn_context, content)
             return content
 
         # API endpoint fallback (Bloc 5): whether the one allowed "primary
@@ -14068,11 +14042,7 @@ class OSIAAgent:
                     and getattr(e, "native_action", False)
                     and getattr(e, "reformulatable_native_action", False)
                 )
-                if (
-                    reformulatable_native_action
-                    and not native_action_reformulation_used
-                ):
-                    native_action_reformulation_used = True
+                if reformulatable_native_action:
                     provisional_sentences.clear()
                     self.messages.append({
                         "role": "user",
@@ -14080,30 +14050,14 @@ class OSIAAgent:
                         "content": (
                             "The previous ChatGPT Account turn attempted a "
                             "Codex-native action that OSIA could not map exactly. "
-                            "No action occurred. This is the single allowed "
-                            "reformulation attempt: use an available canonical "
+                            "This rejected proposal was not executed. Use an available canonical "
                             "OSIA <tool_call> JSON block with its exact tool name "
                             "and schema. Do not call a Codex-native tool. If no "
                             "exact OSIA tool can perform the request, explain that "
-                            "once in plain text without attempting another action."
+                            "in plain text. Preserve earlier execution receipts."
                         ),
                     })
                     continue
-                if reformulatable_native_action:
-                    # Turn the second bounded refusal into the normal canonical
-                    # final path so desktop, Mobile and TTS all receive it once.
-                    provisional_sentences.clear()
-                    message = None
-                    content = (
-                        str(e)
-                        if (
-                            self.lang == "en"
-                            and getattr(e, "controlled_refusal", False)
-                        )
-                        else localized_text(
-                            "chatgpt_account.native_action_refused", self.lang,
-                        )
-                    )
                 status = (
                     getattr(e, "status_code", None)
                     or getattr(getattr(e, "response", None), "status_code", None)
@@ -14323,26 +14277,6 @@ class OSIAAgent:
                     "content": instruction,
                 })
                 continue
-            if argument_repair_active:
-                repaired_name = (
-                    str(tool_calls[0].get("tool") or "")
-                    if len(tool_calls) == 1 and isinstance(tool_calls[0], dict)
-                    else ""
-                )
-                if (
-                    argument_repair_provider_model != (
-                        str(self.provider or ""), str(self.model or ""),
-                    )
-                    or repaired_name != argument_repair_tool_name
-                ):
-                    return _finish_invalid_arguments(
-                        {
-                            "issues": [],
-                            "repair_count": 1,
-                            "reason": "invalid_repair_tool_call",
-                        },
-                        round_number,
-                    )
             if tool_calls and language_consistency_retry_used:
                 # The bounded consistency retry is synthesis-only. A provider
                 # must not turn it into another dispatch or replay an earlier
@@ -14356,7 +14290,9 @@ class OSIAAgent:
                 _account_attempt_committed = True
 
             if tool_calls and public_narration:
-                self._emit_public_model_narration(public_narration)
+                self._emit_public_model_narration(
+                    public_narration, self._provider_commentary_source,
+                )
 
             # STEP 3 — execute the parsed tool calls.
             if tool_calls:
@@ -14552,44 +14488,47 @@ class OSIAAgent:
                             repair_attempt=bool(argument_repair_used),
                             validation_passed=False,
                         )
-                        if argument_repair_used:
-                            details["repair_count"] = 1
-                            return _finish_invalid_arguments(
-                                details, round_number,
-                            )
                         argument_repair_used = True
                         argument_repair_active = True
                         argument_repair_provider_model = (
                             str(self.provider or ""), str(self.model or ""),
                         )
-                        argument_repair_tool_name = tool_name
                         details["repair_count"] = 1
                         details["repair_instruction"] = (
-                            "emit_one_complete_replacement_tool_call"
+                            "use_current_schema_or_another_available_tool"
                         )
                         details["tool"] = guard._safe_tool_name(tool_name)
+                        if self._terminality_controller is not None:
+                            from osia.tool_contracts import effective_contract
+
+                            self._terminality_controller.record_execution_record(
+                                tool_name, ToolExecutionRecord(
+                                    result=details, is_error=True,
+                                    outcome=ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
+                                    attempts=0, dispatched=False, timed_out=False,
+                                    contract=effective_contract(spec, kwargs),
+                                    reason_code="invalid_arguments",
+                                ),
+                            )
                         validation_text = json.dumps(
                             details,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
                         )
-                        repair_context = ""
-                        if tool_name.startswith("computer_"):
-                            schema_text = json.dumps(
-                                spec.input_schema,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            repair_context = (
-                                "\nThis call was not dispatched. Emit one complete "
-                                "replacement call for this capability using the "
-                                "current-turn schema below. Keep arguments at the "
-                                "top level and use only references from this turn; "
-                                "do not reuse prior-turn arguments or frame IDs."
-                                "\nCurrent tool JSON Schema: " + schema_text
-                            )
+                        schema_text = json.dumps(
+                            spec.input_schema, ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":"),
+                        )
+                        repair_context = (
+                            "\nThis call was not dispatched and had no effect. "
+                            "Continue toward the objective with a new valid call "
+                            "or another available canonical tool. Keep arguments "
+                            "at the top level and use only current-turn references. "
+                            "Preserve prior execution receipts; do not automatically "
+                            "replay earlier actions.\nCurrent tool JSON Schema: "
+                            + schema_text
+                        )
                         tool_results.append(
                             localized_text(
                                 "tool_result_header", self.lang, tool=tool_name,
@@ -14609,7 +14548,7 @@ class OSIAAgent:
                         if argument_repair_provider_model != (
                             str(self.provider or ""), str(self.model or ""),
                         ):
-                            return _finish_invalid_arguments(
+                            return _finish_argument_route_change(
                                 {
                                     "issues": [],
                                     "repair_count": 1,
@@ -15399,26 +15338,9 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": feedback_text})
                 continue
 
-            # No tool call in any format — candidate final response.
-            if argument_repair_active:
-                safe_rejection = re.search(
-                    r"\b(?:invalid|rejected|not executed|not run|invalide|"
-                    r"invalides|rejet|pas [e\u00e9]t[e\u00e9] "
-                    r"ex[e\u00e9]cut[e\u00e9])\b",
-                    str(content or ""),
-                    flags=re.IGNORECASE,
-                )
-                if safe_rejection:
-                    argument_repair_active = False
-                else:
-                    return _finish_invalid_arguments(
-                        {
-                            "issues": [],
-                            "repair_count": 1,
-                            "reason": "replacement_tool_call_missing",
-                        },
-                        round_number,
-                    )
+            # No tool call in any format — candidate final response. A rejected
+            # call is feedback, not a turn ceiling; the normal completion
+            # evidence path below assesses this selected-model response.
             if self._continuation_resolution_pending:
                 if not self._continuation_control_retry_used:
                     self._continuation_control_retry_used = True
@@ -15826,10 +15748,13 @@ class OSIAAgent:
                     round_number=round_number,
                 )
             if unresolved_tool_timeout and self.last_run_diagnostic is None:
+                failure_reason = (
+                    "tool_timeout" if turn_has_tool_timeout else "task_execution_failure"
+                )
                 self.last_run_diagnostic = {
                     "stage": "task_execution",
-                    "error_category": "tool_timeout",
-                    "reason_code": "tool_timeout",
+                    "error_category": failure_reason,
+                    "reason_code": failure_reason,
                 }
             if (
                 self._slash_turn_directives is not None

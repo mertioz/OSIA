@@ -122,7 +122,7 @@ class RealValidationRequirement(str, Enum):
 
 ALL_TEXT_PROVIDERS = (
     "anthropic", "chatgpt_account", "deepseek", "google", "groq",
-    "ollama", "openai", "xai",
+    "mistral", "ollama", "openai", "xai",
 )
 
 
@@ -1786,6 +1786,15 @@ def _validation_issue(error: ValidationError) -> list[ToolValidationIssue]:
         for item in path_parts
     )
     validator = str(error.validator or "invalid")[:48]
+    if validator in {"anyOf", "oneOf"} and error.context:
+        # Report constraints for branches matching the value's JSON type.
+        # Nullable numeric failures otherwise say only "anyOf", hiding the
+        # actual bound. Never copy error.message or the rejected instance.
+        matching = [item for item in error.context if item.validator != "type"]
+        if matching:
+            return [
+                issue for item in matching[:8] for issue in _validation_issue(item)
+            ][:16]
     if validator == "required" and isinstance(error.validator_value, list):
         instance_keys = set(error.instance) if isinstance(error.instance, dict) else set()
         properties = (
@@ -1838,8 +1847,11 @@ def _validation_issue(error: ValidationError) -> list[ToolValidationIssue]:
                 allowed.append(item)
         expected = {"allowed": allowed}
     elif validator in {
-        "minLength", "maxLength", "minimum", "maximum", "minItems",
-        "maxItems", "format", "pattern", "oneOf", "anyOf",
+        "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems",
+    } and isinstance(error.validator_value, (int, float)):
+        expected = {validator: error.validator_value}
+    elif validator in {
+        "format", "pattern", "oneOf", "anyOf",
         "additionalProperties",
     }:
         expected = validator
@@ -2677,11 +2689,13 @@ def static_tool_prompt_block(lang: str = "en") -> str:
     """Render compact canonical signatures from the authoritative registry."""
 
     del lang
+    specs = effective_static_tool_specs()
+    schemas, definitions = _prompt_schema_bundle(specs)
     lines = [
         "## Available OSIA capabilities",
         "Only these turn capabilities exist. Arguments are top-level; unknown fields are rejected.",
     ]
-    for spec in effective_static_tool_specs():
+    for spec in specs:
         schema = spec.input_schema
         props = schema.get("properties") if isinstance(schema, dict) else {}
         props = props if isinstance(props, dict) else {}
@@ -2736,8 +2750,64 @@ def static_tool_prompt_block(lang: str = "en") -> str:
         # catalogue must not advertise one to the model.
         lines.append(
             f"- {spec.name}({signature}): {capability}; " + "; ".join(contract)
+            + "; input_schema=" + json.dumps(
+                schemas[spec.name], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+        )
+    if definitions:
+        lines.append(
+            "Shared input schema definitions: resolve every #/$defs/ reference "
+            "against this block. " + json.dumps(
+                {"$defs": definitions}, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
         )
     return "\n".join(lines)
+
+
+def _prompt_schema_bundle(specs: Iterable[ToolSpec]) -> tuple[dict, dict]:
+    """Losslessly factor repeated schemas without hiding any tool/constraint."""
+    specs = tuple(specs)
+    counts: dict[str, int] = {}
+    values: dict[str, dict] = {}
+    def key(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    def collect(value):
+        if isinstance(value, dict):
+            encoded = key(value)
+            # Only schema nodes, not property-name maps, may become $refs.
+            is_schema = (
+                isinstance(value.get("type"), str)
+                or isinstance(value.get("anyOf"), list)
+                or isinstance(value.get("oneOf"), list)
+            )
+            if is_schema and len(encoded) > 35:
+                counts[encoded] = counts.get(encoded, 0) + 1
+                values[encoded] = value
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+    for spec in specs:
+        collect(spec.input_schema)
+    names = {encoded: f"s{index}" for index, encoded in enumerate(
+        sorted(encoded for encoded, count in counts.items()
+               if len(encoded) * (count - 1) > 28 * count + 16)
+    )}
+    def project(value, *, definition_root=False):
+        if isinstance(value, dict):
+            encoded = key(value)
+            if not definition_root and encoded in names:
+                return {"$ref": "#/$defs/" + names[encoded]}
+            return {k: project(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [project(item) for item in value]
+        return value
+    return (
+        {spec.name: project(spec.input_schema) for spec in specs},
+        {name: project(values[encoded], definition_root=True) for encoded, name in names.items()},
+    )
 
 
 def _prompt_schema_type(schema: Any) -> str:

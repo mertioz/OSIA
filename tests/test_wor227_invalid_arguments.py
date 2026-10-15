@@ -89,7 +89,7 @@ def test_one_repair_dispatches_once_with_exact_provider_and_model(monkeypatch):
     assert final != WAITING_TOOL_RESULT
 
 
-def test_second_invalid_call_stops_without_dispatch_or_waiting(monkeypatch):
+def test_second_invalid_call_allows_new_valid_call(monkeypatch):
     dispatches = []
     monkeypatch.setitem(
         agent_module.TOOL_MAP,
@@ -102,11 +102,14 @@ def test_second_invalid_call_stops_without_dispatch_or_waiting(monkeypatch):
     _install_rounds(agent, [
         '<tool_call>{"tool":"get_system_info","extra":"FIRST_SECRET"}</tool_call>',
         '<tool_call>{"tool":"get_system_info","extra":"SECOND_SECRET"}</tool_call>',
+        '<tool_call>{"tool":"get_system_info"}</tool_call>',
+        'The valid read completed.',
+        'The valid read completed.',
     ], observations)
     final = agent.run("Read synthetic system info.", history=[], on_sentence=lambda _x: None)
-    assert dispatches == []
-    assert len(observations) == 2
-    assert "single repair attempt" in final
+    assert dispatches == ["called"]
+    assert len(observations) == 5
+    assert final == "The valid read completed."
     assert final != WAITING_TOOL_RESULT
     exported = json.dumps(agent.exported_history(), ensure_ascii=False)
     repair_feedback = observations[1]["messages"].rsplit("<tool_result>", 1)[-1]
@@ -126,11 +129,12 @@ def test_missing_replacement_tool_call_returns_precise_zero_dispatch(monkeypatch
     agent.provider = "repair-provider"
     _install_rounds(agent, [
         '<tool_call>{"tool":"get_system_info","extra":"SECRET"}</tool_call>',
-        "I will try something else.",
+        "The invalid call was not executed.",
+        "The invalid call was not executed.",
     ])
     final = agent.run("Read synthetic system info.", history=[], on_sentence=lambda _x: None)
     assert dispatches == []
-    assert "single repair attempt" in final
+    assert final == "The invalid call was not executed."
     assert final != WAITING_TOOL_RESULT
 
 
@@ -207,7 +211,7 @@ def test_wait_spec_repair_dispatches_once_with_exact_route(monkeypatch):
     assert '\\"expected\\":\\"object\\"' in repair_feedback
 
 
-def test_second_invalid_wait_spec_repair_stops_with_zero_dispatch(monkeypatch):
+def test_second_invalid_wait_spec_remains_recoverable_with_zero_dispatch(monkeypatch):
     dispatches = []
     private_value = "PRIVATE_REJECTED_WAIT_VALUE"
     monkeypatch.setitem(
@@ -227,6 +231,8 @@ def test_second_invalid_wait_spec_repair_stops_with_zero_dispatch(monkeypatch):
         f'"state_ref":{state_json},"element_ref":"{_ELEMENT_REF}",'
         '"wait_spec":{"condition_type":"text_appearance",'
         f'"expected":"{private_value}"}}</tool_call>',
+        'The invalid call was not executed.',
+        'The invalid call was not executed.',
     ], observations)
 
     final = agent.run(
@@ -236,6 +242,6 @@ def test_second_invalid_wait_spec_repair_stops_with_zero_dispatch(monkeypatch):
     )
 
     assert dispatches == []
-    assert "single repair attempt" in final
+    assert final == "The invalid call was not executed."
     assert private_value not in final
     assert private_value not in json.dumps(agent.exported_history())

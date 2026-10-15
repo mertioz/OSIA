@@ -139,6 +139,11 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
     "declare_outcomes",
     "read_file",
     "run_command",
+    "open_application",
+    "open_uri",
+    "is_installed",
+    "is_running",
+    "has_window",
     "write_file",
     "navigate",
     "open_browser",
@@ -2593,13 +2598,20 @@ class AppServerClient:
             ):
                 raise LookupError("canonical_read_only_dispatcher_unavailable")
             clean_arguments = validate_tool_arguments(spec, arguments)
-        except ToolValidationError:
+        except ToolValidationError as exc:
+            from osia.tool_contracts import validation_error_details
+
             self._close_dynamic_failure(
                 attempt,
                 request_id=request_id,
                 call=call,
                 reason_code="INVALID_TOOL_ARGUMENTS",
-                result={"available": True, "executed": False},
+                result={
+                    "available": True, "executed": False,
+                    "validation": validation_error_details(exc),
+                    "input_schema": spec.input_schema,
+                    "retryable_in_same_model_turn": True,
+                },
                 arguments=arguments,
             )
             return
