@@ -26,11 +26,11 @@ from osia.tool_contracts import (
 def test_prompt_stops_after_conclusive_current_evidence_without_weakening_truth():
     prompt = SYSTEM_PROMPT_CORE
 
-    assert "continue until its end state is verified or a factual blocker is established" in prompt
+    assert "Give the final answer when the full objective is established by evidence" in prompt
     assert "The selected provider/model remains the semantic authority through the turn." in prompt
     assert "OUTCOME_UNKNOWN is not success" in prompt
     assert "does not block a distinct fresh model-requested call" in prompt
-    assert "Use current evidence for each next decision" in prompt
+    assert "Reuse fresh, authoritative receipts and observations" in prompt
     assert "Never claim an action or postcondition without supporting evidence." in prompt
     assert "Respect cancellation, target identity, and stale-state rejection." in prompt
     assert "resolve conflicts by observing further or stating uncertainty" in prompt
@@ -366,7 +366,10 @@ def test_invalid_second_computer_call_stays_non_dispatched_and_truthful(
         str(item.get("content") or "")
         for item in completions.calls[2]["messages"]
     )
-    assert "rejected by argument validation before dispatch" in third_round
+    # WOR-341 keeps each rejection inside the selected model's tool loop,
+    # rather than ending a segment after the second proposal.
+    assert "This call was not dispatched and had no effect." in third_round
+    assert '"dispatch_state":"not_dispatched"' in third_round
     assert "Current tool JSON Schema:" in third_round
     assert "$.status" in third_round
     result = agent.terminality_result("turn-invalid-repair") or {}
