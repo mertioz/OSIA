@@ -155,3 +155,19 @@ HARNESS: the false-disconnect case failed before the fix; **55 passed** after,
 covering all WOR-343 cases, Mobile parity, Thinking V5 disclosure/UI, WOR-342
 crash regressions and connect/disconnect/restart selection preservation.
 Compile/import/diff/credential checks passed.
+
+## Correction 5 — complete Claude model discovery
+
+The previous discovery code fetched only the first page of Claude's official
+Models API (default 20 entries). It now follows `has_more` / `last_id` using
+`after_id`, preserving exact model IDs, the same supplied key and workspace.
+The existing request site and discovery callers/signatures are retained. Other
+providers keep their original single-request behavior. A failed later page or
+missing/repeated cursor returns discovery failure, rather than presenting a
+partial list as complete. Cursor validation protects this one operation; it
+does not impose any Chat/tool iteration limit.
+
+Source contract: [Claude List Models](https://platform.claude.com/docs/en/api/models/list).
+HARNESS: all five pagination cases failed before correction; **74 passed**
+afterwards across Claude discovery/authentication, reasoning, Mobile parity and
+DeepSeek/non-DeepSeek invariants. Compile/import/diff/credential checks passed.

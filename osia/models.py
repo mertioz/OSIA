@@ -307,15 +307,36 @@ def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> li
     else:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    try:
-        r = requests.get(cfg["models_endpoint"], headers=headers, timeout=timeout)
-        if r.status_code != 200:
+    items = []
+    cursor = None
+    seen_cursors = set()
+    while True:
+        request_options = {"headers": headers, "timeout": timeout}
+        if provider == "anthropic":
+            request_options["params"] = {"limit": 1000}
+            if cursor:
+                request_options["params"]["after_id"] = cursor
+        try:
+            r = requests.get(cfg["models_endpoint"], **request_options)
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if not isinstance(data, dict):
+                return []
+            page = data.get("data") or data.get("models") or []
+            if not isinstance(page, list):
+                return []
+        except Exception:
             return []
-        data = r.json()
-    except Exception:
-        return []
-
-    items = data.get("data") or data.get("models") or []
+        items.extend(page)
+        if provider != "anthropic" or data.get("has_more") is not True:
+            break
+        cursor = data.get("last_id")
+        # Bound one corrupt discovery operation by its actual cursor identity,
+        # without a page-count ceiling or any restriction on Chat/tool rounds.
+        if not page or not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            return []
+        seen_cursors.add(cursor)
     out = []
     for item in items:
         if not isinstance(item, dict):
