@@ -1205,6 +1205,8 @@ class AppServerClient:
         if process is None or process.stdout is None:
             return
         for line in process.stdout:
+            if self._process is not process:
+                return
             if self._image_log_redaction_pending:
                 self._schedule_operational_log_redaction()
             try:
@@ -1237,6 +1239,8 @@ class AppServerClient:
         if process is None or process.stderr is None:
             return
         for line in process.stderr:
+            if self._process is not process:
+                return
             lower = line.lower()
             if "warning" in lower:
                 category = "warning"
@@ -1257,7 +1261,7 @@ class AppServerClient:
         with self._state_lock:
             intentional = id(process) in self._intentional_processes
             self._intentional_processes.discard(id(process))
-        if not intentional:
+        if not intentional and self._process is process:
             with self._state_lock:
                 self._crash_times.append(time.monotonic())
             if self._process is process:
@@ -1278,6 +1282,19 @@ class AppServerClient:
                 pass
         for attempt in attempts:
             attempt.events.put(("error", error))
+        # Login is also an in-flight RPC lifecycle. Wake its owner now instead
+        # of leaving the UI connecting until its unrelated login deadline.
+        with self._login_lock:
+            waiters = list(self._login_events.values())
+            self._login_events.clear()
+            self._active_login = None
+            for event, state in waiters:
+                state.update({
+                    "success": False,
+                    "cancelled": category == "shutdown",
+                    "failure_category": category,
+                })
+                event.set()
 
     @staticmethod
     def _thread_id(params: dict) -> str | None:
@@ -4071,9 +4088,15 @@ class AppServerClient:
             raise AppServerError("ERROR: ChatGPT login timed out.", category="login_timeout")
         success = bool(waiter[1].get("success"))
         cancelled = bool(waiter[1].get("cancelled"))
+        failure_category = waiter[1].get("failure_category")
         self._clear_login_state(login_id)
         if cancelled:
             raise AppServerError("ERROR: ChatGPT login was cancelled.", category="login_cancelled")
+        if failure_category:
+            raise AppServerError(
+                "ERROR: the Codex App Server stopped during ChatGPT login.",
+                category=str(failure_category),
+            )
         if not success:
             raise AppServerError("ERROR: ChatGPT login was not completed.", category="login_failed")
         return self.get_account_status()
@@ -4120,6 +4143,9 @@ class AppServerClient:
             waiter[0].set()
 
     def logout(self) -> None:
+        # Stop a pending OAuth flow before logging out, so it cannot complete
+        # afterwards and reconnect the account the operator just disconnected.
+        self.reset_login()
         self._request("account/logout", {})
         with self._state_lock:
             self._rate_limits_cache = None
