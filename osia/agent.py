@@ -10170,6 +10170,8 @@ class OSIAAgent:
             api_key=api_key,
             default_headers=default_headers,
         )
+        from osia.claude_messages import provider_client
+        self.client = provider_client(self.client, provider)
         self.model = model_id
         self.provider = provider
         # Refresh the system message so the model/provider line at the
@@ -10192,6 +10194,8 @@ class OSIAAgent:
             api_key=self._api_key,
             default_headers=self._default_headers,
         )
+        from osia.claude_messages import provider_client
+        self.client = provider_client(self.client, self.provider)
         self._active_base_url = fallback
         return True
 
@@ -10236,6 +10240,8 @@ class OSIAAgent:
             api_key=new_key,
             default_headers=self._default_headers,
         )
+        from osia.claude_messages import provider_client
+        self.client = provider_client(self.client, self.provider)
         return self._api_key_index + 1
 
     # ── Task-hierarchy routing (Bloc 3) ───────────────────────────────────
@@ -10583,12 +10589,18 @@ class OSIAAgent:
                 except (IndexError, AttributeError):
                     yield ""
                     continue
+                if self.provider == "anthropic" and getattr(delta, "public_thinking", ""):
+                    ledger = getattr(self, "_execution_trace_ledger", None)
+                    if ledger is not None:
+                        ledger.record_public_reasoning_summary(
+                            delta.public_thinking, source_id=delta.thinking_source,
+                        )
                 yield commentary.observe(delta)
             self._raise_if_execution_generation_cancelled()
             if finish_reason == "length":
                 raise ProviderOutputTruncatedError()
             commentary.finish()
-            self._streamed_provider_message = commentary.message
+            self._streamed_provider_message = getattr(stream, "message", None) or commentary.message
             if not outcome_recorded:
                 from osia.reasoning import record_reasoning_outcome
                 record_reasoning_outcome(
@@ -10975,12 +10987,16 @@ class OSIAAgent:
                     retained.append(part)
                 elif part.get("type") in {"image_ref", "image_url"}:
                     removed += 1
+                else:
+                    # Native Messages signatures/calls/results are protocol
+                    # history, not stale screenshots.
+                    retained.append(part)
             if len(retained) != len(content):
                 image_refs = [
                     part for part in retained
                     if part.get("type") == "image_ref"
                 ]
-                if image_refs:
+                if image_refs or any(part.get("type") != "text" for part in retained):
                     msg["content"] = retained
                 else:
                     msg["content"] = "\n\n".join(
@@ -13972,6 +13988,12 @@ class OSIAAgent:
                     if getattr(choice, "finish_reason", None) == "length":
                         raise ProviderOutputTruncatedError()
                     message = choice.message
+                    if self.provider == "anthropic" and getattr(message, "public_thinking", ""):
+                        ledger = getattr(self, "_execution_trace_ledger", None)
+                        if ledger is not None:
+                            ledger.record_public_reasoning_summary(
+                                message.public_thinking, source_id="claude:" + message.id,
+                            )
                     from osia.public_commentary import public_assistant_text
                     content = public_assistant_text(message.content)
                 event_summary = self._consume_provider_capability_events()
@@ -14313,7 +14335,7 @@ class OSIAAgent:
                 )
                 self.messages.append({
                     "role": "assistant",
-                    "content": assistant_record,
+                    "content": getattr(message, "native_content", None) or assistant_record,
                     "_provisional": True,
                 })
                 document_tool_used = any(
@@ -15285,6 +15307,8 @@ class OSIAAgent:
                     f"{synthesis_instruction}\n\n"
                     f"{language_instruction(self.turn_context or self.lang)}"
                 )
+                from osia.claude_messages import tool_feedback
+                native_feedback = tool_feedback(message, tool_results, feedback_text)
                 # Before storing this turn's tool results, strip the base64
                 # screenshots already in history: the model saw them on the
                 # turn right after their capture, so keeping them only
@@ -15292,7 +15316,7 @@ class OSIAAgent:
                 # appended just below, so it survives for the next turn.
                 self._drop_history_screenshots()
                 if tool_screenshots and _provider_supports_vision(self.provider, self.model):
-                    content_parts: list = [{"type": "text", "text": feedback_text}]
+                    content_parts: list = native_feedback or [{"type": "text", "text": feedback_text}]
                     for visual in tool_screenshots:
                         image_reference = visual.get("image_ref")
                         if isinstance(image_reference, dict):
@@ -15337,7 +15361,7 @@ class OSIAAgent:
                             f"[OSIA Agent] ⚠ dropping {len(tool_screenshots)} screenshot(s): "
                             f"model {self.model!r} ({self.provider}) doesn't support vision content"
                         )
-                    self.messages.append({"role": "user", "content": feedback_text})
+                    self.messages.append({"role": "user", "content": native_feedback or feedback_text})
                 continue
 
             # No tool call in any format — candidate final response. A rejected

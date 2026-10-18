@@ -25,7 +25,7 @@ def configured_agent(monkeypatch, handler):
         clients.append(client)
         return client
 
-    monkeypatch.setattr(config, "get_setting", lambda name, default=None: WORKSPACE if name == "anthropic_workspace_id" else default)
+    monkeypatch.setattr(config, "get_setting", lambda name, default=None: {"anthropic_workspace_id": WORKSPACE, "anthropic_transport": "compatibility"}.get(name, default))
     monkeypatch.setattr(agent_module, "OpenAI", client_factory)
     monkeypatch.setattr(agent, "_provider_key_chain", lambda provider: ["fixture-key-1", "fixture-key-2"])
     agent.set_model(MODEL, provider="anthropic")
