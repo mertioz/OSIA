@@ -1257,7 +1257,7 @@ class GuiContractTests(unittest.TestCase):
             row.deleteLater()
         panel.deleteLater()
 
-    def test_missing_saved_account_model_persists_deterministic_replacement(self):
+    def test_missing_saved_account_model_is_not_silently_replaced(self):
         from unittest.mock import MagicMock
         from osia.gui import main_popup
         provider = MagicMock()
@@ -1269,7 +1269,7 @@ class GuiContractTests(unittest.TestCase):
         with patch.object(main_popup, "get_setting", return_value="missing"):
             status = main_popup._SettingsPanel._chatgpt_status_with_usage(provider)
         self.assertEqual(status["selectedModel"], "default")
-        provider.set_selected_model.assert_called_once_with("default")
+        provider.set_selected_model.assert_not_called()
 
     def test_models_page_refresh_listener_stays_single_across_visits(self):
         from osia.config import DEFAULT_SETTINGS

@@ -116,6 +116,7 @@ class _ConversationState:
     tool_schema_fingerprint: str
     runtime_client: AppServerClient
     expected_messages: list[dict]
+    account_generation: int = 0
     planning_only: bool = False
     native_tool_names: tuple[str, ...] = ()
     strategy_revision: int = 0
@@ -395,6 +396,7 @@ class ChatGPTAccountProvider:
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._models: list[dict] = []
+        self._models_account_generation = getattr(self.client, "account_generation", 0)
         self._threads: dict[str, _ConversationState] = {}
         self._conversation_locks: dict[str, threading.RLock] = {}
 
@@ -410,11 +412,18 @@ class ChatGPTAccountProvider:
         try:
             health = self.client.health_check()
             account = self.client.get_account_status()
-            models = self.list_models(force=True) if account["connected"] and refresh_models else list(self._models)
-            selected = self.selected_model(models)
+            if account["connected"]:
+                models = self.list_models(force=True) if refresh_models else self.cached_models()
+                selected = self.selected_model(models)
+            else:
+                with self._lock:
+                    self._models.clear()
+                    self._threads.clear()
+                models = []
+                selected = None
             feature_enabled = bool(get_setting("chatgpt_account_feature_enabled", True))
             return {
-                "available": bool(feature_enabled and account["connected"] and selected),
+                "available": bool(feature_enabled and account["connected"] and models and selected),
                 "runtimeAvailable": True,
                 "runtimeVersion": health.get("runtimeVersion"),
                 "connected": bool(account["connected"]),
@@ -441,22 +450,32 @@ class ChatGPTAccountProvider:
 
     def list_models(self, *, force: bool = False) -> list[dict]:
         with self._lock:
-            if self._models and not force:
-                return [dict(model) for model in self._models]
+            cached = self.cached_models()
+            if cached and not force:
+                return cached
+        account_generation = getattr(self.client, "account_generation", 0)
         models = self.client.list_models()
         with self._lock:
+            if account_generation != getattr(self.client, "account_generation", 0):
+                self._models.clear()
+                return []
             self._models = [dict(model) for model in models]
+            self._models_account_generation = account_generation
             return [dict(model) for model in self._models]
 
     def cached_models(self) -> list[dict]:
         with self._lock:
+            if self._models_account_generation != getattr(self.client, "account_generation", 0):
+                self._models.clear()
             return [dict(model) for model in self._models]
 
     def selected_model(self, models: list[dict] | None = None) -> str | None:
         models = models if models is not None else self.list_models()
-        valid = {str(model.get("id")) for model in models if model.get("id")}
         selected = str(get_setting("chatgpt_account_model", "") or "").strip()
-        if selected in valid:
+        # Catalog visibility is not entitlement. Preserve an explicit model
+        # even if discovery changes; only its actual request can prove access
+        # or return an actionable provider error. Never select another model.
+        if selected:
             return selected
         default = next((m for m in models if m.get("isDefault")), None)
         chosen = default or (models[0] if models else None)
@@ -479,6 +498,7 @@ class ChatGPTAccountProvider:
     def wait_for_login(self, login_id: str, timeout: float = 300.0) -> dict:
         status = self.client.wait_for_login(login_id, timeout=timeout)
         if status.get("connected"):
+            self.reset_login()
             self.list_models(force=True)
         _notify_account_changed()
         return status
@@ -557,6 +577,13 @@ class ChatGPTAccountProvider:
         runtime_client = (
             self._direct_visual_client if direct_visual_turn else self.client
         )
+        # Establish process ownership before deciding whether an existing
+        # thread is still loaded. run_turn() may otherwise restart the child
+        # only after we have chosen a stale thread from the previous process.
+        start_runtime = getattr(runtime_client, "start", None)
+        if callable(start_runtime):
+            start_runtime()
+        account_generation = getattr(runtime_client, "account_generation", 0)
         frontier_names = [
             str(item.get("name") or "")
             for item in dynamic_tools
@@ -610,6 +637,7 @@ class ChatGPTAccountProvider:
                 state
                 and state.runtime_client is runtime_client
                 and state.generation == runtime_client.generation
+                and state.account_generation == account_generation
                 and state.model == model
                 and state.system_fingerprint == system_fingerprint
                 and state.tool_schema_fingerprint == tool_schema_fingerprint
@@ -631,6 +659,7 @@ class ChatGPTAccountProvider:
             state = _ConversationState(
                 thread_id=thread_id,
                 generation=runtime_client.generation,
+                account_generation=account_generation,
                 model=model,
                 system_fingerprint=system_fingerprint,
                 tool_schema_fingerprint=tool_schema_fingerprint,

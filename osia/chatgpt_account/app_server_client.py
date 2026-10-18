@@ -648,6 +648,7 @@ class AppServerClient:
         self._wait_thread: threading.Thread | None = None
         self._intentional_processes: set[int] = set()
         self._generation = 0
+        self._account_generation = 0
         self._stderr_categories: dict[str, int] = {}
         self._crash_times: list[float] = []
         self._rate_limits_refresh_lock = threading.Lock()
@@ -666,6 +667,11 @@ class AppServerClient:
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def account_generation(self) -> int:
+        with self._state_lock:
+            return self._account_generation
 
     def is_runtime_available(self) -> bool:
         try:
@@ -3584,6 +3590,12 @@ class AppServerClient:
             self._mark_unsafe(params, "native_request")
 
     def _dispatch_notification(self, method: str, params: dict) -> None:
+        if method == "account/updated":
+            with self._state_lock:
+                self._account_generation += 1
+                self._rate_limits_cache = None
+                self._rate_limits_pending_update = {}
+            return
         if method == "account/login/completed":
             login_id = params.get("loginId")
             if login_id:
@@ -4196,6 +4208,7 @@ class AppServerClient:
     def get_rate_limits(self) -> dict:
         with self._rate_limits_refresh_lock:
             with self._state_lock:
+                account_generation = self._account_generation
                 self._rate_limits_pending_update = {}
             try:
                 result = self._request("account/rateLimits/read", {})
@@ -4206,6 +4219,8 @@ class AppServerClient:
                 raise
             safe = sanitize_rate_limit_payload(result)
             with self._state_lock:
+                if account_generation != self._account_generation:
+                    safe = {}
                 if self._rate_limits_pending_update:
                     safe = merge_rate_limit_payload(
                         safe, self._rate_limits_pending_update

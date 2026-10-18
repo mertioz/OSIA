@@ -88,3 +88,25 @@ afterwards **54 passed** across the new lifecycle tests, runtime compatibility,
 provider-native boundaries, public reasoning summaries, cancellation and turn
 supersession. `py_compile`, touched-module imports and `git diff --check` passed.
 Existing FastAPI startup deprecation warnings remain unrelated.
+
+## Correction 2 — selected model and account freshness
+
+An explicit saved model stays exact even when absent from the current catalog;
+new selections still validate against discovery, and first use may initialize
+the reported default. Actual provider execution, not the catalog, determines
+access. The Settings probe no longer writes a replacement selection. The old
+test requiring silent replacement contradicted the operator's selected-model
+contract and was updated to require no write.
+
+Account updates invalidate quota and model caches and give conversation state a
+new account generation. Late model/quota responses from the old account are
+discarded. Disconnected status exposes no cached model list. After successful
+login, old threads/alternate processes are released. Runtime startup happens
+before thread reuse decisions, so a restarted process receives full canonical
+history with the same model rather than a stale unloaded thread ID.
+
+HARNESS: six new state defects reproduced before correction. **73 passed**
+afterwards, including dynamic/active native handoffs, model authority, public
+summaries, Mobile parity, Thinking, WOR-342 Qt stability and quota/login fixtures.
+`py_compile`, imports, exact diff review and credential-pattern scan passed.
+No WebSocket schema or Mobile source changes.

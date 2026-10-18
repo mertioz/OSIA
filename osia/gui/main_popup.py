@@ -9017,10 +9017,9 @@ class _SettingsPanel(QWidget):
         if not status.get("connected"):
             return status
         selected = str(status.get("selectedModel") or "").strip()
-        if selected and str(get_setting("chatgpt_account_model", "") or "") != selected:
-            # Persist the provider's deterministic default/first valid model when
-            # a saved account model disappeared. This is account-only state and
-            # never touches the manual/API selected_model field.
+        if selected and not str(get_setting("chatgpt_account_model", "") or "").strip():
+            # Initialize a first selection only. Discovery must never overwrite
+            # an explicit model, including one no longer in the current catalog.
             try:
                 provider.set_selected_model(selected)
             except Exception:
