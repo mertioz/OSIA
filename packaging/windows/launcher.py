@@ -207,6 +207,25 @@ def _package_smoke() -> int:
         ).get_runtime_version()
         if not codex_version or "0.144.1" not in codex_version:
             raise RuntimeError("managed Codex runtime did not initialize")
+        step = "codex_jsonl_boundary"
+        with tempfile.TemporaryDirectory(prefix="osia-codex-smoke-") as temporary:
+            client = AppServerClient(base_dir=Path(temporary), runtime_executable=codex_path)
+            try:
+                for _ in range(2):
+                    if not client.health_check()["healthy"]:
+                        raise RuntimeError("managed App Server did not initialize")
+                    account = client.get_account_status()
+                    if account["connected"] or not account["requiresOpenaiAuth"]:
+                        raise RuntimeError("isolated App Server account state is invalid")
+                    if not client.list_models():
+                        raise RuntimeError("managed App Server model catalog is empty")
+                    client.shutdown()
+            finally:
+                client.shutdown()
+
+        step = "claude_messages_boundary"
+        from osia.provider_smoke import run_claude_messages_smoke
+        run_claude_messages_smoke()
 
         step = "whisper_model"
         whisper_path = bundled_model_path("faster-whisper-small")

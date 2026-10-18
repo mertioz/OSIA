@@ -126,7 +126,15 @@ def _run_package_smoke(executable: Path) -> None:
     environment = os.environ.copy()
     environment["OSIA_PACKAGE_SMOKE_REPORT"] = str(report)
     try:
-        _run([str(executable), "--osia-package-smoke"], env=environment)
+        with tempfile.TemporaryDirectory(prefix="osia-frozen-profile-") as temporary:
+            profile = Path(temporary)
+            for name in ("HOME", "USERPROFILE"):
+                environment[name] = str(profile)
+            for name in ("APPDATA", "LOCALAPPDATA"):
+                folder = profile / name.lower()
+                folder.mkdir()
+                environment[name] = str(folder)
+            _run([str(executable), "--osia-package-smoke"], env=environment)
     except subprocess.CalledProcessError:
         try:
             diagnostic = report.read_text("utf-8").strip()

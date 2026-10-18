@@ -820,10 +820,15 @@ class AppServerClient:
             "--disable", "plugins",
             "--disable", "standalone_web_search",
             "--disable", "in_app_browser",
-            "--disable", "in_app_local_automation",
             "--config", 'web_search="disabled"',
             "--config", "tools.web_search=false",
         ))
+        # 0.144 is the shipped Windows runtime. It predates this gate and
+        # rejects unknown feature names before JSONL initialization. The
+        # source-supported 0.156 runtime has the gate and must disable it.
+        version = _version_tuple(self._runtime_version_override or _probe_executable(executable) or "")
+        if version in _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS:
+            command.extend(("--disable", "in_app_local_automation"))
         if self._disable_code_mode_host:
             # Keep ordinary code-mode-only account turns unchanged.  This
             # alternate client is selected only for a turn whose exact
