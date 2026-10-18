@@ -171,3 +171,105 @@ Source contract: [Claude List Models](https://platform.claude.com/docs/en/api/mo
 HARNESS: all five pagination cases failed before correction; **74 passed**
 afterwards across Claude discovery/authentication, reasoning, Mobile parity and
 DeepSeek/non-DeepSeek invariants. Compile/import/diff/credential checks passed.
+
+## Final operator report
+
+| Requested item | Result and evidence |
+| --- | --- |
+| 1. ChatGPT Account capabilities | Existing managed browser/device login, account read/logout, quota, model discovery, streams and canonical tool adaptation retained. HARNESS verified; authenticated access UNVERIFIED. |
+| 2. Claude capabilities | Console API/BYOK with optional workspace, model discovery, compatible chat/streaming/tool proposals. No Claude Account or Agent SDK runtime. |
+| 3. Official methods/conditions | Managed Codex RPCs and Claude Console API documented above. SIWC app-owned registration is a distinct route; paid/hosted use needs OpenAI's separate eligibility/partner process. Claude product subscription login needs Anthropic approval. |
+| 4. Exact defects | Retired process callbacks, orphaned login waits, silent model replacement, stale account quota/models/thread reuse, restart before stale thread reuse, missing Claude workspace headers, false desktop logout status, first-page-only Claude discovery. Correction sections identify methods and evidence. |
+| 5. ChatGPT corrections | Corrections 1, 2 and 4. Existing compliant managed auth preserved; no token extraction or new OAuth workaround. |
+| 6. Claude corrections | Corrections 3 and 5. Shared workspace headers, API settings/labels/billing, official key link and complete pagination. |
+| 7. Subscription status | ChatGPT managed path exists and matches documented RPCs, but no LIVE sign-in/inference was performed. Separate SIWC plan-sharing route is not implemented. Claude subscription login for OSIA is BLOCKED absent prior approval and a supported transport compatible with the canonical engine. |
+| 8. API-key status | Existing OpenAI API route unchanged. Claude API route improved and HARNESS validated; real Console authentication, balance and billing remain NOT_TESTED. No implicit switch from subscription to API billing. |
+| 9. Catalog/entitlement | Exact IDs retained; explicit saved ChatGPT model never silently replaced. New selections validate against discovery. Catalog presence, stored credentials and a green key-presence indicator do not prove request entitlement. Only successful authorized execution proves that request. |
+| 10. Tool integration | Real canonical read_file on a temporary fixture file, with mocked Claude HTTP/SSE and same-model result reinjection. ChatGPT native dynamic handoff, raw-native-effect rejection, model authority and tool-surface regressions pass. No LIVE model-driven physical effects claimed. |
+| 11. PC/Mobile parity | PC remains owner of accounts, workspace, model execution and tools. Existing sanitized WebSocket schemas retained. PC-side Mobile projection/lifecycle/reconnect regressions pass. No Mobile files, build numbers or TestFlight releases changed; no Flutter rebuild/test or physical iOS reconnect performed. |
+| 12. Authentication/security | Managed login/device/cancel/success/timeout/failure boundaries, isolation, logout, account freshness and secret-free snapshots covered by fixtures. API keys still use existing store/key_chain. No credentials copied from other apps, logged or committed. Existing Windows credential-store protection is unchanged; no new encryption/ACL claim. |
+| 13. Tests | Final combined HARNESS: **404 passed, 18 existing FastAPI deprecation warnings, 43.33 s**. All 14 changed Python files py_compile successfully; all 8 touched production modules import. Diff checks and reviewed candidate credential-pattern scans pass. |
+| 14. Windows package | Source tests ran on Windows/Python 3.12. Frozen paths with spaces/Unicode, Qt DLL hook, build environment isolation, package source inclusion and managed-runtime smoke requirements pass as HARNESS/CONTRACT_ONLY. Actual frozen executable startup/login/streaming/Stop is NOT_TESTED; no package build or app launch performed. |
+| 15. Commits/remote SHAs | Five source corrections listed below, each pushed immediately and exact remote HEAD independently verified. Documentation-only finalization follows them in Git history. No force push, reset, clean, broad staging or release. |
+| 16. External blockers | No evidence of OSIA OpenAI paid/hosted SIWC approval; no app-owned SIWC registration, persisted host ID or app-owned token lifecycle. No evidence of Anthropic product subscription-login approval or a documented standalone subscription inference transport that avoids a second agent loop. |
+| 17. Operator sign-in tests | Real ChatGPT login/decline/expired-refresh/revocation/switch/logout, entitlement/quota and cancellation; real Claude Console key (single-/multi-workspace), revoked/expired key, 401/403/429/credit exhaustion; restart and physical PC/Mobile reconnect. These require operator interaction and authorization for any billed requests/app launch. |
+| 18. Remaining work | Operator source acceptance, then separately authorized frozen-package validation. Confirm OSIA deployment/commercial eligibility before any SIWC expansion. Obtain Anthropic approval before adding subscription product login. A native Claude Messages transport for full native Thinking/structured outputs remains a separately scoped enhancement, not an existing capability. |
+| 19. Linear | WOR-343 remains **In Progress**. Audit and every pushed correction have their own comments containing evidence, full SHA and remaining LIVE limits; final acceptance summary is posted after documentation push. |
+| 20. Recommended next step | Operator validates the corrected source checkout at C:\\Users\\vertu\\osia-worktrees\\wor343-providers with a real managed ChatGPT account and an explicitly configured Claude Console API key/workspace. Confirm exact selected model, one safe read-tool turn, Stop, restart and Mobile reconnect before ticket acceptance. |
+
+### Source correction commits
+
+| Correction | Verified OSIA origin/main SHA |
+| --- | --- |
+| 1 — retired process/login lifecycle | `c4d14d6f54873f8b21d9da5f1a1743f5572fd7d1` |
+| 2 — exact model/account/restart context | `7f2d9707196758e5c6ecf1dda0e96ac606288b1c` |
+| 3 — Claude workspace API credentials | `07ce8b3071c9239037458c1d262d7ceb254d104e` |
+| 4 — observed logout projection | `e1ed7eb958dbe8f6de2152dbc203fc2766d0905b` |
+| 5 — Claude model pagination | `6bda58fb0b9d8d650f144ca539b6bfcfa80829af` |
+
+### Authentication evidence boundaries
+
+| Scenario | ChatGPT | Claude API |
+| --- | --- | --- |
+| Initial login / success / cancel | HARNESS official managed RPC fixtures | HARNESS SDK HTTP + key/workspace configuration |
+| Failed authentication | HARNESS login/error/cancel boundaries; actual refusal NOT_TESTED | HARNESS 401/403 status preserved |
+| Expired/revoked credentials / refresh | CONTRACT_ONLY: managed Codex owns renewal; real expiry/revocation NOT_TESTED | HARNESS 401 preserved; manual Console key replacement, no invented refresh token |
+| Logout / account switch | HARNESS cancellation, observed state and account-generation freshness | HARNESS key rotation/workspace persistence; no subscription session |
+| Rate limits / unavailability | HARNESS quota snapshots/process failure; LIVE 429/entitlement NOT_TESTED | HARNESS 429/503 fixtures and existing shared key-chain regressions |
+| App restart / frozen package | HARNESS process generation/context and frozen resource contracts; actual app NOT_TESTED | HARNESS client reconstruction/header preservation; actual app NOT_TESTED |
+| PC/Mobile reconnect / Stop | HARNESS canonical WebSocket/cancellation/parity regressions | Same PC canonical engine; physical Mobile/provider session NOT_TESTED |
+
+### Changed files and callers
+
+- `osia/chatgpt_account/app_server_client.py`: process readers/wait loop,
+  login failure/wait/logout, account notifications and quota refresh.
+- `osia/chatgpt_account/provider.py`: status/model cache, selected model,
+  successful login, `_prepare` process/account conversation binding.
+- `osia/anthropic_api.py`: shared header construction; consumed by
+  `OSIAAgent.set_model`, `_activate_next_api_key` and `fetch_remote_models`.
+  `_activate_fallback_endpoint` preserves the constructed headers.
+- `osia/agent.py`: the two existing Claude client-construction callers;
+  canonical execution semantics unchanged.
+- `osia/models.py`: existing remote-discovery request and pagination;
+  `discover_all_remote_models`, async discovery and UI/catalog callers retain
+  their signatures.
+- `osia/config.py`: optional non-secret workspace setting.
+- `osia/gui/main_popup.py`: Claude API card/settings, initial-selection-only
+  persistence and observed disconnect projection.
+- `osia/i18n.py`: English/French API/workspace and disconnect-failure copy,
+  with the existing English fallback for other languages.
+- Five new `tests/test_wor343_*.py` files, one corrected legacy selection
+  assertion in `tools/test_chatgpt_account_integration.py`, and this audit.
+
+### Final regression coverage
+
+The combined 404-test command included all new WOR-343 tests, provider/runtime
+compatibility and model-authority suites, WOR-300/301 tool-surface freedom,
+WOR-302 native/textual/DSML parser and continuation, ActionTruth/cancellation,
+WOR-305 WebSocket claims/supersession, WOR-308 Mobile projection, WOR-340
+timelines/Thinking/disclosure, WOR-342 Qt stability, WOR-298 non-DeepSeek
+snapshot invariants, reasoning/key-chain tests, selected managed account
+auth/quota/settings fixtures, and seven Windows packaging/resource contracts.
+This is a focused acceptance regression set, not the entire repository suite.
+
+### Preserved local work
+
+The isolated correction checkout is clean after reviewed commits. The original
+PC checkout stays at `509e17c8`; its 22 pre-existing tracked changes and 128
+untracked entries remain outside this task's staging/commits. This includes the
+pre-existing `.claude/settings.local.json` deletion; changes in `osia/agent.py`,
+`osia/chatgpt_account/app_server_client.py`, `osia/execution_trace.py`,
+`osia/gui/main_popup.py`, `osia/gui/thinking_orbs.py`, `osia/i18n.py`,
+`osia/main.py`, `osia/relay_connector.py`, `osia/server/server.py`,
+`osia/tool_contracts.py`, `osia/turn_context.py`, `osia/voice/tts.py`; and the
+existing WOR-178/186/200/227/247/249/265/269/311 test edits. Untracked tool state,
+benchmarks, diagnostic data and older source/test/docs evidence were excluded
+because they predate and are unrelated to these corrections.
+
+The original Mobile checkout stays at `8c9a974`, with its 10 tracked edits
+(`README.md`, `lib/l10n.dart`, `lib/screens/chat_screen.dart`,
+`lib/services/execution_trace.dart`, `lib/widgets/execution_trace_block.dart`,
+`lib/widgets/thinking_orbs.dart`, and WOR-254/257/265/311 tests) and three
+untracked tests preserved. Its pushed accepted baseline remains `b47da71`.
+Neither original checkout was reset, stashed, overwritten or relaunched. The
+running/installed OSIA application has not been updated by these source pushes.
