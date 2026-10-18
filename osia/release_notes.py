@@ -63,6 +63,23 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="1.1.8",
+        released_on="2026-10-18",
+        public=False,
+        changes_en=(
+            "Development test candidate: native Claude Messages streaming, public Thinking and canonical OSIA tool results, using Console API billing.",
+            "Fix bundled Windows ChatGPT Account startup with version-compatible Codex feature gates; preserve the working source sign-in flow.",
+            "Strengthen frozen provider startup/restart and offline tool-boundary checks. Real account sign-in and installed acceptance remain operator tests.",
+            "Unsigned internal preview. Stable 1.1.7 remains unchanged and is the rollback version.",
+        ),
+        changes_fr=(
+            "Candidat de test : streaming Claude Messages natif, Thinking public et résultats des outils OSIA, avec facturation API Console.",
+            "Corrige le démarrage ChatGPT Account Windows empaqueté avec des flags Codex adaptés à la version ; conserve la connexion source fonctionnelle.",
+            "Renforce les contrôles du runtime empaqueté et des échanges d’outils hors ligne. La connexion réelle et la validation installée restent à tester par l’opérateur.",
+            "Préversion interne non signée. Stable 1.1.7 reste inchangée et disponible pour revenir en arrière.",
+        ),
+    ),
+    ReleaseEntry(
         version="1.1.7",
         released_on="2026-10-07",
         public=True,
