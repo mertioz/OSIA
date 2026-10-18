@@ -87,6 +87,7 @@ def test_stream_nonstream_tool_thinking_usage_and_headers(stream):
         assert c.usage["input_tokens"] == 20
         assert requests[0].url.path == "/v1/messages"
         assert requests[0].headers["anthropic-version"] == "2023-06-01"
+        assert "authorization" not in requests[0].headers
         assert requests[0].headers["anthropic-workspace-id"] == "wrkspc_fixture"
     finally:
         c.close()

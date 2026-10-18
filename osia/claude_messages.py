@@ -12,7 +12,7 @@ from types import SimpleNamespace as NS
 from typing import Any
 
 import httpx
-from openai import APIError, Stream
+from openai import APIError, Omit, Stream
 
 
 def native_tools():
@@ -167,7 +167,7 @@ class ClaudeMessagesClient:
 
     def create(self, *, model, messages, stream=False, timeout=None, extra_body=None, **kwargs):
         body = request_body(model, messages, stream=stream, extra_body=extra_body, **kwargs)
-        options = {"headers": {"anthropic-version": "2023-06-01"}}
+        options = {"headers": {"anthropic-version": "2023-06-01", "Authorization": Omit()}}
         if timeout is not None:
             options["timeout"] = timeout
         if stream:
