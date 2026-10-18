@@ -86,6 +86,9 @@ DEFAULT_SETTINGS = {
     # deliberately separate from the OpenAI API selection above.
     "chatgpt_account_feature_enabled": True,
     "chatgpt_account_model": None,
+    # Non-secret Console workspace selection for multi-workspace Claude API
+    # keys. Single-workspace keys can leave this empty. PC owns execution.
+    "anthropic_workspace_id": "",
     "tts_provider": "local",   # one of: "local", "openai", "google"
     "tts_voice": None,         # provider-specific voice id; None = provider default
     # Speech-to-text (Whisper). The active switching logic lands in Bloc 2;

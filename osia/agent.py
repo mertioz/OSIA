@@ -10152,7 +10152,8 @@ class OSIAAgent:
         # ``api_key`` automatically.
         default_headers: dict[str, str] | None = None
         if provider == "anthropic":
-            default_headers = {"x-api-key": api_key}
+            from osia.anthropic_api import request_headers
+            default_headers = request_headers(api_key)
 
         # API endpoint fallback (Bloc 5): resolve the provider's *effective*
         # primary base_url (honouring any user override) and remember the
@@ -10228,7 +10229,8 @@ class OSIAAgent:
         new_key = chain[self._api_key_index]
         self._api_key = new_key
         if self.provider == "anthropic":
-            self._default_headers = {"x-api-key": new_key}
+            from osia.anthropic_api import request_headers
+            self._default_headers = request_headers(new_key)
         self.client = OpenAI(
             base_url=self._active_base_url,
             api_key=new_key,

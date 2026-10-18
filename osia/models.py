@@ -301,7 +301,8 @@ def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> li
 
     headers = {}
     if provider == "anthropic":
-        headers["x-api-key"] = api_key
+        from osia.anthropic_api import request_headers
+        headers = request_headers(api_key)
         headers["anthropic-version"] = "2023-06-01"
     else:
         headers["Authorization"] = f"Bearer {api_key}"

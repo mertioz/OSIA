@@ -45,6 +45,18 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "claude_api.billing": {
+        "en": "Claude Console API key. Uses Console API billing or credits, including any eligible plan credits. A saved key does not verify access.",
+        "fr": "Clé API Claude Console. Utilise la facturation ou les crédits API de la Console, dont ceux inclus dans une offre éligible. Une clé enregistrée ne prouve pas l'accès.",
+    },
+    "claude_api.workspace": {
+        "en": "Workspace ID (if required)",
+        "fr": "Identifiant du workspace (si requis)",
+    },
+    "claude_api.workspace_info": {
+        "en": "Required for personal or service account API keys with access to multiple workspaces. Leave empty for a single-workspace key.",
+        "fr": "Requis pour les clés personnelles ou de service donnant accès à plusieurs workspaces. Laisser vide pour une clé limitée à un workspace.",
+    },
     "settings.cat.updates": {"en": "Updates", "fr": "Mises à jour"},
     "updates.title": {"en": "Updates", "fr": "Mises à jour"},
     "updates.banner": {

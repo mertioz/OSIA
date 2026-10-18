@@ -164,7 +164,7 @@ STARTUP_SERVICES = ("osia-server.service",)
 # Official API-key pages opened by the "Get API key" → Browse button on each
 # provider's configuration card. Ollama is local and has no key page.
 PROVIDER_KEY_URLS = {
-    "anthropic": "https://console.anthropic.com/settings/keys",
+    "anthropic": "https://platform.claude.com/settings/keys",
     "openai":    "https://platform.openai.com/api-keys",
     "google":    "https://aistudio.google.com/apikey",
     "deepseek":  "https://platform.deepseek.com/api_keys",
@@ -3668,7 +3668,7 @@ class _ProviderCard(QFrame):
         self._status_dot.setFixedSize(8, 8)
         self._status_dot.setProperty("state", "stopped")
 
-        name = QLabel(cfg["name"])
+        name = QLabel("Claude API" if provider == "anthropic" else cfg["name"])
         name.setObjectName("providerName")
         name.setMinimumWidth(72)
 
@@ -3693,6 +3693,21 @@ class _ProviderCard(QFrame):
         key_row.addWidget(self._save_btn)
         layout.addLayout(key_row)
 
+        self._workspace_input = None
+        self._claude_api_note = None
+        if provider == "anthropic":
+            self._claude_api_note = QLabel(i18n.t("claude_api.billing"))
+            self._claude_api_note.setObjectName("providerSub")
+            self._claude_api_note.setWordWrap(True)
+            layout.addWidget(self._claude_api_note)
+            self._workspace_input = QLineEdit()
+            self._workspace_input.setObjectName("keyInput")
+            self._workspace_input.setText(str(get_setting("anthropic_workspace_id", "") or ""))
+            self._workspace_input.setPlaceholderText(i18n.t("claude_api.workspace"))
+            self._workspace_input.setAccessibleName(i18n.t("claude_api.workspace"))
+            self._workspace_input.setToolTip(i18n.t("claude_api.workspace_info"))
+            layout.addWidget(self._workspace_input)
+
         # Re-translate in place when the UI language changes.
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
@@ -3706,6 +3721,11 @@ class _ProviderCard(QFrame):
         self._key_input.setPlaceholderText(
             i18n.t("provider.key_placeholder", name=cfg["name"])
         )
+        if self._workspace_input is not None:
+            self._workspace_input.setPlaceholderText(i18n.t("claude_api.workspace"))
+            self._workspace_input.setAccessibleName(i18n.t("claude_api.workspace"))
+            self._workspace_input.setToolTip(i18n.t("claude_api.workspace_info"))
+            self._claude_api_note.setText(i18n.t("claude_api.billing"))
         # Don't clobber the transient "Saved ✓" flash.
         if not self._save_btn.property("saved"):
             self._save_btn.setText(i18n.t("provider.save"))
@@ -3720,6 +3740,8 @@ class _ProviderCard(QFrame):
 
     def set_key(self, key: str) -> None:
         self._key_input.setText(key or "")
+        if self._workspace_input is not None:
+            self._workspace_input.setText(str(get_setting("anthropic_workspace_id", "") or ""))
         self._update_status_dot()
 
     def current_key(self) -> str:
@@ -3735,6 +3757,8 @@ class _ProviderCard(QFrame):
 
     def _on_save(self) -> None:
         key = self.current_key()
+        if self._workspace_input is not None:
+            set_setting("anthropic_workspace_id", self._workspace_input.text().strip())
         if key:
             set_api_key(self._provider, key)
         else:
@@ -8860,7 +8884,9 @@ class _SettingsPanel(QWidget):
             i18n.t("chatgpt_account.title"), "chatgpt_account"
         )
         for provider in (*self._AI_PROVIDER_ORDER, "ollama"):
-            self._ai_provider_combo.addItem(PROVIDERS[provider]["name"], provider)
+            self._ai_provider_combo.addItem(
+                "Claude API" if provider == "anthropic" else PROVIDERS[provider]["name"], provider,
+            )
         sel_row.addWidget(self._ai_prov_label)
         sel_row.addWidget(self._ai_provider_combo, 1)
         l.addLayout(sel_row)

@@ -110,3 +110,34 @@ afterwards, including dynamic/active native handoffs, model authority, public
 summaries, Mobile parity, Thinking, WOR-342 Qt stability and quota/login fixtures.
 `py_compile`, imports, exact diff review and credential-pattern scan passed.
 No WebSocket schema or Mobile source changes.
+
+## Correction 3 — Claude API workspace authentication
+
+Added the optional PC-owned `anthropic_workspace_id` setting and a shared
+`osia.anthropic_api.request_headers` helper. Existing `key_chain.iter_keys`
+resolution remains authoritative. Chat client creation, key rotation, endpoint
+rebuild and model discovery preserve the Console workspace header. Existing
+single-workspace keys send their original headers when the setting is empty.
+
+The PC API card/dropdown says **Claude API**, links to the current Console key
+page and explains Console billing/credits (including eligible plan credits).
+It provides an optional workspace field; key-presence indication does not claim
+authenticated access. The credential store is unchanged; workspace IDs are
+non-secret settings, and no raw credentials are added to Mobile projection.
+The save path persists workspace selection before key-change listeners rebuild
+clients. No account-login button or Claude SDK agent was introduced.
+
+HARNESS: three failing workspace/UI cases reproduced before implementation.
+**162 passed** afterwards, covering the Claude HTTP fixtures, 401/403/429/503,
+key rotation, provider parsers, Thinking, reasoning mappings, DeepSeek/non-
+DeepSeek invariants, key-chain rules and WOR-342 regressions. One fixture-backed
+Claude streamed native tool proposal passed through the real canonical
+`read_file` tool on a temporary file, then its factual contents were reinjected
+into the same selected Claude model. This is not LIVE provider evidence.
+Compile/import/diff checks passed. Offscreen card inspection used an explicitly
+loaded system font; it does not establish packaged application rendering.
+
+The existing OpenAI-compatible Claude route remains supported, with its
+documented Thinking-return and structured-output limitations. Native Messages
+transport is not claimed to exist. Operator must validate a real Console key
+(single-/multi-workspace), permissions, credits and actual model access.
