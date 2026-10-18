@@ -113,6 +113,27 @@ def test_incomplete_stream_is_unknown_transport_failure():
         c.close()
 
 
+def test_receipts_follow_canonical_calls_after_continuation_control_is_removed():
+    from osia.claude_messages import response_message, tool_feedback
+    message = response_message(payload([
+        {"type": "tool_use", "id": "control", "name": "resolve_unfinished_execution", "input": {"decision": "keep_pending"}},
+        {"type": "tool_use", "id": "read", "name": "read_file", "input": {"path": "fixture"}},
+    ]))
+    result = tool_feedback(message, [{"tool": "read_file", "path": "fixture"}], ["actual read receipt"], "factual batch")
+    assert "actual read receipt" not in result[0]["content"]
+    assert result[1] == {"type": "tool_result", "tool_use_id": "read", "content": "actual read receipt"}
+
+
+def test_distinct_repeated_native_calls_keep_distinct_receipts():
+    from osia.claude_messages import response_message, tool_feedback
+    message = response_message(payload([
+        {"type": "tool_use", "id": name, "name": "read_file", "input": {"path": "fixture"}}
+        for name in ["first", "second"]
+    ]))
+    result = tool_feedback(message, [{"tool": "read_file", "path": "fixture"}] * 2, ["receipt 1", "receipt 2"], "batch")
+    assert [(b["tool_use_id"], b["content"]) for b in result[:2]] == [("first", "receipt 1"), ("second", "receipt 2")]
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_real_canonical_read_and_native_receipt_reinjection(monkeypatch, tmp_path, streaming):
     fixture = tmp_path / "fixture.txt"

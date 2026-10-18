@@ -15308,7 +15308,7 @@ class OSIAAgent:
                     f"{language_instruction(self.turn_context or self.lang)}"
                 )
                 from osia.claude_messages import tool_feedback
-                native_feedback = tool_feedback(message, tool_results, feedback_text)
+                native_feedback = tool_feedback(message, tool_calls, tool_results, feedback_text)
                 # Before storing this turn's tool results, strip the base64
                 # screenshots already in history: the model saw them on the
                 # turn right after their capture, so keeping them only

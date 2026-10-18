@@ -189,11 +189,22 @@ def provider_client(client, provider):
     return client
 
 
-def tool_feedback(message, results, feedback):
+def tool_feedback(message, canonical_calls, results, feedback):
     """Bind each native call to the receipts produced by canonical dispatch."""
     calls = [b for b in getattr(message, "native_content", []) if b.get("type") == "tool_use"]
     if not calls:
         return []
-    return [{"type": "tool_result", "tool_use_id": call["id"],
-             "content": results[index] if index < len(results) else "No execution receipt is available for this call."}
-            for index, call in enumerate(calls)] + [{"type": "text", "text": feedback}]
+    remaining = list(enumerate(canonical_calls))
+    blocks = []
+    for call in calls:
+        expected = {"tool": call["name"], **call.get("input", {})}
+        match = next(((position, index) for position, (index, canonical) in enumerate(remaining)
+                      if canonical == expected), None)
+        content = "No canonical execution receipt is correlated with this native call. See the factual batch feedback below."
+        if match is not None:
+            position, index = match
+            remaining.pop(position)
+            if index < len(results):
+                content = results[index]
+        blocks.append({"type": "tool_result", "tool_use_id": call["id"], "content": content})
+    return blocks + [{"type": "text", "text": feedback}]
