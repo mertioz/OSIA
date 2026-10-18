@@ -45,6 +45,10 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "chatgpt_account.disconnect_failed": {
+        "en": "Disconnect failed. The account is still connected; try Disconnect again.",
+        "fr": "La déconnexion a échoué. Le compte est encore connecté ; réessayez Déconnecter.",
+    },
     "claude_api.billing": {
         "en": "Claude Console API key. Uses Console API billing or credits, including any eligible plan credits. A saved key does not verify access.",
         "fr": "Clé API Claude Console. Utilise la facturation ou les crédits API de la Console, dont ceux inclus dans une offre éligible. Une clé enregistrée ne prouve pas l'accès.",

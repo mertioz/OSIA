@@ -9187,6 +9187,7 @@ class _SettingsPanel(QWidget):
 
     def _apply_chatgpt_status(self, status: dict) -> None:
         status = dict(status or {})
+        logout_failed = bool(status.pop("_osiaLogoutFailed", False))
         generation = status.pop("_osiaRequestGeneration", None)
         request_kind = status.pop("_osiaRequestKind", None)
         if generation is not None and generation != self._chatgpt_request_generation:
@@ -9232,6 +9233,8 @@ class _SettingsPanel(QWidget):
             self._chatgpt_account_detail.setVisible(bool(details))
             if available:
                 self._set_chatgpt_ui_state("connected")
+                if logout_failed:
+                    self._chatgpt_status.setText(i18n.t("chatgpt_account.disconnect_failed"))
             else:
                 self._chatgpt_status.setText(i18n.t("chatgpt_account.error"))
                 self._set_chatgpt_ui_state("error")
@@ -9379,14 +9382,26 @@ class _SettingsPanel(QWidget):
         self._set_chatgpt_ui_state("checking")
 
         def worker():
+            logout_failed = False
             try:
                 from osia.chatgpt_account.provider import get_account_provider
-                get_account_provider().logout()
+                provider = get_account_provider()
+                try:
+                    provider.logout()
+                except Exception:
+                    logout_failed = True
+                # Project the observed account state after the RPC, including
+                # failures. An exception is not evidence of disconnection.
+                status = self._chatgpt_status_with_usage(provider)
             except Exception:
-                pass
+                logout_failed = True
+                status = {
+                    "available": False, "runtimeAvailable": False,
+                    "connected": False, "models": [], "error": "provider_error",
+                }
             self._chatgpt_status_ready.emit({
-                "available": False, "runtimeAvailable": True,
-                "connected": False, "models": [], "error": "disconnected",
+                **status,
+                "_osiaLogoutFailed": logout_failed,
                 "_osiaRequestGeneration": generation,
                 "_osiaRequestKind": "action",
             })

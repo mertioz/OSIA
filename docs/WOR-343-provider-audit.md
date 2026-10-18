@@ -141,3 +141,17 @@ The existing OpenAI-compatible Claude route remains supported, with its
 documented Thinking-return and structured-output limitations. Native Messages
 transport is not claimed to exist. Operator must validate a real Console key
 (single-/multi-workspace), permissions, credits and actual model access.
+
+## Correction 4 — truthful desktop disconnect status
+
+The desktop disconnect worker previously emitted `connected=False` even when
+logout raised. It now rereads the provider's factual state; a still-connected
+account remains connected and shows a retryable disconnect failure. The local
+UI-only failure marker is removed before storing/projecting account status.
+Errors never include exception bodies or credentials. Mobile already rereads
+actual state and requires no source change.
+
+HARNESS: the false-disconnect case failed before the fix; **55 passed** after,
+covering all WOR-343 cases, Mobile parity, Thinking V5 disclosure/UI, WOR-342
+crash regressions and connect/disconnect/restart selection preservation.
+Compile/import/diff/credential checks passed.
