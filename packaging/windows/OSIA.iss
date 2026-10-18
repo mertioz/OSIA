@@ -39,7 +39,7 @@
 #endif
 
 [Setup]
-AppId={{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}
+AppId={code:InstallerAppId}
 AppName=OSIA
 AppVersion={#AppVersion}
 AppVerName=OSIA {#AppVersion}
@@ -76,6 +76,7 @@ RestartApplications=no
 AppMutex=Local\OSIA.Desktop
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
+UsePreviousLanguage=no
 VersionInfoVersion={#AppVersion}.0
 VersionInfoCompany=OSIA
 VersionInfoDescription=OSIA Installer
@@ -247,17 +248,17 @@ Source: "{#BuildRoot}\generated\major-update-band.png"; DestName: "major-update-
 Type: filesandordirs; Name: "{app}\_internal"; Check: IsUpdateMode
 
 [Icons]
-Name: "{group}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"
-Name: "{group}\{cm:UninstallOSIA}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"; Tasks: desktopicon
+Name: "{group}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"; Check: ShouldRemoveIntegration
+Name: "{group}\{cm:UninstallOSIA}"; Filename: "{uninstallexe}"; Check: ShouldRemoveIntegration
+Name: "{autodesktop}\OSIA"; Filename: "{app}\OSIA.exe"; WorkingDir: "{app}"; IconFilename: "{app}\OSIA.exe"; Tasks: desktopicon; Check: ShouldRemoveIntegration
 
 [Run]
 Filename: "{app}\OSIA.exe"; Description: "{cm:LaunchOSIA}"; Flags: nowait postinstall skipifsilent; Check: not IsUpdateMode
-Filename: "{app}\OSIA.exe"; Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode
+Filename: "{app}\OSIA.exe"; Parameters: "--wake"; Flags: nowait; Check: IsUpdateMode and ShouldRemoveIntegration
 
 [UninstallRun]
 ; Remove only manifests registered by older OSIA versions that shipped the local browser bridge.
-Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-legacy-browser-registration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIALegacyBrowserRegistration"
+Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-legacy-browser-registration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIALegacyBrowserRegistration"; Check: ShouldRemoveIntegration
 Filename: "{app}\OSIA.exe"; Parameters: "--osia-remove-integration"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAIntegration"; Check: ShouldRemoveIntegration
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\tools\configure_lan_firewall.ps1"" -Action Remove"; Flags: runhidden waituntilterminated; RunOnceId: "OSIAFirewall"; Tasks: firewall; Check: ShouldRemoveIntegration
 
@@ -342,6 +343,14 @@ begin
     end;
 end;
 
+function InstallerAppId(Value: String): String;
+begin
+  Result := '{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}';
+  if CompareText(ExpandConstant('{param:NOINTEGRATION|0}'), '1') = 0 then
+    Result := Result + '-isolated-' + GetMD5OfString(
+      Lowercase(ExpandFileName(ExpandConstant('{param:DIR|}'))));
+end;
+
 function InitializeSetup: Boolean;
 var
   UninstallKey: String;
@@ -351,13 +360,37 @@ var
   RegistryPackedVersion: Int64;
   PackagePackedVersion: Int64;
   ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
+  ProductionInstallDir, TestInstallDir: String;
 begin
   Result := True;
   OsiaProfileDirectory := ResolveOsiaProfileDirectory;
-  UninstallKey :=
-    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1';
+  IntegrationSuppressed :=
+    CompareText(ExpandConstant('{param:NOINTEGRATION|0}'), '1') = 0;
+  if IntegrationSuppressed then
+  begin
+    TestInstallDir := ExpandConstant('{param:DIR|}');
+    if TestInstallDir = '' then
+    begin
+      MsgBox('Isolated validation requires an explicit /DIR.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+    TestInstallDir := RemoveBackslashUnlessRoot(ExpandFileName(TestInstallDir));
+    RegQueryStringValue(HKCU,
+      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1',
+      'InstallLocation', ProductionInstallDir);
+    if (CompareText(TestInstallDir, RemoveBackslashUnlessRoot(ProductionInstallDir)) = 0) or
+      (CompareText(TestInstallDir, ExpandConstant('{localappdata}\Programs\OSIA')) = 0) then
+    begin
+      MsgBox('Isolated validation cannot replace the normal installation.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+  end;
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    InstallerAppId('') + '_is1';
   FreshInstallOnboardingEligible :=
-    (not DirExists(OsiaProfileDirectory)) and
+    (not IntegrationSuppressed) and (not DirExists(OsiaProfileDirectory)) and
     (not RegKeyExists(HKCU, UninstallKey));
   UpdateModeRequested := HasExactUpdateSwitch;
   UpdateModeActive := False;
@@ -1178,15 +1211,18 @@ begin
     end;
 
     AutoCommand := '"' + AppExe + '" --wake';
-    if IsUpdateMode then
-      RestorePreviousAutostart
-    else if WizardIsTaskSelected('autostart') then
-      RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
-        'OSIA', AutoCommand)
-    else
-      RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA');
+    if not IntegrationSuppressed then
+    begin
+      if IsUpdateMode then
+        RestorePreviousAutostart
+      else if WizardIsTaskSelected('autostart') then
+        RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run',
+          'OSIA', AutoCommand)
+      else
+        RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'OSIA');
+    end;
 
-    if WizardIsTaskSelected('firewall') and (not IsUpdateMode) then
+    if (not IntegrationSuppressed) and WizardIsTaskSelected('firewall') and (not IsUpdateMode) then
     begin
       StageLabel.Caption := CustomMessage('PhaseFirewall');
       AddDetail(CustomMessage('DetailFirewall'));

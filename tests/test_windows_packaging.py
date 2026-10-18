@@ -517,7 +517,10 @@ def test_installer_contract_preserves_user_data_and_has_real_progress():
     assert "--osia-remove-integration" in script
     assert 'Tasks: firewall' in script
     assert "{param:NOINTEGRATION|0}" in script
-    assert script.count("Check: ShouldRemoveIntegration") == 2
+    assert script.count("Check: ShouldRemoveIntegration") == 6
+    assert "AppId={code:InstallerAppId}" in script
+    assert "'-isolated-' + GetMD5OfString" in script
+    assert "Isolated validation cannot replace the normal installation." in script
     assert ".osia-no-integration-test" in script
     assert "Result := not IntegrationSuppressed" in script
     assert "OutputBaseFilename=OSIA-Setup" in script
@@ -597,12 +600,13 @@ def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
         "{group}",
         "{localappdata}",
         "{param:NOINTEGRATION|0}",
+        "{param:DIR|}",
         "{src}",
         "{sys}",
         "{tmp}",
         "{uninstallexe}",
     }
-    assert inventory["custom_code"] == ()
+    assert inventory["custom_code"] == ("{code:InstallerAppId}",)
     assert set(inventory["literal_brace_text"]) == {
         "{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}",
         '{"schemaVersion":1,"status":"pending"}',
@@ -729,7 +733,8 @@ def test_generated_installer_logo_has_real_transparency(monkeypatch, tmp_path):
 
 def test_installer_identity_scope_and_output_name_are_unchanged():
     script = (ROOT / "packaging" / "windows" / "OSIA.iss").read_text("utf-8")
-    assert "AppId={{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}" in script
+    assert "AppId={code:InstallerAppId}" in script
+    assert "Result := '{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}';" in script
     assert "PrivilegesRequired=lowest" in script
     assert "PrivilegesRequiredOverridesAllowed=commandline" in script
     assert "DefaultDirName={localappdata}\\Programs\\OSIA" in script
@@ -801,6 +806,42 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert (output / "OSIA-Setup.exe").is_file()
+
+    # Exercise the same compiled installer mode used for package QA. It must
+    # own a different uninstall identity and leave normal OSIA registration
+    # byte-for-byte unchanged, even when that installation already exists.
+    import winreg
+
+    uninstall_root = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    normal_id = "{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1"
+    def registration(name):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, uninstall_root + "\\" + name) as key:
+                return tuple(winreg.EnumValue(key, i) for i in range(winreg.QueryInfoKey(key)[1]))
+        except FileNotFoundError:
+            return None
+    before = registration(normal_id)
+    def autostart():
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            try:
+                return winreg.QueryValueEx(key, "OSIA")
+            except FileNotFoundError:
+                return None
+    before_autostart = autostart()
+    isolated = tmp_path / "isolated install"
+    setup = subprocess.run([str(output / "OSIA-Setup.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES",
+        "/SP-", "/NORESTART", "/NOICONS", "/NOINTEGRATION=1", "/MERGETASKS=!firewall,!autostart,!desktopicon",
+        "/DIR=" + str(isolated)], capture_output=True, timeout=90)
+    assert setup.returncode == 0
+    assert registration(normal_id) == before
+    assert autostart() == before_autostart
+    assert (isolated / ".osia-no-integration-test").is_file()
+    assert (isolated / "unins000.exe").is_file()
+    uninstall = subprocess.run([str(isolated / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+        capture_output=True, timeout=90)
+    assert uninstall.returncode == 0
+    assert registration(normal_id) == before
+    assert autostart() == before_autostart
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Inno Setup is Windows-only")
@@ -1135,7 +1176,7 @@ def test_wor149_update_is_in_place_idempotent_and_rollback_safe():
     assert "WizardStyle=modern dark hidebevels includetitlebar" in script
     assert "WizardForm.ProgressGauge" in script
     assert "and (not IsUpdateMode)" in script
-    assert "if IsUpdateMode then\n      RestorePreviousAutostart" in script
+    assert re.search(r"if IsUpdateMode then\s+RestorePreviousAutostart", script)
     assert "PrepareUpdateRollback" in script
     assert "RegisterExtraCloseApplicationsResources" in script
     assert "RegisterExtraCloseApplicationsResource(" in script
