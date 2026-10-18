@@ -519,7 +519,7 @@ def test_installer_contract_preserves_user_data_and_has_real_progress():
     assert "{param:NOINTEGRATION|0}" in script
     assert script.count("Check: ShouldRemoveIntegration") == 6
     assert "AppId={code:InstallerAppId}" in script
-    assert "'-isolated-' + GetMD5OfString" in script
+    assert "'OSIA-Isolated-' + GetMD5OfString" in script
     assert "Isolated validation cannot replace the normal installation." in script
     assert ".osia-no-integration-test" in script
     assert "Result := not IntegrationSuppressed" in script
@@ -837,6 +837,10 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     assert autostart() == before_autostart
     assert (isolated / ".osia-no-integration-test").is_file()
     assert (isolated / "unins000.exe").is_file()
+    import hashlib
+    isolated_id = "OSIA-Isolated-" + hashlib.md5(str(isolated).lower().encode("utf-8")).hexdigest() + "_is1"
+    assert len(isolated_id.removesuffix("_is1")) <= 57
+    assert registration(isolated_id) is not None
     uninstall = subprocess.run([str(isolated / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
         capture_output=True, timeout=90)
     assert uninstall.returncode == 0

@@ -67,7 +67,11 @@ WizardSmallImageFile={#BuildRoot}\generated\wizard-small.png
 WizardImageFileDynamicDark={#BuildRoot}\generated\wizard-large.png
 WizardSmallImageFileDynamicDark={#BuildRoot}\generated\wizard-small.png
 WizardSmallImageBackColor=#110b15
+#if InternalBuild == "1"
+Compression=lzma2/normal
+#else
 Compression=lzma2/ultra64
+#endif
 SolidCompression=yes
 LZMAUseSeparateProcess=yes
 SetupLogging=yes
@@ -347,7 +351,9 @@ function InstallerAppId(Value: String): String;
 begin
   Result := '{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}';
   if CompareText(ExpandConstant('{param:NOINTEGRATION|0}'), '1') = 0 then
-    Result := Result + '-isolated-' + GetMD5OfString(
+    { Keep the full ID below Inno's 57-character registry-name limit, so
+      InitializeSetup and Inno resolve the same isolated uninstall key. }
+    Result := 'OSIA-Isolated-' + GetMD5OfString(
       Lowercase(ExpandFileName(ExpandConstant('{param:DIR|}'))));
 end;
 
