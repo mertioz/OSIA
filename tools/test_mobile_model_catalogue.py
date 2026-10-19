@@ -55,13 +55,12 @@ class MobileModelCatalogueTests(unittest.TestCase):
             patch.object(catalogue, "account_snapshot", return_value=account or _account()),
             patch.object(catalogue, "get_reasoning_options", return_value=[]),
             patch.object(catalogue, "resolve_reasoning_option_id", return_value="auto"),
-            patch.object(catalogue, "model_has_vision", return_value=False),
             patch.object(catalogue, "load_settings", return_value={}),
         ):
             return catalogue.build_catalogue()
 
     def test_unconfigured_api_is_omitted_and_configured_api_is_included(self):
-        models = [_model("openai", "gpt"), _model("deepseek", "deep")]
+        models = [_model("openai", "gpt"), _model("deepseek", "deepseek-flash")]
         result = self.build({"deepseek": "key"}, models)
         self.assertEqual(
             [item["providerId"] for item in result["providers"]], ["deepseek"]
