@@ -9382,6 +9382,8 @@ async def websocket_endpoint(ws: WebSocket):
                     "heartbeat_checks",
                     # Shared reasoning/thinking level settings (WOR-77).
                     "reasoning",
+                    # Non-secret Claude Console workspace, shared with PC.
+                    "anthropic_workspace_id",
                     # MCP / Connectors server list (WOR-44 Phase 4). The list is
                     # NON-SECRET (env is always {} — see the mcp_servers write
                     # branch below); per-server tokens live only in the
@@ -9395,6 +9397,15 @@ async def websocket_endpoint(ws: WebSocket):
                     )
                     await out.send_json({"type": "status", "status": "error"})
                     continue
+                if setting_key == "anthropic_workspace_id":
+                    if (
+                        not isinstance(setting_value, str)
+                        or len(setting_value) > 256
+                        or any(ord(char) < 32 or ord(char) == 127 for char in setting_value)
+                    ):
+                        await out.send_json({"type": "status", "status": "error"})
+                        continue
+                    setting_value = setting_value.strip()
                 if setting_key == "stt_fallback_provider" and (
                     not isinstance(setting_value, str)
                     or setting_value not in {"local", "groq", "none"}
