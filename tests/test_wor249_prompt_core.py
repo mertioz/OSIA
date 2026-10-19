@@ -45,6 +45,11 @@ def test_tool_outcomes_are_factual_and_unknown_does_not_veto_a_fresh_request():
     assert "does not block a distinct fresh model-requested call" in core
     assert "does not require reconciliation before such a call" in core
     assert "never claim an effect without supporting evidence" in core
+    assert "an unchanged screenshot proves neither failure nor success" in core
+    assert "never dispatch stale coordinates" in core
+    assert "respect cancellation, target identity, and stale-state rejection" in core
+    assert "protect secrets and private data" in core
+    assert "do not bypass operating-system" in core
     for obsolete in (
         "never repeat a successful mutation",
         "do not intentionally duplicate it solely because",

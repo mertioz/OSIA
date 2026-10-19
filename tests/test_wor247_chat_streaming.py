@@ -469,7 +469,7 @@ def _install_rounds(agent: OSIAAgent, rounds) -> None:
     agent._stream_with_sentences = types.MethodType(fake_stream, agent)
 
 
-def test_failed_list_files_is_reresolved_before_another_dispatch(
+def test_failed_list_files_does_not_veto_a_fresh_model_dispatch(
     tmp_path, monkeypatch,
 ):
     desktop = tmp_path / "Desktop"

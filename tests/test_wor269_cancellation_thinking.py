@@ -318,9 +318,18 @@ def test_server_projects_cancelled_before_stopping_local_turn_owner(tmp_path):
                 if frame.get("status") == "cancelled"
             )
             assert terminal["terminal"] is True
-            assert channel.frames[-1]["type"] == "conversation_busy_changed"
-            assert channel.frames[-1]["conversation_id"] == conversation_id
-            assert channel.frames[-1]["busy"] is False
+            busy_frame = channel.frames[-1]
+            assert {key: busy_frame[key] for key in (
+                "type", "conversation_id", "busy",
+            )} == {
+                "type": "conversation_busy_changed",
+                "conversation_id": conversation_id,
+                "busy": False,
+            }
+            # Canonical envelopes also retain the exact cancellation identity.
+            assert busy_frame["request_id"] == request_id
+            assert busy_frame["turn_id"] == meta["turn_id"]
+            assert busy_frame["run_id"] == meta["run_id"]
             assert conversation_id not in server._ACTIVE_TURNS_BY_CONV
             assert conversation_id not in server._ACTIVE_TURN_META_BY_CONV
             assert request_id not in server._ACTIVE_CONV_BY_REQUEST
