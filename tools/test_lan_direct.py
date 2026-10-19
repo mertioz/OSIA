@@ -574,7 +574,7 @@ class GatewayLifecycleTests(unittest.TestCase):
 class RelayPriorityTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_stays_standby_until_encrypted_mobile_commit(self):
         relay_socket = _FakeWebSocket()
-        with mock.patch.dict(os.environ, {"OSIA_LAN_DIRECT_V1": "1"}):
+        with mock.patch.dict(os.environ, {"OSIA_LAN_DIRECT_V1": "1", "OSIA_WEBRTC_DIRECT_V1": "0"}):
             bridge = RelayBridge("phase-a-token", "wss://relay.osia.space/ws")
         bridge.e2e_peer_ready = True
         bridge.e2e_keys = object()
@@ -615,7 +615,7 @@ class RelayPriorityTests(unittest.IsolatedAsyncioTestCase):
                 "protocol_version": 1,
                 "enabled": False,
                 "configuration_id": bridge._webrtc_manager.configuration_id,
-                "ice_servers": [],
+                "ice_servers": bridge._webrtc_manager.ice_servers,
             },
         )
         self.assertEqual(
@@ -640,7 +640,7 @@ class LanCertificateTests(unittest.TestCase):
     def test_flag_off_relay_leases_never_contend(self):
         from unittest import mock
 
-        with mock.patch.dict("os.environ", {"OSIA_LAN_DIRECT_V1": "0"}):
+        with mock.patch.dict("os.environ", {"OSIA_LAN_DIRECT_V1": "0", "OSIA_WEBRTC_DIRECT_V1": "0"}):
             first = acquire_application_transport("relay", object())
             second = acquire_application_transport("relay", object())
         self.assertIsNotNone(first)

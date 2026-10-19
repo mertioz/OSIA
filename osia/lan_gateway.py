@@ -383,6 +383,17 @@ def _regenerate_certificate_pair(host: str, cert_file: Path, key_file: Path) -> 
                 staged_cert.unlink()
 
 
+def _windows_acl_environment(path: Path) -> dict[str, str]:
+    # A PowerShell 7 parent can export Core-only module paths. Windows
+    # PowerShell must discover its own Security module for Get/Set-Acl.
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key.upper() != "PSMODULEPATH"
+    }
+    environment["OSIA_LAN_ACL_TARGET"] = str(path)
+    return environment
+
+
 def _protect_private_key(path: Path) -> None:
     if os.name != "nt":
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
@@ -422,7 +433,7 @@ Set-Acl -LiteralPath $path -AclObject $acl
             "-Command",
             script,
         ],
-        env={**os.environ, "OSIA_LAN_ACL_TARGET": str(path)},
+        env=_windows_acl_environment(path),
         capture_output=True,
         text=True,
         timeout=15,
@@ -471,7 +482,7 @@ exit 0
                 "-Command",
                 script,
             ],
-            env={**os.environ, "OSIA_LAN_ACL_TARGET": str(path)},
+            env=_windows_acl_environment(path),
             capture_output=True,
             text=True,
             timeout=15,

@@ -441,7 +441,10 @@ class WebRtcDirectLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_cleans_preapplication_session_and_allows_fresh_attempt(self) -> None:
         with mock.patch("osia.webrtc_transport.CONNECT_TIMEOUT_SECONDS", 0.01):
             session = await self.start_session()
-            await asyncio.sleep(0.03)
+            async def settled():
+                while self.manager._session is not None:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(settled(), timeout=2)
         self.assertEqual(session.state, WebRtcSessionState.DISCONNECTED)
         self.assertIsNone(self.coordinator.active_transport)
         self.assertIsNone(self.manager._session)
