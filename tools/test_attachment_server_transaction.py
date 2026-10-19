@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from osia.server import server  # noqa: E402
+from tools.mobile_test_state import isolated_mobile_server_state
 
 
 class _FakeWebSocket:
@@ -45,7 +46,7 @@ class _FakeWebSocket:
         for index, message in enumerate(self.messages):
             yield json.dumps(message)
             if index == self.pause_after and self.pause is not None:
-                await self.pause.wait()
+                await asyncio.wait_for(self.pause.wait(), timeout=5)
 
 
 async def _idle_heartbeat(_channel) -> None:
@@ -130,6 +131,8 @@ def _attachment_frames(data: bytes) -> list[dict]:
 
 class AttachmentServerTransactionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="osia-attachment-contract-")))
+        self.enterContext(isolated_mobile_server_state(root))
         server._ACTIVE_TURNS_BY_CONV.clear()
         server._ACTIVE_TURN_META_BY_CONV.clear()
         server._ACTIVE_CONV_BY_REQUEST.clear()
@@ -219,6 +222,7 @@ class AttachmentServerTransactionTests(unittest.IsolatedAsyncioTestCase):
 
         async def run_agent(_channel, agent_input, history, conv_id, **_kwargs):
             provider_inputs.append(agent_input)
+            ws.messages[-1]["conversation_id"] = conv_id
             started.set()
             await finish.wait()
             return history, conv_id
@@ -260,8 +264,8 @@ class AttachmentServerTransactionTests(unittest.IsolatedAsyncioTestCase):
                     stack.enter_context(patcher)
                 create_conversation = stack.enter_context(mock.patch.object(
                     server.conversations,
-                    "create_conversation",
-                    return_value={"id": "conv_created", "title": "Public"},
+                    "resolve_request_conversation",
+                    wraps=server.conversations.resolve_request_conversation,
                 ))
                 stack.enter_context(mock.patch.object(
                     server, "_run_agent_and_respond", new=run_agent
@@ -277,7 +281,8 @@ class AttachmentServerTransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create_conversation.call_count, 1)
         self.assertEqual(len(provider_inputs), 1)
         self.assertIsInstance(provider_inputs[0], str)
-        self.assertIn("public.txt", provider_inputs[0])
+        self.assertIn("source_ref=src_", provider_inputs[0])
+        self.assertNotIn(str(upload_root), provider_inputs[0])
         accepted = [
             frame for frame in ws.sent if frame.get("type") == "turn_accepted"
         ]

@@ -7,11 +7,14 @@ import asyncio
 import base64
 from contextlib import ExitStack
 import json
+import io
+import re
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest import mock
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +22,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from osia.server import server  # noqa: E402
+from tools.mobile_test_state import isolated_mobile_server_state
+from osia.document_artifacts import artifact_access_scope
+from osia.document_sources import get_source_store
 
 
 class _FakeWebSocket:
@@ -43,7 +49,7 @@ class _FakeWebSocket:
         for index, message in enumerate(self.messages):
             yield json.dumps(message)
             if index == self.pause_after and self.pause is not None:
-                await self.pause.wait()
+                await asyncio.wait_for(self.pause.wait(), timeout=5)
 
 
 async def _idle_heartbeat(_channel) -> None:
@@ -59,8 +65,16 @@ def _file_frame(data: bytes, filename: str, **fields) -> dict:
     }
 
 
+def _image_bytes() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(output, format="PNG")
+    return output.getvalue()
+
+
 class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="osia-legacy-contract-")))
+        self.enterContext(isolated_mobile_server_state(root))
         server._ACTIVE_TURNS_BY_CONV.clear()
         server._ACTIVE_TURN_META_BY_CONV.clear()
         server._ACTIVE_CONV_BY_REQUEST.clear()
@@ -89,20 +103,6 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
                 server.conversations, "list_conversations", return_value=[]
             ),
             mock.patch.object(
-                server.conversations,
-                "create_conversation",
-                return_value={"id": "conv_synthetic", "title": "Synthetic"},
-            ),
-            mock.patch.object(
-                server.conversations,
-                "get_conversation",
-                return_value={
-                    "id": "conv_synthetic",
-                    "title": "Synthetic",
-                    "messages": [],
-                },
-            ),
-            mock.patch.object(
                 server, "_pending_cron_notifications", return_value=[]
             ),
             mock.patch.object(
@@ -127,9 +127,9 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
         consumed = []
 
         async def run_agent(_channel, agent_input, history, conv_id, **_kwargs):
-            marker = "[Fichiers joints disponibles localement :\n- "
-            path_text = agent_input.split(marker, 1)[1].split("\n", 1)[0]
-            consumed.append(Path(path_text).read_bytes())
+            reference = re.search(r"source_ref=(src_[0-9a-f]{32})", agent_input).group(1)
+            with artifact_access_scope(conv_id):
+                consumed.append(get_source_store().resolve(reference)[0])
             return history, conv_id
 
         ws = _FakeWebSocket([
@@ -155,15 +155,18 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authenticated_image_turn_consumes_then_cleans(self) -> None:
         consumed = []
+        image_bytes = _image_bytes()
 
         async def run_agent(_channel, agent_input, history, conv_id, **_kwargs):
-            consumed.append(agent_input[-1]["image_url"]["url"])
+            reference = re.search(r"source_ref=(src_[0-9a-f]{32})", agent_input).group(1)
+            with artifact_access_scope(conv_id):
+                consumed.append(get_source_store().resolve(reference)[0])
             return history, conv_id
 
         ws = _FakeWebSocket([
             {"type": "auth", "token": "synthetic-token"},
             _file_frame(
-                b"synthetic-image",
+                image_bytes,
                 "image.png",
                 conversation_id="",
                 request_id="request_image",
@@ -175,7 +178,7 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
             await self._run(ws, root, run_agent)
             self.assertEqual(list((root / "legacy").glob("legacy-*")), [])
         self.assertEqual(len(consumed), 1)
-        self.assertTrue(consumed[0].startswith("data:image/png;base64,"))
+        self.assertEqual(consumed[0], image_bytes)
 
     async def test_provider_exception_still_cleans_owned_file(self) -> None:
         async def run_agent(*_args, **_kwargs):
@@ -184,7 +187,7 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
         ws = _FakeWebSocket([
             {"type": "auth", "token": "synthetic-token"},
             _file_frame(
-                b"synthetic-image",
+                _image_bytes(),
                 "image.png",
                 request_id="request_failure",
                 client_request_id="request_failure",
@@ -226,7 +229,7 @@ class LegacyUploadServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((root / "legacy").exists())
         received = [frame for frame in ws.sent if frame.get("type") == "file_received"]
         self.assertEqual(received[-1]["error"], {"code": "invalid_base64"})
-        self.assertEqual(received[-1]["path"], "")
+        self.assertNotIn("path", received[-1])
         self.assertEqual(received[-1]["filename"], "bad.txt")
 
 
