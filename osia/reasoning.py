@@ -379,6 +379,11 @@ def get_reasoning_capability(provider, model) -> dict | None:
         capability = _account_capability(model_id)
     else:
         capability = MODEL_REASONING_CAPABILITIES.get((provider_id, model_id))
+        if capability is None and provider_id == "openai":
+            from osia.models import model_metadata
+            metadata = model_metadata(provider_id, model_id) or {}
+            capability = MODEL_REASONING_CAPABILITIES.get(
+                (provider_id, metadata.get("reasoning_model_id")))
         if provider_id == "xai":
             from osia.models import model_metadata
             metadata = model_metadata(provider_id, model_id) or {}

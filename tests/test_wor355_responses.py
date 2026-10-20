@@ -131,3 +131,47 @@ def test_receipts_are_correlated_by_arguments_and_call_identity():
     ]))
     outputs = tool_feedback(message, [{"tool": "read_file", "path": "fixture"}] * 2, ["receipt 1", "receipt 2"])
     assert [(item["call_id"], item["output"]) for item in outputs] == [("first", "receipt 1"), ("second", "receipt 2")]
+
+
+def test_documented_nonstreaming_model_returns_one_completed_delta():
+    bodies = []
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        assert body["stream"] is False
+        assert "reasoning" not in body
+        return httpx.Response(200, json=payload([
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Completed reply"}]}
+        ], "gpt-5.5-pro"))
+    client = ResponsesClient(OpenAI(api_key="fixture", http_client=httpx.Client(transport=httpx.MockTransport(handler))), "openai")
+    try:
+        response = client.create(model="gpt-5.5-pro", messages=[{"role": "user", "content": "Hello"}], stream=True)
+        chunks = list(response)
+        assert len(chunks) == 1
+        assert chunks[0].choices[0].delta.content == "Completed reply"
+        assert response.message.content == "Completed reply"
+        assert len(bodies) == 1
+    finally:
+        client.close()
+
+
+def test_provider_switch_never_forwards_another_models_ciphertext(monkeypatch):
+    agent = OSIAAgent(lang="en")
+    agent.provider, agent.model = "groq", "openai/gpt-oss-120b"
+    agent.messages = [
+        {"role": "system", "content": "System"},
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": [{"type": "reasoning", "encrypted_content": "opaque-private"}],
+         "_response_route": ["openai", MODEL], "_response_fallback": "Factual call history"},
+    ]
+    wire = json.dumps(agent._wire_messages())
+    assert "opaque-private" not in wire
+    assert "Factual call history" in wire
+
+
+def test_native_refusal_is_public_response_text():
+    from osia.responses_api import response_message
+    message = response_message(payload([
+        {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "Provider refusal"}]}
+    ]))
+    assert message.content == "Provider refusal"

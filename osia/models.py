@@ -356,8 +356,20 @@ def model_metadata(provider, model_id):
         entry = next((m for m in remote if m["id"] == model_id), None)
         if entry is not None:
             return copy.deepcopy(entry)
-    return next((dict(m) for m in HARDCODED_MODELS
-                 if m["provider"] == provider and m["id"] == model_id), None)
+    return _documented_model_metadata(provider, model_id)
+
+
+def _documented_model_metadata(provider, model_id):
+    known = next((dict(m) for m in HARDCODED_MODELS
+                  if m["provider"] == provider and m["id"] == model_id), None)
+    if known is None and provider == "openai":
+        from osia.openai_model_contracts import DISCOVERY_CONTRACTS, SNAPSHOT_BASES
+        known = copy.deepcopy(DISCOVERY_CONTRACTS.get(model_id))
+        if known is None and model_id in SNAPSHOT_BASES:
+            base = _documented_model_metadata(provider, SNAPSHOT_BASES[model_id])
+            if base:
+                known = {**base, "id": model_id, "reasoning_model_id": SNAPSHOT_BASES[model_id]}
+    return known
 
 
 def _supported(value):
@@ -371,7 +383,7 @@ def _discovered_model(provider, item):
     mid = mid.removeprefix("models/")
     if item.get("active") is False or item.get("archived") is True or item.get("lifecycle") == "retired":
         return None
-    known = next((m for m in HARDCODED_MODELS if m["provider"] == provider and m["id"] == mid), {})
+    known = _documented_model_metadata(provider, mid) or {}
     caps = item.get("capabilities") or {}
     if not isinstance(caps, dict):
         caps = {}
@@ -402,7 +414,7 @@ def _discovered_model(provider, item):
     result = {**known, "id": mid, "provider": provider,
               "label": item.get("display_name") or item.get("displayName") or known.get("label") or mid,
               "tier": known.get("tier", "mid"), "source": "provider_discovery",
-              "availability": "listed", "available": True, "streaming": True}
+              "availability": "listed", "available": True, "streaming": known.get("streaming", True)}
     if provider == "mistral":
         result.update(vision=_supported(caps.get("vision")), tool_calls=_supported(caps.get("function_calling")))
     elif provider == "xai":

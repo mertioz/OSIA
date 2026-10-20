@@ -42,6 +42,17 @@ not evidence that an unknown model is unavailable at the provider. Future
 Responses-only contracts may require another documented metadata entry. Claude,
 Mistral and Google preserve the metadata their endpoints actually expose.
 
+Compatibility review additionally preserves discovered GPT-4o/4o-mini,
+GPT-5/mini/nano/5.1/5.2/5.4-nano, their explicitly documented dated snapshots,
+o1/o3/o3-mini/o4-mini, Pro variants and Daybreak aliases. Each contract was
+retrieved from its official OpenAI model page on the verification date.
+`osia/openai_model_contracts.py` contains discovery-only metadata rather than
+more offline dropdown entries. Unsupported or unknown IDs remain excluded;
+account entitlement is still determined by `/models`. GPT-5.5 Pro's page does
+not advertise streaming: its request runs without SSE and the completed reply
+is projected into the existing UI stream only after completion. Its capability
+is explicitly `streaming: false`; OSIA does not claim native streaming support.
+
 Mobile receives exact provider/model identity, availability and source fields,
 and renders the PC display name. It maintains no new independent model list.
 Secrets and raw provider responses are never serialized in the catalogue.

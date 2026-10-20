@@ -122,3 +122,15 @@ def test_mobile_rejects_direct_selection_of_unverified_entry(monkeypatch):
         pytest.fail("An unavailable model must not change selected configuration")
     monkeypatch.setattr(mobile, "set_setting", no_write)
     assert not mobile.validate_and_select("openai", "gpt-6.1-sol")
+
+
+def test_supported_older_openai_models_and_published_snapshots_are_preserved(monkeypatch):
+    ids = ["gpt-4o", "gpt-5-mini", "gpt-5.2-2025-12-11", "gpt-4.1-2025-04-14", "gpt-5.5-pro", "text-embedding-3-large", "gpt-unknown-future"]
+    monkeypatch.setattr(models.requests, "get", lambda *a, **kw: reply({"data": [{"id": mid} for mid in ids]}))
+    found = models.discover_all_remote_models({"openai": "fixture-key"})
+    assert [entry["id"] for entry in found] == ids[:5]
+    pro = next(entry for entry in found if entry["id"] == "gpt-5.5-pro")
+    assert pro["streaming"] is False
+    phone = mobile._mobile_model(mobile.build_model_inventory([pro], {"openai"})[0])
+    assert phone["capabilities"]["streaming"] is False
+    assert not any(entry["id"] == "gpt-4o" for entry in models.HARDCODED_MODELS)

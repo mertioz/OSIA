@@ -63,7 +63,7 @@ def input_items(messages):
 
 def response_message(payload):
     output = deepcopy(payload.get("output") or [])
-    public = "".join(part.get("text", "") for item in output
+    public = "".join(part.get("text") or part.get("refusal", "") for item in output
                      if item.get("type") == "message" for part in item.get("content", [])
                      if part.get("type") in {"output_text", "refusal"})
     summary = "".join(part.get("text", "") for item in output
@@ -93,7 +93,7 @@ class ResponsesStream:
                 data = event.model_dump() if hasattr(event, "model_dump") else event
                 kind = data.get("type")
                 delta = NS(content=None, tool_calls=None)
-                if kind == "response.output_text.delta":
+                if kind in {"response.output_text.delta", "response.refusal.delta"}:
                     delta.content = data.get("delta", "")
                 elif kind == "response.reasoning_summary_text.delta" or (
                     kind == "response.reasoning_text.delta" and self.public_reasoning_text
@@ -140,11 +140,14 @@ class ResponsesClient:
             return self.http_client.chat.completions.create(
                 model=model, messages=messages, stream=stream,
                 **({"timeout": timeout} if timeout is not None else {}), **kwargs)
-        body = {"model": model, "input": input_items(messages), "stream": stream,
+        native_stream = stream and metadata.get("streaming", True)
+        body = {"model": model, "input": input_items(messages), "stream": native_stream,
                 "store": False, "tools": native_tools(),
                 "include": ["reasoning.encrypted_content"]}
         # Grok returns its public summary by default; OpenAI requests it.
-        reasoning = {"summary": "auto"} if self.provider == "openai" else {}
+        reasoning = {"summary": "auto"} if (
+            self.provider == "openai" and metadata.get("request_reasoning_summary", True)
+        ) else {}
         if reasoning_effort is not None:
             reasoning["effort"] = reasoning_effort
         if reasoning:
@@ -152,14 +155,35 @@ class ResponsesClient:
         if timeout is not None:
             body["timeout"] = timeout
         response = self.http_client.responses.create(**body)
-        if stream:
+        if native_stream:
             return ResponsesStream(response, public_reasoning_text=bool(
                 self.provider == "xai" and metadata.get("public_reasoning_text")))
         payload = response.model_dump()
         if payload.get("status") == "failed":
             raise APIError("Responses request failed", request=None, body=None)
-        return NS(choices=[NS(message=response_message(payload), finish_reason=(
-            "length" if payload.get("status") == "incomplete" else "stop"))])
+        message = response_message(payload)
+        finish = "length" if payload.get("status") == "incomplete" else "stop"
+        if stream:
+            return CompletedResponseStream(message, finish)
+        return NS(choices=[NS(message=message, finish_reason=finish)])
+
+
+class CompletedResponseStream:
+    """Project one completed reply when the provider does not support SSE."""
+    def __init__(self, message, finish):
+        self.message, self.finish = message, finish
+
+    def close(self):
+        pass
+
+    def __iter__(self):
+        delta = NS(content=self.message.content,
+                   tool_calls=[NS(index=i, id=call.id, function=call.function)
+                               for i, call in enumerate(self.message.tool_calls)])
+        if self.message.public_thinking:
+            delta.public_thinking = self.message.public_thinking
+            delta.thinking_source = "responses:" + self.message.id
+        yield NS(choices=[NS(delta=delta, finish_reason=self.finish)])
 
 
 def tool_feedback(message, canonical_calls, results):

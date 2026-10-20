@@ -214,6 +214,7 @@ def _mobile_model(entry: dict) -> dict:
         "usable": bool(entry.get("available")),
         "selectable": bool(entry.get("picker_visible") and entry.get("available")),
         "vision": bool(entry.get("capabilities", {}).get("vision")),
+        "capabilities": dict(entry.get("capabilities") or {}),
         "availability": entry.get("availability", "listed"),
         "source": entry.get("catalogue_source", entry.get("source_type", "")),
         "reasoning": {
@@ -367,7 +368,10 @@ def _canonical_entry(raw: dict, provider_id: str, source_type: str) -> dict | No
         "catalogue_source": str(raw.get("source") or source_type),
         "picker_visible": True,
         "input_modalities": safe_modalities,
-        "capabilities": {"vision": bool(vision)},
+        "capabilities": {"vision": bool(vision),
+                         "tool_calls": raw.get("tool_calls") if isinstance(raw.get("tool_calls"), bool) else None,
+                         "streaming": raw.get("streaming") if isinstance(raw.get("streaming"), bool) else None,
+                         "context_window": raw.get("context_window") if isinstance(raw.get("context_window"), int) else None},
         "reasoning_options": _safe_reasoning_options(raw, provider_id, model_id),
         "stable_key": stable_model_key(provider_id, model_id),
     }
