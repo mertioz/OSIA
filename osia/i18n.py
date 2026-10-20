@@ -133,6 +133,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Installed version: {version} · {status}",
         "fr": "Version installée : {version} · {status}",
     },
+    "updates.product_beta": {
+        "en": "OSIA Desktop {version} — Public Beta",
+        "fr": "OSIA Desktop {version} — Bêta publique",
+    },
     "updates.version": {"en": "OSIA {version}", "fr": "OSIA {version}"},
     "updates.current": {"en": "Current", "fr": "Actuelle"},
     "updates.current_major": {

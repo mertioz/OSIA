@@ -2,6 +2,7 @@
 """PyInstaller 6.21 onedir build for the Windows OSIA application."""
 
 import os
+import subprocess
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -28,9 +29,18 @@ datas = [
 ]
 binaries = []
 
+# Build the committed product, without importing operator experiments that may
+# coexist in the primary checkout. Git is a build dependency, never a runtime one.
+tracked_python = subprocess.check_output(
+    ["git", "ls-files", "-z", "--", "osia"], cwd=ROOT,
+).decode("utf-8").split("\0")
+product_modules = {
+    name.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+    for name in tracked_python if name.endswith(".py")
+}
 hiddenimports = collect_submodules(
     "osia",
-    filter=lambda name: not any(
+    filter=lambda name: name in product_modules and not any(
         part.startswith("test_") or part == "_selftest"
         for part in name.split(".")
     ) and not name.startswith("osia.wake_training"),

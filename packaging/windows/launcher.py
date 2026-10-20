@@ -74,6 +74,58 @@ def _normalized_args(args: list[str] | None = None) -> list[str]:
     return values
 
 
+def _release_identity_smoke(metadata) -> None:
+    """Exercise the embedded updater and visible history without any download."""
+    import json
+    from dataclasses import replace
+    from osia.gui.update_ui import _ReleaseCard
+    from osia.updater import CHANNEL_URLS, ManifestError, parse_manifest
+    from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, display_version
+
+    if metadata.version != PRODUCT_VERSION or metadata.release_sequence != RELEASE_SEQUENCE:
+        raise RuntimeError("frozen release identity does not match product source")
+    raw = {
+        "schemaVersion": 2, "releaseSequence": RELEASE_SEQUENCE,
+        "product": "OSIA", "platform": "windows", "architecture": "x86_64",
+        "channel": metadata.channel, "version": PRODUCT_VERSION,
+        "publishedAt": "2026-10-20T00:00:00Z",
+        "installer": {
+            "url": f"https://download.osia.space/windows/{PRODUCT_VERSION}/OSIA-Setup.exe",
+            "sizeBytes": 1, "sha256": "a" * 64, "signed": False,
+            "signaturePublisher": None,
+        },
+        "mandatory": False, "minimumSupportedVersion": "1.0.1",
+        "minimumUpdaterVersion": "1.0.1", "releaseNotes": ["Offline validation fixture."],
+        "releaseNotesUrl": None, "rollout": {"state": "paused"},
+    }
+    for old in ("1.1.7", "1.1.8"):
+        legacy = replace(metadata, version=old, updater_schema_version=1, release_sequence=None)
+        if parse_manifest(
+            json.dumps(raw), legacy, source_url=CHANNEL_URLS[metadata.channel],
+        ).release_sequence != RELEASE_SEQUENCE:
+            raise RuntimeError("legacy release chronology failed")
+    try:
+        parse_manifest(json.dumps(raw), metadata, source_url=CHANNEL_URLS[metadata.channel])
+    except ManifestError as exc:
+        if str(exc) != "equal_version":
+            raise
+    else:
+        raise RuntimeError("equal release was accepted as newer")
+    if display_version("1.0.0") != "0.8.0" or display_version("1.1.8") != "0.8.952":
+        raise RuntimeError("historical aliases changed")
+    card = _ReleaseCard()
+    try:
+        card.apply(version=PRODUCT_VERSION, released_on=None, notes=())
+        if "OSIA Desktop" not in card.version.text() or PRODUCT_VERSION not in card.version.text():
+            raise RuntimeError("installed beta identity is missing")
+        card.apply(version="1.1.8", released_on=None, notes=())
+        if "0.8.952" not in card.version.text() or "1.1.8" not in card.version.toolTip():
+            raise RuntimeError("historical artifact identity is missing")
+    finally:
+        card.close()
+        card.deleteLater()
+
+
 def _package_smoke() -> int:
     """Offline dependency/model probe used by build and install validation."""
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -156,6 +208,8 @@ def _package_smoke() -> int:
         step = "release_notes"
         if release_for_version(metadata.version) is None:
             raise RuntimeError("embedded release notes are unavailable")
+        step = "release_identity"
+        _release_identity_smoke(metadata)
         step = "pdf_ocr_dependencies"
         if not verify_packaged_dependencies():
             raise RuntimeError("local PDF/OCR dependencies are incomplete")
@@ -219,6 +273,20 @@ def _package_smoke() -> int:
                         raise RuntimeError("isolated App Server account state is invalid")
                     if not client.list_models():
                         raise RuntimeError("managed App Server model catalog is empty")
+                    from osia.chatgpt_account.app_server_client import _canonical_native_tools
+                    tools = _canonical_native_tools()
+                    if not tools:
+                        raise RuntimeError("packaged canonical tool catalog is empty")
+                    models = client.list_models()
+                    if not client.start_or_resume_conversation(
+                        thread_id=None, model=models[0]["id"],
+                        base_instructions="Offline packaging validation. No inference.",
+                        developer_instructions="Use OSIA tools only.", dynamic_tools=tools,
+                    ):
+                        raise RuntimeError("canonical dynamic tools were not registered")
+                    client.logout()
+                    if client.get_account_status()["connected"]:
+                        raise RuntimeError("signed-out logout did not persist")
                     client.shutdown()
             finally:
                 client.shutdown()

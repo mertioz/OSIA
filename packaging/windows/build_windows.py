@@ -474,12 +474,12 @@ VSVersionInfo(
     mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName', 'OSIA'),
-    StringStruct('FileDescription', 'OSIA Personal AI Assistant'),
+    StringStruct('FileDescription', 'OSIA Desktop {version} — Public Beta'),
     StringStruct('FileVersion', '{version}'),
     StringStruct('InternalName', 'OSIA'),
     StringStruct('LegalCopyright', 'Copyright OSIA'),
     StringStruct('OriginalFilename', 'OSIA.exe'),
-    StringStruct('ProductName', 'OSIA'),
+    StringStruct('ProductName', 'OSIA Desktop — Public Beta'),
     StringStruct('ProductVersion', '{version}')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])]
 )

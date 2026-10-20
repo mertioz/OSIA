@@ -1963,7 +1963,11 @@ def wake_mode():
 
     app = QApplication(sys.argv)
     app.setApplicationName("OSIA")
-    app.setApplicationDisplayName("OSIA")
+    from osia.version import current_product_version
+    app.setApplicationVersion(current_product_version())
+    app.setApplicationDisplayName(
+        f"OSIA Desktop {app.applicationVersion()} — Public Beta"
+    )
     app.setWindowIcon(QIcon(ICON_PATH))
 
     # WOR-11 (Windows): bring up the mobile server alongside the GUI. On Linux a

@@ -781,7 +781,10 @@ class _ReleaseCard(QFrame):
         major_update: bool = False,
     ) -> None:
         self._set_major_update(major_update)
-        self.version.setText(i18n.t("updates.version", version=display_version(version)))
+        self.version.setText(i18n.t(
+            "updates.product_beta" if version == PRODUCT_VERSION else "updates.version",
+            version=display_version(version),
+        ))
         self.version.setToolTip(f"Artifact version: {version}")
         self.badge.setText(badge)
         self.badge.setVisible(bool(badge))
