@@ -83,7 +83,8 @@ def effective_route_capabilities(
         except Exception:
             metadata = None
         if metadata is not None:
-            source = "osia_models_exact_registry"
+            source = ("provider_model_discovery" if metadata.get("source") == "provider_discovery"
+                      else "osia_models_exact_registry")
 
     modalities: tuple[str, ...] = ()
     vision: bool | None = None

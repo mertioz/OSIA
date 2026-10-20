@@ -112,3 +112,13 @@ def test_stale_discovery_is_not_selectable(monkeypatch):
     entry = next(m for m in raw if m["provider"] == "openai")
     assert entry["availability"] == "stale"
     assert entry["available"] is False
+
+
+def test_mobile_rejects_direct_selection_of_unverified_entry(monkeypatch):
+    monkeypatch.setattr(mobile, "build_catalogue", lambda **kw: {"models": [
+        {"providerId": "openai", "id": "gpt-6.1-sol", "selectable": False}
+    ]})
+    def no_write(*args):
+        pytest.fail("An unavailable model must not change selected configuration")
+    monkeypatch.setattr(mobile, "set_setting", no_write)
+    assert not mobile.validate_and_select("openai", "gpt-6.1-sol")

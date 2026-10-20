@@ -515,6 +515,7 @@ def validate_and_select(provider_id: str, model_id: str) -> bool:
     catalogue = build_catalogue(refresh_local=True, refresh_account=True)
     valid = any(
         model["providerId"] == provider_id and model["id"] == model_id
+        and model.get("selectable", True)
         for model in catalogue["models"]
     )
     if not valid:
@@ -541,6 +542,8 @@ def validate_and_set_reasoning(provider_id: str, model_id: str, option_id: str) 
         None,
     )
     if model is None:
+        return False
+    if not model.get("selectable", True):
         return False
     valid_options = {item["id"] for item in model["reasoning"]["options"]}
     if option_id not in valid_options:
