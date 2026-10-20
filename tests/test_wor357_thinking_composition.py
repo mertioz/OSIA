@@ -66,6 +66,16 @@ def test_thinking_layout_stream_completion_cancel_and_history(monkeypatch):
         assert len(chat._thinking_widgets) == 2
         for number, widget in enumerate(chat._thinking_widgets.values(), 1):
             assert widget._detail.toPlainText() == f"Public commentary {number}."
+        chat.set_messages([
+            {"role": "user", "content": "Legacy question"},
+            {"role": "assistant", "content": "Legacy answer"},
+        ])
+        app.processEvents()
+        assert composition() == ["Legacy question", "thinking", "Legacy answer"]
+        empty = chat._messages_host.findChildren(_ChatThinkingTrace)
+        visible = [w for w in empty if not w.isHidden()]
+        assert len(visible) == 1
+        assert visible[0]._detail.toPlainText() == ""
     finally:
         chat.close()
         chat.deleteLater()

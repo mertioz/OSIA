@@ -60,7 +60,7 @@ def test_no_displayable_content_does_not_invent_thoughts(app):
         trace.record(kind="terminal", display_key="execution.terminal.success", terminal=True)
         assert widget.apply_trace(payload(trace))
         widget.set_active(False)
-        assert widget.isHidden()
+        assert not widget.isHidden()  # One disclosure remains, without invented prose.
         assert not widget._detail.toPlainText()
     finally:
         widget.deleteLater()

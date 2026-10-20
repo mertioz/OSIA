@@ -1071,10 +1071,7 @@ class _ChatThinkingTrace(QFrame):
         self._stop.setVisible(cancellable)
         self._stop.setEnabled(cancellable)
         self._orbs.set_active(cancellable)
-        self.setVisible(
-            (not self._auto_collapsed_for_final and not self.terminal)
-            or bool(self._detail.toPlainText())
-        )
+        self.setVisible(True)
         self._refresh_toggle()
 
     def mark_inactive(self) -> None:
@@ -1114,7 +1111,7 @@ class _ChatThinkingTrace(QFrame):
             if self._expanded else "chat.thinking.expand"
         )
         settled = self.terminal or self._auto_collapsed_for_final
-        self._toggle.setVisible(settled and bool(self._detail.toPlainText()))
+        self._toggle.setVisible(settled)
         self._orbs.setVisible(not settled)
         for control in (self._toggle, self._orbs):
             control.setChecked(self._expanded)
@@ -1220,6 +1217,7 @@ class _ChatPage(QWidget):
             tuple[str, str, str, str], _ChatThinkingTrace
         ] = {}
         self._active_thinking_key: tuple[str, str, str, str] | None = None
+        self._pending_thinking_widget: _ChatThinkingTrace | None = None
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._scroll_to_bottom)
@@ -1670,6 +1668,7 @@ class _ChatPage(QWidget):
         self._motion.settle()
         self._thinking_widgets.clear()
         self._active_thinking_key = None
+        self._pending_thinking_widget = None
         # Keep the trailing stretch and the owned empty label. Removed message
         # widgets are hidden immediately so queued input cannot reach them.
         while self._messages_layout.count() > 1:
@@ -1833,6 +1832,7 @@ class _ChatPage(QWidget):
                 self._messages_layout.count() - 1, widget,
             )
             self._thinking_widgets[key] = widget
+            self._pending_thinking_widget = widget
             self._empty.hide()
         elif not widget.apply_trace(payload):
             return False
@@ -2037,6 +2037,21 @@ class _ChatPage(QWidget):
         # violet line in the chat.
         if not text or not str(text).strip():
             return None
+        if role == "assistant":
+            # Old responses may have no trace payload. Keep one empty, truthful
+            # disclosure above the reply without inventing an execution identity.
+            if self._pending_thinking_widget is None:
+                empty_thinking = _ChatThinkingTrace(auto_expand=False)
+                empty_thinking.mark_completed()
+                self._messages_layout.insertWidget(
+                    self._messages_layout.count() - 1, empty_thinking,
+                )
+            else:
+                self._messages_layout.removeWidget(self._pending_thinking_widget)
+                self._messages_layout.insertWidget(
+                    self._messages_layout.count() - 1, self._pending_thinking_widget,
+                )
+            self._pending_thinking_widget = None
         bubble = _Bubble(role, text, streaming=streaming)
         bubble.set_available_width(self._maximum_bubble_width())
         # Insert just before the trailing stretch so the chat grows down.
