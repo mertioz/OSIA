@@ -45,12 +45,12 @@ PROVIDERS = {
         "models_endpoint": "https://generativelanguage.googleapis.com/v1beta/models",
     },
     "xai": {
-        "name": "xAI",
+        "name": "Grok / xAI",
         "base_url": "https://api.x.ai/v1",
         "models_endpoint": "https://api.x.ai/v1/models",
     },
     "groq": {
-        "name": "Groq",
+        "name": "GroqCloud",
         "base_url": "https://api.groq.com/openai/v1",
         "models_endpoint": "https://api.groq.com/openai/v1/models",
     },
@@ -96,9 +96,14 @@ HARDCODED_MODELS = [
     {"id": "gemini-3.1-flash-lite",   "label": "Gemini 3.1 Flash Lite", "provider": "google", "tier": "light", "vision": True},
     {"id": "gemini-2.5-flash",        "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light", "vision": True},  # GA; shutting down Oct 2026
     {"id": "gemini-2.5-flash-lite",   "label": "Gemini 2.5 Flash Lite", "provider": "google", "tier": "light", "vision": True},
-    # xAI — Grok is vision-capable.
-    {"id": "grok-3",              "label": "Grok 3",              "provider": "xai",       "tier": "mid",   "vision": True},
-    {"id": "grok-3-mini",         "label": "Grok 3 Mini",         "provider": "xai",       "tier": "light", "vision": True},
+    # xAI's May 2026 retirement removed the old Grok 3 API IDs.
+    {"id": "grok-4.7", "label": "Grok 4.7", "provider": "xai", "tier": "best",
+     "vision": True, "tool_calls": True, "api_protocol": "responses", "context_window": 500_000,
+     "public_reasoning_text": True},
+    # Retain the existing Mini contract if the key still lists it. It is
+    # text-only, unlike the erroneous old generic Grok vision declaration.
+    {"id": "grok-3-mini", "label": "Grok 3 Mini", "provider": "xai", "tier": "light",
+     "vision": False, "tool_calls": True, "api_protocol": "chat_completions"},
     # Groq — ids must match Groq's /models API exactly (some are namespaced).
     # These Groq-hosted chat models are text-only.
     {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid",   "vision": False},
@@ -372,6 +377,11 @@ def _discovered_model(provider, item):
         caps = {}
     if provider == "deepseek" and mid != "deepseek-flash":
         return None
+    if provider == "xai" and mid in {
+        "grok-3", "grok-4-0709", "grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning",
+        "grok-4-fast-reasoning", "grok-4-fast-non-reasoning", "grok-code-fast-1",
+    }:
+        return None
     if provider == "mistral" and not _supported(caps.get("completion_chat")):
         return None
     if provider == "google":
@@ -383,7 +393,9 @@ def _discovered_model(provider, item):
         return None
     # OpenAI / xAI list endpoints do not carry chat/endpoint capabilities.
     # An exact documented contract is required for tool-capable chat selection.
-    if provider in {"openai", "xai"} and not known:
+    if provider == "openai" and not known:
+        return None
+    if provider == "xai" and not known and not item.get("_language_model"):
         return None
     if provider == "anthropic" and caps.get("tool_use") is not None and not _supported(caps["tool_use"]):
         return None
@@ -393,6 +405,15 @@ def _discovered_model(provider, item):
               "availability": "listed", "available": True, "streaming": True}
     if provider == "mistral":
         result.update(vision=_supported(caps.get("vision")), tool_calls=_supported(caps.get("function_calling")))
+    elif provider == "xai":
+        result["api_protocol"] = known.get("api_protocol", "responses")
+        if item.get("_language_model"):
+            modalities = item.get("input_modalities") or ["text"]
+            result.update(inputModalities=modalities, vision="image" in modalities)
+        efforts = caps.get("reasoning_effort")
+        if isinstance(efforts, list):
+            result["supportedReasoningEfforts"] = [level for level in efforts
+                if level in {"none", "low", "medium", "high", "xhigh", "max"}]
     elif provider == "anthropic" and caps:
         if "image_input" in caps:
             result["vision"] = _supported(caps["image_input"])
@@ -447,6 +468,23 @@ def _fetch_remote_models(provider, api_key, timeout):
         seen.add(next_cursor)
         cursor = next_cursor
     out, identities = [], set()
+    if provider == "xai":
+        # The generic /models list proves identity; language-models supplies
+        # modalities and effort metadata without mixing Imagine/Voice services.
+        try:
+            response = requests.get(cfg["base_url"] + "/language-models", headers=headers, timeout=timeout)
+            language_models = response.json().get("models", []) if response.status_code == 200 else []
+            language_by_id = {}
+            for item in language_models:
+                if not isinstance(item, dict) or "text" not in item.get("output_modalities", []):
+                    continue
+                for identity in [item.get("id"), *(item.get("aliases") or [])]:
+                    language_by_id[identity] = item
+            items = [{**language_by_id.get(item.get("id"), {}), **item,
+                      "_language_model": item.get("id") in language_by_id}
+                     for item in items if isinstance(item, dict)]
+        except Exception:
+            pass  # Exact documented contracts still work with /models alone.
     for item in items:
         model = _discovered_model(provider, item) if isinstance(item, dict) else None
         if model is not None and model["id"] not in identities:

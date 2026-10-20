@@ -28,7 +28,7 @@ EXPECTED_STATIC_OPTIONS = {
     ("google", "gemini-3.1-flash-lite"): ["auto", "minimal", "low", "medium", "high"],
     ("google", "gemini-2.5-flash"): ["auto", "off", "minimal", "low", "medium", "high"],
     ("google", "gemini-2.5-flash-lite"): ["auto", "off", "minimal", "low", "medium", "high"],
-    ("xai", "grok-3"): [],
+    ("xai", "grok-4.7"): ["auto", "low", "medium", "high", "xhigh"],
     ("xai", "grok-3-mini"): [],
     ("groq", "llama-3.3-70b-versatile"): [],
     ("groq", "llama-3.1-8b-instant"): [],

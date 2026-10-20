@@ -79,8 +79,9 @@ def response_message(payload):
 
 
 class ResponsesStream:
-    def __init__(self, raw):
+    def __init__(self, raw, *, public_reasoning_text=False):
         self.raw, self.message = raw, None
+        self.public_reasoning_text = public_reasoning_text
 
     def close(self):
         self.raw.close()
@@ -94,7 +95,9 @@ class ResponsesStream:
                 delta = NS(content=None, tool_calls=None)
                 if kind == "response.output_text.delta":
                     delta.content = data.get("delta", "")
-                elif kind == "response.reasoning_summary_text.delta":
+                elif kind == "response.reasoning_summary_text.delta" or (
+                    kind == "response.reasoning_text.delta" and self.public_reasoning_text
+                ):
                     key = (data.get("item_id", ""), data.get("summary_index", 0))
                     summaries[key] = summaries.get(key, "") + data.get("delta", "")
                     delta.public_thinking = summaries[key]
@@ -140,15 +143,18 @@ class ResponsesClient:
         body = {"model": model, "input": input_items(messages), "stream": stream,
                 "store": False, "tools": native_tools(),
                 "include": ["reasoning.encrypted_content"]}
-        reasoning = {"summary": "auto"}
+        # Grok returns its public summary by default; OpenAI requests it.
+        reasoning = {"summary": "auto"} if self.provider == "openai" else {}
         if reasoning_effort is not None:
             reasoning["effort"] = reasoning_effort
-        body["reasoning"] = reasoning
+        if reasoning:
+            body["reasoning"] = reasoning
         if timeout is not None:
             body["timeout"] = timeout
         response = self.http_client.responses.create(**body)
         if stream:
-            return ResponsesStream(response)
+            return ResponsesStream(response, public_reasoning_text=bool(
+                self.provider == "xai" and metadata.get("public_reasoning_text")))
         payload = response.model_dump()
         if payload.get("status") == "failed":
             raise APIError("Responses request failed", request=None, body=None)

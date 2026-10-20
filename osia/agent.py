@@ -10596,7 +10596,7 @@ class OSIAAgent:
                 except (IndexError, AttributeError):
                     yield ""
                     continue
-                if self.provider in {"anthropic", "openai"} and getattr(delta, "public_thinking", ""):
+                if self.provider in {"anthropic", "openai", "xai"} and getattr(delta, "public_thinking", ""):
                     ledger = getattr(self, "_execution_trace_ledger", None)
                     if ledger is not None:
                         ledger.record_public_reasoning_summary(
@@ -13995,7 +13995,7 @@ class OSIAAgent:
                     if getattr(choice, "finish_reason", None) == "length":
                         raise ProviderOutputTruncatedError()
                     message = choice.message
-                    if self.provider in {"anthropic", "openai"} and getattr(message, "public_thinking", ""):
+                    if self.provider in {"anthropic", "openai", "xai"} and getattr(message, "public_thinking", ""):
                         ledger = getattr(self, "_execution_trace_ledger", None)
                         if ledger is not None:
                             ledger.record_public_reasoning_summary(

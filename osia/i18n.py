@@ -45,6 +45,14 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "grok_api.account_notice": {
+        "en": "Connect with an xAI API key. API billing is separate from Grok subscriptions. Grok account login in OSIA is unavailable pending an official method and authorization.",
+        "fr": "Connexion par clé API xAI. La facturation API est distincte des abonnements Grok. La connexion au compte Grok dans OSIA reste indisponible, dans l’attente d’une méthode officielle et d’une autorisation.",
+        "de": "Mit xAI-API-Schlüssel verbinden. Die API wird getrennt vom Grok-Abo abgerechnet. Die Grok-Kontoanmeldung in OSIA ist bis zu einer offiziellen Methode und Genehmigung nicht verfügbar.",
+        "es": "Conecta con una clave API de xAI. La API se factura por separado de Grok. El inicio de sesión de Grok en OSIA no está disponible hasta contar con un método oficial y autorización.",
+        "ja": "xAI APIキーで接続します。API料金はGrokのサブスクリプションとは別です。OSIAでのGrokアカウント接続は公式の方法と許可が得られるまで利用できません。",
+        "zh": "使用xAI API密钥连接。API与Grok订阅分开计费。OSIA中的Grok账户登录在获得官方方法和授权前不可用。",
+    },
     "chatgpt_account.disconnect_failed": {
         "en": "Disconnect failed. The account is still connected; try Disconnect again.",
         "fr": "La déconnexion a échoué. Le compte est encore connecté ; réessayez Déconnecter.",

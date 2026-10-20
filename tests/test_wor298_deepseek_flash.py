@@ -200,6 +200,8 @@ def test_non_deepseek_before_after_snapshot_identical():
     for key in ("complex", "simple", "image_adapters", "provider_order"):
         assert json.loads(json.dumps(actual[key])) == baseline[key]
     for old in baseline["models"]:
+        if old["provider"] == "xai":
+            continue  # WOR-356: documented Grok retirement and Mini vision fix.
         assert old in actual["models"]
     for pair, capability in baseline["reasoning"].items():
         assert actual["reasoning"][pair] == capability

@@ -12,23 +12,24 @@ from osia.responses_api import ResponsesClient
 MODEL = "gpt-6.1-sol"
 
 
-def payload(output):
-    return {"id": "resp_fixture", "object": "response", "status": "completed", "model": MODEL, "output": output}
+def payload(output, model=MODEL):
+    return {"id": "resp_fixture", "object": "response", "status": "completed", "model": model, "output": output}
 
 
-def sse(output):
+def sse(output, model=MODEL):
     events = []
     for index, item in enumerate(output):
         if item["type"] == "message":
             events.append({"type": "response.output_text.delta", "delta": item["content"][0]["text"]})
         elif item["type"] == "reasoning":
             events.append({"type": "response.reasoning_summary_text.delta", "item_id": item["id"], "summary_index": 0, "delta": item["summary"][0]["text"]})
-    events.append({"type": "response.completed", "response": payload(output)})
+    events.append({"type": "response.completed", "response": payload(output, model)})
     return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
 
 
+@pytest.mark.parametrize("provider,model", [("openai", MODEL), ("xai", "grok-4.7")])
 @pytest.mark.parametrize("streaming", [False, True])
-def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming):
+def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming, provider, model):
     fixture = tmp_path / "fixture.txt"
     fixture.write_text("responses fixture contents", encoding="utf-8")
     bodies = []
@@ -38,6 +39,10 @@ def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming)
         bodies.append(body)
         assert len(bodies) <= 2
         assert body["store"] is False
+        assert request.headers["Authorization"] == "Bearer fixture-key"
+        assert request.url.host == ("api.x.ai" if provider == "xai" else "api.openai.com")
+        if provider == "xai":
+            assert "summary" not in body.get("reasoning", {})
         assert {tool["name"] for tool in body["tools"]} >= {"read_file", "write_file", "run_command"}
         if len(bodies) == 1:
             output = [{"type": "reasoning", "id": "rs_fixture", "encrypted_content": "opaque-private", "summary": [{"type": "summary_text", "text": "I will read the requested file."}]},
@@ -48,21 +53,21 @@ def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming)
             assert receipts[0]["call_id"] == "call_read"
             assert "responses fixture contents" in receipts[0]["output"]
             output = [{"type": "message", "id": "msg_fixture", "role": "assistant", "content": [{"type": "output_text", "text": "I read the file successfully. Its contents are: responses fixture contents.", "annotations": []}]}]
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse(output)) if body.get("stream") else httpx.Response(200, json=payload(output))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse(output, model)) if body.get("stream") else httpx.Response(200, json=payload(output, model))
     def factory(**kwargs):
         return OpenAI(**kwargs, max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
     monkeypatch.setattr(agent_module, "OpenAI", factory)
     monkeypatch.setattr(config, "get_setting", lambda name, default=None: default)
     agent = OSIAAgent(lang="en")
     monkeypatch.setattr(agent, "_provider_key_chain", lambda provider: ["fixture-key"])
-    agent.set_model(MODEL, provider="openai")
+    agent.set_model(model, provider=provider)
     monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path / "turns"))
     try:
         result = agent.run_terminal_turn(f"Read {fixture} and report its contents.", turn_id="responses-fixture", history=[], on_sentence=(lambda text: None) if streaming else None)
         assert "responses fixture contents" in result
         assert "opaque-private" not in result
         assert len(bodies) == 2
-        assert {body["model"] for body in bodies} == {MODEL}
+        assert {body["model"] for body in bodies} == {model}
     finally:
         agent.client.close()
 

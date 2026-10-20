@@ -3696,6 +3696,12 @@ class _ProviderCard(QFrame):
         layout.addLayout(key_row)
 
         self._workspace_input = None
+        self._grok_api_note = None
+        if provider == "xai":
+            self._grok_api_note = QLabel(i18n.t("grok_api.account_notice"))
+            self._grok_api_note.setObjectName("providerSub")
+            self._grok_api_note.setWordWrap(True)
+            layout.addWidget(self._grok_api_note)
         self._claude_api_note = None
         if provider == "anthropic":
             self._claude_api_note = QLabel(i18n.t("claude_api.billing"))
@@ -3728,6 +3734,8 @@ class _ProviderCard(QFrame):
             self._workspace_input.setAccessibleName(i18n.t("claude_api.workspace"))
             self._workspace_input.setToolTip(i18n.t("claude_api.workspace_info"))
             self._claude_api_note.setText(i18n.t("claude_api.billing"))
+        if self._grok_api_note is not None:
+            self._grok_api_note.setText(i18n.t("grok_api.account_notice"))
         # Don't clobber the transient "Saved ✓" flash.
         if not self._save_btn.property("saved"):
             self._save_btn.setText(i18n.t("provider.save"))

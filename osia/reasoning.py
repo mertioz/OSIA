@@ -256,6 +256,13 @@ _register(
     "https://console.groq.com/docs/reasoning",
 )
 
+_register(
+    MODEL_REASONING_CAPABILITIES, "xai", ("grok-4.7",),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                           for level in ("low", "medium", "high", "xhigh")]),
+    "https://docs.x.ai/developers/model-capabilities/text/reasoning",
+)
+
 def normalize_level(value) -> str:
     """Return a normalized canonical reasoning option id."""
     return normalize_reasoning_level(value)
@@ -372,6 +379,14 @@ def get_reasoning_capability(provider, model) -> dict | None:
         capability = _account_capability(model_id)
     else:
         capability = MODEL_REASONING_CAPABILITIES.get((provider_id, model_id))
+        if provider_id == "xai":
+            from osia.models import model_metadata
+            metadata = model_metadata(provider_id, model_id) or {}
+            efforts = metadata.get("supportedReasoningEfforts")
+            if isinstance(efforts, list) and efforts:
+                options = [_AUTO_OPTION, *[_option("off" if level == "none" else level,
+                    "Off" if level == "none" else level.title(), {"reasoning_effort": level}) for level in efforts]]
+                capability = {"options": options, "evidence": "xai:language-models.capabilities"}
         if provider_id == "anthropic":
             from osia.models import model_metadata
             metadata = model_metadata(provider_id, model_id) or {}

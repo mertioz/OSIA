@@ -186,7 +186,7 @@ def provider_client(client, provider):
 
     if provider == "anthropic" and get_setting("anthropic_transport", "messages") != "compatibility":
         return ClaudeMessagesClient(client)
-    if provider == "openai":
+    if provider in {"openai", "xai"}:
         from osia.responses_api import ResponsesClient
         return ResponsesClient(client, provider)
     return client
