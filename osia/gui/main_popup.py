@@ -3441,6 +3441,7 @@ class _ModelPanel(QWidget):
             "provider": entry.get("provider_id") or "",
             "label": entry.get("model_display_name") or entry.get("model_id") or "?",
             "reasoning_options": list(entry.get("reasoning_options") or []),
+            "available": bool(entry.get("available")),
         }
 
     def _account_is_visible(self, models: list[dict] | None = None) -> bool:
@@ -3539,6 +3540,7 @@ class _ModelPanel(QWidget):
                 ),
                 reasoning_options=m.get("reasoning_options") if is_account else None,
             )
+            row.setEnabled(bool(m.get("available")))
             if is_account:
                 row.selected.connect(self._select_account_model)
             else:
@@ -10738,6 +10740,7 @@ class MainPopup(QWidget):
     wake_word_enabled_changed = pyqtSignal(bool)
     chat_execution_cancel_requested = pyqtSignal(dict)
     _ollama_models_ready = pyqtSignal(list)
+    _remote_catalogue_ready = pyqtSignal(list)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -10940,6 +10943,11 @@ class MainPopup(QWidget):
             self._request_local_models_refresh
         )
         self._ollama_models_ready.connect(self._apply_local_models)
+        self._remote_catalogue_ready.connect(self.set_remote_models)
+        self._remote_catalogue_timer = QTimer(self)
+        self._remote_catalogue_timer.setInterval(10 * 60 * 1000)
+        self._remote_catalogue_timer.timeout.connect(self._request_remote_catalogue)
+        self._remote_catalogue_timer.start()
         self._settings.capsule_visibility_changed.connect(
             self.capsule_visibility_changed.emit
         )
@@ -11724,6 +11732,11 @@ class MainPopup(QWidget):
 
     def _request_local_models_refresh(self) -> None:
         refresh_ollama_models_async(self._publish_local_models)
+
+    def _request_remote_catalogue(self) -> None:
+        from osia.models import discover_models_async
+
+        discover_models_async(self._remote_catalogue_ready.emit)
 
     def _publish_local_models(self, models: list) -> None:
         self._ollama_models_ready.emit(list(models))

@@ -10393,6 +10393,13 @@ class OSIAAgent:
         from osia.image_inputs import adapt_messages_for_provider
 
         logical = [copy.deepcopy(message) for message in self.messages]
+        # Responses items (especially ciphertext) belong to the exact route
+        # that authored them. A later provider/model switch gets the factual
+        # textual call/receipt history, never another model's opaque protocol.
+        for frame in logical:
+            route = frame.get("_response_route")
+            if route and route != [self.provider, self.model]:
+                frame["content"] = frame.get("_response_fallback", "")
 
         # Restate the current turn's authoritative target language at
         # the end of the latest user/provider-continuation payload. This is a
@@ -10589,7 +10596,7 @@ class OSIAAgent:
                 except (IndexError, AttributeError):
                     yield ""
                     continue
-                if self.provider == "anthropic" and getattr(delta, "public_thinking", ""):
+                if self.provider in {"anthropic", "openai"} and getattr(delta, "public_thinking", ""):
                     ledger = getattr(self, "_execution_trace_ledger", None)
                     if ledger is not None:
                         ledger.record_public_reasoning_summary(
@@ -13988,11 +13995,11 @@ class OSIAAgent:
                     if getattr(choice, "finish_reason", None) == "length":
                         raise ProviderOutputTruncatedError()
                     message = choice.message
-                    if self.provider == "anthropic" and getattr(message, "public_thinking", ""):
+                    if self.provider in {"anthropic", "openai"} and getattr(message, "public_thinking", ""):
                         ledger = getattr(self, "_execution_trace_ledger", None)
                         if ledger is not None:
                             ledger.record_public_reasoning_summary(
-                                message.public_thinking, source_id="claude:" + message.id,
+                                message.public_thinking, source_id=self.provider + ":" + message.id,
                             )
                     from osia.public_commentary import public_assistant_text
                     content = public_assistant_text(message.content)
@@ -14337,6 +14344,9 @@ class OSIAAgent:
                     "role": "assistant",
                     "content": getattr(message, "native_content", None) or assistant_record,
                     "_provisional": True,
+                    **({"_response_route": [self.provider, self.model],
+                        "_response_fallback": assistant_record}
+                       if getattr(message, "response_output", None) else {}),
                 })
                 document_tool_used = any(
                     tc.get("tool") in _DOCUMENT_TOOL_NAMES
@@ -15349,7 +15359,10 @@ class OSIAAgent:
                             ))
                         except Exception:
                             continue
-                    self.messages.append({"role": "user", "content": content_parts})
+                    self.messages.append({"role": "user", "content": content_parts,
+                        **({"_response_route": [self.provider, self.model],
+                            "_response_fallback": feedback_text}
+                           if getattr(message, "response_output", None) else {})})
                     active_visual_strategy = (
                         _execution_strategy.current_execution_strategy()
                     )
@@ -15361,7 +15374,10 @@ class OSIAAgent:
                             f"[OSIA Agent] ⚠ dropping {len(tool_screenshots)} screenshot(s): "
                             f"model {self.model!r} ({self.provider}) doesn't support vision content"
                         )
-                    self.messages.append({"role": "user", "content": native_feedback or feedback_text})
+                    self.messages.append({"role": "user", "content": native_feedback or feedback_text,
+                        **({"_response_route": [self.provider, self.model],
+                            "_response_fallback": feedback_text}
+                           if getattr(message, "response_output", None) else {})})
                 continue
 
             # No tool call in any format — candidate final response. A rejected

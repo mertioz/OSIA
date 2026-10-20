@@ -362,6 +362,11 @@ def resolve_context_limit(provider, model) -> int:
 
     provider_id = str(provider or "").strip().lower()
     model_id = str(model or "").strip()
+    from osia.models import model_metadata
+    metadata = model_metadata(provider_id, model_id) or {}
+    limit = metadata.get("context_window")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        return limit
     return _MODEL_CONTEXT_LIMITS.get(
         (provider_id, model_id),
         _PROVIDER_CONTEXT_DEFAULTS.get(provider_id, 32_768),

@@ -214,6 +214,8 @@ def _mobile_model(entry: dict) -> dict:
         "usable": bool(entry.get("available")),
         "selectable": bool(entry.get("picker_visible") and entry.get("available")),
         "vision": bool(entry.get("capabilities", {}).get("vision")),
+        "availability": entry.get("availability", "listed"),
+        "source": entry.get("catalogue_source", entry.get("source_type", "")),
         "reasoning": {
             "supported": bool(options),
             "options": options,
@@ -236,7 +238,7 @@ def _provider_entry(provider_id: str, entries: list[dict]) -> dict:
         "providerId": provider_id,
         "displayName": name,
         "kind": kind,
-        "available": True,
+        "available": any(entry.get("available") for entry in entries),
         "modelCount": len(entries),
         "models": [_mobile_model(entry) for entry in entries],
     }
@@ -360,7 +362,9 @@ def _canonical_entry(raw: dict, provider_id: str, source_type: str) -> dict | No
         "model_display_name": display_name,
         "source_type": source_type,
         "configured": True,
-        "available": True,
+        "available": bool(raw.get("available", True)),
+        "availability": str(raw.get("availability") or "listed"),
+        "catalogue_source": str(raw.get("source") or source_type),
         "picker_visible": True,
         "input_modalities": safe_modalities,
         "capabilities": {"vision": bool(vision)},
@@ -465,7 +469,9 @@ def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True)
     ]
     flat_models = [model for provider in providers for model in provider["models"]]
     settings = load_settings()
+    from osia.models import discovery_status
     return {
+        "discovery": discovery_status(),
         "version": 1,
         "providers": providers,
         "models": flat_models,

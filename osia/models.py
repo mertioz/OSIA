@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """OSIA model registry.
 
-Defines providers, their hardcoded 2026 models, smart routing logic and
-remote model discovery.
+PC-owned cloud discovery, documented capability fallbacks and local models.
 """
 
 import re
+import copy
 import threading
 import time
 
@@ -37,7 +37,7 @@ PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com/v1",
-        "models_endpoint": None,  # No public list endpoint — hardcoded only
+        "models_endpoint": "https://api.deepseek.com/v1/models",
     },
     "google": {
         "name": "Google",
@@ -57,9 +57,7 @@ PROVIDERS = {
     "mistral": {
         "name": "Mistral",
         "base_url": "https://api.mistral.ai/v1",
-        # hardcoded only (cf. DeepSeek) — Mistral's /models also lists
-        # embed/OCR/moderation models, which don't belong in the chat selector.
-        "models_endpoint": None,
+        "models_endpoint": "https://api.mistral.ai/v1/models",
     },
     "ollama": {
         "name": "Local (Ollama)",
@@ -117,6 +115,39 @@ HARDCODED_MODELS = [
     {"id": "codestral-2508",      "label": "Codestral",          "provider": "mistral", "tier": "mid",   "vision": False},
 ]
 
+# Small documented contract fallback, verified 2026-10-20. These records
+# describe capabilities; only discovery proves current account availability.
+HARDCODED_MODELS.extend([
+    {"id": mid, "label": label, "provider": "openai", "tier": "best",
+     "vision": True, "tool_calls": True, "api_protocol": "responses", "context_window": 1_050_000}
+    for mid, label in (
+        ("gpt-6.1-sol", "GPT-6.1 Sol"), ("gpt-6-astra", "GPT-6 Astra"),
+        ("gpt-6-sol", "GPT-6 Sol"), ("gpt-6-luna", "GPT-6 Luna"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol"), ("gpt-5.6-terra", "GPT-5.6 Terra"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    )
+])
+HARDCODED_MODELS.extend([
+    {"id": mid, "label": label, "provider": "anthropic", "tier": "best",
+     "vision": True, "tool_calls": True, "context_window": 1_000_000}
+    for mid, label in (("claude-fable-5-1", "Claude Fable 5.1"),
+                       ("claude-opus-5-5", "Claude Opus 5.5"),
+                       ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                       ("claude-haiku-5-5", "Claude Haiku 5.5"))
+])
+HARDCODED_MODELS.extend([
+    {"id": mid, "label": label, "provider": "google", "tier": "best",
+     "vision": True, "tool_calls": True, "context_window": 1_048_576}
+    for mid, label in (("gemini-4-argon", "Gemini 4 Argon"),
+                       ("gemini-3.8-flash", "Gemini 3.8 Flash"))
+])
+HARDCODED_MODELS.extend([
+    {"id": "qwen/qwen3.8-27b", "label": "Qwen 3.8 27B", "provider": "groq",
+     "tier": "mid", "vision": True, "tool_calls": True, "context_window": 131_072},
+    {"id": "mistral-large-4", "label": "Mistral Large 4", "provider": "mistral",
+     "tier": "best", "vision": True, "tool_calls": True, "context_window": 1_000_000},
+])
+
 # ── Vision capability (WOR-25) ─────────────────────────────────────────────
 
 def model_has_vision(provider: str | None, model_id: str) -> bool:
@@ -126,16 +157,8 @@ def model_has_vision(provider: str | None, model_id: str) -> bool:
     remote-discovered IDs fail closed instead of inferring capability from a
     provider name or model-name fragment.
     """
-    if not model_id or not provider:
-        return False
-    provider_id = str(provider or "").lower()
-    for metadata in HARDCODED_MODELS:
-        if metadata["id"] != model_id:
-            continue
-        if provider_id and metadata["provider"] != provider_id:
-            return False
-        return bool(metadata.get("vision", False))
-    return False
+    metadata = model_metadata(str(provider or "").lower(), model_id)
+    return bool(metadata and metadata.get("vision") is True)
 
 
 # ── Local Ollama discovery ────────────────────────────────────────────────
@@ -291,138 +314,223 @@ GROQ_NON_CHAT_PATTERNS = (
 )
 
 
-def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> list:
-    """Query a provider's /models endpoint. Returns [] on any failure."""
-    if not api_key:
-        return []
-    cfg = PROVIDERS.get(provider)
-    if not cfg or not cfg.get("models_endpoint"):
-        return []
+# Discovery data is PC-owned, process-local, and contains no credentials.
+_DISCOVERY_LOCK = threading.RLock()
+_DISCOVERY: dict[str, dict] = {}
+_DISCOVERY_INVALIDATED: set[str] = set()
+_DISCOVERY_EPOCH = 0
+_DISCOVERY_TTL = 900.0
 
-    headers = {}
+
+class ModelDiscoveryError(RuntimeError):
+    def __init__(self, status_code=None):
+        super().__init__("model_discovery_failed")
+        self.status_code = status_code
+
+
+def invalidate_remote_models(provider=None):
+    global _DISCOVERY_EPOCH
+    with _DISCOVERY_LOCK:
+        _DISCOVERY_EPOCH += 1
+        _DISCOVERY_INVALIDATED.update((provider,) if provider else API_PROVIDERS)
+        if provider:
+            _DISCOVERY.pop(provider, None)
+        else:
+            _DISCOVERY.clear()
+
+
+def discovery_status() -> dict:
+    with _DISCOVERY_LOCK:
+        return {provider: {"status": value["status"], "checked_at": value["checked_at"]}
+                for provider, value in _DISCOVERY.items()}
+
+
+def model_metadata(provider, model_id):
+    with _DISCOVERY_LOCK:
+        remote = _DISCOVERY.get(provider, {}).get("models", [])
+        entry = next((m for m in remote if m["id"] == model_id), None)
+        if entry is not None:
+            return copy.deepcopy(entry)
+    return next((dict(m) for m in HARDCODED_MODELS
+                 if m["provider"] == provider and m["id"] == model_id), None)
+
+
+def _supported(value):
+    return value is True or (isinstance(value, dict) and value.get("supported") is True)
+
+
+def _discovered_model(provider, item):
+    mid = item.get("id") or item.get("name") or ""
+    if not isinstance(mid, str) or not mid or any(c.isspace() for c in mid):
+        return None
+    mid = mid.removeprefix("models/")
+    if item.get("active") is False or item.get("archived") is True or item.get("lifecycle") == "retired":
+        return None
+    known = next((m for m in HARDCODED_MODELS if m["provider"] == provider and m["id"] == mid), {})
+    caps = item.get("capabilities") or {}
+    if not isinstance(caps, dict):
+        caps = {}
+    if provider == "deepseek" and mid != "deepseek-flash":
+        return None
+    if provider == "mistral" and not _supported(caps.get("completion_chat")):
+        return None
+    if provider == "google":
+        if "generateContent" not in item.get("supportedGenerationMethods", []):
+            return None
+        if any(x in mid.lower() for x in ("embedding", "image", "tts", "live", "robotics")):
+            return None
+    if provider == "groq" and any(p in mid.lower() for p in GROQ_NON_CHAT_PATTERNS):
+        return None
+    # OpenAI / xAI list endpoints do not carry chat/endpoint capabilities.
+    # An exact documented contract is required for tool-capable chat selection.
+    if provider in {"openai", "xai"} and not known:
+        return None
+    if provider == "anthropic" and caps.get("tool_use") is not None and not _supported(caps["tool_use"]):
+        return None
+    result = {**known, "id": mid, "provider": provider,
+              "label": item.get("display_name") or item.get("displayName") or known.get("label") or mid,
+              "tier": known.get("tier", "mid"), "source": "provider_discovery",
+              "availability": "listed", "available": True, "streaming": True}
+    if provider == "mistral":
+        result.update(vision=_supported(caps.get("vision")), tool_calls=_supported(caps.get("function_calling")))
+    elif provider == "anthropic" and caps:
+        if "image_input" in caps:
+            result["vision"] = _supported(caps["image_input"])
+        thinking = caps.get("thinking") or {}
+        effort = caps.get("effort") or {}
+        types = thinking.get("types") or {}
+        if _supported(thinking) and _supported(types.get("adaptive")):
+            result["adaptive_thinking"] = True
+            result["thinking_disabled"] = _supported(types.get("disabled"))
+            result["supportedReasoningEfforts"] = [k for k in ("low", "medium", "high", "xhigh", "max") if _supported(effort.get(k))]
+    limit = item.get("max_input_tokens") or item.get("inputTokenLimit") or item.get("context_window") or item.get("max_context_length")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        result["context_window"] = limit
+    if item.get("lifecycle") in {"active", "deprecated"}:
+        result["lifecycle"] = item["lifecycle"]
+    return result
+
+
+def _fetch_remote_models(provider, api_key, timeout):
+    cfg = PROVIDERS.get(provider, {})
+    if not cfg.get("models_endpoint"):
+        return []
     if provider == "anthropic":
         from osia.anthropic_api import request_headers
-        headers = request_headers(api_key)
-        headers["anthropic-version"] = "2023-06-01"
+        headers = {**request_headers(api_key), "anthropic-version": "2023-06-01"}
+    elif provider == "google":
+        headers = {"x-goog-api-key": api_key}
     else:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    items = []
-    cursor = None
-    seen_cursors = set()
+        headers = {"Authorization": f"Bearer {api_key}"}
+    items, cursor, seen = [], None, set()
     while True:
-        request_options = {"headers": headers, "timeout": timeout}
+        params = {}
         if provider == "anthropic":
-            request_options["params"] = {"limit": 1000}
-            if cursor:
-                request_options["params"]["after_id"] = cursor
-        try:
-            r = requests.get(cfg["models_endpoint"], **request_options)
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            if not isinstance(data, dict):
-                return []
-            page = data.get("data") or data.get("models") or []
-            if not isinstance(page, list):
-                return []
-        except Exception:
-            return []
+            params = {"limit": 1000, **({"after_id": cursor} if cursor else {})}
+        elif provider == "google":
+            params = {"pageSize": 1000, **({"pageToken": cursor} if cursor else {})}
+        response = requests.get(cfg["models_endpoint"], headers=headers, timeout=timeout, **({"params": params} if params else {}))
+        if response.status_code != 200:
+            raise ModelDiscoveryError(response.status_code)
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ModelDiscoveryError()
+        page = data.get("models", []) if provider == "google" else data.get("data", [])
+        if not isinstance(page, list):
+            raise ModelDiscoveryError()
         items.extend(page)
-        if provider != "anthropic" or data.get("has_more") is not True:
+        next_cursor = (data.get("last_id") if data.get("has_more") is True else None) if provider == "anthropic" else data.get("nextPageToken") if provider == "google" else None
+        if not next_cursor and not (provider == "anthropic" and data.get("has_more") is True):
             break
-        cursor = data.get("last_id")
-        # Bound one corrupt discovery operation by its actual cursor identity,
-        # without a page-count ceiling or any restriction on Chat/tool rounds.
-        if not page or not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
-            return []
-        seen_cursors.add(cursor)
-    out = []
+        if not page or not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen:
+            raise ModelDiscoveryError()
+        seen.add(next_cursor)
+        cursor = next_cursor
+    out, identities = [], set()
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("id") or item.get("name") or ""
-        if not mid:
-            continue
-        # Google's API prefixes names with "models/" — strip it.
-        if mid.startswith("models/"):
-            mid = mid[len("models/"):]
-        # Groq's endpoint mixes chat with non-chat models — keep chat only.
-        if provider == "groq" and any(p in mid.lower() for p in GROQ_NON_CHAT_PATTERNS):
-            continue
-        out.append({
-            "id": mid,
-            "label": item.get("display_name") or mid,
-            "provider": provider,
-            "tier": "mid",
-        })
+        model = _discovered_model(provider, item) if isinstance(item, dict) else None
+        if model is not None and model["id"] not in identities:
+            identities.add(model["id"])
+            out.append(model)
     return out
+
+
+def fetch_remote_models(provider: str, api_key: str, timeout: float = 5.0) -> list:
+    """Compatibility entry point; failures never publish a partial catalogue."""
+    if not api_key:
+        return []
+    try:
+        return _fetch_remote_models(provider, api_key, timeout)
+    except Exception:
+        return []
 
 
 def discover_all_remote_models(api_keys: dict, timeout: float = 5.0) -> list:
-    """Run remote discovery for each provider with a key set. Returns merged list."""
+    from osia.utils.key_chain import iter_keys, is_technical_error
+
     out = []
+    with _DISCOVERY_LOCK:
+        epoch = _DISCOVERY_EPOCH
     for provider in API_PROVIDERS:
-        key = api_keys.get(provider)
-        if key:
-            out.extend(fetch_remote_models(provider, key, timeout=timeout))
+        # Shared key-chain owner also supports fallback-only configuration.
+        chain = list(iter_keys(provider))
+        if not chain and api_keys.get(provider):
+            chain = [api_keys[provider]]
+        if not chain:
+            continue
+        models, status = [], "error"
+        for key in chain:
+            try:
+                models = _fetch_remote_models(provider, key, timeout)
+                status = "ready" if models else "empty"
+                break
+            except Exception as exc:
+                if not is_technical_error(exc):
+                    break
+        with _DISCOVERY_LOCK:
+            if epoch != _DISCOVERY_EPOCH:
+                continue  # Credentials changed while the request was in flight.
+            _DISCOVERY[provider] = {"models": copy.deepcopy(models), "status": status, "checked_at": time.time()}
+            _DISCOVERY_INVALIDATED.discard(provider)
+        out.extend(models)
     return out
 
 
-# ── Combined registry ─────────────────────────────────────────────────────
-
-def get_all_models(api_keys: dict | None = None,
-                   include_remote: bool = False,
-                   remote_models: list | None = None) -> list:
-    """Return combined model list: hardcoded + local Ollama + (optional) remote.
-
-    Models are deduplicated by (provider, id). Pass ``remote_models`` if you
-    already discovered them in a background thread.
-    """
-    if api_keys is None:
-        from osia.config import load_api_keys
-        api_keys = load_api_keys()
-
-    models = list(HARDCODED_MODELS)
-    models.extend(get_ollama_models())
-
-    if remote_models:
-        models.extend(remote_models)
-    elif include_remote:
-        models.extend(discover_all_remote_models(api_keys))
-
-    seen = set()
-    deduped = []
-    for m in models:
-        key = (m["provider"], m["id"])
-        if key[0] == "deepseek" and key[1] != "deepseek-flash":
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(m)
-    return deduped
+def _combined_models(local, remote_models=None):
+    with _DISCOVERY_LOCK:
+        states = copy.deepcopy(_DISCOVERY)
+        invalidated = set(_DISCOVERY_INVALIDATED)
+    provided = {}
+    for item in remote_models or []:
+        provided.setdefault(item["provider"], []).append(item)
+    result = []
+    for provider in API_PROVIDERS:
+        state = states.get(provider)
+        if state is not None:
+            fresh = time.time() - state["checked_at"] < _DISCOVERY_TTL
+            result.extend({**m, "available": fresh and state["status"] == "ready",
+                           "availability": "listed" if fresh else "stale"} for m in state["models"])
+        elif provider in provided and provider not in invalidated:
+            result.extend(provided[provider])
+        else:
+            result.extend({**m, "source": "static_fallback", "availability": "unverified", "available": False}
+                          for m in HARDCODED_MODELS if m["provider"] == provider)
+    result.extend(local)
+    return list({(m["provider"], m["id"]): m for m in result
+                 if m["provider"] != "deepseek" or m["id"] == "deepseek-flash"}.values())
 
 
-def get_all_models_cached(api_keys: dict | None = None,
-                          remote_models: list | None = None) -> list:
-    """Return the UI-safe registry without synchronously probing local runtimes."""
-    models = list(HARDCODED_MODELS)
-    models.extend(cached_ollama_models())
-    if remote_models:
-        models.extend(remote_models)
+def get_all_models(api_keys=None, include_remote=False, remote_models=None):
+    if include_remote:
+        if api_keys is None:
+            from osia.config import load_api_keys
+            api_keys = load_api_keys()
+        remote_models = discover_all_remote_models(api_keys)
+    return _combined_models(get_ollama_models(), remote_models)
 
-    seen = set()
-    deduped = []
-    for model in models:
-        key = (model["provider"], model["id"])
-        if key[0] == "deepseek" and key[1] != "deepseek-flash":
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(model)
-    return deduped
+
+def get_all_models_cached(api_keys=None, remote_models=None):
+    return _combined_models(cached_ollama_models(), remote_models)
 
 
 def discover_models_async(callback, api_keys: dict | None = None) -> threading.Thread:
@@ -583,3 +691,15 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
 def provider_for_model_cached(model_id: str) -> str:
     """Resolve a model for UI rendering without starting a runtime probe."""
     return provider_for_model(model_id, models=get_all_models_cached())
+
+
+from osia.config import add_api_key_change_listener as _listen_for_key_changes
+_listen_for_key_changes(invalidate_remote_models)
+
+from osia.config import add_setting_change_listener as _listen_for_setting_changes
+
+def _discovery_setting_changed(key):
+    if key in {"api_key_fallbacks", "anthropic_workspace_id", "api_fallbacks"}:
+        invalidate_remote_models()
+
+_listen_for_setting_changes(_discovery_setting_changed)

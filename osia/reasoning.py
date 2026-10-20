@@ -228,6 +228,34 @@ _register(
 )
 
 
+_register(
+    MODEL_REASONING_CAPABILITIES, "openai",
+    ("gpt-6.1-sol", "gpt-6-astra"),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                           for level in ("low", "medium", "high", "xhigh", "max")]),
+    "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "openai", ("gpt-6-luna", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+    _options(_AUTO_OPTION, _option("off", "Off", {"reasoning_effort": "none"}),
+             *[_option(level, level.title(), {"reasoning_effort": level})
+               for level in ("low", "medium", "high", "xhigh", "max")]),
+    "https://developers.openai.com/api/docs/models/gpt-6-luna",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "google", ("gemini-4-argon", "gemini-3.8-flash"),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                           for level in ("low", "medium", "high")]),
+    "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "groq", ("qwen/qwen3.8-27b",),
+    _options(_AUTO_OPTION, _option("off", "Off", {"reasoning_effort": "none"}),
+             *[_option(level, level.title(), {"reasoning_effort": level})
+               for level in ("low", "medium", "high")]),
+    "https://console.groq.com/docs/reasoning",
+)
+
 def normalize_level(value) -> str:
     """Return a normalized canonical reasoning option id."""
     return normalize_reasoning_level(value)
@@ -344,6 +372,17 @@ def get_reasoning_capability(provider, model) -> dict | None:
         capability = _account_capability(model_id)
     else:
         capability = MODEL_REASONING_CAPABILITIES.get((provider_id, model_id))
+        if provider_id == "anthropic":
+            from osia.models import model_metadata
+            metadata = model_metadata(provider_id, model_id) or {}
+            if metadata.get("adaptive_thinking"):
+                options = [_AUTO_OPTION]
+                if metadata.get("thinking_disabled"):
+                    options.append(_option("off", "Off", {"extra_body": {"thinking": {"type": "disabled"}}}))
+                options.extend(_option(level, level.title(), _anthropic_adaptive_kwargs(level))
+                               for level in metadata.get("supportedReasoningEfforts", []))
+                capability = {"options": options, "evidence": "anthropic:models.capabilities"}
+
     return copy.deepcopy(capability) if capability else None
 
 

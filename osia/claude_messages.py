@@ -186,11 +186,18 @@ def provider_client(client, provider):
 
     if provider == "anthropic" and get_setting("anthropic_transport", "messages") != "compatibility":
         return ClaudeMessagesClient(client)
+    if provider == "openai":
+        from osia.responses_api import ResponsesClient
+        return ResponsesClient(client, provider)
     return client
 
 
 def tool_feedback(message, canonical_calls, results, feedback):
     """Bind each native call to the receipts produced by canonical dispatch."""
+    if getattr(message, "response_output", None):
+        from osia.responses_api import tool_feedback as responses_feedback
+        outputs = responses_feedback(message, canonical_calls, results)
+        return outputs + [{"type": "text", "text": feedback}] if outputs else []
     calls = [b for b in getattr(message, "native_content", []) if b.get("type") == "tool_use"]
     if not calls:
         return []

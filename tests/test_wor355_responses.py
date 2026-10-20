@@ -1,0 +1,128 @@
+"""Real SDK + synthetic HTTP transport, including canonical OSIA dispatch."""
+import json
+
+import httpx
+import pytest
+from openai import OpenAI, APIError, APIStatusError
+
+from osia import agent as agent_module, config
+from osia.agent import OSIAAgent
+from osia.responses_api import ResponsesClient
+
+MODEL = "gpt-6.1-sol"
+
+
+def payload(output):
+    return {"id": "resp_fixture", "object": "response", "status": "completed", "model": MODEL, "output": output}
+
+
+def sse(output):
+    events = []
+    for index, item in enumerate(output):
+        if item["type"] == "message":
+            events.append({"type": "response.output_text.delta", "delta": item["content"][0]["text"]})
+        elif item["type"] == "reasoning":
+            events.append({"type": "response.reasoning_summary_text.delta", "item_id": item["id"], "summary_index": 0, "delta": item["summary"][0]["text"]})
+    events.append({"type": "response.completed", "response": payload(output)})
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming):
+    fixture = tmp_path / "fixture.txt"
+    fixture.write_text("responses fixture contents", encoding="utf-8")
+    bodies = []
+    def handler(request):
+        assert request.url.path == "/v1/responses"
+        body = json.loads(request.content)
+        bodies.append(body)
+        assert len(bodies) <= 2
+        assert body["store"] is False
+        assert {tool["name"] for tool in body["tools"]} >= {"read_file", "write_file", "run_command"}
+        if len(bodies) == 1:
+            output = [{"type": "reasoning", "id": "rs_fixture", "encrypted_content": "opaque-private", "summary": [{"type": "summary_text", "text": "I will read the requested file."}]},
+                      {"type": "function_call", "id": "fc_fixture", "call_id": "call_read", "name": "read_file", "arguments": json.dumps({"path": str(fixture)})}]
+        else:
+            assert any(item.get("encrypted_content") == "opaque-private" for item in body["input"])
+            receipts = [item for item in body["input"] if item.get("type") == "function_call_output"]
+            assert receipts[0]["call_id"] == "call_read"
+            assert "responses fixture contents" in receipts[0]["output"]
+            output = [{"type": "message", "id": "msg_fixture", "role": "assistant", "content": [{"type": "output_text", "text": "I read the file successfully. Its contents are: responses fixture contents.", "annotations": []}]}]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse(output)) if body.get("stream") else httpx.Response(200, json=payload(output))
+    def factory(**kwargs):
+        return OpenAI(**kwargs, max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(agent_module, "OpenAI", factory)
+    monkeypatch.setattr(config, "get_setting", lambda name, default=None: default)
+    agent = OSIAAgent(lang="en")
+    monkeypatch.setattr(agent, "_provider_key_chain", lambda provider: ["fixture-key"])
+    agent.set_model(MODEL, provider="openai")
+    monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path / "turns"))
+    try:
+        result = agent.run_terminal_turn(f"Read {fixture} and report its contents.", turn_id="responses-fixture", history=[], on_sentence=(lambda text: None) if streaming else None)
+        assert "responses fixture contents" in result
+        assert "opaque-private" not in result
+        assert len(bodies) == 2
+        assert {body["model"] for body in bodies} == {MODEL}
+    finally:
+        agent.client.close()
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 429])
+def test_typed_http_errors(status):
+    client = ResponsesClient(OpenAI(api_key="fixture", max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(status, json={"error": {"message": "synthetic", "type": "test"}})))), "openai")
+    try:
+        with pytest.raises(APIStatusError) as caught:
+            client.create(model=MODEL, messages=[{"role": "user", "content": "Hello"}])
+        assert caught.value.status_code == status
+    finally:
+        client.close()
+
+
+def test_stream_eof_is_not_success():
+    client = ResponsesClient(OpenAI(api_key="fixture", http_client=httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, content='data: {"type":"response.output_text.delta","delta":"partial"}\n\n')))), "openai")
+    try:
+        with pytest.raises(APIError):
+            list(client.create(model=MODEL, messages=[{"role": "user", "content": "Hello"}], stream=True))
+    finally:
+        client.close()
+
+
+def test_private_reasoning_never_becomes_public_summary():
+    from osia.responses_api import ResponsesStream
+    from types import SimpleNamespace as NS
+    class Raw:
+        response = NS(request=httpx.Request("POST", "https://api.openai.com/v1/responses"))
+        closed = False
+        def close(self):
+            self.closed = True
+        def __iter__(self):
+            yield {"type": "response.reasoning_text.delta", "delta": "private chain"}
+            yield {"type": "response.reasoning_summary_text.delta", "item_id": "summary", "delta": "Public summary"}
+            yield {"type": "response.completed", "response": payload([])}
+    raw = Raw()
+    stream = ResponsesStream(raw)
+    chunks = list(stream)
+    public = "".join(getattr(c.choices[0].delta, "public_thinking", "") for c in chunks)
+    assert public == "Public summary"
+    assert raw.closed
+
+
+def test_close_propagates_to_exact_stream():
+    from osia.responses_api import ResponsesStream
+    from unittest.mock import Mock
+    raw = Mock()
+    stream = ResponsesStream(raw)
+    stream.close()
+    raw.close.assert_called_once_with()
+
+
+def test_receipts_are_correlated_by_arguments_and_call_identity():
+    from osia.responses_api import response_message, tool_feedback
+    message = response_message(payload([
+        {"type": "function_call", "name": "read_file", "call_id": call, "arguments": '{"path":"fixture"}'}
+        for call in ["first", "second"]
+    ]))
+    outputs = tool_feedback(message, [{"tool": "read_file", "path": "fixture"}] * 2, ["receipt 1", "receipt 2"])
+    assert [(item["call_id"], item["output"]) for item in outputs] == [("first", "receipt 1"), ("second", "receipt 2")]

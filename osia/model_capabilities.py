@@ -77,16 +77,9 @@ def effective_route_capabilities(
             source = "app_server_model_list"
     elif metadata is None and provider != "chatgpt_account":
         try:
-            from osia.models import HARDCODED_MODELS
+            from osia.models import model_metadata
+            metadata = model_metadata(provider, model)
 
-            metadata = next(
-                (
-                    item for item in HARDCODED_MODELS
-                    if str(item.get("provider") or "").casefold() == provider
-                    and str(item.get("id") or "") == model
-                ),
-                None,
-            )
         except Exception:
             metadata = None
         if metadata is not None:
