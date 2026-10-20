@@ -98,3 +98,6 @@ uiautomation; sys_platform == "win32"
 # NVIDIA GPU temperature in the heartbeat monitor; safely skipped at runtime
 # when absent or when there is no NVIDIA GPU. Remove if not needed.
 pynvml>=11.5.0
+
+# Windows has no system IANA database for zoneinfo / scheduled tasks.
+tzdata==2026.5

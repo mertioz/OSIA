@@ -30,3 +30,15 @@ def test_frozen_release_gate_and_bilingual_beta_history(channel, language):
     finally:
         i18n.set_language(previous, persist=False)
         app.processEvents()
+
+
+def test_shipped_timezone_data_works_without_system_database(monkeypatch):
+    import zoneinfo
+    original = zoneinfo.TZPATH
+    try:
+        zoneinfo.reset_tzpath(())
+        zoneinfo.ZoneInfo.clear_cache()
+        _load_launcher()._timezone_smoke()
+    finally:
+        zoneinfo.ZoneInfo.clear_cache()
+        zoneinfo.reset_tzpath(original)

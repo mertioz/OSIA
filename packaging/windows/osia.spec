@@ -61,6 +61,7 @@ for package in (
     "soundfile",
     "onnxruntime",
     "uiautomation",
+    "tzdata",
 ):
     package_datas, package_bins, package_hidden = collect_all(package)
     datas += package_datas

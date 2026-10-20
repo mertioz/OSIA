@@ -126,6 +126,22 @@ def _release_identity_smoke(metadata) -> None:
         card.deleteLater()
 
 
+def _timezone_smoke() -> None:
+    """Load shipped IANA data, including on Windows without a system database."""
+    from datetime import datetime, timedelta
+    from importlib.resources import files
+    from zoneinfo import ZoneInfo
+
+    with files("tzdata.zoneinfo").joinpath("Europe/Paris").open("rb") as stream:
+        paris = ZoneInfo.from_file(stream, key="Europe/Paris")
+    if (
+        datetime(2025, 1, 1, tzinfo=paris).utcoffset() != timedelta(hours=1)
+        or datetime(2025, 7, 1, tzinfo=paris).utcoffset() != timedelta(hours=2)
+        or ZoneInfo("UTC").utcoffset(None) != timedelta(0)
+    ):
+        raise RuntimeError("packaged IANA timezone data is invalid")
+
+
 def _package_smoke() -> int:
     """Offline dependency/model probe used by build and install validation."""
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -210,6 +226,8 @@ def _package_smoke() -> int:
             raise RuntimeError("embedded release notes are unavailable")
         step = "release_identity"
         _release_identity_smoke(metadata)
+        step = "timezone_data"
+        _timezone_smoke()
         step = "pdf_ocr_dependencies"
         if not verify_packaged_dependencies():
             raise RuntimeError("local PDF/OCR dependencies are incomplete")
