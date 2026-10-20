@@ -99,6 +99,22 @@ tickets, tests, comments, and documentation when they conflict.
   Linux, Windows tunnel scripts and detached service processes on Windows.
 - Keep install.bat, start.bat, and requirements.txt as the Windows setup path.
 
+## Windows release workflow
+
+- The operator performs real Windows `.exe` installation, upgrade, migration,
+  rollback and authenticated account tests **after publication**. Record these
+  as `OPERATOR_PENDING` until the operator supplies results. Do not require a
+  disposable VM, physical installation or manual OAuth test before an explicitly
+  authorized Windows beta publication, and never claim those scenarios passed.
+- Before publication, verify automated build integrity, frozen runtime, secrets,
+  security, product/display versions, source commit, hashes and artifact metadata.
+  Publish only the authorized platform through the existing immutable R2 release
+  infrastructure and verify the full public download and the site deployment.
+- Preserve published historical artifacts and their original URLs. Do not change
+  installed update channels or force automatic migration without proven schema
+  and migration compatibility. Clearly disclose beta, signing and acceptance
+  status and unverified commercial ChatGPT Account eligibility.
+
 ## Change and verification workflow
 
 1. Keep scope to the requested work. Before changing a function or protocol,
