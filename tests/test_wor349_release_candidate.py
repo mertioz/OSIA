@@ -42,3 +42,23 @@ def test_shipped_timezone_data_works_without_system_database(monkeypatch):
     finally:
         zoneinfo.ZoneInfo.clear_cache()
         zoneinfo.reset_tzpath(original)
+
+
+def test_provider_probe_uses_canonical_chat_with_long_spaced_profile(monkeypatch, tmp_path):
+    import tempfile
+    from osia import config, execution_strategy, tool_attempts, turn_terminality
+    from osia.provider_smoke import run_claude_messages_smoke
+
+    temporary = tmp_path / "profil vierge é" / ("long-profile-" * 6)
+    temporary.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(config, "get_setting", lambda name, default=None: default)
+    monkeypatch.setattr(turn_terminality, "CONFIG_DIR", str(tmp_path / "turns"))
+    store = tool_attempts.ToolAttemptStore(tmp_path / "attempts")
+    monkeypatch.setattr(tool_attempts, "get_tool_attempt_store", lambda: store)
+    monkeypatch.setattr(
+        execution_strategy, "build_execution_strategy",
+        lambda *args, **kwargs: pytest.fail("probe entered the legacy strategy compiler"),
+    )
+    run_claude_messages_smoke()

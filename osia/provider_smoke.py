@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import secrets
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from openai import OpenAI
@@ -11,7 +13,6 @@ from openai import OpenAI
 
 def run_claude_messages_smoke():
     from osia.agent import OSIAAgent
-    from osia.claude_messages import ClaudeMessagesClient
 
     model = "claude-sonnet-4-6"
     requests = []
@@ -33,6 +34,12 @@ def run_claude_messages_smoke():
                            and "OSIA frozen provider fixture" in b.get("content", "") for b in results):
                     raise RuntimeError("canonical frozen tool receipt was not reinjected")
                 content, stop = [{"type": "text", "text": "The file contains OSIA frozen provider fixture."}], "end_turn"
+            if not body.get("stream"):
+                return httpx.Response(200, json={
+                    "id": "msg_frozen", "type": "message", "role": "assistant",
+                    "model": model, "content": content, "stop_reason": stop,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                })
             events = [{"type": "message_start", "message": {"id": "msg_frozen", "usage": {"input_tokens": 1}}}]
             for index, block in enumerate(content):
                 events.extend([{"type": "content_block_start", "index": index, "content_block": block},
@@ -42,18 +49,38 @@ def run_claude_messages_smoke():
             return httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   content="".join("data: " + json.dumps(e) + "\n\n" for e in events))
 
-        agent = OSIAAgent(lang="en")
-        agent.model, agent.provider = model, "anthropic"
-        agent.client = ClaudeMessagesClient(OpenAI(
-            base_url="https://fixture.invalid/v1", api_key="offline-fixture",
-            max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        ))
-        try:
-            # _run_turn avoids the persistent turn controller in this isolated
-            # offline probe. Actual OSIA dispatch still owns read_file.
-            result = agent.run("Read the file " + str(path), on_sentence=lambda text: None,
-                               canonical_output=False)
-            if "OSIA frozen provider fixture" not in result or len(requests) != 2:
-                raise RuntimeError("frozen Claude tool round did not complete")
-        finally:
-            agent.client.close()
+        def factory(**kwargs):
+            kwargs.update(
+                max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            )
+            return OpenAI(**kwargs)
+
+        # Exercise the same canonical entry and correlated receipts as Chat.
+        # The compatibility run() wrapper has a legacy strategy compiler and
+        # is not a product-runtime acceptance probe. Every HTTP client here is
+        # mocked; no real provider credential or inference is used.
+        with patch("osia.agent.OpenAI", factory):
+            agent = OSIAAgent(lang="en")
+            agent._provider_key_chain = lambda provider: ["offline-fixture"]
+            agent.set_model(model, provider="anthropic")
+            identity = "package-smoke-" + secrets.token_hex(12)
+            agent.configure_tool_attempts(
+                conversation_id=identity, turn_id=identity,
+                request_id=identity, final_response_message_id=identity,
+            )
+            try:
+                result = agent.run_terminal_turn(
+                    "Read the file " + str(path), turn_id=identity,
+                    current_conversation_id=identity, history=[],
+                    on_sentence=lambda text: None,
+                )
+                if (
+                    "OSIA frozen provider fixture" not in result
+                    or len(requests) != 2
+                    or agent.last_execution_strategy_snapshot is not None
+                ):
+                    raise RuntimeError("frozen canonical Claude tool round did not complete")
+            finally:
+                agent.clear_tool_attempts()
+                agent.client.close()
