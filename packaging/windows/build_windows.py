@@ -348,7 +348,25 @@ def _stage_codex_runtime() -> dict:
 def _stage_legal() -> list[dict]:
     license_root = LEGAL_STAGE / "licenses"
     license_root.mkdir(parents=True, exist_ok=True)
-    dependencies = []
+    # The standalone Codex archive contains executables, not its license text.
+    # Retain the exact upstream tag's license/notice independently of Python's
+    # distribution inventory (Codex is not a pip distribution).
+    codex_licenses = ROOT / "packaging" / "windows" / "licenses" / "codex"
+    expected = {
+        "LICENSE": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+        "NOTICE": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915",
+    }
+    target = license_root / f"codex-{CODEX_RUNTIME_VERSION}"
+    target.mkdir(parents=True, exist_ok=True)
+    for name, digest in expected.items():
+        source = codex_licenses / name
+        if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+            raise RuntimeError("pinned Codex redistribution notice changed")
+        shutil.copy2(source, target / name)
+    dependencies = [{
+        "name": "OpenAI Codex", "version": CODEX_RUNTIME_VERSION,
+        "license": "Apache-2.0", "homepage": "https://github.com/openai/codex",
+    }]
     for dist in sorted(
         importlib.metadata.distributions(),
         key=lambda item: (item.metadata.get("Name") or "").lower(),

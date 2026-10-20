@@ -4,6 +4,18 @@ OSIA is distributed with third-party open-source libraries and model assets.
 The build creates `legal/DEPENDENCIES.json` and copies the license/notice files
 available in each installed Python distribution into `legal/licenses/`.
 
+## Bundled ChatGPT Account runtime
+
+OpenAI Codex 0.144.1 is included as a standalone native Windows package, not
+as a dependency on a user-installed Codex CLI. Its upstream Apache-2.0 LICENSE
+and NOTICE from `openai/codex` tag `rust-v0.144.1` are retained under
+`legal/licenses/codex-0.144.1/`. The builder verifies their pinned hashes.
+The upstream NOTICE includes the Ratatui attribution.
+
+The open-source software license does not establish eligibility to offer
+ChatGPT plan usage in a paid application. The OpenAI authorization and
+clean-Windows acceptance gates are documented separately before distribution.
+
 ## Bundled model assets
 
 - **Kokoro-82M** (`hexgrad/Kokoro-82M`, pinned revision

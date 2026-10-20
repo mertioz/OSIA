@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
-from osia.runtime import resource_path
+from osia.runtime import resource_path, is_frozen
+from osia.version import PRODUCT_VERSION
 from osia.utils.subprocess_policy import (
     ProcessMode,
     process_kwargs,
@@ -47,7 +48,7 @@ _DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE = ((0, 144, 1), (0, 145, 0))
 # Codex 0.156.1 is separately supported after checking its generated App Server
 # contract; unreviewed releases stay fail-closed.
 _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1)})
-CLIENT_VERSION = "1.0.0"
+CLIENT_VERSION = PRODUCT_VERSION
 _IMAGE_LOG_REDACTION_POLL_SECONDS = 0.5
 
 _SAFE_CONFIG = """# Managed by OSIA for the isolated ChatGPT-account provider.
@@ -552,6 +553,10 @@ def _managed_runtime_candidates(base_dir: Path | None = None) -> list[Path]:
 
 def _native_candidates(base_dir: Path | None = None) -> list[Path]:
     candidates: list[Path] = _managed_runtime_candidates(base_dir)
+    # A packaged install must prove its own dependency is usable. A developer's
+    # global CLI/override must never mask a missing runtime in the distributable.
+    if is_frozen():
+        return candidates
     override = os.environ.get("OSIA_CODEX_EXECUTABLE")
     if override:
         candidates.append(Path(override))
