@@ -121,7 +121,7 @@ def test_app_metadata_is_strict_and_records_only_internal_override():
     ("path", "value", "code"),
     [
         (("extra",), True, "unknown_manifest_field"),
-        (("schemaVersion",), 2, "unsupported_schema"),
+        (("schemaVersion",), 3, "unsupported_schema"),
         (("schemaVersion",), "1", "invalid_schema"),
         (("channel",), "stable", "channel_mismatch"),
         (("platform",), "linux", "platform_mismatch"),

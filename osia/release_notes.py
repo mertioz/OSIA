@@ -11,7 +11,7 @@ import html
 import re
 from dataclasses import dataclass
 
-from osia.version import parse_product_version
+from osia.version import parse_product_version, display_version, display_historical_text
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,21 @@ class ReleaseEntry:
 
 
 _RELEASES = (
+    ReleaseEntry(
+        version="0.9.0", released_on=None, public=False,
+        changes_en=(
+            "Public beta source candidate; installer publication awaits operator acceptance.",
+            "Keep one Thinking section above each assistant response, with retained public commentary and exact turn ownership.",
+            "Adopt the official product versions and historical display aliases; preserve original artifact identities and user data.",
+            "Use explicit Windows release chronology. Legacy clients require the reviewed standalone installer; existing channel manifests remain unchanged.",
+        ),
+        changes_fr=(
+            "Candidat source bêta publique ; publication après validation opérateur.",
+            "Un seul Thinking au-dessus de chaque réponse, avec commentaires publics conservés et identité exacte du tour.",
+            "Versions officielles et alias historiques ; identités des artefacts et données utilisateur conservées.",
+            "Chronologie Windows explicite. Les anciens clients nécessitent l’installateur autonome validé ; manifestes existants inchangés.",
+        ),
+    ),
     ReleaseEntry(
         version="1.1.8",
         released_on="2026-10-18",
@@ -1082,7 +1097,7 @@ _RELEASES = (
 )
 
 RELEASE_HISTORY = tuple(
-    sorted(_RELEASES, key=lambda entry: parse_product_version(entry.version), reverse=True)
+    sorted(_RELEASES, key=lambda entry: parse_product_version(display_version(entry.version)), reverse=True)
 )
 
 _INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
@@ -1125,7 +1140,7 @@ def installer_release_notes(version: str, language: str) -> str:
             lines.append(title.upper())
             lines.append("")
         lines.extend(f"• {change}" for change in changes)
-    return "\n".join(lines).strip() + "\n"
+    return display_historical_text("\n".join(lines).strip()) + "\n"
 
 
 def normalize_remote_notes(notes) -> tuple[str, ...]:

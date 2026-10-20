@@ -574,6 +574,7 @@ def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
 
     assert set(inventory["compile_time_preprocessor"]) == {
         "{#AppVersion}",
+        "{#ReleaseSequence}",
         "{#AppVersionMajor}",
         "{#AppVersionMinor}",
         "{#AppVersionPatch}",
@@ -783,6 +784,7 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
             str(iscc),
             "/Qp",
             "/DAppVersion=1.0.0",
+            "/DReleaseSequence=2026102001",
             "/DAppVersionMajor=1",
             "/DAppVersionMinor=0",
             "/DAppVersionPatch=0",
@@ -990,9 +992,9 @@ def test_release_gate_runs_before_smoke_and_after_installer_manifest():
 
 def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
-    assert "from osia.version import PRODUCT_VERSION, parse_product_version" in build
+    assert "from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "1.1.8"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "0.9.0"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
@@ -1010,19 +1012,19 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_build_commit", lambda: "a" * 40)
     monkeypatch.setattr(module, "_build_timestamp", lambda: "2026-07-20T10:00:00Z")
 
-    baseline = module._resolve_build_identity("internal-preview", "1.0.1")
-    assert baseline["version"] == "1.0.1"
-    assert baseline["override"] == {
-        "sourceVersion": "1.1.8", "version": "1.0.1", "channel": "internal-preview",
-    }
+    baseline = module._resolve_build_identity("internal-preview")
+    assert baseline["version"] == "0.9.0"
+    assert baseline["override"] is None
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
-    assert embedded.version == "1.0.1"
-    assert embedded.build_override["sourceVersion"] == "1.1.8"
-    with pytest.raises(ValueError, match="forbidden"):
-        module._resolve_build_identity("stable", "1.0.1")
+    assert embedded.version == "0.9.0"
+    assert embedded.release_sequence == module.RELEASE_SEQUENCE
+    for channel in ("stable", "internal-preview"):
+        with pytest.raises(ValueError, match="forbidden"):
+            module._resolve_build_identity(channel, "1.0.1")
+
 
 
 def test_pe_inno_and_release_manifest_share_resolved_build_version():
@@ -1045,7 +1047,7 @@ def test_wor149_update_detection_is_authoritative_and_strict():
     assert "function InitializeSetup" in script
     assert "UpdateModeRequested := HasExactUpdateSwitch" in script
     assert "UpdateModeActive := False" in script
-    assert "UpdateModeActive := True" in script
+    assert "UpdateModeActive := UpdateModeRequested" in script
     assert "RegKeyExists(HKCU, UninstallKey)" in script
     assert "{8B8666D0-0DD4-4D1C-86D0-6B5E23A4FE36}_is1" in script
     assert "InstallLocation" in script
@@ -1058,7 +1060,8 @@ def test_wor149_update_detection_is_authoritative_and_strict():
     assert "ExistingBuild <> 0" in script
     assert "CompareStr(RegistryVersion, ExistingVersionText) <> 0" in script
     assert "SamePackedVersion(RegistryPackedVersion, ExistingPackedVersion)" in script
-    assert "ComparePackedVersion(PackagePackedVersion, ExistingPackedVersion) <= 0" in script
+    assert "{#ReleaseSequence} < ExistingSequence" in script
+    assert "RegQueryDWordValue(HKCU, UninstallKey, 'OSIAReleaseSequence'" in script
     assert "UpdateMissingInstall" in script
     assert "UpdateInvalidDir" in script
     assert "UpdateInvalidVersion" in script

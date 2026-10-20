@@ -64,7 +64,7 @@ from osia.release_notes import (
     normalize_remote_notes,
     release_for_version,
 )
-from osia.version import PRODUCT_VERSION
+from osia.version import PRODUCT_VERSION, display_version, display_historical_text
 
 
 _LEGACY_UNSIGNED_STABLE_ERRORS = frozenset({"stable_unsigned", "stable_notsigned"})
@@ -80,7 +80,7 @@ def update_error_text(code: str) -> str:
             size = size.replace(",", "\u202f")
         return i18n.t(
             "updates.error.legacy_unsigned_stable",
-            version=bridge.version,
+            version=display_version(bridge.version),
             url=bridge.url,
             size=size,
             sha256=bridge.sha256,
@@ -492,7 +492,7 @@ class UpdateController(QObject):
         answer = QMessageBox.question(
             self._confirmation_parent,
             i18n.t("updates.confirm_title"),
-            i18n.t(confirmation_key, version=self.manifest.version),
+            i18n.t(confirmation_key, version=display_version(self.manifest.version)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -580,7 +580,7 @@ class UpdateBanner(QFrame):
         if self._state:
             self._render(self._state)
             return
-        self.label.setText(i18n.t("updates.banner", version=self._version))
+        self.label.setText(i18n.t("updates.banner", version=display_version(self._version)))
         self.view_button.setText(i18n.t("updates.view"))
         self.install_button.setText(i18n.t("updates.install"))
         self.dismiss_button.setText(i18n.t("updates.later"))
@@ -617,7 +617,7 @@ class UpdateBanner(QFrame):
                 or state.get("error") or ""
             ))
         else:
-            text = i18n.t("updates.banner", version=self._version)
+            text = i18n.t("updates.banner", version=display_version(self._version))
         self.label.setText(text)
 
         active = phase in {"preparing", "downloading", "verifying", "launching"}
@@ -781,7 +781,8 @@ class _ReleaseCard(QFrame):
         major_update: bool = False,
     ) -> None:
         self._set_major_update(major_update)
-        self.version.setText(i18n.t("updates.version", version=version))
+        self.version.setText(i18n.t("updates.version", version=display_version(version)))
+        self.version.setToolTip(f"Artifact version: {version}")
         self.badge.setText(badge)
         self.badge.setVisible(bool(badge))
         self.date.setText(
@@ -798,7 +799,7 @@ class _ReleaseCard(QFrame):
         else:
             shown = notes or (i18n.t("updates.notes_unavailable"),)
             text = "\n".join(f"• {note}" for note in shown)
-        self.notes.setText(text)
+        self.notes.setText(display_historical_text(text))
         QTimer.singleShot(0, self._resize_notes)
 
 
@@ -1014,7 +1015,7 @@ class UpdateSettingsSection(QFrame):
         available = state.get("availableVersion")
         self.summary.setText(i18n.t(
             "updates.installed_summary",
-            version=installed,
+            version=display_version(installed),
             status=i18n.t(f"updates.status.{status}"),
         ))
         self.preview_toggle.setEnabled(
@@ -1077,7 +1078,7 @@ class UpdateSettingsSection(QFrame):
         self.title.setText(i18n.t("updates.title"))
         self.summary.setText(i18n.t(
             "updates.installed_summary",
-            version=installed,
+            version=display_version(installed),
             status=i18n.t(f"updates.status.{status}"),
         ))
         preview_enabled = bool(state.get("previewOptIn", False))

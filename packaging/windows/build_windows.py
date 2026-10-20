@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from osia.version import PRODUCT_VERSION, parse_product_version
+from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version
 from osia.release_notes import (
     installer_release_notes,
     is_major_update,
@@ -52,7 +52,7 @@ ALLOWED_BUILD_CHANNELS = {"internal-preview", "stable"}
 # keeps this temporary switch enabled until WOR-220 supplies recognized signing;
 # do not replace it with a version allowlist (WOR-66 C13).
 ALLOW_UNSIGNED_STABLE_BUILD = True
-UPDATER_SCHEMA_VERSION = 1
+UPDATER_SCHEMA_VERSION = 2
 
 _APPROVED_INNO_RUNTIME_CONSTANTS = frozenset({
     "app",
@@ -507,17 +507,7 @@ def _resolve_build_identity(
     version = SOURCE_VERSION
     override = None
     if version_override is not None:
-        parse_product_version(version_override)
-        if channel != "internal-preview":
-            raise ValueError("version overrides are forbidden for stable builds")
-        if version_override != "1.0.1":
-            raise ValueError("the only supported internal override is 1.0.1")
-        version = version_override
-        override = {
-            "sourceVersion": SOURCE_VERSION,
-            "version": version,
-            "channel": channel,
-        }
+        raise ValueError("version overrides are forbidden after the product version transition")
     return {
         "version": version,
         "channel": channel,
@@ -537,6 +527,7 @@ def _write_app_metadata(identity: dict) -> Path:
         "buildTimestamp": identity["timestamp"],
         "commitSha": identity["commit"],
         "updaterSchemaVersion": UPDATER_SCHEMA_VERSION,
+        "releaseSequence": RELEASE_SEQUENCE,
         "buildOverride": identity["override"],
     }
     GENERATED.mkdir(parents=True, exist_ok=True)
@@ -794,6 +785,7 @@ def build(
     _run([
         str(iscc),
         f"/DAppVersion={version}",
+        f"/DReleaseSequence={RELEASE_SEQUENCE}",
         f"/DAppVersionMajor={parse_product_version(version)[0]}",
         f"/DAppVersionMinor={parse_product_version(version)[1]}",
         f"/DAppVersionPatch={parse_product_version(version)[2]}",
@@ -827,6 +819,7 @@ def build(
     shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")
     release_manifest = {
         "schemaVersion": UPDATER_SCHEMA_VERSION,
+        "releaseSequence": RELEASE_SEQUENCE,
         "product": "OSIA",
         "platform": "windows",
         "architecture": "x86_64",

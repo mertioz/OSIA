@@ -1,6 +1,9 @@
 #ifndef AppVersion
   #error AppVersion must be supplied by build_windows.py
 #endif
+#ifndef ReleaseSequence
+  #error ReleaseSequence must be supplied by build_windows.py
+#endif
 #ifndef AppVersionMajor
   #error AppVersionMajor must be supplied by build_windows.py
 #endif
@@ -93,6 +96,9 @@ DisableWelcomePage=no
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "french"; MessagesFile: "compiler:Languages\French.isl"
+
+[Registry]
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{code:InstallerAppId}_is1"; ValueType: dword; ValueName: "OSIAReleaseSequence"; ValueData: "{#ReleaseSequence}"; Flags: uninsdeletevalue
 
 [CustomMessages]
 english.AutostartTask=Launch OSIA when I sign in
@@ -366,6 +372,7 @@ var
   RegistryPackedVersion: Int64;
   PackagePackedVersion: Int64;
   ExistingMajor, ExistingMinor, ExistingPatch, ExistingBuild: Word;
+  ExistingSequence: Cardinal;
   ProductionInstallDir, TestInstallDir: String;
 begin
   Result := True;
@@ -400,7 +407,7 @@ begin
     (not RegKeyExists(HKCU, UninstallKey));
   UpdateModeRequested := HasExactUpdateSwitch;
   UpdateModeActive := False;
-  if not UpdateModeRequested then
+  if (not UpdateModeRequested) and (not RegKeyExists(HKCU, UninstallKey)) then
     exit;
 
   if (not RegKeyExists(HKCU, UninstallKey)) or
@@ -448,7 +455,22 @@ begin
 
   PackagePackedVersion := PackVersionComponents(
     {#AppVersionMajor}, {#AppVersionMinor}, {#AppVersionPatch}, 0);
-  if ComparePackedVersion(PackagePackedVersion, ExistingPackedVersion) <= 0 then
+  if not RegQueryDWordValue(HKCU, UninstallKey, 'OSIAReleaseSequence', ExistingSequence) then
+  begin
+    { Only observed legacy version families may enter the new release epoch. }
+    if (ExistingMajor = 1) and
+      (((ExistingMinor = 0) and (ExistingPatch <= 6)) or
+       ((ExistingMinor = 1) and (ExistingPatch <= 8))) then
+      ExistingSequence := 10000 + ExistingMinor * 100 + ExistingPatch
+    else
+    begin
+      MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+  end;
+  if ({#ReleaseSequence} < ExistingSequence) or
+    (UpdateModeRequested and ({#ReleaseSequence} = ExistingSequence)) then
   begin
     MsgBox(Format(CustomMessage('UpdateNotNewer'), ['{#AppVersion}',
       ExistingVersionText]), mbError, MB_OK);
@@ -456,7 +478,12 @@ begin
     exit;
   end;
 
-  UpdateModeActive := True;
+  UpdateModeActive := UpdateModeRequested;
+  { Only the presentation label changes; registry/PE validation above uses originals. }
+  if (ExistingMajor = 1) and (ExistingMinor = 0) and (ExistingPatch <= 6) then
+    ExistingVersionText := Format('0.8.%d', [ExistingPatch])
+  else if (ExistingMajor = 1) and (ExistingMinor = 1) and (ExistingPatch <= 8) then
+    ExistingVersionText := Format('0.8.%d', [944 + ExistingPatch]);
 end;
 
 function IntegrationMarker: String;

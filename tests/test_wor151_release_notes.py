@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from osia import i18n, updater
+from osia.version import display_historical_text
 from osia.gui import update_ui
 from osia.release_notes import (
     RELEASE_HISTORY,
@@ -82,7 +83,7 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "0.9.0", "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
     current = release_for_version("1.1.6")
     assert release_for_version("1.1.8").public is False
@@ -126,7 +127,7 @@ def test_117_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.6 remains the previous public rollback",
         "no mobile release is included",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "même tour chat durable",
         "outcome_unknown reste inconnu",
@@ -137,7 +138,7 @@ def test_117_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.6 reste le rollback public précédent",
         "aucune release mobile n'est incluse",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.7")
     raw["releaseNotes"] = manifest_release_notes("1.1.7")
@@ -165,7 +166,7 @@ def test_116_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.5 remains the verified immutable rollback",
         "includes no mobile publication",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "outil lent peut libérer le tour chat",
         "effets externes possibles ou inconnus ne sont jamais rejoués",
@@ -175,7 +176,7 @@ def test_116_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.5 reste le rollback immuable vérifié",
         "n’inclut aucune publication mobile",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.6")
     raw["releaseNotes"] = manifest_release_notes("1.1.6")
@@ -202,7 +203,7 @@ def test_115_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.4 remains the validated rollback",
         "no mobile publication is part of this windows release",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "l’activité chat dépend uniquement de sa conversation, de sa requête et de son tour exacts",
         "abandon autonomous cible uniquement le run exact",
@@ -210,7 +211,7 @@ def test_115_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.4 reste le rollback validé",
         "aucune publication mobile ne fait partie de cette release windows",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.5")
     raw["releaseNotes"] = manifest_release_notes("1.1.5")
@@ -239,7 +240,7 @@ def test_114_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.3 remains the validated rollback",
         "this release is windows-only. the next mobile update will be published separately.",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "conversation, de tour et de mission actifs",
         "chat normal et autonomous",
@@ -249,7 +250,7 @@ def test_114_notes_are_complete_bilingual_and_manifest_compatible():
         "windows 1.1.3 reste le rollback validé",
         "cette publication concerne windows uniquement. la prochaine mise à jour mobile sera publiée séparément.",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.4")
     raw["releaseNotes"] = manifest_release_notes("1.1.4")
@@ -280,7 +281,7 @@ def test_113_notes_are_complete_bilingual_and_manifest_compatible():
         "no fallback",
         "windows 1.1.2 remains the validated rollback",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "cycle de vie durable des tentatives",
         "même tour",
@@ -292,7 +293,7 @@ def test_113_notes_are_complete_bilingual_and_manifest_compatible():
         "aucun fallback",
         "windows 1.1.2 reste le rollback validé",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.3")
     raw["releaseNotes"] = manifest_release_notes("1.1.3")
@@ -325,7 +326,7 @@ def test_112_hotfix_notes_are_complete_bilingual_and_manifest_compatible():
         "do not automatically install 1.1.2",
         "windows 1.1.1 remains the validated rollback",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "endpoint stable officiel exact",
         "download.osia.space",
@@ -338,7 +339,7 @@ def test_112_hotfix_notes_are_complete_bilingual_and_manifest_compatible():
         "n’installent pas automatiquement 1.1.2",
         "windows 1.1.1 reste l’artefact de rollback validé",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.2")
     raw["releaseNotes"] = manifest_release_notes("1.1.2")
@@ -382,7 +383,7 @@ def test_111_notes_are_complete_bilingual_and_manifest_compatible():
         "more info",
         "run anyway",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
     for subject in (
         "stable et preview",
         "révision canonique",
@@ -394,7 +395,7 @@ def test_111_notes_are_complete_bilingual_and_manifest_compatible():
         "informations complémentaires",
         "exécuter quand même",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
     raw = _manifest(version="1.1.1")
     raw["releaseNotes"] = manifest_release_notes("1.1.1")
@@ -435,12 +436,12 @@ def test_110_notes_are_exhaustive_bilingual_and_manifest_compatible():
 
     english = installer_release_notes("1.1.0", "en").lower()
     french = installer_release_notes("1.1.0", "fr").lower()
-    assert "windows 1.1.0" in english
-    assert "android 1.0.2" in english
+    assert "windows 0.8.944" in english
+    assert "android 0.8.3" in english
     assert "worker tooling" in english
     assert "not deployed" in english
-    assert "windows 1.1.0" in french
-    assert "android 1.0.2" in french
+    assert "windows 0.8.944" in french
+    assert "android 0.8.3" in french
     assert "limites connues" in french
     assert "unknown publisher" in english
     assert "smartscreen" in english
@@ -475,7 +476,7 @@ def test_106_notes_are_bilingual_bounded_and_keep_internal_release_semantics():
         "without clipping",
         "copied text",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
 
     french = " ".join(current.changes_fr).lower()
     for subject in (
@@ -489,7 +490,7 @@ def test_106_notes_are_bilingual_bounded_and_keep_internal_release_semantics():
         "sans rognage",
         "texte copié",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
 
 def test_105_notes_are_bilingual_bounded_and_keep_release_semantics():
@@ -516,7 +517,7 @@ def test_105_notes_are_bilingual_bounded_and_keep_release_semantics():
         "update",
         "windows distribution",
     ):
-        assert subject in english
+        assert display_historical_text(subject) in english
 
     french = " ".join(current.changes_fr).lower()
     for subject in (
@@ -535,7 +536,7 @@ def test_105_notes_are_bilingual_bounded_and_keep_release_semantics():
         "mise à jour",
         "distribution windows",
     ):
-        assert subject in french
+        assert display_historical_text(subject) in french
 
 
 def test_generated_105_manifest_is_accepted_as_an_update_from_104():

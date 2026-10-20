@@ -29,10 +29,13 @@ from urllib.parse import urlsplit
 
 from osia.config import CONFIG_DIR
 from osia.runtime import is_frozen, resource_path
-from osia.version import PRODUCT_VERSION, parse_product_version
+from osia.version import (
+    PRODUCT_VERSION, FIRST_RELEASE_SEQUENCE, HISTORICAL_DISPLAY_VERSIONS,
+    parse_product_version, legacy_release_sequence,
+)
 
 
-UPDATER_SCHEMA_VERSION = 1
+UPDATER_SCHEMA_VERSION = 2
 PRODUCT = "OSIA"
 PLATFORM = "windows"
 ARCHITECTURE = "x86_64"
@@ -290,6 +293,7 @@ class AppMetadata:
     commit_sha: str | None
     updater_schema_version: int
     build_override: dict | None
+    release_sequence: int | None = None
 
 
 @dataclass(frozen=True)
@@ -359,9 +363,10 @@ class UpdateManifest:
     release_notes_url: None
     rollout_state: str
     temporary_unsigned_stable: bool = False
+    release_sequence: int | None = None
 
     def as_dict(self) -> dict:
-        return {
+        result = {
             "schemaVersion": self.schema_version,
             "product": self.product,
             "platform": self.platform,
@@ -383,6 +388,9 @@ class UpdateManifest:
             "releaseNotesUrl": None,
             "rollout": {"state": self.rollout_state},
         }
+        if self.schema_version == 2:
+            result["releaseSequence"] = self.release_sequence
+        return result
 
 
 @dataclass(frozen=True)
@@ -468,9 +476,36 @@ def _validate_version(value: object, code: str = "invalid_version") -> str:
 
 
 def compare_versions(left: str, right: str) -> int:
+    # A legacy minimum-version floor must not reject the new product epoch.
+    # New-to-new update selection uses explicit releaseSequence below.
+    if left == PRODUCT_VERSION and right != PRODUCT_VERSION:
+        try:
+            legacy_release_sequence(right)
+            return 1
+        except ValueError:
+            pass
+    if right == PRODUCT_VERSION and left != PRODUCT_VERSION:
+        try:
+            legacy_release_sequence(left)
+            return -1
+        except ValueError:
+            pass
     a = parse_product_version(left)
     b = parse_product_version(right)
     return (a > b) - (a < b)
+
+
+def _parse_release_sequence(raw: Mapping, schema: int, version: str) -> int | None:
+    if schema == 1:
+        return None
+    sequence = _require_plain_int(raw["releaseSequence"], "invalid_release_sequence")
+    if not FIRST_RELEASE_SEQUENCE <= sequence <= 2147483647:
+        raise ValueError("invalid_release_sequence")
+    try:
+        legacy_release_sequence(version)
+    except ValueError:
+        return sequence
+    raise ValueError("legacy_identity_in_new_epoch")
 
 
 def parse_app_metadata(payload: bytes | str) -> AppMetadata:
@@ -491,7 +526,7 @@ def parse_app_metadata(payload: bytes | str) -> AppMetadata:
                 "commitSha",
                 "updaterSchemaVersion",
                 "buildOverride",
-            },
+            } | ({"releaseSequence"} if raw.get("updaterSchemaVersion") == 2 else set()),
             "unknown_metadata_field",
         )
         if raw["product"] != PRODUCT:
@@ -511,8 +546,9 @@ def parse_app_metadata(payload: bytes | str) -> AppMetadata:
         ):
             raise ValueError("invalid_metadata_commit")
         schema = _require_plain_int(raw["updaterSchemaVersion"], "invalid_metadata_schema")
-        if schema != UPDATER_SCHEMA_VERSION:
+        if schema not in (1, 2):
             raise ValueError("unsupported_metadata_schema")
+        release_sequence = _parse_release_sequence(raw, schema, version)
         override = raw["buildOverride"]
         if override is not None:
             override = _require_object(override, "invalid_build_override")
@@ -522,7 +558,7 @@ def parse_app_metadata(payload: bytes | str) -> AppMetadata:
                 "invalid_build_override",
             )
             _validate_version(override["sourceVersion"], "invalid_build_override")
-            if override["sourceVersion"] != PRODUCT_VERSION:
+            if schema == 2 or override["sourceVersion"] not in HISTORICAL_DISPLAY_VERSIONS:
                 raise ValueError("invalid_build_override")
             if _validate_version(override["version"], "invalid_build_override") != version:
                 raise ValueError("invalid_build_override")
@@ -538,6 +574,7 @@ def parse_app_metadata(payload: bytes | str) -> AppMetadata:
             commit_sha=commit,
             updater_schema_version=schema,
             build_override=dict(override) if override is not None else None,
+            release_sequence=release_sequence,
         )
     except ValueError as exc:
         raise MetadataError(str(exc)) from exc
@@ -660,11 +697,11 @@ def parse_manifest(
                 "releaseNotes",
                 "releaseNotesUrl",
                 "rollout",
-            },
+            } | ({"releaseSequence"} if raw.get("schemaVersion") == 2 else set()),
             "unknown_manifest_field",
         )
         schema = _require_plain_int(raw["schemaVersion"], "invalid_schema")
-        if schema != UPDATER_SCHEMA_VERSION:
+        if schema not in (1, 2):
             raise ValueError("unsupported_schema")
         if raw["product"] != PRODUCT:
             raise ValueError("product_mismatch")
@@ -675,7 +712,18 @@ def parse_manifest(
         if raw["channel"] != metadata.channel:
             raise ValueError("channel_mismatch")
         version = _validate_version(raw["version"])
-        comparison = compare_versions(version, metadata.version)
+        release_sequence = _parse_release_sequence(raw, schema, version)
+        if schema == 2:
+            installed_sequence = metadata.release_sequence
+            if installed_sequence is None:
+                installed_sequence = legacy_release_sequence(metadata.version)
+            comparison = (release_sequence > installed_sequence) - (release_sequence < installed_sequence)
+        elif metadata.updater_schema_version == 2:
+            raise ValueError("legacy_manifest_after_transition")
+        elif version == PRODUCT_VERSION:
+            raise ValueError("release_sequence_required")
+        else:
+            comparison = compare_versions(version, metadata.version)
         if comparison == 0:
             raise ValueError("equal_version")
         if comparison < 0:
@@ -736,6 +784,7 @@ def parse_manifest(
             raise ValueError("unsupported_rollout_state")
         return UpdateManifest(
             schema_version=schema,
+            release_sequence=release_sequence,
             product=PRODUCT,
             platform=metadata.platform,
             architecture=metadata.architecture,
@@ -1187,7 +1236,13 @@ def fetch_eligible_manifest(
     if candidates:
         selected = candidates[0]
         for candidate in candidates[1:]:
-            if compare_versions(candidate.version, selected.version) > 0:
+            comparison = (
+                (candidate.release_sequence > selected.release_sequence)
+                - (candidate.release_sequence < selected.release_sequence)
+                if candidate.release_sequence is not None and selected.release_sequence is not None
+                else compare_versions(candidate.version, selected.version)
+            )
+            if comparison > 0:
                 selected = candidate
         store.update(
             cachedManifest=selected.as_dict(),
