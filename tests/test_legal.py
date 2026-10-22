@@ -63,10 +63,10 @@ def _canonical_legal_source_bytes(source):
 
 class LegalManifestTests(unittest.TestCase):
     def test_bundled_manifest_matches_canonical_version_and_urls(self):
-        self.assertEqual(legal.TERMS_VERSION, "2026-10-05.4")
-        self.assertEqual(legal.PRIVACY_VERSION, "2026-10-05.4")
-        self.assertEqual(legal.LAST_UPDATED, "2026-10-05")
-        self.assertEqual(legal.EFFECTIVE_DATE, "2026-10-06")
+        self.assertEqual(legal.TERMS_VERSION, "2026-10-22.1")
+        self.assertEqual(legal.PRIVACY_VERSION, "2026-10-22.1")
+        self.assertEqual(legal.LAST_UPDATED, "2026-10-22")
+        self.assertEqual(legal.EFFECTIVE_DATE, "2026-10-22")
         self.assertEqual(legal.PUBLIC_CONTACT_EMAIL, "contact@osia.space")
         self.assertEqual(legal.GOVERNING_LAW, "France")
         self.assertIsNone(legal.MINIMUM_AGE)
@@ -88,7 +88,7 @@ class LegalManifestTests(unittest.TestCase):
         )
         self.assertEqual(
             legal.CANONICAL_SHA256,
-            "80a13b01fad30ce9ef8b7974f4452fd0a2f653f78dc49ed75db54a7e921427a6",
+            "0bbe9ce0744e647a5ed840f2c1b824bbaf3bdf519847f2bf16b9d20bfb1a9670",
         )
         for locale in ("en", "fr"):
             for document in ("terms", "privacy"):

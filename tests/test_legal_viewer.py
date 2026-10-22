@@ -29,7 +29,7 @@ class LegalViewerTests(unittest.TestCase):
                 rendered = reader.toPlainText()
                 self.assertIn(expected, rendered)
                 self.assertIn("Aymen Gherbi", rendered)
-                self.assertIn("2026-10-05.4", dialog._metadata.text())
+                self.assertIn("2026-10-22.1", dialog._metadata.text())
                 dialog.close()
 
     def test_language_selector_switches_the_offline_copy(self):
