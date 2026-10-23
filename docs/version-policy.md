@@ -38,3 +38,9 @@ Never reuse a native build, overwrite an immutable release object, change an
 old URL, or describe an uploaded draft as store-public. Preserve Mobile
 0.9.5/build22 and Windows0.9.0 exactly. Store submission, physical acceptance,
 APK publication, and financial-site publication remain separate gates.
+
+Final0.9.51 native candidates: Android24 and iOS25. iOS24 failed its stale
+packaging guard and was not reused;25 passed verification and uploaded. Native
+build floors may differ by platform without changing the shared public product
+version. Failed/unpublished candidate builds do not manufacture another public
+version increment. The next separately published Mobile update is0.9.52.

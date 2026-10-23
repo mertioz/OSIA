@@ -103,3 +103,29 @@ scope test proves selected replay equals the prior filtered result, cursor ACKs
 remain effective, and empty/invalid scopes never enumerate unrelated history.
 All changed Python files compile; module imports pass. Final physical tests
 must use the resulting source generation; Windows public0.9.0 stays unchanged.
+
+
+## Final controlled physical measurements
+
+Pixel9a0.9.51/code24, sourcePCa4ad7e5b: connected in-app snapshot51/77/66ms,
+median66ms; controlled cold-app snapshot49ms. ADB gesture-to-observation times
+134.8/158.9/192.9ms include82.3–118.2ms clock-probe round trips, not a Flutter
+first-frame benchmark. Earlier uncontrolled cold failures are retained as
+inconclusive; the phone was later observed in another foreground application.
+After the operator reserved OSIA in foreground, the controlled cold run passed.
+
+Actual Desktop-unavailable check: stop_service returnedTrue; Mobile showed
+Disconnected/Retry and no old remote categories. ensure_service_running restored
+the canonical source runtime in19.5s; categories returned. The observed post-PC-
+restart config read took5283ms, so reconnect is explicitly not claimed sub100ms.
+The runtime health probe passed10.3s after the restored child launched. No
+controlled packet-loss or new physical Chat/Thinking/Stop campaign is claimed.
+The operator accepted Android24 and separately authorized its public APK.
+
+The exact Android artifact is public at
+https://download.osia.space/android/0.9.51/24/OSIA-Mobile.apk
+SHA2565a9f3060250418553537ba29f1407315c2f27673d9d00ceff8decc5746eaeea6.
+Windows0.9.0 installer and channels remain unchanged; these PC source fixes are
+not retroactively included in that frozen artifact. Mobile final delivery,
+store draft IDs and native/platform source distinctions are documented in
+osia-mobile/docs/WOR-352-mobile-0.9.51.md. No store review was submitted.
