@@ -46,3 +46,31 @@ it. Actual runtime readiness and phone reconnect must be rechecked after commit.
 
 Startup/shutdown/voice/parity/ActionTruth regression set:87passed,18existing
 FastAPI warnings. Compilation and server import passed.
+
+
+## Provider-read queueing found by the physical after test
+
+The first physical after run was still slow: warm config13768ms in-app,
+cold app5865ms in-app. In both cases a model response preceded config.
+The fresh Settings config request was serialized behind an earlier Chat model
+catalogue request on the same socket. Model/account snapshots perform bounded
+provider/runtime I/O even though their work is off the event loop; awaiting
+that work inside the receive loop still blocks later config messages.
+
+get_models and get_chatgpt_account now schedule independent, connection-owned
+read tasks. Each distinct request receives its own observed PC snapshot;
+there is no cache masquerading as fresh data or repeat-request veto. Pending
+read tasks are cancelled/gathered before closing their exact connection, so
+late reads cannot write through a replacement socket. Writes, selected-model
+authority, Chat dispatch and exact-turn cancellation retain their existing paths.
+No message type or payload shape changed; response ordering is deliberately
+independent. Mobile already consumes these snapshots on separate streams.
+
+Two real-ASGI socket regressions hold model/account reads pending, request
+config behind them, prove config arrives first, then release the read and
+verify its own response still arrives. Existing repeatability/turn tests retain
+all assertions; their fake socket now stays open while awaiting requested
+read replies instead of sending EOF and cancelling them before assertions.
+The focused read/PC-Mobile parity/conversation/WebSocket lifecycle/provider/
+ActionTruth/packaged-provider/catalogue set passes115tests,19existing dependency
+warnings. Compilation and module import pass. Physical after recheck follows.

@@ -14,16 +14,24 @@ from osia.turn_terminality import live_process_identity
 
 
 class Socket:
-    def __init__(self, messages, close_error=None):
+    def __init__(self, messages, close_error=None, *, wait_for_controls=False):
         self.messages = messages
         self.sent = []
         self.close_error = close_error
+        self._control_replies = asyncio.Event()
+        self._controls_pending = sum(
+            msg.get("type") == "get_models" for msg in messages
+        ) if wait_for_controls else 0
 
     async def accept(self):
         pass
 
     async def send_json(self, frame):
         self.sent.append(frame)
+        if frame.get("type") == "models_list":
+            self._controls_pending -= 1
+            if self._controls_pending <= 0:
+                self._control_replies.set()
 
     async def close(self, **kwargs):
         pass
@@ -31,6 +39,10 @@ class Socket:
     async def iter_text(self):
         for message in self.messages:
             yield json.dumps(message)
+        # A real client keeps the socket open while reading independent RPC
+        # replies; immediate fixture EOF would deliberately cancel those reads.
+        if self._controls_pending > 0:
+            await asyncio.wait_for(self._control_replies.wait(), timeout=5)
         if self.close_error:
             raise self.close_error
 
@@ -127,7 +139,7 @@ def test_authenticated_get_models_is_non_durable_and_repeatable(
         {"type": "auth", "token": "synthetic"},
         {"type": "get_models"},
         {"type": "get_models"},
-    ])
+    ], wait_for_controls=True)
 
     asyncio.run(drive(socket))
 
@@ -182,7 +194,7 @@ def test_get_models_then_text_on_same_socket_preserves_durable_turn(
         {"type": "get_models"},
         message,
         {"type": "get_models"},
-    ])
+    ], wait_for_controls=True)
 
     asyncio.run(drive(socket))
 
@@ -215,7 +227,7 @@ def test_non_durable_control_and_unknown_message_do_not_break_socket(
         {"type": "set_model", "provider": "", "model": ""},
         {"type": "unknown_control_for_test"},
         {"type": "get_models"},
-    ])
+    ], wait_for_controls=True)
 
     asyncio.run(drive(socket))
 
@@ -266,7 +278,7 @@ def test_catalogue_request_does_not_touch_active_turn_ownership(
     socket = Socket([
         {"type": "auth", "token": "synthetic"},
         {"type": "get_models"},
-    ])
+    ], wait_for_controls=True)
 
     asyncio.run(drive(socket))
 

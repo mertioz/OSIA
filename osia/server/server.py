@@ -7499,6 +7499,7 @@ async def websocket_endpoint(ws: WebSocket):
     # a successful auth, cancelled in the finally block on disconnect.
     heartbeat_task: asyncio.Task | None = None
     remote_catalogue_refresh_pending = False
+    settings_read_tasks: set[asyncio.Task] = set()
     chatgpt_login_started_here = False
     catalogue_change_task: asyncio.Task | None = None
     account_change_task: asyncio.Task | None = None
@@ -7531,6 +7532,54 @@ async def websocket_endpoint(ws: WebSocket):
             "current_provider": catalogue["currentProvider"],
             "account": catalogue["account"],
         })
+
+    async def _respond_models() -> None:
+        try:
+            await _send_model_catalogue()
+            _request_remote_catalogue_refresh()
+        except Exception as e:
+            print(f"[OSIA Server] get_models failed: {e}")
+            await out.send_json({
+                "type": "models_list",
+                "catalogue": {"version": 1, "providers": []},
+                "models": [],
+                "current": None,
+                "current_provider": None,
+                "account": {},
+            })
+
+    async def _respond_account() -> None:
+        try:
+            from osia.mobile_model_catalogue import account_snapshot
+
+            state = await asyncio.to_thread(account_snapshot)
+        except Exception:
+            state = {
+                "providerId": "chatgpt_account",
+                "runtimeAvailable": False,
+                "connected": False,
+                "connecting": False,
+                "loginCancellable": False,
+                "available": False,
+                "error": "runtime_missing",
+                "models": [],
+            }
+        await out.send_json({
+            "type": "chatgpt_account_state", "account": state
+        })
+
+    def _schedule_settings_read(coroutine) -> None:
+        # Read-only provider I/O must not serialize Settings behind model/account
+        # discovery. Each request still receives its own observed PC snapshot.
+        task = asyncio.create_task(coroutine)
+        settings_read_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            settings_read_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                print("[OSIA Server] settings read failed after client closure")
+
+        task.add_done_callback(finished)
 
     def _canonical_config_changed(key: str) -> None:
         """Push the safe PC-owned snapshot after any canonical setting change."""
@@ -9085,19 +9134,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Models ---
             if msg_type == "get_models":
-                try:
-                    await _send_model_catalogue()
-                    _request_remote_catalogue_refresh()
-                except Exception as e:
-                    print(f"[OSIA Server] get_models failed: {e}")
-                    await out.send_json({
-                        "type": "models_list",
-                        "catalogue": {"version": 1, "providers": []},
-                        "models": [],
-                        "current": None,
-                        "current_provider": None,
-                        "account": {},
-                    })
+                _schedule_settings_read(_respond_models())
                 continue
 
             if msg_type == "set_model":
@@ -9163,24 +9200,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "get_chatgpt_account":
-                try:
-                    from osia.mobile_model_catalogue import account_snapshot
-
-                    state = await asyncio.to_thread(account_snapshot)
-                except Exception:
-                    state = {
-                        "providerId": "chatgpt_account",
-                        "runtimeAvailable": False,
-                        "connected": False,
-                        "connecting": False,
-                        "loginCancellable": False,
-                        "available": False,
-                        "error": "runtime_missing",
-                        "models": [],
-                    }
-                await out.send_json({
-                    "type": "chatgpt_account_state", "account": state
-                })
+                _schedule_settings_read(_respond_account())
                 continue
 
             if msg_type == "chatgpt_account_login":
@@ -11342,6 +11362,12 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        pending_settings_reads = list(settings_read_tasks)
+        for task in pending_settings_reads:
+            task.cancel()
+        if pending_settings_reads:
+            await asyncio.gather(*pending_settings_reads, return_exceptions=True)
+        settings_read_tasks.clear()
         for owner in command_owners:
             settlement = asyncio.create_task(_settle_websocket_command_owner(owner))
             try:
