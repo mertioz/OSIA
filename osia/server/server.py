@@ -6501,7 +6501,33 @@ async def _reconcile_legacy_uploads_at_startup() -> None:
         print(f"[OSIA Server] removed {removed} orphaned legacy upload(s)")
 
 
+_TOOL_ATTEMPT_RECOVERY_TASK: asyncio.Task | None = None
+
+
 @app.on_event("startup")
+async def _start_tool_attempt_recovery() -> None:
+    """Recover old receipts independently of accepting fresh client requests.
+
+    Durable recovery retains its exact ownership/correlation checks. It is
+    maintenance, never a prerequisite for Settings, health or a new model call.
+    """
+    global _TOOL_ATTEMPT_RECOVERY_TASK
+    if (_TOOL_ATTEMPT_RECOVERY_TASK is None
+            or _TOOL_ATTEMPT_RECOVERY_TASK.done()):
+        _TOOL_ATTEMPT_RECOVERY_TASK = asyncio.create_task(
+            _recover_tool_attempts_at_startup(), name="osia-tool-recovery",
+        )
+
+
+async def _stop_tool_attempt_recovery() -> None:
+    global _TOOL_ATTEMPT_RECOVERY_TASK
+    task = _TOOL_ATTEMPT_RECOVERY_TASK
+    _TOOL_ATTEMPT_RECOVERY_TASK = None
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def _recover_tool_attempts_at_startup() -> None:
     """Resolve orphaned durable attempts without replaying their action."""
 
@@ -6688,6 +6714,7 @@ async def _cleanup_on_server_shutdown() -> None:
     """
 
     global _SERVER_CRON_MANAGER, _SERVER_CRON_UNSUBSCRIBE
+    await _stop_tool_attempt_recovery()
     if _SERVER_CRON_UNSUBSCRIBE is not None:
         try:
             _SERVER_CRON_UNSUBSCRIBE()

@@ -22,3 +22,34 @@ def test_discovery_preserves_bundled_and_cached_models(tmp_path, monkeypatch):
     monkeypatch.setattr(model_inventory.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(model_inventory, "bundled_model_path", lambda name: tmp_path if name == "faster-whisper-small" else None)
     assert model_inventory.available_whisper_model_sizes() == {"small", "medium"}
+
+
+def test_pending_recovery_does_not_hold_server_startup_or_health(monkeypatch):
+    import asyncio
+    from osia.server import server
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def pending_recovery():
+            calls.append("recovery")
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(server, "_recover_tool_attempts_at_startup", pending_recovery)
+        monkeypatch.setattr(server, "_TOOL_ATTEMPT_RECOVERY_TASK", None)
+        await server._start_tool_attempt_recovery()
+        await started.wait()
+        task = server._TOOL_ATTEMPT_RECOVERY_TASK
+        assert not task.done()
+        assert (await server.root())["status"] == "ok"
+        await server._start_tool_attempt_recovery()
+        assert server._TOOL_ATTEMPT_RECOVERY_TASK is task
+        assert calls == ["recovery"]
+        await server._stop_tool_attempt_recovery()
+        assert task.cancelled()
+        assert server._TOOL_ATTEMPT_RECOVERY_TASK is None
+
+    asyncio.run(scenario())

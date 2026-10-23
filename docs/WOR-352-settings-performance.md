@@ -25,3 +25,24 @@ at docs/WOR-352-mobile-0.9.51.md. A source runtime was refreshed through the
 existing ensure_service_running readiness mechanism; this does not release
 an updated Windows installer. Windows public0.9.0 remains unchanged, and
 Desktop macOS development remains paused. See docs/version-policy.md.
+
+
+## Physical reconnect uncovered a separate startup dependency
+
+A real source-server restart stalled in application startup. Its45second
+faulthandler trace identifies recover_orphaned_tool_attempts/release_continuation
+performing filesystem recovery; the live store contains995attempt files and149
+barrier files. The service supervisor killed/relaunched the still-unlistening
+server after270seconds. No records or operator files were removed.
+
+Recovery now runs as one tracked background maintenance task, started once per
+server lifespan and cancelled/gathered at shutdown. Existing recovery ownership,
+ActionTruth and continuation semantics are unchanged. Health, Settings and fresh
+model calls do not wait for reconciliation of older attempts, as required by
+WOR-298/305. There is no new agent, router, global timeout or turn limit.
+A regression holds recovery pending and proves startup/root remain responsive,
+duplicate startup does not create another maintenance task and shutdown cancels
+it. Actual runtime readiness and phone reconnect must be rechecked after commit.
+
+Startup/shutdown/voice/parity/ActionTruth regression set:87passed,18existing
+FastAPI warnings. Compilation and server import passed.
