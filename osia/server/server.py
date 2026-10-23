@@ -5491,7 +5491,7 @@ def _build_config_snapshot() -> dict:
     cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
     try:
-        from osia.voice.stt import available_whisper_model_sizes
+        from osia.voice.model_inventory import available_whisper_model_sizes
 
         cfg["stt_local_models_available"] = sorted(
             available_whisper_model_sizes().intersection({"small", "medium"})
@@ -9414,7 +9414,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 if setting_key == "stt_local_model":
                     try:
-                        from osia.voice.stt import available_whisper_model_sizes
+                        from osia.voice.model_inventory import available_whisper_model_sizes
 
                         available = available_whisper_model_sizes()
                     except Exception:
@@ -9533,7 +9533,7 @@ async def websocket_endpoint(ws: WebSocket):
                     # Built by the shared _build_config_snapshot() so an
                     # unsolicited config PUSH (the MCP mirror, Fix 2) ships the
                     # EXACT same shape this request/response path does.
-                    cfg = _build_config_snapshot()
+                    cfg = await asyncio.to_thread(_build_config_snapshot)
                     await out.send_json({"type": "config", "config": cfg})
                     await _send_pending_cron_notifications(out)
                     print(

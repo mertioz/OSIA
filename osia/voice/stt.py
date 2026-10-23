@@ -12,7 +12,6 @@ import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 from scipy.signal import resample as scipy_resample
@@ -50,23 +49,8 @@ WHISPER_SAMPLE_RATE = 16000
 RECORD_SECONDS = 5
 MODEL_SIZE = "small"  # tiny, base, small, medium, large
 
-_FASTER_WHISPER_REPO_PREFIX = "models--Systran--faster-whisper-"
-
-
-def available_whisper_model_sizes() -> set[str]:
-    """Return local faster-whisper model sizes available to OSIA."""
-    found: set[str] = set()
-    for size in ("tiny", "base", "small", "medium", "large-v3"):
-        if bundled_model_path(f"faster-whisper-{size}") is not None:
-            found.add(size)
-    hub = Path.home() / ".cache" / "huggingface" / "hub"
-    try:
-        for entry in hub.iterdir():
-            if entry.is_dir() and entry.name.startswith(_FASTER_WHISPER_REPO_PREFIX):
-                found.add(entry.name[len(_FASTER_WHISPER_REPO_PREFIX):])
-    except OSError:
-        pass
-    return found
+# Keep the existing public import available to recording callers.
+from osia.voice.model_inventory import available_whisper_model_sizes
 
 # Voice Activity Detection parameters
 VAD_SAMPLE_RATE = 16000

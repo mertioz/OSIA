@@ -7,7 +7,7 @@ from osia import config, personality
 from osia.gui.theme import PALETTES
 from osia.memory import MemoryStore, add_memory_change_listener
 from osia.server import server
-from osia.voice import stt
+from osia.voice import model_inventory
 
 
 def test_mobile_config_snapshot_contains_presence_metadata_only(monkeypatch):
@@ -51,7 +51,7 @@ def test_mobile_config_snapshot_contains_presence_metadata_only(monkeypatch):
         lambda: SimpleNamespace(text="safe personality", identifier="default", fallback_reason=None),
     )
     monkeypatch.setattr(personality, "discover_skills", lambda: [])
-    monkeypatch.setattr(stt, "available_whisper_model_sizes", lambda: {"small"})
+    monkeypatch.setattr(model_inventory, "available_whisper_model_sizes", lambda: {"small"})
 
     snapshot = server._build_config_snapshot()
     serialized = json.dumps(snapshot)

@@ -313,7 +313,7 @@ def _cap_combo_width(combo: QComboBox) -> None:
 
 def _downloaded_whisper_models() -> set[str]:
     """Return local model availability shared with the Mobile config snapshot."""
-    from osia.voice.stt import available_whisper_model_sizes
+    from osia.voice.model_inventory import available_whisper_model_sizes
 
     return available_whisper_model_sizes()
 
