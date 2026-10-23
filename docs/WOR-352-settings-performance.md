@@ -74,3 +74,32 @@ read replies instead of sending EOF and cancelling them before assertions.
 The focused read/PC-Mobile parity/conversation/WebSocket lifecycle/provider/
 ActionTruth/packaged-provider/catalogue set passes115tests,19existing dependency
 warnings. Compilation and module import pass. Physical after recheck follows.
+
+
+## Cold/reconnect replay cost
+
+Further real measurements kept the cold connected path at12329ms in-app after
+the queue fix, while an already warm Settings read reached56ms. The receive
+loop was still finishing auth replay before consuming Settings messages. It
+materialized every historical event and only then filtered to resumable streams.
+The actual store has841streams/11283733bytes. A read-only local benchmark on
+warm filesystem state found cursor lookup1050.2ms and all-history replay1879.0ms,
+materializing9415frames that a fresh client would discard. Selecting the known
+empty resume set first took0.0ms and read/replayed no unrelated streams. Cold
+filesystem/concurrent recovery observations were slower; these warm function
+numbers must not be substituted for physical first-frame latency.
+
+replay_for_client now accepts an optional explicit stream_ids scope. Default
+callers retain the full historical replay contract. The WebSocket auth caller
+passes the same server/supplied cursor union it already used for filtering,
+before materializing frames. ACK rules, sequence ordering, replay identity,
+compaction and action truth are unchanged; history is preserved. Invalid scopes
+are rejected safely. Model/account cold imports also run inside the worker,
+so module initialization cannot block the event loop while config is ready.
+
+182focused durable-transport/replay/cancellation, parity, conversation, provider,
+ActionTruth and metadata regressions pass with19dependency warnings. The new
+scope test proves selected replay equals the prior filtered result, cursor ACKs
+remain effective, and empty/invalid scopes never enumerate unrelated history.
+All changed Python files compile; module imports pass. Final physical tests
+must use the resulting source generation; Windows public0.9.0 stays unchanged.

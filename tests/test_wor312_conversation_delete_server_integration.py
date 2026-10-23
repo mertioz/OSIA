@@ -15,7 +15,7 @@ class _NoDurableTransport:
     def client_cursors(self, _client_id):
         return {}
 
-    def replay_for_client(self, _client_id, _cursors):
+    def replay_for_client(self, _client_id, _cursors, *, stream_ids=None):
         return []
 
 

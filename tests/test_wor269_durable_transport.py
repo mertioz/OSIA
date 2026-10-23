@@ -1236,3 +1236,14 @@ def test_formal_invariants_i1_through_i10(tmp_path, invariant):
         decision = controller.evaluate()
         assert decision.terminal_state == ""
         assert decision.action == "continue"
+
+
+def test_reconnect_scope_matches_existing_filtered_replay_without_history_scan(tmp_path, monkeypatch):
+    store = DurableTransportStore(tmp_path / "scoped")
+    event = _append_event(store, "turn_accepted")
+    expected = store.replay_for_client("scope_client")
+    monkeypatch.setattr(store, "list_stream_bindings", lambda: pytest.fail("scoped replay must not enumerate unrelated history"))
+    assert store.replay_for_client("scope_client", stream_ids=[]) == []
+    assert store.replay_for_client("scope_client", stream_ids=["../invalid"]) == []
+    assert store.replay_for_client("scope_client", stream_ids=[event.stream_id]) == expected
+    assert store.replay_for_client("scope_client", {event.stream_id: 1}, stream_ids=[event.stream_id]) == []

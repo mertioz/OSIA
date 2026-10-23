@@ -530,11 +530,26 @@ class DurableTransportStore:
         self,
         client_id: str,
         cursors: Mapping[str, Any] | None = None,
+        *,
+        stream_ids: Iterable[str] | None = None,
     ) -> list[dict]:
         client_id = _safe_id(client_id, "client_id")
         supplied = dict(cursors) if isinstance(cursors, Mapping) else {}
+        if stream_ids is None:
+            bindings = self.list_stream_bindings()
+        else:
+            # Reconnect already knows its resumable streams. Do not deserialize
+            # every historical stream only to discard those frames afterwards.
+            bindings = []
+            for stream_id in set(stream_ids):
+                try:
+                    binding = self.binding_for_stream(stream_id)
+                except (RuntimeError, TypeError, ValueError):
+                    continue
+                if binding is not None:
+                    bindings.append(binding)
         frames: list[dict] = []
-        for binding in self.list_stream_bindings():
+        for binding in bindings:
             stream = self.get_stream(**binding)
             stream_id = str(stream["stream_id"])
             try:

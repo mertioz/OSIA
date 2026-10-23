@@ -7513,13 +7513,14 @@ async def websocket_endpoint(ws: WebSocket):
         *, refresh_local: bool = True, refresh_account: bool = True
     ) -> None:
         """Send one safe PC-authoritative catalogue without blocking the loop."""
-        from osia.mobile_model_catalogue import build_catalogue
+        def read_catalogue():
+            from osia.mobile_model_catalogue import build_catalogue
 
-        catalogue = await asyncio.to_thread(
-            build_catalogue,
-            refresh_local=refresh_local,
-            refresh_account=refresh_account,
-        )
+            return build_catalogue(
+                refresh_local=refresh_local, refresh_account=refresh_account,
+            )
+
+        catalogue = await asyncio.to_thread(read_catalogue)
         await out.send_json({
             "type": "models_list",
             "catalogue": {
@@ -7550,9 +7551,12 @@ async def websocket_endpoint(ws: WebSocket):
 
     async def _respond_account() -> None:
         try:
-            from osia.mobile_model_catalogue import account_snapshot
+            def read_account():
+                from osia.mobile_model_catalogue import account_snapshot
 
-            state = await asyncio.to_thread(account_snapshot)
+                return account_snapshot()
+
+            state = await asyncio.to_thread(read_account)
         except Exception:
             state = {
                 "providerId": "chatgpt_account",
@@ -8424,17 +8428,18 @@ async def websocket_endpoint(ws: WebSocket):
                         "ack_mode": "contiguous_per_stream",
                         "cursors": server_cursors,
                     })
+                    resume_streams = set(server_cursors) | set(supplied_cursors)
                     replay_frames = await asyncio.to_thread(
                         _DURABLE_TRANSPORT.replay_for_client,
                         durable_client_id,
                         supplied_cursors,
+                        stream_ids=resume_streams,
                     )
                     # A fresh mobile session hydrates completed conversations
                     # separately and has no delivery cursor for their old runs.
                     # Replay only streams this client can actually resume;
                     # otherwise a new device ID floods the relay with every
                     # historical projection in the store.
-                    resume_streams = set(server_cursors) | set(supplied_cursors)
                     for replay_frame in replay_frames:
                         if replay_frame.get("stream_id") in resume_streams:
                             await out.send_durable_replay(replay_frame)
