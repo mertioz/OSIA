@@ -15,7 +15,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import QCheckBox, QWidget
 
-from osia.gui.motion import MOTION, reduced_motion_requested
+from osia.gui.motion import reduced_motion_requested
 from osia.gui.theme import ThemeManager, get_theme_manager
 
 
@@ -38,13 +38,13 @@ class OsiaSwitch(QCheckBox):
     presentation and bounded state transition are custom.
     """
 
-    TRACK_WIDTH = 38
-    TRACK_HEIGHT = 20
-    CONTROL_WIDTH = 40
-    CONTROL_HEIGHT = 22
+    TRACK_WIDTH = 40
+    TRACK_HEIGHT = 22
+    CONTROL_WIDTH = TRACK_WIDTH + 6
+    CONTROL_HEIGHT = TRACK_HEIGHT + 6
     THUMB_DIAMETER = 16
     TEXT_GAP = 8
-    ANIMATION_MS = MOTION.appearance_ms
+    ANIMATION_MS = 220
 
     def __init__(
         self,
@@ -69,7 +69,7 @@ class OsiaSwitch(QCheckBox):
         self._target_position = self._thumb_position
         self._animation = QVariantAnimation(self)
         self._animation.setDuration(self.ANIMATION_MS)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.setEasingCurve(QEasingCurve.Type.InOutSine)
         self._animation.valueChanged.connect(self._set_thumb_position)
         self._animation.finished.connect(self._settle_animation)
         self._theme.theme_changed.connect(self._on_theme_changed)
@@ -159,10 +159,11 @@ class OsiaSwitch(QCheckBox):
             self._animation.stop()
             self._set_thumb_position(target)
             return
+        if self.active_animation_count and self._animation.endValue() == target:
+            return
         self._animation.stop()
         self._animation.setStartValue(self._thumb_position)
         self._animation.setEndValue(target)
-        self._animation.setDuration(self.ANIMATION_MS)
         self._animation.start()
 
     def _set_thumb_position(self, value) -> None:
@@ -177,10 +178,11 @@ class OsiaSwitch(QCheckBox):
 
     def _track_rect(self) -> QRectF:
         top = (self.height() - self.TRACK_HEIGHT) / 2.0
+        inset = (self.CONTROL_WIDTH - self.TRACK_WIDTH) / 2.0
         if self.layoutDirection() == Qt.LayoutDirection.RightToLeft:
-            left = self.width() - self.CONTROL_WIDTH + 1.0
+            left = self.width() - self.CONTROL_WIDTH + inset
         else:
-            left = 1.0
+            left = inset
         return QRectF(left, top, self.TRACK_WIDTH, self.TRACK_HEIGHT)
 
     def paintEvent(self, _event) -> None:
@@ -207,11 +209,11 @@ class OsiaSwitch(QCheckBox):
             focus = _blend(QColor(palette.focus), QColor(palette.text), 0.52)
             focus.setAlpha(220 if self.isEnabled() else 100)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(focus, 1.8))
+            painter.setPen(QPen(focus, 1.4))
             painter.drawRoundedRect(
-                track_rect.adjusted(-0.5, -0.5, 0.5, 0.5),
-                self.TRACK_HEIGHT / 2.0,
-                self.TRACK_HEIGHT / 2.0,
+                track_rect.adjusted(-2.0, -2.0, 2.0, 2.0),
+                self.TRACK_HEIGHT / 2.0 + 2.0,
+                self.TRACK_HEIGHT / 2.0 + 2.0,
             )
 
         painter.setBrush(track)
@@ -223,20 +225,11 @@ class OsiaSwitch(QCheckBox):
         )
 
         radius = self.THUMB_DIAMETER / 2.0
-        start_x = track_rect.left() + 2.0 + radius
-        end_x = track_rect.right() - 2.0 - radius
+        inset = self.TRACK_HEIGHT / 2.0
+        start_x = track_rect.left() + inset
+        end_x = track_rect.right() - inset
         center_x = start_x + (end_x - start_x) * progress
         center_y = track_rect.center().y()
-        if (self._hovered or self.hasFocus()) and self.isEnabled():
-            halo = QColor(accent)
-            halo.setAlpha(78 if self.hasFocus() else round(20 + 20 * progress))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(halo)
-            painter.drawEllipse(
-                QRectF(center_x - radius - 1.5, center_y - radius - 1.5,
-                       self.THUMB_DIAMETER + 3.0, self.THUMB_DIAMETER + 3.0)
-            )
-
         thumb = _blend(QColor(palette.text), QColor(palette.background), progress)
         painter.setPen(QPen(QColor(0, 0, 0, 45), 0.8))
         painter.setBrush(thumb)

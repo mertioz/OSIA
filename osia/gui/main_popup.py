@@ -12142,6 +12142,33 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(88, 205, 255, 0.52);
                 border-radius: 10px;
             }
+            QFrame#publicBetaUpdateBanner {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(237, 139, 71, 0.24),
+                    stop:1 rgba(255, 212, 121, 0.15));
+                border: 1px solid rgba(255, 196, 122, 0.62);
+                border-radius: 10px;
+            }
+            QFrame#publicBetaUpdateBanner QPushButton {
+                border: 1px solid rgba(255, 196, 122, 0.50);
+                border-radius: 8px;
+                background: rgba(38, 22, 15, 0.58);
+                color: #fff2df;
+                font-size: 11px;
+                padding: 5px 9px;
+            }
+            QFrame#publicBetaUpdateBanner QPushButton:hover,
+            QFrame#publicBetaUpdateBanner QPushButton:focus {
+                border-color: #ffd479;
+            }
+            QFrame#publicBetaUpdateBanner QPushButton#primaryBtn {
+                background: #ffd479;
+                color: #29170e;
+            }
+            QFrame#publicBetaUpdateBanner QPushButton#primaryBtn:hover,
+            QFrame#publicBetaUpdateBanner QPushButton#primaryBtn:focus {
+                background: #ffe5a3;
+            }
             QLabel#updateBannerText {
                 color: #f8f6ff;
                 font-size: 11px;
@@ -12158,6 +12185,10 @@ class MainPopup(QWidget):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #8b5cff, stop:1 #34d8ff);
                 border-radius: 2px;
+            }
+            QFrame#publicBetaUpdateBanner QProgressBar#updateBannerProgress::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ed8b47, stop:1 #ffd479);
             }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,
@@ -12605,7 +12636,7 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.16);
                 border-radius: 10px;
             }
-            QFrame#majorUpdateCard {
+            QFrame#majorUpdateCard, QFrame#publicBetaUpdateCard {
                 background: transparent;
                 border: none;
                 border-radius: 11px;
@@ -12621,13 +12652,18 @@ class MainPopup(QWidget):
                 font-size: 13px;
                 font-weight: 600;
             }
-            QLabel#releaseBadge {
+            QLabel#releaseBadge, QLabel#publicBetaReleaseBadge {
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.34);
                 border-radius: 8px;
                 color: #c4b5f5;
                 padding: 2px 7px;
                 font-size: 10px;
+            }
+            QLabel#publicBetaReleaseBadge {
+                background: rgba(237, 139, 71, 0.20);
+                border-color: rgba(255, 196, 122, 0.52);
+                color: #ffd479;
             }
             QPushButton#themeChoice {
                 background: rgba(196, 181, 245, 0.04);

@@ -675,10 +675,44 @@ def test_major_update_card_is_distinct_scrollable_and_reduced_motion_safe(
         assert section.available_card.notes_scroll.height() <= 390
         assert section.available_card._reduced_motion
         assert section.available_card._animation.state().value == 0
-        assert section.progress._major_update
+        assert section.progress._accent == "major"
         assert section.progress._reduced_motion
         assert section.progress.value() == 750
     finally:
+        section.close()
+        section.deleteLater()
+        _QT_APP.processEvents()
+
+
+def test_public_beta_uses_its_own_accent_on_cards_banner_and_progress(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    controller = _controller(monkeypatch, tmp_path)
+    section = update_ui.UpdateSettingsSection(controller)
+    banner = update_ui.UpdateBanner()
+    state = controller.state
+    state.update(status="available", availableVersion="0.9.0", bannerVisible=True)
+    try:
+        section.apply_state(state)
+        banner.apply_state(state)
+        assert banner.objectName() == "publicBetaUpdateBanner"
+        assert section.available_card.objectName() == "publicBetaUpdateCard"
+        assert section.available_card.badge.objectName() == "publicBetaReleaseBadge"
+        assert section.progress._accent == "beta"
+        assert section.history_layout.itemAt(0).widget().objectName() == "publicBetaUpdateCard"
+
+        state.update(installedVersion="0.9.0", availableVersion="1.1.0")
+        section.apply_state(state)
+        banner.apply_state(state)
+        assert section.current_card.objectName() == "publicBetaUpdateCard"
+        assert section.available_card.objectName() == "majorUpdateCard"
+        assert section.available_card.badge.objectName() == "releaseBadge"
+        assert banner.objectName() == "majorUpdateBanner"
+        assert section.progress._accent == "major"
+    finally:
+        banner.close()
+        banner.deleteLater()
         section.close()
         section.deleteLater()
         _QT_APP.processEvents()

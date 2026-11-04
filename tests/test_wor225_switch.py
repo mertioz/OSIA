@@ -15,6 +15,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QRectF,
     QTimer,
     Qt,
     pyqtSignal,
@@ -180,6 +181,23 @@ class TestCanonicalSwitch:
         self.app.processEvents()
         assert switch.active_animation_count == 0
         assert switch.thumb_position == 1.0
+
+    def test_focus_outline_fits_and_thumb_visits_intermediate_positions(self):
+        switch = self._switch(reduced_motion=lambda: False)
+        switch.show()
+        try:
+            track = switch._track_rect()
+            focus_bounds = track.adjusted(-2.7, -2.7, 2.7, 2.7)
+            assert QRectF(switch.rect()).contains(focus_bounds)
+            switch.setFocus(Qt.FocusReason.TabFocusReason)
+            QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
+            QTest.qWait(switch.ANIMATION_MS // 2)
+            assert 0 < switch.thumb_position < 1
+            QTest.qWait(switch.ANIMATION_MS)
+            assert switch.thumb_position == 1
+            assert switch.active_animation_count == 0
+        finally:
+            switch.close()
 
     def test_disabled_state_rejects_mouse_and_keyboard_mutation(self):
         switch = self._switch(reduced_motion=lambda: True)

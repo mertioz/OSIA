@@ -160,6 +160,25 @@ def _major_animation(parent: QObject, callback) -> QVariantAnimation:
     return animation
 
 
+def _release_accent(version: str | None, major_update: bool = False) -> str | None:
+    if version == PRODUCT_VERSION:
+        return "beta"
+    return "major" if version and (major_update or is_major_update(version)) else None
+
+
+def _release_colors(accent: str, dark: bool) -> tuple[QColor, QColor, QColor]:
+    if accent == "beta":
+        colors = ("#ed8b47", "#ffd479", "#ffc47a") if dark else (
+            "#b2582d", "#9a650d", "#a66825",
+        )
+    else:
+        colors = ("#8b5cff", "#34d8ff", "#a979ff") if dark else (
+            "#6c36e8", "#007f9c", "#7442dc",
+        )
+    start, end, border = colors
+    return QColor(start), QColor(end), QColor(border)
+
+
 class UpdateController(QObject):
     """Schedule updater work without ever blocking Qt's event loop."""
 
@@ -646,12 +665,18 @@ class UpdateBanner(QFrame):
     def apply_state(self, state: dict) -> None:
         self._state = dict(state)
         self._version = state.get("availableVersion") or ""
-        major = bool(state.get("majorUpdate") and self._version)
-        object_name = "majorUpdateBanner" if major else "updateBanner"
+        accent = _release_accent(self._version, bool(state.get("majorUpdate")))
+        object_name = {
+            "beta": "publicBetaUpdateBanner", "major": "majorUpdateBanner",
+        }.get(accent, "updateBanner")
         if self.objectName() != object_name:
             self.setObjectName(object_name)
-            self.style().unpolish(self)
-            self.style().polish(self)
+            for widget in (
+                self, self.view_button, self.install_button,
+                self.dismiss_button, self.progress,
+            ):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
         self._render(state)
         self.setVisible(bool(state.get("bannerVisible") and self._version))
 
@@ -692,7 +717,7 @@ class _ReleaseCard(QFrame):
         )
         self.notes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.notes_scroll.setWidget(self.notes)
-        self._major_update = False
+        self._accent: str | None = None
         self._breath = 0.45
         self._reduced_motion = _system_reduced_motion()
         self._animation = _major_animation(self, self._set_breath)
@@ -704,15 +729,21 @@ class _ReleaseCard(QFrame):
         self._breath = float(value)
         self.update()
 
-    def _set_major_update(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        if self._major_update == enabled:
+    def _set_accent(self, accent: str | None) -> None:
+        if self._accent == accent:
             return
-        self._major_update = enabled
-        self.setObjectName("majorUpdateCard" if enabled else "releaseCard")
+        self._accent = accent
+        self.setObjectName({
+            "beta": "publicBetaUpdateCard", "major": "majorUpdateCard",
+        }.get(accent, "releaseCard"))
+        self.badge.setObjectName(
+            "publicBetaReleaseBadge" if accent == "beta" else "releaseBadge",
+        )
         self.style().unpolish(self)
         self.style().polish(self)
-        if enabled and not self._reduced_motion and self.isVisible():
+        self.badge.style().unpolish(self.badge)
+        self.badge.style().polish(self.badge)
+        if accent and not self._reduced_motion and self.isVisible():
             self._animation.start()
         else:
             self._animation.stop()
@@ -721,7 +752,7 @@ class _ReleaseCard(QFrame):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._major_update and not self._reduced_motion:
+        if self._accent and not self._reduced_motion:
             self._animation.start()
 
     def hideEvent(self, event) -> None:
@@ -730,7 +761,7 @@ class _ReleaseCard(QFrame):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self._major_update:
+        if self._accent is None:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -738,22 +769,20 @@ class _ReleaseCard(QFrame):
         theme = get_theme_manager().palette
         dark = QColor(theme.background).lightnessF() < 0.5
         base = QColor(theme.elevated_surface if dark else theme.surface)
-        purple = QColor("#8b5cff" if dark else "#6c36e8")
-        cyan = QColor("#34d8ff" if dark else "#007f9c")
+        start, end, border = _release_colors(self._accent, dark)
         glow_alpha = round((34 if dark else 24) + self._breath * 32)
-        purple.setAlpha(glow_alpha)
-        cyan.setAlpha(glow_alpha)
+        start.setAlpha(glow_alpha)
+        end.setAlpha(glow_alpha)
         gradient = QLinearGradient(
             QPointF(bounds.left(), bounds.top()),
             QPointF(bounds.right(), bounds.bottom()),
         )
-        gradient.setColorAt(0.0, purple)
+        gradient.setColorAt(0.0, start)
         gradient.setColorAt(0.48 + (self._breath - 0.5) * 0.08, base)
-        gradient.setColorAt(1.0, cyan)
+        gradient.setColorAt(1.0, end)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(gradient)
         painter.drawRoundedRect(bounds, 11.0, 11.0)
-        border = QColor("#a979ff" if dark else "#7442dc")
         border.setAlpha(round(120 + self._breath * 70))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(border, 1.2))
@@ -780,7 +809,7 @@ class _ReleaseCard(QFrame):
         sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         major_update: bool = False,
     ) -> None:
-        self._set_major_update(major_update)
+        self._set_accent(_release_accent(version, major_update))
         self.version.setText(i18n.t(
             "updates.product_beta" if version == PRODUCT_VERSION else "updates.version",
             version=display_version(version),
@@ -806,12 +835,12 @@ class _ReleaseCard(QFrame):
         QTimer.singleShot(0, self._resize_notes)
 
 
-class _MajorProgressBar(QProgressBar):
+class _ReleaseProgressBar(QProgressBar):
     """Updater-only gradient progress with a restrained breathing treatment."""
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self._major_update = False
+        self._accent: str | None = None
         self._breath = 0.45
         self._reduced_motion = _system_reduced_motion()
         self._animation = _major_animation(self, self._set_breath)
@@ -820,12 +849,11 @@ class _MajorProgressBar(QProgressBar):
         self._breath = float(value)
         self.update()
 
-    def set_major_update(self, enabled: bool) -> None:
-        enabled = bool(enabled)
-        if self._major_update == enabled:
+    def set_accent(self, accent: str | None) -> None:
+        if self._accent == accent:
             return
-        self._major_update = enabled
-        if enabled and not self._reduced_motion and self.isVisible():
+        self._accent = accent
+        if accent and not self._reduced_motion and self.isVisible():
             self._animation.start()
         else:
             self._animation.stop()
@@ -834,7 +862,7 @@ class _MajorProgressBar(QProgressBar):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._major_update and not self._reduced_motion:
+        if self._accent and not self._reduced_motion:
             self._animation.start()
 
     def hideEvent(self, event) -> None:
@@ -842,7 +870,7 @@ class _MajorProgressBar(QProgressBar):
         super().hideEvent(event)
 
     def paintEvent(self, event) -> None:
-        if not self._major_update:
+        if self._accent is None:
             super().paintEvent(event)
             return
         painter = QPainter(self)
@@ -858,22 +886,18 @@ class _MajorProgressBar(QProgressBar):
         fraction = (self.value() - self.minimum()) / span if span > 0 else 0.0
         fill = QRectF(bounds)
         fill.setWidth(max(0.0, bounds.width() * max(0.0, min(1.0, fraction))))
+        start, end, border = _release_colors(self._accent, dark)
         if fill.width() > 0:
-            purple = QColor("#8b5cff" if dark else "#6c36e8")
-            cyan = QColor("#34d8ff" if dark else "#007f9c")
             pulse = round(self._breath * 22)
-            purple = purple.lighter(100 + pulse)
-            cyan = cyan.lighter(100 + pulse)
             gradient = QLinearGradient(fill.topLeft(), fill.topRight())
-            gradient.setColorAt(0.0, purple)
-            gradient.setColorAt(1.0, cyan)
+            gradient.setColorAt(0.0, start.lighter(100 + pulse))
+            gradient.setColorAt(1.0, end.lighter(100 + pulse))
             path = QPainterPath()
             path.addRoundedRect(bounds, 7.0, 7.0)
             painter.save()
             painter.setClipPath(path)
             painter.fillRect(fill, gradient)
             painter.restore()
-        border = QColor("#a979ff" if dark else "#7442dc")
         border.setAlpha(round(125 + self._breath * 65))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(border, 1.0))
@@ -949,7 +973,7 @@ class UpdateSettingsSection(QFrame):
         self.history_layout.setContentsMargins(0, 0, 0, 0)
         self.history_layout.setSpacing(7)
         self.history_host.hide()
-        self.progress = _MajorProgressBar()
+        self.progress = _ReleaseProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.hide()
         actions = QHBoxLayout()
@@ -1037,10 +1061,9 @@ class UpdateSettingsSection(QFrame):
 
         total = int(state.get("progressTotal") or 0)
         received = int(state.get("progressReceived") or 0)
-        major_available = bool(
-            state.get("majorUpdate") or is_major_update(str(available))
-        ) if available else False
-        self.progress.set_major_update(major_available)
+        self.progress.set_accent(
+            _release_accent(available, bool(state.get("majorUpdate"))),
+        )
         self.progress.setVisible(
             status in {"preparing", "downloading", "verifying", "launching"}
         )
