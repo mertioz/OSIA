@@ -1688,6 +1688,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Couldn't stop this turn. Try again.",
         "fr": "Impossible d’arrêter ce tour. Réessaie.",
     },
+    "chat.stopped": {
+        "en": "OSIA stopped this turn.",
+        "fr": "OSIA s’est arrêté.",
+        "zh": "OSIA 已停止本轮。",
+        "ja": "OSIA はこのターンを停止しました。",
+        "de": "OSIA hat diesen Durchlauf gestoppt.",
+        "es": "OSIA detuvo este turno.",
+    },
     "chat.status_cancelled_proven": {
         "en": "The action was cancelled before any effect was confirmed.",
         "fr": "L’action a été annulée avant tout effet confirmé.",
@@ -3450,16 +3458,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "fr": "OSIA n’a pas pu fermer sa connexion mobile. Réessayez.",
     },
     "settings.getting_started": {
-        "en": "Complete OSIA guide",
-        "fr": "Guide OSIA complet",
+        "en": "OSIA Guide",
+        "fr": "Guide OSIA",
     },
     "settings.getting_started_sub": {
-        "en": "Learn the essentials or explore every advanced feature.",
-        "fr": "Apprenez l’essentiel ou explorez chaque fonction avancée.",
+        "en": "Learn the basic settings in four short steps.",
+        "fr": "Découvre les réglages de base en quatre étapes.",
     },
     "settings.getting_started_desc": {
-        "en": "The guide does not change or reset your settings.",
-        "fr": "Le guide ne modifie ni ne réinitialise vos réglages.",
+        "en": "Language, theme, model, and voice.",
+        "fr": "Langue, thème, modèle et voix.",
     },
     "settings.getting_started_button": {
         "en": "Open the OSIA guide",

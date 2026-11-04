@@ -326,11 +326,15 @@ def test_stop_emits_the_exact_chat_turn_binding_once(app):
         chat.deleteLater()
 
 
-def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup):
-    ledger = _ledger(suffix="committed_stop")
+@pytest.mark.parametrize("settle_before_confirm", [False, True])
+def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(
+    app, popup, settle_before_confirm,
+):
+    ledger = _ledger(suffix=f"committed_stop_{settle_before_confirm}")
     ledger.record_public_reasoning_summary("Public reasoning is active.")
     binding = ledger.binding_dict()
     popup.refresh_conversations(binding["conversation_id"])
+    popup.set_messages([])
     popup._active_conversation_id = binding["conversation_id"]
     requested = []
     capture_request = requested.append
@@ -356,8 +360,14 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         popup._chat._send_btn.click()
         assert len(requested) == 2
 
-        assert popup.confirm_chat_execution_cancellation(binding)
+        if settle_before_confirm:
+            popup.set_conversation_busy(binding["conversation_id"], False)
+        assert popup.confirm_chat_execution_cancellation(binding, discard_stream=True)
         app.processEvents()
+        stopped = i18n.t("chat.stopped")
+        assert _bubble_texts(popup._chat).count(stopped) == 1
+        assert not popup.confirm_chat_execution_cancellation(binding, discard_stream=True)
+        assert _bubble_texts(popup._chat).count(stopped) == 1
         assert not trace._expanded
         assert not popup._chat._send_btn.stop_mode
         assert popup._chat._active_thinking_key is None
@@ -367,7 +377,7 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         assert binding["conversation_id"] not in popup._busy_conversation_ids
         assert popup._chat._input.isEnabled()
 
-        next_ledger = _ledger(suffix="committed_stop_next")
+        next_ledger = _ledger(suffix=f"committed_stop_next_{settle_before_confirm}")
         next_binding = {
             **next_ledger.binding_dict(),
             "conversation_id": binding["conversation_id"],

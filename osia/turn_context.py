@@ -682,6 +682,10 @@ _LOCALIZED = {
         "de": "Ich konnte diese Anfrage wegen eines Fehlers des Antwortanbieters nicht abschließen. Bitte versuchen Sie es erneut.",
         "es": "No pude completar esta solicitud porque falló el proveedor de respuesta. Inténtalo de nuevo.",
     },
+    "desktop_turn_setup_failed": {
+        "en": "OSIA couldn't prepare this turn. Please try again.",
+        "fr": "OSIA n’a pas pu préparer ce tour. Réessaie.",
+    },
     "capture_protected_surface": {
         "en": "I can't read this window's content because the application asks the operating system to exclude it from screen capture. I did not bypass that protection or infer the content from accessibility-only elements.",
         "fr": "Je ne peux pas lire le contenu de cette fenêtre, car l’application demande au système d’exploitation de l’exclure des captures d’écran. Je n’ai ni contourné cette protection ni déduit le contenu à partir des seuls éléments d’accessibilité.",

@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from osia.agent import OSIAAgent
 from osia.execution_strategy import (
     ExecutionStrategy,
@@ -40,6 +42,37 @@ def _controller(tmp, *, turn="turn-1", execution=True, postconditions=("done",))
         execution_required=execution,
         storage_dir=Path(tmp),
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing semantics")
+def test_first_turn_binding_survives_a_brief_windows_reader(tmp_path, monkeypatch):
+    controller = _controller(tmp_path)
+    real_replace = os.replace
+    failures = []
+    target = next(tmp_path.glob("*.json"))
+
+    def replace(source, destination):
+        if destination == target and not failures:
+            with target.open(encoding="utf-8"):
+                try:
+                    real_replace(source, destination)
+                except PermissionError as exc:
+                    failures.append(exc.winerror)
+                    raise
+        else:
+            real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    binding = {
+        "conversation_id": "new-chat", "request_id": "first-request",
+        "turn_id": "turn-1", "run_id": "first-run",
+        "provider_id": "deepseek", "model_id": "deepseek-flash",
+        "effective_reasoning": "auto",
+    }
+    controller.set_execution_binding(binding)
+    assert len(failures) == 1 and failures[0] in (5, 32, 33)
+    assert json.loads(target.read_text(encoding="utf-8"))["execution_binding"] == binding
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def _completion_fixture(agent, answer, directory=None):

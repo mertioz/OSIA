@@ -15,6 +15,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -738,11 +739,31 @@ class TurnTerminalityController:
         temporary = self._path.with_name(
             self._path.name + f".{os.getpid()}.{secrets.token_hex(6)}.tmp"
         )
-        temporary.write_text(
-            json.dumps(self._state, sort_keys=True, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        os.replace(temporary, self._path)
+        try:
+            temporary.write_text(
+                json.dumps(self._state, sort_keys=True, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            for delay in (0.02, 0.05, 0.10, 0.20, None):
+                try:
+                    os.replace(temporary, self._path)
+                    return
+                except PermissionError as exc:
+                    # A Windows reader can briefly deny replacement of the
+                    # same file. Retry the atomic write while its owner holds
+                    # the existing turn locks.
+                    if (
+                        delay is None or sys.platform != "win32"
+                        or getattr(exc, "winerror", None) not in (5, 32, 33)
+                    ):
+                        raise
+                    time.sleep(delay)
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     @contextmanager
     def _process_lock(self):

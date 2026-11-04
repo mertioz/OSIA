@@ -3401,7 +3401,8 @@ def wake_mode():
                 terminal_state = TerminalState.BLOCKED_VERIFIED.value
                 reason_code = "durable_turn_setup_failed"
                 final_text = localized_text(
-                    "provider_failure", context.language,
+                    "provider_failure" if invocations else "desktop_turn_setup_failed",
+                    context.language,
                 )
             controller.reserve_final(
                 terminal_state,

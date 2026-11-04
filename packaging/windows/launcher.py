@@ -180,7 +180,7 @@ def _package_smoke() -> int:
         import win32com.client  # noqa: F401
         from uiautomation.uiautomation import _DllClient
         from PyQt6.QtGui import QPixmap
-        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtWidgets import QApplication, QLabel
         from faster_whisper import WhisperModel
         from playwright._impl._driver import compute_driver_executable
         from osia.chatgpt_account.app_server_client import AppServerClient
@@ -257,12 +257,8 @@ def _package_smoke() -> int:
                 raise RuntimeError("onboarding completion did not persist")
         step = "onboarding_ui"
         onboarding = OnboardingDialog(automatic=False)
-        if (
-            onboarding.ESSENTIAL_COUNT < 7
-            or onboarding.MASTERY_COUNT < 16
-            or onboarding.ADVANCED_COUNT < 38
-        ):
-            raise RuntimeError("packaged OSIA guide is incomplete")
+        if onboarding.SLIDE_COUNT < 4 or onboarding.findChild(QLabel, "guideCaption") is None:
+            raise RuntimeError("packaged OSIA Settings guide is incomplete")
         onboarding.deleteLater()
         qt_app.processEvents()
 

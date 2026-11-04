@@ -11208,6 +11208,7 @@ class MainPopup(QWidget):
         self._cancelled_thinking_keys: set[
             tuple[str, str, str, str]
         ] = set()
+        self._stop_notice_keys: set[tuple[str, str, str, str]] = set()
         self._retired_thinking_keys: set[
             tuple[str, str, str, str]
         ] = set()
@@ -11821,7 +11822,15 @@ class MainPopup(QWidget):
         key = _ChatPage._binding_key(payload)
         if key is None:
             return False
-        if self._active_thinking_key_by_conversation.get(key[0]) != key:
+        show_stop_notice = (
+            discard_stream and self._chat._stream_key == key
+            and self._active_conversation_id == key[0]
+            and key not in self._stop_notice_keys
+        )
+        active_key = self._active_thinking_key_by_conversation.get(key[0])
+        if active_key != key and not (
+            active_key is None and show_stop_notice and key in self._retired_thinking_keys
+        ):
             return False
         expected = self._turn_binding_by_key.get(key)
         if not isinstance(expected, dict) or any(
@@ -11836,7 +11845,8 @@ class MainPopup(QWidget):
         self._cancelled_thinking_keys.add(key)
         self._terminal_thinking_keys.add(key)
         self._chat.tombstone_cancelled_turn(payload)
-        if discard_stream and self._chat._stream_key == key:
+        if show_stop_notice:
+            self._stop_notice_keys.add(key)
             self._chat.cancel_assistant_stream(flush=False)
         projected = dict(self._thinking_by_key.get(key) or payload)
         projected["cancel_requested"] = True
@@ -11854,6 +11864,8 @@ class MainPopup(QWidget):
         # is intentionally tied to the committed tombstone, not the earlier
         # optimistic Stop tap.
         self.set_conversation_busy(key[0], False)
+        if show_stop_notice:
+            self._chat.append_message("assistant", i18n.t("chat.stopped"))
         return True
 
     def _apply_current_activity(self) -> None:

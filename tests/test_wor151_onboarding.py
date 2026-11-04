@@ -12,10 +12,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PIL import Image
-from PyQt6.QtCore import QPoint, QPointF, Qt
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QFrame, QLabel, QPushButton
+from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia import i18n, onboarding
 from osia.guide_content import (
@@ -29,8 +28,7 @@ from osia.guide_content import (
     lessons_for_category,
 )
 from osia.gui import main_popup
-from osia.gui.onboarding import OnboardingDialog, _ScaledPixmapLabel
-from osia.gui.theme import get_theme_manager
+from osia.gui.onboarding import OnboardingDialog
 from osia.utils.assets import asset_path
 
 
@@ -241,11 +239,69 @@ def test_frozen_smoke_covers_complete_guide_and_assets():
     assert "create_fresh_install_marker(state_path)" in launcher
     assert 'mark_onboarding_handled("completed", state_path)' in launcher
     assert "OnboardingDialog(automatic=False)" in launcher
-    assert "ESSENTIAL_COUNT < 7" in launcher
-    assert "MASTERY_COUNT < 16" in launcher
-    assert "ADVANCED_COUNT < 38" in launcher
+    assert "onboarding.SLIDE_COUNT < 4" in launcher
+    assert '"guideCaption"' in launcher
     assert "guide asset" in launcher
     assert '(str(ROOT / "assets"), "assets")' in spec
+
+
+@pytest.mark.parametrize("language", ["en", "fr"])
+def test_settings_guide_has_one_image_two_lines_and_one_arrow(tmp_path, language):
+    marker = tmp_path / "onboarding.json"
+    i18n.set_language(language, persist=False)
+    dialog = OnboardingDialog(state_path=marker)
+    try:
+        dialog.resize(dialog.minimumSize())
+        dialog.show()
+        _QT_APP.processEvents()
+        assert dialog.findChildren(QPushButton) == [dialog._next]
+        assert dialog._next.text() == "→"
+        assert dialog._next.shortcut().toString() == "Right"
+        assert dialog._illustration.geometry().bottom() < dialog._caption.geometry().top()
+        captions = []
+        frames = []
+        for _ in range(dialog.SLIDE_COUNT):
+            lines = dialog._caption.text().splitlines()
+            assert len(lines) == 2
+            assert all(
+                dialog._caption.fontMetrics().horizontalAdvance(line) <= dialog._caption.width()
+                for line in lines
+            )
+            captions.append(dialog._caption.text())
+            frames.append(dialog._illustration.grab().toImage())
+            dialog._next.click()
+            _QT_APP.processEvents()
+        assert len(set(captions)) == 4
+        assert all(frame != frames[0] for frame in frames[1:])
+        assert not dialog.isVisible()
+        assert not marker.exists()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        i18n.set_language("en", persist=False)
+
+
+@pytest.mark.parametrize("finish", [True, False])
+def test_settings_guide_preserves_first_install_handling(tmp_path, finish):
+    marker = tmp_path / "onboarding.json"
+    assert onboarding.create_fresh_install_marker(marker)
+    assert onboarding.claim_automatic_onboarding(marker)
+    dialog = OnboardingDialog(automatic=True, state_path=marker)
+    handled = QSignalSpy(dialog.handled)
+    try:
+        dialog.show()
+        if finish:
+            for _ in range(dialog.SLIDE_COUNT):
+                dialog._next.click()
+        else:
+            dialog.close()
+        outcome = "completed" if finish else "closed"
+        assert [list(item) for item in handled] == [[outcome]]
+        assert onboarding.onboarding_state(marker)["outcome"] == outcome
+        assert not onboarding.claim_automatic_onboarding(marker)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
 
 
 def test_three_categories_and_all_stable_ids_are_unique():
@@ -263,15 +319,6 @@ def test_three_categories_and_all_stable_ids_are_unique():
     for category in CATEGORIES:
         orders = [lesson.order for lesson in lessons_for_category(category.id)]
         assert orders == list(range(1, len(orders) + 1))
-
-
-def test_premium_header_exposes_three_track_selectors(tmp_path):
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    assert dialog.findChild(QFrame, "guideHeader") is not None
-    assert len(dialog._category_buttons) == 3
-    body_top = dialog._toc.mapTo(dialog, dialog._toc.rect().topLeft()).y()
-    assert body_top < 190
-    dialog.deleteLater()
 
 
 def test_mastery_and_developer_progress_are_independent(tmp_path):
@@ -381,124 +428,6 @@ def test_every_lesson_has_complete_english_and_french_copy():
             assert lesson.alt_text.get("en") and lesson.alt_text.get("fr")
 
 
-def test_no_content_level_configuration_or_application_action_buttons(tmp_path):
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    buttons = dialog.findChildren(QPushButton)
-    assert buttons
-    assert all(button.property("guideNavigation") is True for button in buttons)
-    forbidden = {
-        "connect chatgpt",
-        "open models",
-        "open mobile",
-        "go to settings",
-        "configure provider",
-        "start pairing",
-    }
-    assert not forbidden.intersection(button.text().strip().lower() for button in buttons)
-    assert not hasattr(dialog, "answer_settings_requested")
-    assert not hasattr(dialog, "phone_settings_requested")
-    parent_source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
-    assert "dialog.answer_settings_requested.connect" not in parent_source
-    assert "dialog.phone_settings_requested.connect" not in parent_source
-    dialog.deleteLater()
-
-
-def test_toc_category_previous_and_next_navigation(tmp_path):
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    assert dialog._current_lesson_id is None
-    assert dialog._toc.count() == 17
-    assert dialog._next.text() == "Resume"
-    QTest.mouseClick(dialog._next, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.osia-role"
-    assert not dialog._back.isEnabled()
-    QTest.mouseClick(dialog._next, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.requirements"
-    assert dialog._back.isEnabled()
-    QTest.mouseClick(dialog._back, Qt.MouseButton.LeftButton)
-    assert dialog._current_lesson_id == "essential.osia-role"
-    QTest.mouseClick(
-        dialog._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
-    )
-    assert dialog._selected_category == CATEGORY_MASTERY
-    assert dialog._current_lesson_id == "mastery.pc-authority"
-    dialog._toc.setCurrentRow(4)
-    assert dialog._current_lesson_id == "mastery.provider-routes"
-    dialog.deleteLater()
-
-
-def test_skip_persists_and_french_ui_is_available(tmp_path):
-    marker = tmp_path / "state.json"
-    onboarding.create_fresh_install_marker(marker)
-    assert onboarding.claim_automatic_onboarding(marker)
-    dialog = OnboardingDialog(automatic=True, state_path=marker)
-    handled = QSignalSpy(dialog.handled)
-    try:
-        i18n.set_language("fr", persist=False)
-        assert dialog._skip.text() == "Passer"
-        assert dialog._next.text() == "Suivant"
-        titles = " ".join(label.text() for label in dialog.findChildren(QLabel))
-        assert "OSIA fonctionne depuis votre PC" in titles
-        QTest.mouseClick(dialog._skip, Qt.MouseButton.LeftButton)
-        state = onboarding.onboarding_state(marker)
-        assert state["outcome"] == "skipped"
-        assert state["skipped"] is True
-        assert [list(item) for item in handled] == [["skipped"]]
-    finally:
-        i18n.set_language("en", persist=False)
-
-
-def test_finish_persists_essential_completion_and_second_launch_is_quiet(tmp_path):
-    marker = tmp_path / "state.json"
-    onboarding.create_fresh_install_marker(marker)
-    assert onboarding.claim_automatic_onboarding(marker)
-    dialog = OnboardingDialog(automatic=True, state_path=marker)
-    dialog._show_lesson("essential.ready", persist=True)
-    assert dialog._next.text() == "Finish"
-    QTest.mouseClick(dialog._next, Qt.MouseButton.LeftButton)
-    state = onboarding.onboarding_state(marker)
-    assert state["status"] == "handled"
-    assert state["outcome"] == "completed"
-    assert state["essentialCompleted"] is True
-    assert state["finished"] is True
-    assert not onboarding.claim_automatic_onboarding(marker)
-    manual = OnboardingDialog(automatic=False, state_path=marker)
-    assert manual._current_lesson_id is None
-    assert manual._toc.count() == 17
-    manual.deleteLater()
-
-
-def test_close_and_manual_reopen_resume_from_saved_lesson(tmp_path):
-    marker = tmp_path / "state.json"
-    first = OnboardingDialog(automatic=False, state_path=marker)
-    first._show_lesson("advanced.voice-tts-stt", persist=True)
-    first.reject()
-    state = onboarding.onboarding_state(marker)
-    assert state["status"] == "handled"
-    assert state["outcome"] == "migrated"
-    assert state["currentLesson"] == "mastery.voice-tts"
-
-    reopened = OnboardingDialog(automatic=False, state_path=marker)
-    assert reopened._current_lesson_id is None
-    QTest.mouseClick(
-        reopened._category_buttons[CATEGORY_MASTERY], Qt.MouseButton.LeftButton
-    )
-    assert reopened._current_lesson_id == "mastery.voice-tts"
-    reopened.deleteLater()
-
-
-def test_advanced_guide_is_not_forced_on_first_launch(tmp_path):
-    marker = tmp_path / "state.json"
-    onboarding.create_fresh_install_marker(marker)
-    onboarding.claim_automatic_onboarding(marker)
-    dialog = OnboardingDialog(automatic=True, state_path=marker)
-    dialog.show()
-    _QT_APP.processEvents()
-    assert dialog._selected_category == CATEGORY_ESSENTIAL
-    assert dialog._current_lesson_id == "essential.osia-role"
-    assert dialog._skip.isVisible()
-    dialog.close()
-
-
 class _DormantThread:
     def __init__(self, *args, target=None, **_kwargs):
         self.target = target if target is not None else (args[0] if args else None)
@@ -560,92 +489,3 @@ def test_assets_and_fixture_copy_have_no_secret_email_or_machine_identity_patter
     assert "Aymen" not in combined
     assert "%USERPROFILE%" not in combined
     assert "C:\\Users\\vertu" not in combined
-
-
-@pytest.mark.parametrize(
-    "size", [(1040, 710), (832, 568), (700, 480), (680, 420)]
-)
-def test_layout_scrolls_wraps_and_has_no_horizontal_overflow(tmp_path, size):
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    dialog.resize(*size)
-    dialog._show_lesson("advanced.pc-mobile-connection", persist=True)
-    dialog.show()
-    _QT_APP.processEvents()
-    assert dialog._scroll.horizontalScrollBar().maximum() == 0
-    body_labels = [
-        label for label in dialog.findChildren(QLabel)
-        if label.objectName() in {"guideBody", "guideSubtitle", "guideLessonTitle"}
-    ]
-    assert body_labels and all(label.wordWrap() for label in body_labels)
-    dialog.close()
-
-
-def test_keyboard_focus_shortcuts_and_accessible_image_text(tmp_path):
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    dialog._show_lesson("essential.pairing-token", persist=True)
-    for button in dialog.findChildren(QPushButton):
-        assert button.focusPolicy() == Qt.FocusPolicy.StrongFocus
-        assert button.accessibleName().strip()
-    assert dialog._toc.accessibleName() == "Contents"
-    assert dialog._previous_shortcut.key().toString() == "Alt+Left"
-    assert dialog._next_shortcut.key().toString() == "Alt+Right"
-    image = dialog.findChild(_ScaledPixmapLabel)
-    assert image is not None
-    assert "mask" in image.accessibleName().lower()
-    assert image.toolTip() == image.accessibleName()
-    dialog.deleteLater()
-
-
-def test_keyboard_wheel_theme_and_reduced_motion_behaviors(tmp_path, monkeypatch):
-    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
-    dialog = OnboardingDialog(state_path=tmp_path / "state.json")
-    dialog._show_lesson("essential.osia-role", persist=True)
-    dialog.show()
-    _QT_APP.processEvents()
-    assert dialog._motion.active_animation_count == 0
-
-    dialog.setFocus()
-    QTest.keyClick(dialog, Qt.Key.Key_Right)
-    assert dialog._current_lesson_id == "essential.requirements"
-    QTest.keyClick(dialog, Qt.Key.Key_Left, Qt.KeyboardModifier.AltModifier)
-    assert dialog._current_lesson_id == "essential.osia-role"
-    QTest.keyClick(dialog, Qt.Key.Key_Right, Qt.KeyboardModifier.AltModifier)
-    assert dialog._current_lesson_id == "essential.requirements"
-    QTest.keyClick(dialog, Qt.Key.Key_Home, Qt.KeyboardModifier.ControlModifier)
-    assert dialog._current_lesson_id is None
-
-    dialog._show_lesson("essential.osia-role", persist=True)
-    normal = QWheelEvent(
-        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
-        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
-        Qt.ScrollPhase.ScrollUpdate, False,
-    )
-    assert dialog.eventFilter(dialog._scroll.viewport(), normal) is False
-    assert dialog._current_lesson_id == "essential.osia-role"
-    shifted = QWheelEvent(
-        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
-        Qt.MouseButton.NoButton, Qt.KeyboardModifier.ShiftModifier,
-        Qt.ScrollPhase.ScrollUpdate, False,
-    )
-    assert dialog.eventFilter(dialog._scroll.viewport(), shifted) is True
-    assert dialog._current_lesson_id == "essential.requirements"
-    shifted_again = QWheelEvent(
-        QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, -120),
-        Qt.MouseButton.NoButton, Qt.KeyboardModifier.ShiftModifier,
-        Qt.ScrollPhase.ScrollUpdate, False,
-    )
-    assert dialog.eventFilter(dialog._scroll.viewport(), shifted_again) is True
-    assert dialog._current_lesson_id == "essential.requirements"
-
-    manager = get_theme_manager()
-    original = manager.palette.key
-    alternate = "azure" if original != "azure" else "rose"
-    before = dialog.styleSheet()
-    try:
-        assert manager.set_theme(alternate, persist=False)
-        _QT_APP.processEvents()
-        assert dialog.styleSheet() != before
-        assert manager.palette.primary in dialog.styleSheet()
-    finally:
-        manager.set_theme(original, persist=False)
-        dialog.close()

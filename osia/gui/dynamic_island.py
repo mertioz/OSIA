@@ -646,19 +646,25 @@ class DynamicIsland(QWidget):
             p.drawEllipse(QPointF(gx, cy + dy), 1.6, 1.6)
 
     def _paint_docked_active(self, p: QPainter) -> None:
-        """Small animated glow used by every active docked state."""
+        """Sweep light up and down a vertical rail in the side capsule."""
         rect = self._capsule_rect()
         centre = rect.center()
-        pulse = 0.5 + 0.5 * math.sin(self._phase)
-        glow = QColor(self._primary_color)
-        glow.setAlpha(round(45 + 55 * pulse))
-        dot = QColor(self._primary_color)
-        dot.setAlpha(230)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(glow)
-        p.drawEllipse(centre, 6.0 + pulse * 2.0, 6.0 + pulse * 2.0)
-        p.setBrush(dot)
-        p.drawEllipse(centre, 2.6, 2.6)
+        height = min(36.0, rect.height() * 0.66)
+        rail = QRectF(centre.x() - 2.0, centre.y() - height / 2, 4.0, height)
+        path = QPainterPath()
+        path.addRoundedRect(rail, 2.0, 2.0)
+        palette = self._theme.palette
+        p.fillPath(path, palette.color("primary", 45))
+
+        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
+        y = centre.y() + height * 0.28 * math.sin(math.tau * progress)
+        span = height * 0.27
+        sweep = QLinearGradient(0, y - span, 0, y + span)
+        sweep.setColorAt(0.0, palette.color("primary", 0))
+        sweep.setColorAt(0.30, palette.color("secondary", 190))
+        sweep.setColorAt(0.62, palette.color("text", 240))
+        sweep.setColorAt(1.0, palette.color("primary", 0))
+        p.fillPath(path, QBrush(sweep))
 
     def _paint_idle(self, p: QPainter) -> None:
         """Center the idle wordmark and fade it in at the end of launch."""
