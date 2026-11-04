@@ -9,7 +9,7 @@ import types
 from datetime import datetime
 
 import pytest
-from PyQt6.QtCore import QThread
+from PyQt6.QtCore import QEvent, QObject, QThread
 from PyQt6.QtWidgets import QApplication
 
 from osia import models
@@ -348,6 +348,65 @@ def test_startup_status_cache_and_single_flight(monkeypatch, qt_app):
     panel.close()
     panel.deleteLater()
     qt_app.processEvents()
+
+
+@pytest.mark.parametrize("checked, ok", [(False, True), (True, True), (False, False)])
+def test_startup_toggle_keeps_window_open_and_ignores_old_status(
+    monkeypatch, qt_app, checked, ok,
+):
+    class HideProbe(QObject):
+        count = 0
+
+        def eventFilter(self, _watched, event):
+            if event.type() == QEvent.Type.Hide:
+                self.count += 1
+            return False
+
+    calls = []
+
+    def change(unit):
+        calls.append((unit, QThread.currentThread() == qt_app.thread()))
+        return ok
+
+    monkeypatch.setattr(main_popup, "threading", types.SimpleNamespace(Thread=_DormantThread))
+    monkeypatch.setattr(main_popup._SettingsPanel, "_refresh_visible_probes", lambda _self: None)
+    monkeypatch.setattr(main_popup, "enable_service" if checked else "disable_service", change)
+    panel = main_popup._SettingsPanel()
+    panel.show_mobile_settings()
+    panel.show()
+    qt_app.processEvents()
+    probe = HideProbe(panel)
+    panel.installEventFilter(probe)
+    _DormantThread.started.clear()
+    unit, _dot, toggle = panel._startup_rows[0]
+    old_status = [(unit, "running" if not checked else "stopped", not checked)]
+    panel._apply_startup_status(old_status)
+    panel._refresh_startup_status(force=True)
+    try:
+        toggle.click()
+        assert calls == []
+        assert panel.isVisible() and probe.count == 0
+        assert toggle.isChecked() == checked and not toggle.isEnabled()
+        assert len(_DormantThread.started) == 2
+
+        worker = threading.Thread(target=_DormantThread.started[1].target)
+        worker.start()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        qt_app.processEvents()
+        assert calls == [(unit, False)]
+        assert panel.isVisible() and probe.count == 0
+        expected = checked if ok else not checked
+        assert toggle.isEnabled() and toggle.isChecked() == expected
+
+        panel._apply_startup_status(old_status)
+        qt_app.processEvents()
+        assert toggle.isChecked() == expected
+        assert len(_DormantThread.started) == 3
+    finally:
+        panel.close()
+        panel.deleteLater()
+        qt_app.processEvents()
 
 
 def test_chatgpt_retry_invalidates_cache_and_starts_real_login_path(

@@ -4651,6 +4651,7 @@ class _SettingsPanel(QWidget):
     # the background probe thread back onto the GUI thread (WOR perf fix — the
     # probe does slow tasklist/socket calls that must not block the UI).
     _startup_status_ready = pyqtSignal(list)
+    _startup_change_finished = pyqtSignal(str, bool, bool)
     # Carries token-safe native Gmail REST status from a background probe.
     _gmail_rest_status_ready = pyqtSignal(dict)
     # Managed ChatGPT account operations always run off the GUI thread.
@@ -4743,9 +4744,12 @@ class _SettingsPanel(QWidget):
         # True while a background startup-status probe is in flight, so the 5s
         # timer / repeated shows never pile up overlapping probe threads.
         self._startup_probe_busy = False
+        self._startup_probe_stale = False
+        self._startup_changes: set[str] = set()
         self._startup_refresh_pending = False
         self._startup_last_probe = datetime.min
         self._startup_status_ready.connect(self._apply_startup_status)
+        self._startup_change_finished.connect(self._apply_startup_change)
         self._shutdown_finished.connect(self._on_shutdown_finished)
         self._gmail_rest_status = {
             "status": "disconnected",
@@ -10243,20 +10247,44 @@ class _SettingsPanel(QWidget):
         self._settings_nav.setAccessibleName(i18n.t("settings.title"))
 
     def _on_startup_toggle_changed(self, unit: str, toggle: OsiaSwitch) -> None:
-        if self._startup_refresh_guard:
+        if self._startup_refresh_guard or unit in self._startup_changes:
             return
         checked = toggle.isChecked()
         op = enable_service if checked else disable_service
-        self.window().hide()
-        QApplication.processEvents()
+        self._startup_changes.add(unit)
+        # An in-flight probe may have read the state before this change.
+        self._startup_probe_stale = self._startup_probe_busy
+        toggle.setEnabled(False)
+
+        def _change_service() -> None:
+            try:
+                ok = bool(op(unit))
+            except Exception as exc:
+                print(f"[OSIA] Startup service change failed: {type(exc).__name__}")
+                ok = False
+            try:
+                self._startup_change_finished.emit(unit, checked, ok)
+            except RuntimeError:
+                pass  # The panel was disposed before the worker finished.
+
         try:
-            ok = op(unit)
-        finally:
-            self.window().show()
-        if not ok:
-            self._startup_refresh_guard = True
-            toggle.setChecked(not checked)
-            self._startup_refresh_guard = False
+            threading.Thread(
+                target=_change_service, name="osia-startup-service-change", daemon=True,
+            ).start()
+        except RuntimeError:
+            self._apply_startup_change(unit, checked, False)
+
+    def _apply_startup_change(self, unit: str, checked: bool, ok: bool) -> None:
+        self._startup_changes.discard(unit)
+        for row_unit, _dot, toggle in self._startup_rows:
+            if row_unit != unit:
+                continue
+            if not ok:
+                self._startup_refresh_guard = True
+                toggle.setChecked(not checked)
+                self._startup_refresh_guard = False
+            toggle.setEnabled(True)
+            break
         self._refresh_startup_status(force=True)
 
     def _refresh_startup_status(self, force: bool = False) -> None:
@@ -10269,7 +10297,7 @@ class _SettingsPanel(QWidget):
         daemon thread and apply the result on the GUI thread via a queued signal
         (WOR perf fix). A guard prevents overlapping probes from stacking up.
         """
-        if self._startup_probe_busy:
+        if self._startup_probe_busy or self._startup_changes:
             if force:
                 self._startup_refresh_pending = True
             return
@@ -10282,6 +10310,7 @@ class _SettingsPanel(QWidget):
         if not units:
             return
         self._startup_probe_busy = True
+        self._startup_refresh_pending = False
 
         def _probe():
             results = []
@@ -10292,14 +10321,27 @@ class _SettingsPanel(QWidget):
                 except Exception:
                     state, enabled = "error", False
                 results.append((unit, state, enabled))
-            # Queued (cross-thread) signal — applied on the GUI thread.
-            self._startup_status_ready.emit(results)
+            try:
+                self._startup_status_ready.emit(results)
+            except RuntimeError:
+                pass  # The panel was disposed before the probe finished.
 
-        threading.Thread(target=_probe, daemon=True).start()
+        try:
+            threading.Thread(target=_probe, daemon=True).start()
+        except RuntimeError:
+            self._startup_probe_busy = False
 
     def _apply_startup_status(self, results: list) -> None:
         """Apply background startup-status probe results on the GUI thread."""
         self._startup_probe_busy = False
+        if self._startup_refresh_pending:
+            self._startup_refresh_pending = False
+            QTimer.singleShot(
+                0, lambda: self._refresh_startup_status(force=True)
+            )
+        if self._startup_probe_stale:
+            self._startup_probe_stale = False
+            return
         self._startup_last_probe = datetime.now()
         status = {unit: (state, enabled) for (unit, state, enabled) in results}
         self._startup_refresh_guard = True
@@ -10314,11 +10356,6 @@ class _SettingsPanel(QWidget):
             if toggle.isChecked() != enabled:
                 toggle.setChecked(enabled)
         self._startup_refresh_guard = False
-        if self._startup_refresh_pending:
-            self._startup_refresh_pending = False
-            QTimer.singleShot(
-                0, lambda: self._refresh_startup_status(force=True)
-            )
 
     # ── Visibility hooks ──────────────────────────────────────────────────
 
