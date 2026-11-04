@@ -28,7 +28,7 @@ from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
     QEasingCurve, QVariantAnimation, QAbstractAnimation,
 )
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen, QPixmap
+from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from osia.gui.motion import MOTION, reduced_motion_requested
@@ -48,10 +48,6 @@ LAUNCH_W = 60
 LAUNCH_H = 20
 LAUNCH_MS = 220
 
-# Idle state — the OSIA logo sits to the left of the "OSIA" wordmark.
-IDLE_LOGO_H = 44               # px; the capsule is 52px tall
-IDLE_LOGO_GAP = 8              # px between the logo and the wordmark
-
 # Thinking animation — traveling wave. Seven dots sit on a horizontal line
 # through the capsule centre; each dot oscillates vertically on a sine wave
 # with a per-dot phase offset, so the crest glides smoothly left → right.
@@ -69,7 +65,7 @@ VALID_STATES = ("idle", "listening", "thinking", "speaking")
 # capsule is dropped on screen, the *state* by what OSIA is doing. The capsule
 # morphs between three shapes with a smooth ~300ms geometry animation.
 SHAPE_CAPSULE = "capsule"   # default horizontal pill (ISLAND_W x ISLAND_H)
-SHAPE_CIRCLE = "circle"     # compact logo+mic disc, snapped into a bottom corner
+SHAPE_CIRCLE = "circle"     # compact disc snapped into a bottom corner
 SHAPE_DOCKED = "docked"     # vertical pill tucked behind a side edge ("ear")
 
 MORPH_MS = 300              # preserved pre-WOR-129 geometry contract
@@ -137,34 +133,6 @@ class DynamicIsland(QWidget):
         # window must be resizable. It starts as the full capsule.
         self.resize(ISLAND_W, ISLAND_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        # OSIA logo shown beside the wordmark in the idle state. Scaled once
-        # at load (the idle paint runs at 30 FPS). A null pixmap — asset
-        # missing or osia not importable in the standalone self-test — is
-        # simply skipped while painting, so the wordmark still shows.
-        # ``_logo_src`` is the full-resolution master; every on-screen size is
-        # scaled from it so the result is crisp. ``_logo`` is the idle-row logo
-        # cached at the current device-pixel ratio (DPR), rebuilt by
-        # ``_ensure_logo_dpr`` if the capsule moves to a screen with a different
-        # DPR — this is what keeps the logo sharp on high-DPI / fractionally
-        # scaled Windows displays (WOR-11). ``_circle_logo``/``_circle_key``
-        # memoise the per-size scaling done for the compact circle shape so the
-        # 30 FPS idle paint never re-scales the master every frame. A null master
-        # (asset missing / standalone self-test) is simply skipped while
-        # painting, so the wordmark still shows.
-        self._dpr = 1.0
-        self._logo_src = QPixmap()
-        self._logo = QPixmap()
-        self._circle_logo = QPixmap()
-        self._circle_key = None
-        try:
-            from osia.utils.assets import LOGO_PATH
-            src = QPixmap(LOGO_PATH)
-            if not src.isNull():
-                self._logo_src = src
-                self._logo = self._scaled_logo(IDLE_LOGO_H, self._dpr)
-        except Exception:
-            pass
 
         # Animation state
         self._state = "idle"
@@ -383,8 +351,7 @@ class DynamicIsland(QWidget):
             self._phase -= 2 * math.pi
         self._anim_ms += self._timer.interval()
         # WOR-74: a steady-idle capsule renders a pixel-identical frame every
-        # tick — the idle paints (_paint_idle / _paint_circle_idle /
-        # _paint_docked_ear) depend only on _launch_t and geometry, never on
+        # tick — idle painting depends only on _launch_t and geometry, never on
         # _phase/_anim_ms — so repainting it at 30 FPS just piles avoidable load
         # onto the shared GUI thread (the saturation that froze the 640px popup
         # drag). Skip ONLY the steady-idle repaint:
@@ -395,22 +362,10 @@ class DynamicIsland(QWidget):
         #   • keep repainting while the capsule itself is being dragged so its
         #     drag stays as smooth as before this change (its mouseMoveEvent
         #     move()s without repainting, relying on this tick);
-        #   • repaint once when the display's device-pixel ratio changes IN PLACE
-        #     (a DPI/scale change or monitor hot-plug with no move/launch/morph):
-        #     only paintEvent rebuilds the DPR-scaled logo (_ensure_logo_dpr), so
-        #     without this the idle logo would render at the stale DPR until the
-        #     next interaction. The clause is gated on a logo actually existing —
-        #     with a null logo there is nothing DPR-dependent to rebuild (the rest
-        #     is vector and auto-scales), and _ensure_logo_dpr would never sync
-        #     self._dpr, so an ungated check would repaint every tick forever.
-        #     With a logo, the repaint runs _ensure_logo_dpr → self._dpr matches
-        #     again → the clause falls quiet (exactly one repaint per DPR change).
         if (self._state != "idle"
                 or self._dragging
                 or self._launch_anim.state() == QAbstractAnimation.State.Running
-                or self._morph_anim.state() == QAbstractAnimation.State.Running
-                or (not self._logo_src.isNull()
-                    and self.devicePixelRatioF() != self._dpr)):
+                or self._morph_anim.state() == QAbstractAnimation.State.Running):
             self.update()
 
     def _on_launch_value(self, value) -> None:
@@ -631,37 +586,9 @@ class DynamicIsland(QWidget):
         path.addRoundedRect(rect, radius, radius)
         return path
 
-    def _scaled_logo(self, logical_h: float, dpr: float) -> QPixmap:
-        """The logo scaled to ``logical_h`` logical px for a ``dpr`` display.
-
-        Scales from the full-resolution master to ``logical_h·dpr`` physical px
-        and tags the pixmap with ``dpr`` so QPainter draws it at ``logical_h``
-        logical px from native-resolution pixels — crisp on high-DPI Windows
-        displays. ``dpr == 1.0`` reproduces the previous behaviour exactly.
-        """
-        pm = self._logo_src.scaledToHeight(
-            max(1, round(logical_h * dpr)),
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        pm.setDevicePixelRatio(dpr)
-        return pm
-
-    def _ensure_logo_dpr(self, dpr: float) -> None:
-        """Rebuild the cached idle-row logo when the display's DPR changes."""
-        if dpr <= 0:
-            dpr = 1.0
-        if dpr != self._dpr and not self._logo_src.isNull():
-            self._dpr = dpr
-            self._logo = self._scaled_logo(IDLE_LOGO_H, dpr)
-            self._circle_key = None  # force the circle logo to re-scale too
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Keep the logo cached at the current screen's DPR so it stays sharp if
-        # the capsule is dragged to a monitor with a different scale factor.
-        self._ensure_logo_dpr(self.devicePixelRatioF())
 
         # Background capsule
         path = self._capsule_path()
@@ -675,13 +602,12 @@ class DynamicIsland(QWidget):
                 self._paint_docked_active(painter)
             else:
                 self._paint_docked_ear(painter)
-        # The circle is a compact logo+mic disc when idle, and clips its
-        # active-state animation to the disc so nothing spills out.
+        # Clip the corner capsule's content to the disc.
         elif self._shape == SHAPE_CIRCLE:
             painter.save()
             painter.setClipPath(path)
             if self._state == "idle":
-                self._paint_circle_idle(painter)
+                self._paint_idle(painter)
             else:
                 # Scale the pill-sized active animation down around the disc
                 # centre so it fits the circle instead of being clipped.
@@ -740,98 +666,26 @@ class DynamicIsland(QWidget):
         p.setBrush(dot)
         p.drawEllipse(centre, 2.6, 2.6)
 
-    def _paint_circle_idle(self, p: QPainter) -> None:
-        """Compact circle: the OSIA logo with a small mic glyph beneath it."""
+    def _paint_idle(self, p: QPainter) -> None:
+        """Center the idle wordmark and fade it in at the end of launch."""
         fade = min(1.0, max(0.0, (self._launch_t - 0.7) / 0.3))
         if fade <= 0.0:
             return
-        rect = self._capsule_rect()
-        cx = rect.center().x()
-        cy = rect.center().y()
 
-        p.save()
-        p.setOpacity(fade)
-        if not self._logo_src.isNull():
-            size = int(rect.height() * 0.42)
-            key = (size, self._dpr)
-            if key != self._circle_key:
-                # Re-scale from the master only when the target size or DPR
-                # changes (steady state hits the cache every frame).
-                self._circle_logo = self._scaled_logo(size, self._dpr)
-                self._circle_key = key
-            logo = self._circle_logo
-            # Device-independent dims for positioning (the pixmap carries its DPR).
-            lw = logo.width() / self._dpr
-            lh = logo.height() / self._dpr
-            p.drawPixmap(
-                int(cx - lw / 2.0),
-                int(cy - lh - 1),
-                logo,
-            )
-        self._draw_mini_mic(p, cx, cy + rect.height() * 0.20)
-        p.restore()
-
-    def _draw_mini_mic(self, p: QPainter, cx: float, cy: float) -> None:
-        """A small static microphone glyph centred at (cx, cy), ~16px tall."""
-        pen = QPen(self._primary_color, 1.4)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        # Mic body — a rounded vertical capsule.
-        p.drawRoundedRect(QRectF(cx - 3.4, cy - 7.0, 6.8, 10.5), 3.4, 3.4)
-        # Cradle arc beneath the body.
-        stand = QPainterPath()
-        stand.moveTo(cx - 6.0, cy - 0.5)
-        stand.cubicTo(cx - 6.0, cy + 5.5, cx + 6.0, cy + 5.5, cx + 6.0, cy - 0.5)
-        p.drawPath(stand)
-        # Stem + base foot.
-        p.drawLine(QPointF(cx, cy + 5.5), QPointF(cx, cy + 8.5))
-        p.drawLine(QPointF(cx - 3.0, cy + 8.5), QPointF(cx + 3.0, cy + 8.5))
-
-    def _paint_idle(self, p: QPainter) -> None:
-        """The OSIA logo + wordmark, dim — fading in at the end of the launch."""
-        # Hold the mark invisible until the capsule is nearly full size, then
-        # fade it in over the last stretch of the launch animation.
-        fade = max(0.0, (self._launch_t - 0.7) / 0.3)
-        fade = min(1.0, fade)
-        if fade <= 0.0:
-            return
-
-        rect = self._capsule_rect()
-        cy = rect.center().y()
-
+        compact = self._shape == SHAPE_CIRCLE
         font = QFont()
-        font.setPixelSize(12)
-        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+        font.setFamilies(["Segoe UI", "Helvetica Neue", "Noto Sans", "sans-serif"])
+        font.setPixelSize(30 if compact else 12)
         font.setBold(True)
-        p.setFont(font)
-        text_w = p.fontMetrics().horizontalAdvance("OSIA")
+        if not compact:
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
 
-        # Logo (left) + wordmark (right) laid out as a single group centred in
-        # the capsule. The logo is dropped from the layout when unavailable.
-        # Device-independent width/height (the pixmap carries its DPR), so the
-        # layout is identical at dpr == 1.0 and correct on high-DPI displays.
-        logo_w = (self._logo.width() / self._dpr) if not self._logo.isNull() else 0
-        gap = IDLE_LOGO_GAP if logo_w else 0
-        x = rect.center().x() - (logo_w + gap + text_w) / 2.0
-
-        # One opacity for the whole group so logo and text fade in together.
         p.save()
         p.setOpacity(fade)
-        if logo_w:
-            p.drawPixmap(
-                int(round(x)),
-                int(round(cy - (self._logo.height() / self._dpr) / 2.0)),
-                self._logo,
-            )
-            x += logo_w + gap
+        p.setFont(font)
         p.setPen(self._text_color_200)
-        text_rect = QRectF(x, rect.top(), text_w + 2, rect.height())
         p.drawText(
-            text_rect,
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            "OSIA",
+            self._capsule_rect(), Qt.AlignmentFlag.AlignCenter, "O" if compact else "OSIA",
         )
         p.restore()
 
