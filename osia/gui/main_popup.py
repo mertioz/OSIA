@@ -67,7 +67,7 @@ from osia.config import (
     get_oauth_client, set_oauth_client,
     get_reasoning_settings, set_reasoning_settings,
 )
-from osia.reasoning import get_reasoning_options
+from osia.reasoning import get_reasoning_options, model_reasoning_settings_key
 from osia.mobile_model_catalogue import (
     build_model_inventory,
     configured_api_providers,
@@ -162,6 +162,7 @@ PROVIDER_KEY_URLS = {
     "xai":       "https://console.x.ai",
     "groq":      "https://console.groq.com/keys",
     "mistral":   "https://console.mistral.ai/api-keys",
+    "openrouter": "https://openrouter.ai/settings/keys",
 }
 
 # Per-provider accent colors used for the dot indicators on the model panel
@@ -174,6 +175,7 @@ PROVIDER_COLORS = {
     "xai":       "#cfcfcf",   # xAI light
     "groq":      "#f55036",   # Groq orange
     "mistral":   "#FA520F",   # Mistral orange
+    "openrouter": "#a99cff",
     "ollama":    "#69c88c",   # Local green
 }
 
@@ -3263,10 +3265,7 @@ class _ModelRow(QFrame):
         }
         try:
             cfg = get_reasoning_settings()
-            model_key = (
-                f"chatgpt_account:{self._mid}"
-                if self._provider == "chatgpt_account" else self._mid
-            )
+            model_key = model_reasoning_settings_key(self._provider, self._mid)
             selected = (
                 (cfg.get("models") or {}).get(model_key, "auto")
                 if isinstance(cfg, dict) else "auto"
@@ -3350,10 +3349,7 @@ class _ModelRow(QFrame):
             option_id = "auto"
         cfg = get_reasoning_settings()
         models = dict((cfg or {}).get("models") or {})
-        model_key = (
-            f"chatgpt_account:{self._mid}"
-            if self._provider == "chatgpt_account" else self._mid
-        )
+        model_key = model_reasoning_settings_key(self._provider, self._mid)
         models[model_key] = option_id
         cfg["models"] = models
         set_reasoning_settings(cfg)
@@ -3475,8 +3471,9 @@ class _ModelPanel(QWidget):
 
     PROVIDER_ORDER = (
         "chatgpt_account", "anthropic", "openai", "deepseek", "google",
-        "xai", "groq", "mistral", "ollama",
+        "xai", "groq", "mistral", "openrouter", "ollama",
     )
+    _OPENROUTER_PAGE_SIZE = 48
 
     def __init__(self):
         super().__init__()
@@ -3508,6 +3505,14 @@ class _ModelPanel(QWidget):
         self._sub = QLabel(i18n.t("models.choose_provider_sub"))
         self._sub.setObjectName("panelSub")
         outer.addWidget(self._sub)
+
+        self._model_search = QLineEdit()
+        self._model_search.setObjectName("keyInput")
+        self._model_search.setClearButtonEnabled(True)
+        self._model_search.hide()
+        self._model_search.textChanged.connect(self._filter_openrouter_models)
+        self._openrouter_limit = self._OPENROUTER_PAGE_SIZE
+        outer.addWidget(self._model_search)
 
         scroll = QScrollArea()
         scroll.setObjectName("panelScroll")
@@ -3604,6 +3609,7 @@ class _ModelPanel(QWidget):
             "label": entry.get("model_display_name") or entry.get("model_id") or "?",
             "reasoning_options": list(entry.get("reasoning_options") or []),
             "available": bool(entry.get("available")),
+            "capabilities": entry.get("capabilities") or {},
         }
 
     def _account_is_visible(self, models: list[dict] | None = None) -> bool:
@@ -3617,7 +3623,21 @@ class _ModelPanel(QWidget):
         self.refresh()
 
     def _show_provider(self, provider: str) -> None:
+        if provider == "openrouter" and self._view != provider:
+            blocked = self._model_search.blockSignals(True)
+            self._model_search.clear()
+            self._model_search.blockSignals(blocked)
+            self._openrouter_limit = self._OPENROUTER_PAGE_SIZE
         self._view = provider
+        self.refresh()
+
+    def _filter_openrouter_models(self, _query: str) -> None:
+        self._openrouter_limit = self._OPENROUTER_PAGE_SIZE
+        if self._view == "openrouter":
+            self.refresh()
+
+    def _show_more_openrouter_models(self) -> None:
+        self._openrouter_limit += self._OPENROUTER_PAGE_SIZE
         self.refresh()
 
     def refresh(self) -> None:
@@ -3640,6 +3660,7 @@ class _ModelPanel(QWidget):
 
     def _build_grid(self) -> None:
         self._back_btn.hide()
+        self._model_search.hide()
         self._title.setText(i18n.t("models.title"))
         self._sub.setText(i18n.t("models.choose_provider_sub"))
 
@@ -3678,15 +3699,29 @@ class _ModelPanel(QWidget):
             else PROVIDERS.get(provider, {}).get("name") or provider.title()
         )
         self._sub.setText(i18n.t("models.pick_model_sub"))
+        is_openrouter = provider == "openrouter"
+        self._model_search.setVisible(is_openrouter)
+        if is_openrouter:
+            search_label = i18n.t("models.openrouter_search")
+            self._model_search.setPlaceholderText(search_label)
+            self._model_search.setAccessibleName(search_label)
 
         models = [
             self._row_model(entry) for entry in self._inventory
             if entry.get("provider_id") == provider
         ]
         models.sort(key=lambda m: m.get("label", ""))
+        remaining = 0
+        if is_openrouter:
+            terms = self._model_search.text().casefold().split()
+            models = [m for m in models if all(
+                term in f"{m['label']} {m['id']}".casefold() for term in terms
+            )]
+            remaining = max(0, len(models) - self._openrouter_limit)
+            models = models[:self._openrouter_limit]
 
         if not models:
-            empty = QLabel(i18n.t("models.none_for_provider"))
+            empty = QLabel(i18n.t("models.openrouter_no_match" if is_openrouter else "models.none_for_provider"))
             empty.setObjectName("panelEmpty")
             self._host_layout.insertWidget(0, empty)
             return
@@ -3700,8 +3735,16 @@ class _ModelPanel(QWidget):
                     m["id"] == self._current_model
                     and provider == self._current_provider
                 ),
-                reasoning_options=m.get("reasoning_options") if is_account else None,
+                reasoning_options=m.get("reasoning_options") if is_account or is_openrouter else None,
             )
+            if is_openrouter:
+                caps = m["capabilities"]
+                labels = [m["id"]]
+                if caps.get("vision"):
+                    labels.append(i18n.t("models.openrouter_images"))
+                if caps.get("tool_calls"):
+                    labels.append(i18n.t("models.openrouter_tools"))
+                row.setToolTip("\n".join(labels))
             row.setEnabled(bool(m.get("available")))
             if is_account:
                 row.selected.connect(self._select_account_model)
@@ -3711,6 +3754,11 @@ class _ModelPanel(QWidget):
                 )
             self._host_layout.insertWidget(idx, row)
             idx += 1
+        if remaining:
+            more = QPushButton(i18n.t("models.openrouter_more", count=remaining))
+            more.setObjectName("ghostBtn")
+            more.clicked.connect(self._show_more_openrouter_models)
+            self._host_layout.insertWidget(idx, more)
 
     def _select_account_model(self, model_id: str) -> None:
         try:
@@ -4710,7 +4758,7 @@ class _SettingsPanel(QWidget):
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
-    _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq", "mistral")
+    _AI_PROVIDER_ORDER = ("anthropic", "openai", "google", "deepseek", "xai", "groq", "mistral", "openrouter")
     _SETTINGS_STATE_TTL = timedelta(seconds=5)
     _CHATGPT_STATUS_TTL = timedelta(seconds=15)
     _STARTUP_STATUS_TTL = timedelta(seconds=5)

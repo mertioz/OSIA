@@ -2015,6 +2015,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "ChatGPT account models are temporarily unavailable.",
         "fr": "Les modèles du compte ChatGPT sont temporairement indisponibles.",
     },
+    "models.openrouter_search": {"en": "Search OpenRouter models…", "fr": "Rechercher un modèle OpenRouter…", "zh": "搜索 OpenRouter 模型…", "ja": "OpenRouter のモデルを検索…", "de": "OpenRouter-Modelle suchen…", "es": "Buscar modelos de OpenRouter…"},
+    "models.openrouter_no_match": {"en": "No matching models", "fr": "Aucun modèle correspondant", "zh": "没有匹配的模型", "ja": "一致するモデルがありません", "de": "Keine passenden Modelle", "es": "No hay modelos que coincidan"},
+    "models.openrouter_more": {"en": "Show more models ({count} left)", "fr": "Afficher plus de modèles ({count} restants)", "zh": "显示更多模型（剩余 {count} 个）", "ja": "さらに表示（残り {count} 件）", "de": "Weitere Modelle anzeigen ({count} übrig)", "es": "Mostrar más modelos (quedan {count})"},
+    "models.openrouter_images": {"en": "Accepts images", "fr": "Accepte les images", "zh": "接受图像", "ja": "画像入力に対応", "de": "Akzeptiert Bilder", "es": "Acepta imágenes"},
+    "models.openrouter_tools": {"en": "Native tool calling", "fr": "Appels d’outils natifs", "zh": "原生工具调用", "ja": "ネイティブツール呼び出し", "de": "Native Werkzeugaufrufe", "es": "Llamadas nativas a herramientas"},
     "models.pick_model_sub": {
         "en": "Pick the model OSIA will use for new messages.",
         "fr": "Choisissez le modèle qu'OSIA utilisera pour les nouveaux messages.",

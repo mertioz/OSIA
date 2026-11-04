@@ -122,7 +122,7 @@ class RealValidationRequirement(str, Enum):
 
 ALL_TEXT_PROVIDERS = (
     "anthropic", "chatgpt_account", "deepseek", "google", "groq",
-    "mistral", "ollama", "openai", "xai",
+    "mistral", "ollama", "openai", "openrouter", "xai",
 )
 
 

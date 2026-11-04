@@ -66,6 +66,7 @@ _ADAPTERS = {
         frozenset({"image/jpeg", "image/png"}),
     ),
     "openai": ("openai_image_url", _ALL_OSIA_IMAGE_MIMES),
+    "openrouter": ("openai_image_url", _ALL_OSIA_IMAGE_MIMES),
     "xai": (
         "openai_image_url",
         frozenset({"image/jpeg", "image/png"}),

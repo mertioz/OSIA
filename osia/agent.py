@@ -10614,7 +10614,13 @@ class OSIAAgent:
             if finish_reason == "length":
                 raise ProviderOutputTruncatedError()
             commentary.finish()
-            self._streamed_provider_message = getattr(stream, "message", None) or commentary.message
+            finalize_message = (
+                getattr(stream, "finalize_message", None) if self.provider == "openrouter" else None
+            )
+            self._streamed_provider_message = (
+                finalize_message(commentary.message) if callable(finalize_message)
+                else getattr(stream, "message", None) or commentary.message
+            )
             if not outcome_recorded:
                 from osia.reasoning import record_reasoning_outcome
                 record_reasoning_outcome(
@@ -14312,13 +14318,17 @@ class OSIAAgent:
                     f"<tool_call>\n{json.dumps(tc, ensure_ascii=False)}\n</tool_call>"
                     for tc in tool_calls
                 )
+                route_bound_tool_content = bool(
+                    getattr(message, "response_output", None)
+                    or getattr(message, "route_bound_tool_content", False)
+                )
                 self.messages.append({
                     "role": "assistant",
                     "content": getattr(message, "native_content", None) or assistant_record,
                     "_provisional": True,
                     **({"_response_route": [self.provider, self.model],
                         "_response_fallback": assistant_record}
-                       if getattr(message, "response_output", None) else {}),
+                       if route_bound_tool_content else {}),
                 })
                 document_tool_used = any(
                     tc.get("tool") in _DOCUMENT_TOOL_NAMES
@@ -15329,7 +15339,7 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": content_parts,
                         **({"_response_route": [self.provider, self.model],
                             "_response_fallback": feedback_text}
-                           if getattr(message, "response_output", None) else {})})
+                           if route_bound_tool_content else {})})
                     active_visual_strategy = (
                         _execution_strategy.current_execution_strategy()
                     )
@@ -15344,7 +15354,7 @@ class OSIAAgent:
                     self.messages.append({"role": "user", "content": native_feedback or feedback_text,
                         **({"_response_route": [self.provider, self.model],
                             "_response_fallback": feedback_text}
-                           if getattr(message, "response_output", None) else {})})
+                           if route_bound_tool_content else {})})
                 continue
 
             # No tool call in any format — candidate final response. A rejected

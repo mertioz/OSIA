@@ -189,11 +189,17 @@ def provider_client(client, provider):
     if provider in {"openai", "xai"}:
         from osia.responses_api import ResponsesClient
         return ResponsesClient(client, provider)
+    if provider == "openrouter":
+        from osia.openrouter import OpenRouterClient
+        return OpenRouterClient(client)
     return client
 
 
 def tool_feedback(message, canonical_calls, results, feedback):
     """Bind each native call to the receipts produced by canonical dispatch."""
+    if getattr(message, "openrouter_calls", None):
+        from osia.openrouter import tool_feedback as openrouter_feedback
+        return openrouter_feedback(message, canonical_calls, results, feedback)
     if getattr(message, "response_output", None):
         from osia.responses_api import tool_feedback as responses_feedback
         outputs = responses_feedback(message, canonical_calls, results)

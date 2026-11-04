@@ -20,7 +20,9 @@ from osia.models import (
     get_all_models,
     invalidate_ollama_models_cache,
 )
-from osia.reasoning import get_reasoning_options, resolve_reasoning_option_id
+from osia.reasoning import (
+    get_reasoning_options, model_reasoning_settings_key, resolve_reasoning_option_id,
+)
 from osia.utils.key_chain import has_key
 
 ACCOUNT_PROVIDER_ID = "chatgpt_account"
@@ -33,6 +35,7 @@ PROVIDER_ORDER = (
     "xai",
     "groq",
     "mistral",
+    "openrouter",
     "ollama",
 )
 _SAFE_ACCOUNT_ERRORS = {
@@ -554,7 +557,7 @@ def validate_and_set_reasoning(provider_id: str, model_id: str, option_id: str) 
         return False
     settings = get_reasoning_settings()
     levels = dict(settings.get("models") or {})
-    key = f"chatgpt_account:{model_id}" if provider_id == ACCOUNT_PROVIDER_ID else model_id
+    key = model_reasoning_settings_key(provider_id, model_id)
     levels[key] = option_id
     settings["models"] = levels
     set_reasoning_settings(settings)

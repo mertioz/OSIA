@@ -417,6 +417,20 @@ def get_reasoning_capability(provider, model) -> dict | None:
                 options = [_AUTO_OPTION, *[_option("off" if level == "none" else level,
                     "Off" if level == "none" else level.title(), {"reasoning_effort": level}) for level in efforts]]
                 capability = {"options": options, "evidence": "xai:language-models.capabilities"}
+        if provider_id == "openrouter":
+            from osia.models import model_metadata
+            metadata = model_metadata(provider_id, model_id) or {}
+            efforts = metadata.get("supportedReasoningEfforts") or []
+            if efforts:
+                options = [_AUTO_OPTION, *[_option(
+                    "off" if effort == "none" else effort,
+                    "Off" if effort == "none" else effort.title(),
+                    {"reasoning_effort": effort},
+                ) for effort in efforts]]
+                capability = {
+                    "options": options, "evidence": "openrouter:models.reasoning",
+                    "provider_default": normalize_level(metadata.get("defaultReasoningEffort")),
+                }
         if provider_id == "anthropic":
             from osia.models import model_metadata
             metadata = model_metadata(provider_id, model_id) or {}
@@ -437,16 +451,16 @@ def get_reasoning_options(provider, model) -> list[dict]:
     return list(capability.get("options") or []) if capability else []
 
 
-def _model_settings_key(provider_id: str, model_id: str) -> str:
+def model_reasoning_settings_key(provider_id: str, model_id: str) -> str:
     return (
-        f"chatgpt_account:{model_id}"
-        if provider_id == "chatgpt_account" and model_id
+        f"{provider_id}:{model_id}"
+        if provider_id in {"chatgpt_account", "openrouter"} and model_id
         else model_id
     )
 
 
 def _requested_level(provider_id: str, model_id: str, cfg: dict) -> tuple[str, str]:
-    model_key = _model_settings_key(provider_id, model_id)
+    model_key = model_reasoning_settings_key(provider_id, model_id)
     model_levels = cfg.get("models") or {}
     if model_key and model_key in model_levels:
         return normalize_level(model_levels.get(model_key)), "model"
@@ -464,7 +478,7 @@ def _migrate_invalid_to_default(
     model_id: str,
 ) -> None:
     """Pin one invalid effective selection to canonical ``auto``."""
-    model_key = _model_settings_key(provider_id, model_id)
+    model_key = model_reasoning_settings_key(provider_id, model_id)
     if not model_key:
         return
     migrated = copy.deepcopy(cfg)

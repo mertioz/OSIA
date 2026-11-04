@@ -59,6 +59,11 @@ PROVIDERS = {
         "base_url": "https://api.mistral.ai/v1",
         "models_endpoint": "https://api.mistral.ai/v1/models",
     },
+    "openrouter": {
+        "name": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "models_endpoint": "https://openrouter.ai/api/v1/models/user",
+    },
     "ollama": {
         "name": "Local (Ollama)",
         "base_url": "http://localhost:11434/v1",
@@ -67,7 +72,7 @@ PROVIDERS = {
 }
 
 # Providers that take an API key (ollama doesn't).
-API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral")
+API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral", "openrouter")
 
 # ── Hardcoded models (2026) ───────────────────────────────────────────────
 
@@ -398,7 +403,8 @@ def _discovered_model(provider, item):
     mid = item.get("id") or item.get("name") or ""
     if not isinstance(mid, str) or not mid or any(c.isspace() for c in mid):
         return None
-    mid = mid.removeprefix("models/")
+    if provider != "openrouter":
+        mid = mid.removeprefix("models/")
     if item.get("active") is False or item.get("archived") is True or item.get("lifecycle") == "retired":
         return None
     known = _documented_model_metadata(provider, mid) or {}
@@ -429,6 +435,12 @@ def _discovered_model(provider, item):
         return None
     if provider == "anthropic" and caps.get("tool_use") is not None and not _supported(caps["tool_use"]):
         return None
+    if provider == "openrouter":
+        from osia.openrouter import model_capabilities
+
+        known = model_capabilities(mid, item)
+        if known is None:
+            return None
     result = {**known, "id": mid, "provider": provider,
               "label": item.get("display_name") or item.get("displayName") or known.get("label") or mid,
               "tier": known.get("tier", "mid"), "source": "provider_discovery",
@@ -475,6 +487,12 @@ def _fetch_remote_models(provider, api_key, timeout):
         headers = {"x-goog-api-key": api_key}
     else:
         headers = {"Authorization": f"Bearer {api_key}"}
+    if provider == "openrouter":
+        # The catalogue is public even with an invalid bearer token. Verify the
+        # key separately so a disconnected account cannot publish usable models.
+        key_status = requests.get(cfg["base_url"] + "/key", headers=headers, timeout=timeout)
+        if key_status.status_code != 200:
+            raise ModelDiscoveryError(key_status.status_code)
     items, cursor, seen = [], None, set()
     while True:
         params = {}

@@ -191,9 +191,9 @@ def test_non_deepseek_snapshot_preserves_existing_provider_contracts():
         "reasoning": {p + ":" + m: v for (p, m), v in reasoning.MODEL_REASONING_CAPABILITIES.items() if p != "deepseek"},
         "complex": [m for m in models.COMPLEX_PREFERENCE if m[1] != "deepseek"],
         "simple": [m for m in models.SIMPLE_API_FALLBACK if m[1] != "deepseek"],
-        "image_adapters": {p: [v[0], sorted(v[1])] for p, v in image_inputs._ADAPTERS.items() if p != "deepseek"},
+        "image_adapters": {p: [v[0], sorted(v[1])] for p, v in image_inputs._ADAPTERS.items() if p not in {"deepseek", "openrouter"}},
         "pc_inventory": [m for m in mobile.build_model_inventory(models.HARDCODED_MODELS, models.API_PROVIDERS) if m["provider_id"] != "deepseek"],
-        "provider_order": mobile.PROVIDER_ORDER,
+        "provider_order": [p for p in mobile.PROVIDER_ORDER if p != "openrouter"],
     }
     # WOR-355 intentionally evolves other providers. Preserve this historical
     # test's real boundary: DeepSeek cannot modify their established contracts.
