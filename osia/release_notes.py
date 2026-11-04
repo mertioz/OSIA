@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.1", released_on="2026-11-05", public=True,
+        changes_en=(
+            "Updated the ChatGPT Account runtime to Codex 0.166.0 with GPT-6.1 Sol and Terra on eligible accounts. OSIA checks daily for compatible stable Codex releases.",
+            "Added OpenRouter and improved discovery of local Ollama and LM Studio models.",
+            "Refined desktop settings and conversations with clearer controls, smoother transitions and simpler dropdowns.",
+        ),
+        changes_fr=(
+            "Codex 0.166.0 donne accès à GPT-6.1 Sol et Terra sur les comptes éligibles. OSIA vérifie chaque jour les nouvelles versions stables compatibles de Codex.",
+            "Ajout d’OpenRouter et détection améliorée des modèles locaux Ollama et LM Studio.",
+            "Paramètres et discussions affinés, avec des commandes plus lisibles, des transitions fluides et des listes déroulantes simplifiées.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.0", released_on=None, public=False,
         changes_en=(
             "Public beta source candidate; installer publication awaits operator acceptance.",
