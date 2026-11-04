@@ -1855,6 +1855,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Rename project", "fr": "Renommer le projet", "zh": "重命名项目",
         "ja": "プロジェクト名を変更", "de": "Projekt umbenennen", "es": "Renombrar proyecto",
     },
+    "conversations.more_actions": {
+        "en": "More conversation actions", "fr": "Plus d’actions sur les discussions",
+        "zh": "更多对话操作", "ja": "会話のその他の操作",
+        "de": "Weitere Chat-Aktionen", "es": "Más acciones de conversación",
+    },
     "conversations.folder_settings": {
         "en": "Project settings", "fr": "Paramètres du projet", "zh": "项目设置",
         "ja": "プロジェクト設定", "de": "Projekteinstellungen", "es": "Ajustes del proyecto",

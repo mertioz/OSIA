@@ -104,14 +104,24 @@ def _finish_reveal(controller: DesktopTextStreamController) -> None:
 
 
 class ThemeTests(unittest.TestCase):
-    def test_default_palette_is_the_established_pc_palette(self):
+    def test_default_palette_softens_foreground_and_keeps_base_colors(self):
         palette = PALETTES[DEFAULT_THEME_KEY]
         self.assertEqual(palette.background, "#0d0b12")
         self.assertEqual(palette.primary, "#c4b5f5")
-        self.assertEqual(palette.text, "#e8e6f0")
+        self.assertEqual(palette.text, "#d5d3dd")
         self.assertEqual(palette.muted_text, "#9d9aad")
         template = "QWidget { color: #e8e6f0; background: #0d0b12; }"
-        self.assertIs(themed_stylesheet(template, palette), template)
+        self.assertEqual(themed_stylesheet(template, palette),
+                         "QWidget { color: #d5d3dd; background: #0d0b12; }")
+
+    def test_foregrounds_remain_distinct_from_provider_model_counts(self):
+        for palette in PALETTES.values():
+            with self.subTest(theme=palette.key):
+                text = palette.color("text")
+                self.assertLess(max(text.red(), text.green(), text.blue()), 235)
+                self.assertGreaterEqual(_contrast_ratio(text, palette.color("muted_text")), 1.6)
+                style = themed_stylesheet("QWidget { color: #ffffff; }", palette)
+                self.assertIn(palette.text, style)
 
     def test_every_theme_resolves_every_semantic_color(self):
         self.assertGreaterEqual(len(PALETTES), 6)
@@ -274,6 +284,56 @@ class QtUiLifecycleTests(unittest.TestCase):
         self.popup._window_opacity_anim.stop()
         self.popup._motion.settle()
         self.app.processEvents()
+
+    def test_project_toggle_keeps_header_and_focus_at_same_scroll_position(self):
+        from osia.gui.main_popup import _ConversationsPanel
+
+        panel = _ConversationsPanel()
+        panel._poll_timer.stop()
+        panel.resize(425, 400)
+        folders = [
+            {"id": "above", "name": "Above", "collapsed": False},
+            {"id": "target", "name": "Target", "collapsed": True},
+        ]
+        items = [
+            {"id": f"chat-{index}", "title": "Fixture discussion", "folder_id": folder_id}
+            for index, folder_id in enumerate(["above"] * 8 + ["target"] * 12 + [None] * 20)
+        ]
+        snapshot = {"snapshot_revision": 1, "folders": folders, "items": items}
+
+        def update(request):
+            folders[1]["collapsed"] = request["collapsed"]
+            snapshot["snapshot_revision"] += 1
+
+        panel.folder_mutation_requested.connect(update)
+        try:
+            panel.refresh(snapshot=snapshot)
+            panel.show()
+            panel.activateWindow()
+            QTest.qWait(25)
+            scrollbar = panel._scroll.verticalScrollBar()
+            header = panel._folder_widgets["target"]
+            scrollbar.setValue(header.y() - 55)
+            initial = scrollbar.value()
+            for collapsed in (False, True):
+                if collapsed:
+                    QTest.keyClick(header._toggle, Qt.Key.Key_Space)
+                else:
+                    QTest.mouseClick(header._toggle, Qt.MouseButton.LeftButton)
+                self.assertTrue(header._toggle.hasFocus())
+                # The canonical polling refresh runs after the click returns.
+                panel.refresh(snapshot=snapshot)
+                panel.refresh(snapshot=snapshot)
+                QTest.qWait(25)
+                header = panel._folder_widgets["target"]
+                self.assertEqual(header._collapsed, collapsed)
+                self.assertEqual(scrollbar.value(), initial)
+                self.assertEqual(header.y() - scrollbar.value(), 55)
+                self.assertTrue(header._toggle.hasFocus())
+        finally:
+            panel.close()
+            panel.deleteLater()
+            self.app.processEvents()
 
     def test_window_size_and_page_geometry_contracts_are_unchanged(self):
         self.assertEqual((POPUP_W, POPUP_W_WIDE, POPUP_H), (440, 640, 560))

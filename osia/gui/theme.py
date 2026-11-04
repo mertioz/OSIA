@@ -1,8 +1,7 @@
 """Central semantic palettes and live theme selection for the desktop UI.
 
-The default palette intentionally matches the pre-WOR-129 PC colours.  Other
-palettes reuse the dark, restrained choices established by OSIA Mobile while
-keeping the PC preference local to ``settings.json``.
+The desktop palettes use dark surfaces and distinct foreground and muted
+colours. The PC preference is kept locally in ``settings.json``.
 """
 
 from __future__ import annotations
@@ -110,15 +109,13 @@ def _palette(
     )
 
 
-# The first/default entry is the exact established PC palette. Rose, amber and
-# neutral follow Mobile's existing palettes; azure and emerald extend the same
-# dark-surface contrast model requested for PC.
+# Foreground tones are softer than white while the secondary text stays muted.
 PALETTES: dict[str, ThemePalette] = {
     "osia": _palette(
         "osia", "theme.osia",
         background="#0d0b12", surface="#0f0d16", elevated="#13111a",
         glass="#1a1625", primary="#c4b5f5", secondary="#8c6edc",
-        text="#e8e6f0", muted="#9d9aad", border="#2a2438",
+        text="#d5d3dd", muted="#9d9aad", border="#2a2438",
         disabled="#858291",
         user_bubble="#2a2440", assistant_bubble="#0f0d16",
     ),
@@ -126,7 +123,7 @@ PALETTES: dict[str, ThemePalette] = {
         "azure", "theme.azure",
         background="#09111a", surface="#0e1a26", elevated="#132536",
         glass="#162c40", primary="#8ac7ff", secondary="#378fe5",
-        text="#f1f7ff", muted="#8da0b3", border="#294057",
+        text="#d4dce5", muted="#8da0b3", border="#294057",
         disabled="#8da0b3",
         user_bubble="#183b59", assistant_bubble="#0e1a26",
     ),
@@ -134,7 +131,7 @@ PALETTES: dict[str, ThemePalette] = {
         "emerald", "theme.emerald",
         background="#08130f", surface="#0d1d17", elevated="#132a21",
         glass="#173428", primary="#8ee6bd", secondary="#2ca875",
-        text="#effcf6", muted="#88a598", border="#27483a",
+        text="#d4e1db", muted="#88a598", border="#27483a",
         disabled="#88a598",
         user_bubble="#174331", assistant_bubble="#0d1d17",
     ),
@@ -142,7 +139,7 @@ PALETTES: dict[str, ThemePalette] = {
         "rose", "theme.rose",
         background="#120b0e", surface="#22161b", elevated="#2e1b22",
         glass="#2e1b22", primary="#f5b5c4", secondary="#ed4f87",
-        text="#fff3f6", muted="#9c8b91", border="#3a2530",
+        text="#e2d7dc", muted="#9c8b91", border="#3a2530",
         disabled="#9c8b91",
         user_bubble="#38222a", assistant_bubble="#22161b",
     ),
@@ -150,7 +147,7 @@ PALETTES: dict[str, ThemePalette] = {
         "amber", "theme.amber",
         background="#110e0a", surface="#1f1a12", elevated="#2b2419",
         glass="#2b2419", primary="#e6c97a", secondary="#c79d3e",
-        text="#faf1dc", muted="#9c8c6e", border="#3a301f",
+        text="#e0d8c8", muted="#9c8c6e", border="#3a301f",
         disabled="#9c8c6e",
         warning="#e6c97a", user_bubble="#2b2419",
         assistant_bubble="#1f1a12",
@@ -158,8 +155,8 @@ PALETTES: dict[str, ThemePalette] = {
     "neutral": _palette(
         "neutral", "theme.neutral",
         background="#000000", surface="#101010", elevated="#1a1a1a",
-        glass="#1a1a1a", primary="#ededed", secondary="#6b6b6b",
-        text="#ffffff", muted="#8a8a8a", border="#262626",
+        glass="#1a1a1a", primary="#d5d5d5", secondary="#6b6b6b",
+        text="#d3d3d3", muted="#8a8a8a", border="#262626",
         disabled="#8a8a8a", user_bubble="#1f1f1f",
         assistant_bubble="#101010",
     ),
@@ -181,13 +178,13 @@ def _rgb(color: QColor) -> str:
 def themed_stylesheet(template: str, palette: ThemePalette) -> str:
     """Map the legacy default QSS tokens to ``palette`` semantic colours.
 
-    Returning the untouched template for the default is deliberate: it proves
-    that enabling WOR-129 does not alter a single established default QSS token.
-    The mapping lets the large existing stylesheet remain one source of widget
-    state rules instead of duplicating it per preset.
+    The default template already supplies the surface and accent colours.
+    Foreground tokens are resolved for every theme, including the default.
     """
+    result = re.sub(r"#(?:e8e6f0|ffffff)\b", palette.text, template, flags=re.IGNORECASE)
+    result = re.sub(r"(?<!\d)232\s*,\s*230\s*,\s*240(?!\d)", _rgb(palette.color("text")), result)
     if palette.key == DEFAULT_THEME_KEY:
-        return template
+        return result
 
     replacements = {
         "#0d0b12": palette.background,
@@ -195,7 +192,6 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         "#13111a": palette.elevated_surface,
         "#1a1625": palette.glass,
         "#c4b5f5": palette.primary,
-        "#e8e6f0": palette.text,
         "#9d9aad": palette.muted_text,
         "#8a8798": palette.muted_text,
         "#858291": palette.disabled,
@@ -205,13 +201,11 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
         "#c79030": palette.warning,
         "#6fcf97": palette.success,
     }
-    result = template
     for old, new in replacements.items():
         result = re.sub(re.escape(old), new, result, flags=re.IGNORECASE)
 
     rgb_fields = (
         ((196, 181, 245), "primary"),
-        ((232, 230, 240), "text"),
         ((13, 11, 18), "background"),
         ((15, 13, 22), "surface"),
         ((19, 17, 26), "elevated_surface"),

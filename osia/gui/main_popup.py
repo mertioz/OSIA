@@ -2354,6 +2354,18 @@ class _ConversationAction(QPushButton):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.width() / 2 - 10, self.height() / 2 - 10)
+        color = self.palette().color(self.foregroundRole())
+        if self._kind == "more":
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            for y in (4.5, 10.0, 15.5):
+                painter.drawEllipse(QPointF(10, y), 1.55, 1.55)
+            painter.end()
+            return
+
         path = QPainterPath()
         if self._kind == "rename":
             path.moveTo(3, 13)
@@ -2377,10 +2389,7 @@ class _ConversationAction(QPushButton):
             path.lineTo(15, 15)
             path.moveTo(15, 5)
             path.lineTo(5, 15)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.translate(self.width() / 2 - 10, self.height() / 2 - 10)
-        pen = QPen(self.palette().color(self.foregroundRole()), 1.7)
+        pen = QPen(color, 1.7)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
@@ -2529,6 +2538,35 @@ class _ConvRow(QPushButton):
         super().resizeEvent(event)
 
 
+class _FolderIcon(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedSize(18, 18)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = get_theme_manager().palette
+        pen = QPen(palette.color("text", 215), 1.25)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(palette.color("primary", 32))
+        path = QPainterPath()
+        path.moveTo(2, 6)
+        path.quadTo(2, 4, 4, 4)
+        path.lineTo(7, 4)
+        path.lineTo(9, 6)
+        path.lineTo(14, 6)
+        path.quadTo(16, 6, 16, 8)
+        path.lineTo(16, 12.5)
+        path.quadTo(16, 14.5, 14, 14.5)
+        path.lineTo(4, 14.5)
+        path.quadTo(2, 14.5, 2, 12.5)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.end()
+
+
 class _FolderRow(QFrame):
     """Visually distinct canonical folder header and its compact settings."""
 
@@ -2550,7 +2588,7 @@ class _FolderRow(QFrame):
         row = QHBoxLayout(self)
         row.setContentsMargins(10, 8, 8, 8)
         row.setSpacing(7)
-        toggle = QPushButton("▸" if self._collapsed else "▾")
+        toggle = self._toggle = QPushButton("▸" if self._collapsed else "▾")
         toggle.setObjectName("folderToggle")
         toggle.setFixedSize(24, 24)
         toggle.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2559,7 +2597,8 @@ class _FolderRow(QFrame):
                 self._folder_id, not self._collapsed,
             )
         )
-        title = QLabel(f"📁  {self._folder_name}")
+        title = QLabel(self._folder_name)
+        title.setTextFormat(Qt.TextFormat.PlainText)
         title.setObjectName("folderTitle")
         title.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
@@ -2567,14 +2606,15 @@ class _FolderRow(QFrame):
         count_label = QLabel(str(count))
         count_label.setObjectName("folderCount")
         self._count_label = count_label
-        settings = QPushButton("⋯")
-        settings.setObjectName("folderMenu")
+        settings = _ConversationAction(
+            "more", "folderMenu", i18n.t("conversations.folder_settings"),
+        )
         settings.setFixedSize(28, 26)
-        settings.setCursor(Qt.CursorShape.PointingHandCursor)
         settings.clicked.connect(
             lambda: self._show_settings(settings, index, total)
         )
         row.addWidget(toggle)
+        row.addWidget(_FolderIcon())
         row.addWidget(title, 1)
         row.addWidget(count_label)
         row.addWidget(settings)
@@ -2708,12 +2748,13 @@ class _ConversationsPanel(QWidget):
         self._title.setObjectName("panelTitle")
         self._new_btn = QPushButton("＋ " + i18n.t("conversations.new_chat"))
         self._new_btn.setObjectName("primaryBtn")
+        self._new_btn.setProperty("conversationNew", True)
         self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._new_btn.clicked.connect(self.new_conversation.emit)
-        self._more_btn = QPushButton("⋯")
-        self._more_btn.setObjectName("convMore")
+        self._more_btn = _ConversationAction(
+            "more", "convMore", i18n.t("conversations.more_actions"),
+        )
         self._more_btn.setFixedSize(30, 30)
-        self._more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._more_btn.clicked.connect(self._show_more_menu)
         header.addWidget(self._title)
         header.addStretch()
@@ -2730,7 +2771,7 @@ class _ConversationsPanel(QWidget):
         self._delete_notice_timer.setSingleShot(True)
         self._delete_notice_timer.timeout.connect(self._delete_notice.hide)
 
-        scroll = QScrollArea()
+        scroll = self._scroll = QScrollArea()
         scroll.setObjectName("conversationScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2752,6 +2793,10 @@ class _ConversationsPanel(QWidget):
         self._host_layout.addStretch(1)
         scroll.setWidget(self._host)
         outer.addWidget(scroll, 1)
+        self._folder_scroll_anchor: tuple[str, int, bool] | None = None
+        self._folder_scroll_timer = QTimer(self)
+        self._folder_scroll_timer.setSingleShot(True)
+        self._folder_scroll_timer.timeout.connect(self._restore_folder_scroll)
 
         # Re-translate the header + rebuild rows (so per-row labels re-translate)
         # on language change.
@@ -2765,6 +2810,9 @@ class _ConversationsPanel(QWidget):
     def _retranslate(self) -> None:
         self._title.setText(i18n.t("conversations.title"))
         self._new_btn.setText("＋ " + i18n.t("conversations.new_chat"))
+        more_label = i18n.t("conversations.more_actions")
+        self._more_btn.setToolTip(more_label)
+        self._more_btn.setAccessibleName(more_label)
         self.refresh()
 
     def show_notice(self, message: str) -> None:
@@ -3016,8 +3064,50 @@ class _ConversationsPanel(QWidget):
             "folder_id": folder_id,
         })
 
+    def _capture_folder_scroll(self, snapshot: dict) -> None:
+        self._folder_scroll_timer.stop()
+        if not self.isVisible():
+            self._folder_scroll_anchor = None
+            return
+        viewport = self._scroll.viewport()
+        scroll_value = self._scroll.verticalScrollBar().value()
+        for folder in snapshot.get("folders") or []:
+            folder_id = str(folder.get("id") or "")
+            row = self._folder_widgets.get(folder_id)
+            if row is None or row._collapsed == bool(folder.get("collapsed", False)):
+                continue
+            offset = row.mapTo(viewport, QPoint()).y()
+            focused = row._toggle.hasFocus()
+            if focused or -row.height() < offset < viewport.height():
+                self._folder_scroll_anchor = (folder_id, scroll_value, focused)
+            if focused:
+                # Removing a focused arrow sends Qt through the remaining
+                # buttons and QScrollArea follows them. Park focus on the pane.
+                self._scroll.setFocus(Qt.FocusReason.OtherFocusReason)
+                break
+
+    def _restore_folder_scroll(self) -> None:
+        anchor, self._folder_scroll_anchor = self._folder_scroll_anchor, None
+        if anchor is None or not self.isVisible():
+            return
+        folder_id, scroll_value, focused = anchor
+        row = self._folder_widgets.get(folder_id)
+        if row is None:
+            return
+        self._host_layout.activate()
+        if focused and self._scroll.hasFocus():
+            row._toggle.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._scroll.verticalScrollBar().setValue(scroll_value)
+
     def refresh(self, *, snapshot: dict | None = None) -> None:
-        # Wipe & rebuild — the list is small so we don't bother diffing.
+        snapshot = snapshot or conversations.conversation_snapshot()
+        if (
+            self._last_snapshot is not None
+            and int(snapshot.get("snapshot_revision") or 0)
+            < int(self._last_snapshot.get("snapshot_revision") or 0)
+        ):
+            snapshot = self._last_snapshot
+        self._capture_folder_scroll(snapshot)
         active_changed = self._active_id != self._rendered_active_id
         while self._host_layout.count() > 1:
             item = self._host_layout.takeAt(0)
@@ -3028,13 +3118,6 @@ class _ConversationsPanel(QWidget):
         self._row_widgets.clear()
         self._folder_widgets.clear()
         self._empty_label = None
-        snapshot = snapshot or conversations.conversation_snapshot()
-        if (
-            self._last_snapshot is not None
-            and int(snapshot.get("snapshot_revision") or 0)
-            < int(self._last_snapshot.get("snapshot_revision") or 0)
-        ):
-            snapshot = self._last_snapshot
         self._last_snapshot = {
             "items": [dict(item) for item in snapshot.get("items") or []],
             "folders": [dict(item) for item in snapshot.get("folders") or []],
@@ -3122,6 +3205,9 @@ class _ConversationsPanel(QWidget):
         for conv in ungrouped:
             add_conversation(conv, indented=False)
         self._rendered_active_id = self._active_id
+        if self._folder_scroll_anchor is not None:
+            # Let the scroll area settle its resized content and range first.
+            self._folder_scroll_timer.start(0)
 
 
 # ── Model panel ─────────────────────────────────────────────────────────────
@@ -3220,7 +3306,7 @@ class _ModelRow(QFrame):
             icon.fill(Qt.GlobalColor.transparent)
             painter = QPainter(icon)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            _paint_gear(painter, 7, 7, 13, QColor(Qt.GlobalColor.white))
+            _paint_gear(painter, 7, 7, 13, PALETTES["neutral"].color("text"))
             painter.end()
             self._reasoning_btn.setIcon(QIcon(icon))
             self._reasoning_btn.setIconSize(icon_size)
@@ -10967,7 +11053,8 @@ class _NavButton(QPushButton):
 
         highlight = (
             55 if self.isDown()
-            else round(max(35 * self._selection_progress, 24 * self._hover_progress))
+            else round(max(35 * self._selection_progress, 24 * self._hover_progress,
+                           45 if self.hasFocus() else 0))
         )
         if highlight:
             p.setPen(Qt.PenStyle.NoPen)
@@ -10986,12 +11073,7 @@ class _NavButton(QPushButton):
                 1.25, 1.25,
             )
 
-        if self.hasFocus():
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(palette.color("focus", 190), 1.2))
-            p.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 9, 9)
-
-        # Icon colour: violet accent when active, dim white otherwise.
+        # Active icons use the accent and the other icons use the foreground.
         color = (palette.color("primary") if active
                  else palette.color("text", 200))
 
@@ -12245,7 +12327,7 @@ class MainPopup(QWidget):
 
         # The card sits inside the SHADOW_MARGIN band; on non-Windows the band
         # holds the hand-painted drop shadow drawn just below. Inset by
-        # SHADOW_MARGIN and -1px so the 1px border stays crisp inside the widget.
+        # SHADOW_MARGIN so its edges stay inside the widget.
         card = self.rect().adjusted(
             SHADOW_MARGIN, SHADOW_MARGIN, -SHADOW_MARGIN - 1, -SHADOW_MARGIN - 1
         )
@@ -12292,8 +12374,6 @@ class MainPopup(QWidget):
         palette = self._theme.palette
         painter.fillPath(path, palette.color("background", 125))
         painter.fillPath(path, palette.color("glass", 85))
-        painter.setPen(palette.color("primary", 70))
-        painter.drawPath(path)
         painter.end()
 
     # ── Style ─────────────────────────────────────────────────────────────
@@ -12632,19 +12712,17 @@ class MainPopup(QWidget):
             /* Conversations list ────────────────────────────────────── */
             QPushButton#convRow {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 12px;
             }
             QPushButton#convRow:hover {
-                border: 1px solid rgba(196, 181, 245, 0.35);
                 background: #13111a;
             }
             QPushButton#convRow[active="true"] {
                 background: rgba(196, 181, 245, 0.13);
-                border: 1px solid rgba(196, 181, 245, 0.38);
             }
             QPushButton#convRow:focus {
-                border-color: rgba(196, 181, 245, 0.72);
+                background: rgba(196, 181, 245, 0.19);
             }
             QFrame#folderRow {
                 background: rgba(196, 181, 245, 0.10);
@@ -12660,30 +12738,36 @@ class MainPopup(QWidget):
                 font-size: 10px;
                 color: #9d9aad;
             }
-            QPushButton#folderToggle, QPushButton#folderMenu,
-            QPushButton#convMore, QPushButton#convRename,
-            QPushButton#convMove {
+            QPushButton#folderToggle, QPushButton#convRename,
+            QPushButton#convMove, QPushButton#convActionDel {
                 background: rgba(196, 181, 245, 0.08);
-                border: 1px solid rgba(196, 181, 245, 0.16);
+                border: none;
                 border-radius: 8px;
                 color: #e8e6f0;
             }
-            QPushButton#folderToggle:hover, QPushButton#folderMenu:hover,
-            QPushButton#convMore:hover, QPushButton#convRename:hover {
-                background: rgba(196, 181, 245, 0.22);
+            QPushButton#folderMenu, QPushButton#convMore {
+                background: transparent;
+                border: none;
+                color: rgba(232, 230, 240, 0.76);
             }
+            QPushButton#folderMenu:hover, QPushButton#convMore:hover {
+                color: #e8e6f0;
+            }
+            QPushButton#folderMenu:focus, QPushButton#convMore:focus {
+                color: #c4b5f5;
+            }
+            QPushButton#folderToggle:hover, QPushButton#folderToggle:focus,
             QPushButton#convRename:hover, QPushButton#convRename:focus,
             QPushButton#convMove:hover, QPushButton#convMove:focus {
                 background: rgba(196, 181, 245, 0.22);
-                border: 1px solid rgba(196, 181, 245, 0.46);
             }
-            QPushButton#convRename:pressed, QPushButton#convMove:pressed {
+            QPushButton#folderToggle:pressed, QPushButton#convRename:pressed,
+            QPushButton#convMove:pressed {
                 background: rgba(196, 181, 245, 0.34);
-                border: 1px solid rgba(196, 181, 245, 0.62);
             }
-            QPushButton#convRename:disabled, QPushButton#convMove:disabled {
+            QPushButton#convRename:disabled, QPushButton#convMove:disabled,
+            QPushButton#convActionDel:disabled {
                 background: rgba(133, 130, 145, 0.10);
-                border: 1px solid rgba(133, 130, 145, 0.22);
                 color: #858291;
             }
             QLabel#convTitle {
@@ -12706,29 +12790,13 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(220, 80, 80, 0.6);
                 color: #ffffff;
             }
-            QPushButton#convActionDel {
-                background: rgba(196, 181, 245, 0.04);
-                border: 1px solid rgba(196, 181, 245, 0.12);
-                color: rgba(232, 230, 240, 0.72);
-                border-radius: 8px;
-            }
-            QPushButton#convActionDel:hover {
+            QPushButton#convActionDel:hover, QPushButton#convActionDel:focus {
                 background: rgba(220, 80, 80, 0.25);
-                border: 1px solid rgba(220, 80, 80, 0.6);
-                color: #ffffff;
-            }
-            QPushButton#convActionDel:focus {
-                border: 1px solid rgba(196, 181, 245, 0.78);
+                color: #e8e6f0;
             }
             QPushButton#convActionDel:pressed {
                 background: rgba(220, 80, 80, 0.42);
-                border: 1px solid rgba(220, 80, 80, 0.78);
-                color: #ffffff;
-            }
-            QPushButton#convActionDel:disabled {
-                background: rgba(133, 130, 145, 0.10);
-                border: 1px solid rgba(133, 130, 145, 0.22);
-                color: #858291;
+                color: #e8e6f0;
             }
 
             /* Model panel — provider grid ───────────────────────────── */
@@ -13105,6 +13173,12 @@ class MainPopup(QWidget):
                 font-weight: 500;
             }
             QPushButton#primaryBtn:hover {
+                background: rgba(196, 181, 245, 0.36);
+            }
+            QPushButton#primaryBtn[conversationNew="true"] {
+                border: none;
+            }
+            QPushButton#primaryBtn[conversationNew="true"]:focus {
                 background: rgba(196, 181, 245, 0.36);
             }
             QPushButton#destructiveSecondaryBtn {
