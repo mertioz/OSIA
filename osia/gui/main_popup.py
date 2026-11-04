@@ -11064,8 +11064,6 @@ class MainPopup(QWidget):
 
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
-        # WOR-48 P3: slightly larger, SQUARE with lightly rounded corners
-        # (radius in the #closeBtn QSS) instead of the previous 26px circle.
         close_btn.setFixedSize(30, 30)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self._hide_animated)
@@ -12118,18 +12116,19 @@ class MainPopup(QWidget):
                 color: #e8e6f0;
             }
 
-            /* WOR-48 P3: square close button with lightly rounded corners
-               (was a 13px-radius circle); subtle hover kept. */
             QPushButton#closeBtn {
-                background: rgba(196, 181, 245, 0.06);
+                background: transparent;
                 color: rgba(232, 230, 240, 0.7);
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: 1px solid transparent;
                 border-radius: 8px;
-                font-size: 13px;
+                font-size: 15px;
             }
             QPushButton#closeBtn:hover {
-                background: rgba(196, 181, 245, 0.16);
                 color: #e8e6f0;
+            }
+            QPushButton#closeBtn:focus {
+                border-color: transparent;
+                color: #c4b5f5;
             }
 
             /* Panels ─────────────────────────────────────────────────── */
