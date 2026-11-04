@@ -9,8 +9,7 @@ The capsule has four visual states:
 
 * ``idle``      — tiny, semi-transparent, waiting.
 * ``listening`` — centred mic glyph + 3 concentric violet pulse rings.
-* ``thinking``  — seven violet dots bobbing in a sine wave that travels
-                  from left to right across the capsule centre.
+* ``thinking``  — a light sweep in the pill or an orbit around the corner mark.
 * ``speaking``  — bouncing waveform bars.
 
 The window itself is frameless / always-on-top / not in the taskbar.
@@ -28,7 +27,10 @@ from PyQt6.QtCore import (
     Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
     QEasingCurve, QVariantAnimation, QAbstractAnimation,
 )
-from PyQt6.QtGui import QPainter, QColor, QPainterPath, QFont, QPen
+from PyQt6.QtGui import (
+    QBrush, QColor, QConicalGradient, QFont, QLinearGradient, QPainter,
+    QPainterPath, QPen,
+)
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from osia.gui.motion import MOTION, reduced_motion_requested
@@ -48,15 +50,7 @@ LAUNCH_W = 60
 LAUNCH_H = 20
 LAUNCH_MS = 220
 
-# Thinking animation — traveling wave. Seven dots sit on a horizontal line
-# through the capsule centre; each dot oscillates vertically on a sine wave
-# with a per-dot phase offset, so the crest glides smoothly left → right.
-THINK_DOT_COUNT = 7
-THINK_DOT_R = 2.5               # dot radius → 5px diameter
-THINK_DOT_SPACING = 12.0        # px between adjacent dot centres
-THINK_WAVE_AMP = 8.0            # px of vertical travel
-THINK_WAVE_PERIOD_MS = 800      # one full oscillation per dot
-THINK_WAVE_PHASE = math.pi / 3  # phase shift between adjacent dots (60°)
+THINK_CYCLE_MS = 1500
 
 VALID_STATES = ("idle", "listening", "thinking", "speaking")
 
@@ -606,8 +600,8 @@ class DynamicIsland(QWidget):
         elif self._shape == SHAPE_CIRCLE:
             painter.save()
             painter.setClipPath(path)
-            if self._state == "idle":
-                self._paint_idle(painter)
+            if self._state in ("idle", "thinking"):
+                self._paint_state(painter)
             else:
                 # Scale the pill-sized active animation down around the disc
                 # centre so it fits the circle instead of being clipped.
@@ -752,31 +746,57 @@ class DynamicIsland(QWidget):
         p.drawPath(base)
 
     def _paint_thinking(self, p: QPainter) -> None:
-        """Seven violet dots bobbing in a traveling sine wave.
+        """Sweep a soft light across the pill or around the corner mark."""
+        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
+        if self._shape == SHAPE_CIRCLE:
+            self._paint_thinking_orbit(p, progress)
+            return
 
-        The dots are evenly spaced on a horizontal line through the capsule
-        centre and each one oscillates vertically:
+        rect = self._capsule_rect()
+        center = rect.center()
+        width = min(86.0, rect.width() * 0.68)
+        rail = QRectF(center.x() - width / 2, center.y() - 2.0, width, 4.0)
+        path = QPainterPath()
+        path.addRoundedRect(rail, 2.0, 2.0)
+        palette = self._theme.palette
+        p.fillPath(path, palette.color("primary", 42))
 
-            y_offset = amplitude * sin(2π * t / period - i * phase_shift)
+        x = center.x() + width * 0.30 * math.sin(math.tau * progress)
+        half_width = width * 0.29
+        sweep = QLinearGradient(x - half_width, 0.0, x + half_width, 0.0)
+        sweep.setColorAt(0.0, palette.color("secondary", 0))
+        sweep.setColorAt(0.27, palette.color("secondary", 190))
+        sweep.setColorAt(0.53, palette.color("primary"))
+        sweep.setColorAt(0.72, palette.color("text", 230))
+        sweep.setColorAt(1.0, palette.color("primary", 0))
+        p.fillPath(path, QBrush(sweep))
 
-        The per-dot phase shift makes the crest travel smoothly from left
-        to right, which reads as a fluid, organic wave.
-        """
-        cx = self.width() / 2
-        cy = self.height() / 2
+    def _paint_thinking_orbit(self, p: QPainter, progress: float) -> None:
+        rect = self._capsule_rect()
+        center = rect.center()
+        radius = min(rect.width(), rect.height()) * 0.33
+        palette = self._theme.palette
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(palette.color("primary", 48), 1.6))
+        p.drawEllipse(center, radius, radius)
 
-        n = THINK_DOT_COUNT
-        start_x = cx - (n - 1) * THINK_DOT_SPACING / 2
-        omega_t = 2 * math.pi * self._anim_ms / THINK_WAVE_PERIOD_MS
+        trail = QConicalGradient(center, -360.0 * progress)
+        trail.setColorAt(0.0, palette.color("primary", 0))
+        trail.setColorAt(0.16, palette.color("text", 245))
+        trail.setColorAt(0.27, palette.color("primary"))
+        trail.setColorAt(0.46, palette.color("secondary", 180))
+        trail.setColorAt(0.69, palette.color("secondary", 0))
+        trail.setColorAt(1.0, palette.color("primary", 0))
+        p.setPen(QPen(QBrush(trail), 2.4))
+        p.drawEllipse(center, radius, radius)
 
-        p.setPen(Qt.PenStyle.NoPen)
-        color = QColor(self._primary_color)
-        color.setAlpha(235)
-        p.setBrush(color)
-        for i in range(n):
-            x = start_x + i * THINK_DOT_SPACING
-            y = cy + THINK_WAVE_AMP * math.sin(omega_t - i * THINK_WAVE_PHASE)
-            p.drawEllipse(QPointF(x, y), THINK_DOT_R, THINK_DOT_R)
+        font = QFont()
+        font.setFamilies(["Segoe UI", "Helvetica Neue", "Noto Sans", "sans-serif"])
+        font.setPixelSize(max(1, min(18, round(radius))))
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(self._text_color_200)
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "O")
 
     def _paint_speaking(self, p: QPainter) -> None:
         """Symmetric waveform of bars bouncing at independent frequencies."""
