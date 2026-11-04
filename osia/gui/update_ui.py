@@ -19,7 +19,7 @@ from PyQt6.QtCore import (
     QVariantAnimation,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -166,17 +166,13 @@ def _release_accent(version: str | None, major_update: bool = False) -> str | No
     return "major" if version and (major_update or is_major_update(version)) else None
 
 
-def _release_colors(accent: str, dark: bool) -> tuple[QColor, QColor, QColor]:
+def _release_colors(accent: str, dark: bool) -> tuple[QColor, QColor]:
     if accent == "beta":
-        colors = ("#ed8b47", "#ffd479", "#ffc47a") if dark else (
-            "#b2582d", "#9a650d", "#a66825",
-        )
+        colors = ("#ed8b47", "#ffd479") if dark else ("#b2582d", "#9a650d")
     else:
-        colors = ("#8b5cff", "#34d8ff", "#a979ff") if dark else (
-            "#6c36e8", "#007f9c", "#7442dc",
-        )
-    start, end, border = colors
-    return QColor(start), QColor(end), QColor(border)
+        colors = ("#8b5cff", "#34d8ff") if dark else ("#6c36e8", "#007f9c")
+    start, end = colors
+    return QColor(start), QColor(end)
 
 
 class UpdateController(QObject):
@@ -765,11 +761,11 @@ class _ReleaseCard(QFrame):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        bounds = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        bounds = QRectF(self.rect())
         theme = get_theme_manager().palette
         dark = QColor(theme.background).lightnessF() < 0.5
         base = QColor(theme.elevated_surface if dark else theme.surface)
-        start, end, border = _release_colors(self._accent, dark)
+        start, end = _release_colors(self._accent, dark)
         glow_alpha = round((34 if dark else 24) + self._breath * 32)
         start.setAlpha(glow_alpha)
         end.setAlpha(glow_alpha)
@@ -778,15 +774,13 @@ class _ReleaseCard(QFrame):
             QPointF(bounds.right(), bounds.bottom()),
         )
         gradient.setColorAt(0.0, start)
-        gradient.setColorAt(0.48 + (self._breath - 0.5) * 0.08, base)
+        gradient.setColorAt(0.48 + (self._breath - 0.5) * 0.08, QColor(Qt.GlobalColor.transparent))
         gradient.setColorAt(1.0, end)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(gradient)
-        painter.drawRoundedRect(bounds, 11.0, 11.0)
-        border.setAlpha(round(120 + self._breath * 70))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(border, 1.2))
-        painter.drawRoundedRect(bounds, 11.0, 11.0)
+        shape = QPainterPath()
+        shape.addRoundedRect(bounds, 11.0, 11.0)
+        painter.fillPath(shape, base)
+        painter.fillPath(shape, gradient)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -886,7 +880,7 @@ class _ReleaseProgressBar(QProgressBar):
         fraction = (self.value() - self.minimum()) / span if span > 0 else 0.0
         fill = QRectF(bounds)
         fill.setWidth(max(0.0, bounds.width() * max(0.0, min(1.0, fraction))))
-        start, end, border = _release_colors(self._accent, dark)
+        start, end = _release_colors(self._accent, dark)
         if fill.width() > 0:
             pulse = round(self._breath * 22)
             gradient = QLinearGradient(fill.topLeft(), fill.topRight())
@@ -898,10 +892,6 @@ class _ReleaseProgressBar(QProgressBar):
             painter.setClipPath(path)
             painter.fillRect(fill, gradient)
             painter.restore()
-        border.setAlpha(round(125 + self._breath * 65))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(border, 1.0))
-        painter.drawRoundedRect(bounds, 7.0, 7.0)
         painter.setPen(QColor(theme.text))
         painter.drawText(bounds, Qt.AlignmentFlag.AlignCenter, self.text())
 

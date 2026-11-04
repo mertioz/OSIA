@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QFont, QGuiApplication, QKeySequence, QPainter, QPen, QRadialGradient
+from PyQt6.QtGui import QBrush, QFont, QGuiApplication, QKeySequence, QPainter, QRadialGradient
 from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from osia import i18n
@@ -80,12 +80,11 @@ class _SettingsIllustration(QWidget):
         glow.setColorAt(1.0, palette.color("primary", 0))
         painter.fillRect(QRectF(-100, -97, 200, 194), QBrush(glow))
         painter.restore()
-        painter.setPen(QPen(palette.color("primary", 52), 1))
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(palette.color("surface"))
         painter.drawRoundedRect(QRectF(-164, -74, 328, 148), 24, 24)
 
         tile = QRectF(-139, -48, 96, 96)
-        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(palette.color("primary", 28))
         painter.drawRoundedRect(tile, 20, 20)
         font = QFont()

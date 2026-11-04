@@ -3398,7 +3398,7 @@ class _ModelRow(QFrame):
         menu.setStyleSheet(themed_stylesheet("""
             QMenu#reasoningMenu {
                 background: #0d0b12;
-                border: 1px solid rgba(196, 181, 245, 0.28);
+                border: none;
                 color: #e8e6f0;
                 padding: 6px;
             }
@@ -12430,7 +12430,7 @@ class MainPopup(QWidget):
             }
             QFrame#updateBanner {
                 background: rgba(196, 181, 245, 0.12);
-                border: 1px solid rgba(196, 181, 245, 0.34);
+                border: none;
                 border-radius: 10px;
             }
             QFrame#majorUpdateBanner {
@@ -12438,14 +12438,14 @@ class MainPopup(QWidget):
                     stop:0 rgba(139, 92, 255, 0.22),
                     stop:0.52 rgba(88, 86, 170, 0.13),
                     stop:1 rgba(52, 216, 255, 0.18));
-                border: 1px solid rgba(88, 205, 255, 0.52);
+                border: none;
                 border-radius: 10px;
             }
             QFrame#publicBetaUpdateBanner {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 rgba(237, 139, 71, 0.24),
                     stop:1 rgba(255, 212, 121, 0.15));
-                border: 1px solid rgba(255, 196, 122, 0.62);
+                border: none;
                 border-radius: 10px;
             }
             QFrame#publicBetaUpdateBanner QPushButton {
@@ -12511,7 +12511,7 @@ class MainPopup(QWidget):
 
             QListWidget#settingsNav {
                 background: rgba(13, 11, 18, 0.48);
-                border: 1px solid transparent;
+                border: none;
                 border-radius: 13px;
                 padding: 4px;
                 outline: 0;
@@ -12521,7 +12521,7 @@ class MainPopup(QWidget):
                 color: rgba(232, 230, 240, 0.78);
                 padding: 8px 7px;
                 margin: 1px 0;
-                border: 1px solid transparent;
+                border: none;
                 border-radius: 8px;
             }
             QListWidget#settingsNav::item:hover {
@@ -12530,7 +12530,6 @@ class MainPopup(QWidget):
             }
             QListWidget#settingsNav::item:selected {
                 background: rgba(196, 181, 245, 0.16);
-                border-color: rgba(196, 181, 245, 0.22);
                 color: #c4b5f5;
             }
             QLabel#settingsCategoryTitle {
@@ -12542,24 +12541,20 @@ class MainPopup(QWidget):
 
             /* Chat ───────────────────────────────────────────────────── */
             QFrame#msgBubble {
+                border: none;
                 border-radius: 14px;
                 padding: 0px;
             }
             QFrame#msgBubble[role="user"] {
                 background: rgba(196, 181, 245, 0.16);
-                border: 1px solid rgba(196, 181, 245, 0.22);
                 border-bottom-right-radius: 5px;
             }
             QFrame#msgBubble[role="assistant"] {
                 background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.12);
                 border-bottom-left-radius: 5px;
             }
-            QFrame#msgBubble[streaming="true"] {
-                border: 1px solid rgba(196, 181, 245, 0.22);
-            }
             QFrame#msgBubble[error="true"] {
-                border: 1px solid rgba(220, 80, 80, 0.55);
+                background: rgba(220, 80, 80, 0.17);
             }
             QLabel#msgText, QTextBrowser#msgText {
                 color: #e8e6f0;
@@ -12598,11 +12593,11 @@ class MainPopup(QWidget):
             }
             QFrame#inputWrap {
                 background: rgba(19, 17, 26, 0.34);
-                border: 1px solid rgba(196, 181, 245, 0.16);
+                border: none;
                 border-radius: 13px;
             }
             QFrame#inputWrap:hover {
-                border: 1px solid rgba(196, 181, 245, 0.26);
+                background: rgba(19, 17, 26, 0.48);
             }
             QTextEdit#chatInput {
                 background: transparent;
@@ -12666,12 +12661,11 @@ class MainPopup(QWidget):
             }
             QFrame#attachmentChip {
                 background: rgba(196, 181, 245, 0.07);
-                border: 1px solid rgba(196, 181, 245, 0.20);
+                border: none;
                 border-radius: 8px;
             }
             QFrame#attachmentChip[validation="error"] {
-                border: 1px solid rgba(220, 100, 100, 0.72);
-                background: rgba(120, 45, 55, 0.16);
+                background: rgba(220, 80, 80, 0.20);
             }
             QLabel#attachmentKind {
                 color: #c4b5f5;
@@ -12726,7 +12720,7 @@ class MainPopup(QWidget):
             }
             QFrame#folderRow {
                 background: rgba(196, 181, 245, 0.10);
-                border: 1px solid rgba(196, 181, 245, 0.28);
+                border: none;
                 border-radius: 10px;
             }
             QLabel#folderTitle {
@@ -12815,11 +12809,10 @@ class MainPopup(QWidget):
             }
             QFrame#provGridCard {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 12px;
             }
             QFrame#provGridCard:hover {
-                border: 1px solid rgba(196, 181, 245, 0.45);
                 background: #13111a;
             }
             QLabel#provGridName {
@@ -12842,17 +12835,14 @@ class MainPopup(QWidget):
             }
             QFrame#modelRow {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 12px;
             }
             QFrame#modelRow:hover {
-                border: 1px solid rgba(196, 181, 245, 0.35);
                 background: #13111a;
             }
             QFrame#modelRow[active="true"] {
-                background: rgba(196, 181, 245, 0.16);
-                border: 1px solid rgba(196, 181, 245, 0.5);
-                border-left: 3px solid #c4b5f5;
+                background: rgba(196, 181, 245, 0.19);
             }
             QLabel#modelProv {
                 color: rgba(196, 181, 245, 0.85);
@@ -12907,7 +12897,7 @@ class MainPopup(QWidget):
             /* Settings sections ─────────────────────────────────────── */
             QFrame#section {
                 background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.15);
+                border: none;
                 border-radius: 14px;
             }
             QDialog#onboardingDialog {
@@ -12920,7 +12910,7 @@ class MainPopup(QWidget):
             }
             QFrame#releaseCard {
                 background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.16);
+                border: none;
                 border-radius: 10px;
             }
             QFrame#majorUpdateCard, QFrame#publicBetaUpdateCard {
@@ -12941,7 +12931,7 @@ class MainPopup(QWidget):
             }
             QLabel#releaseBadge, QLabel#publicBetaReleaseBadge {
                 background: rgba(196, 181, 245, 0.16);
-                border: 1px solid rgba(196, 181, 245, 0.34);
+                border: none;
                 border-radius: 8px;
                 color: #c4b5f5;
                 padding: 2px 7px;
@@ -12949,12 +12939,11 @@ class MainPopup(QWidget):
             }
             QLabel#publicBetaReleaseBadge {
                 background: rgba(237, 139, 71, 0.20);
-                border-color: rgba(255, 196, 122, 0.52);
                 color: #ffd479;
             }
             QPushButton#themeChoice {
                 background: rgba(196, 181, 245, 0.04);
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 9px;
                 padding: 6px 8px;
                 color: #e8e6f0;
@@ -12963,11 +12952,9 @@ class MainPopup(QWidget):
             }
             QPushButton#themeChoice:hover, QPushButton#themeChoice:focus {
                 background: rgba(196, 181, 245, 0.12);
-                border: 1px solid rgba(196, 181, 245, 0.38);
             }
             QPushButton#themeChoice:checked {
-                background: rgba(196, 181, 245, 0.20);
-                border: 1px solid rgba(196, 181, 245, 0.62);
+                background: rgba(196, 181, 245, 0.24);
             }
             QLabel#sectionTitle {
                 font-size: 15px;
@@ -13006,11 +12993,8 @@ class MainPopup(QWidget):
             /* Provider card (compact configuration row) ─────────────── */
             QFrame#providerCard {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 12px;
-            }
-            QFrame#providerCard:hover {
-                border: 1px solid rgba(196, 181, 245, 0.35);
             }
             QLabel#providerName {
                 font-size: 13px;
@@ -13056,7 +13040,7 @@ class MainPopup(QWidget):
             /* Live API (Bloc 4) — violet info box: STT + TTS bypassed notice */
             QLabel#liveApiNotice {
                 background: rgba(196, 181, 245, 0.14);
-                border: 1px solid rgba(196, 181, 245, 0.30);
+                border: none;
                 border-radius: 10px;
                 padding: 8px 10px;
                 color: #c4b5f5;
@@ -13064,7 +13048,7 @@ class MainPopup(QWidget):
             }
             QLabel#comingSoonPill {
                 background: rgba(232, 230, 240, 0.06);
-                border: 1px solid rgba(232, 230, 240, 0.14);
+                border: none;
                 border-radius: 9px;
                 padding: 3px 8px;
                 color: rgba(232, 230, 240, 0.58);
@@ -13072,7 +13056,7 @@ class MainPopup(QWidget):
             }
             QFrame#dialogCard {
                 background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.30);
+                border: none;
                 border-radius: 14px;
             }
             QLabel#dialogTitle {
@@ -13083,7 +13067,7 @@ class MainPopup(QWidget):
             /* Conversation pill on a cron row + the picker popover rows */
             QLabel#convPill {
                 background: rgba(196, 181, 245, 0.14);
-                border: 1px solid rgba(196, 181, 245, 0.30);
+                border: none;
                 border-radius: 10px;
                 padding: 2px 9px;
                 color: #c4b5f5;
@@ -13095,16 +13079,15 @@ class MainPopup(QWidget):
             }
             QPushButton#convPick {
                 background: rgba(196, 181, 245, 0.04);
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 10px;
                 padding: 6px 12px;          /* WOR-48: trimmed pill padding */
                 color: #e8e6f0;
                 font-size: 12px;
                 text-align: left;
             }
-            QPushButton#convPick:hover {
+            QPushButton#convPick:hover, QPushButton#convPick:focus {
                 background: rgba(196, 181, 245, 0.18);
-                border: 1px solid rgba(196, 181, 245, 0.45);
                 color: #e8e6f0;
             }
 
@@ -13211,20 +13194,20 @@ class MainPopup(QWidget):
             }
 
             QLineEdit#keyInput {
-                background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                background: rgba(196, 181, 245, 0.07);
+                border: none;
                 border-radius: 10px;
                 padding: 6px 10px;
                 color: #e8e6f0;
                 font-size: 12px;
             }
             QLineEdit#keyInput:focus {
-                border: 1px solid rgba(196, 181, 245, 0.55);
+                background: rgba(196, 181, 245, 0.14);
             }
             /* Multi-line Markdown editor (OSIA personality + skills) ──── */
             QTextEdit#mdEditor {
-                background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                background: rgba(196, 181, 245, 0.07);
+                border: none;
                 border-radius: 10px;
                 padding: 6px 10px;
                 color: #e8e6f0;
@@ -13233,7 +13216,7 @@ class MainPopup(QWidget):
                 selection-background-color: rgba(196, 181, 245, 0.30);
             }
             QTextEdit#mdEditor:focus {
-                border: 1px solid rgba(196, 181, 245, 0.55);
+                background: rgba(196, 181, 245, 0.14);
             }
             QPushButton#saveBtn {
                 background: rgba(196, 181, 245, 0.08);
@@ -13255,12 +13238,15 @@ class MainPopup(QWidget):
 
             /* Voice combos ──────────────────────────────────────────── */
             QComboBox#voiceCombo {
-                background: #13111a;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                background: rgba(196, 181, 245, 0.07);
+                border: none;
                 border-radius: 10px;
                 padding: 6px 10px;
                 color: #e8e6f0;
                 font-size: 12px;
+            }
+            QComboBox#voiceCombo:focus {
+                background: rgba(196, 181, 245, 0.14);
             }
             QComboBox#voiceCombo::drop-down {
                 border: none;
@@ -13276,7 +13262,7 @@ class MainPopup(QWidget):
             QComboBox#voiceCombo QAbstractItemView {
                 background: #13111a;
                 color: #e8e6f0;
-                border: 1px solid rgba(196, 181, 245, 0.12);
+                border: none;
                 border-radius: 10px;
                 selection-background-color: rgba(196, 181, 245, 0.30);
                 font-size: 12px;
