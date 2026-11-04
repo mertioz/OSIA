@@ -1,6 +1,3 @@
-import hashlib
-import json
-import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -8,58 +5,6 @@ from pathlib import Path
 
 from osia import legal
 
-
-def _canonical_legal_source_bytes(source):
-    """Serialize the approved legal source in the site generator's key order.
-
-    The approved SHA-256 covers JSON.stringify(source, null, 2) plus a trailing
-    newline, not the Desktop copy's on-disk JSON formatting or key order.
-    """
-    operator = source["operator"]
-    urls = source["urls"]
-    documents = source["documents"]
-    canonical = {
-        "schemaVersion": source["schemaVersion"],
-        "version": source["version"],
-        "lastUpdated": source["lastUpdated"],
-        "effectiveDate": source["effectiveDate"],
-        "languages": source["languages"],
-        "futureLanguages": source["futureLanguages"],
-        "operator": {
-            key: operator[key]
-            for key in (
-                "publicIdentity", "legalIdentity", "tradeName", "contact",
-                "governingLaw",
-            )
-        },
-        "agePolicy": source["agePolicy"],
-        "termsAcceptanceRequired": source["termsAcceptanceRequired"],
-        "privacyNoticeRequired": source["privacyNoticeRequired"],
-        "materialChange": source["materialChange"],
-        "urls": {
-            locale: {
-                key: urls[locale][key]
-                for key in (
-                    "terms", "privacy", "legalNotice", "thirdParty",
-                    "licenses", "manifest",
-                )
-            }
-            for locale in ("fr", "en")
-        },
-        "documents": {
-            locale: {
-                document: {
-                    key: documents[locale][document][key]
-                    for key in ("file", "slug", "title", "description", "markdown")
-                }
-                for document in (
-                    "terms", "privacy", "legalNotice", "thirdParty", "licenses",
-                )
-            }
-            for locale in ("en", "fr")
-        },
-    }
-    return (json.dumps(canonical, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 class LegalManifestTests(unittest.TestCase):
     def test_bundled_manifest_matches_canonical_version_and_urls(self):
@@ -81,72 +26,21 @@ class LegalManifestTests(unittest.TestCase):
             "https://osia.space/legal/privacy",
         )
 
-    def test_source_hash_and_complete_english_french_offline_documents(self):
+    def test_legal_links_follow_the_interface_language(self):
+        self.assertEqual(legal.online_url("terms", "fr-CA"), "https://osia.space/legal/terms")
         self.assertEqual(
-            hashlib.sha256(_canonical_legal_source_bytes(legal.LEGAL_SOURCE)).hexdigest(),
-            legal.CANONICAL_SHA256,
+            legal.online_url("legalNotice", "fr"), "https://osia.space/legal/mentions-legales",
         )
         self.assertEqual(
-            legal.CANONICAL_SHA256,
-            "0bbe9ce0744e647a5ed840f2c1b824bbaf3bdf519847f2bf16b9d20bfb1a9670",
+            legal.online_url("privacy", "ja"), "https://osia.space/en/legal/privacy",
         )
-        for locale in ("en", "fr"):
-            for document in ("terms", "privacy"):
-                page = legal.get_document(document, locale)
-                self.assertGreater(len(page["markdown"]), 7000)
-                headings = re.findall(r"(?m)^## ", page["markdown"])
-                self.assertGreaterEqual(len(headings), 30)
+        self.assertEqual(legal.online_url("unknown"), "")
 
-    def test_public_copy_has_no_draft_markers_or_retired_runtime_claims(self):
-        corpus = str(legal.LEGAL_SOURCE["documents"])
-        self.assertNotRegex(
-            corpus,
-            re.compile(
-                r"draft|brouillon|legal review|revue juridique|not in force|non en vigueur",
-                re.IGNORECASE,
-            ),
-        )
-        self.assertNotRegex(
-            corpus,
-            re.compile(
-                r"Autonomous|GoalContract|WorldState|permission broker|anti-replay|semantic equivalence",
-                re.IGNORECASE,
-            ),
-        )
-        self.assertNotRegex(
-            corpus,
-            re.compile(r"\b(?:sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{30,})\b"),
-        )
-
-    def test_legal_notice_contains_only_minimum_operator_approved_identity_fields(self):
-        corpus = str(legal.LEGAL_SOURCE["documents"])
-        markdown_corpus = "\n".join(
-            page["markdown"]
-            for locale in ("en", "fr")
-            for page in legal.LEGAL_SOURCE["documents"][locale].values()
-        ).replace("\n- ", " ")
-        self.assertIn("SIREN : 101 523 215", corpus)
-        self.assertIn("SIREN: 101 523 215", corpus)
-        self.assertIn("Cloudflare, Inc.", corpus)
-        self.assertIn("+1 (650) 319-8930", corpus)
-        self.assertIn("Téléphone professionnel : 07 59 54 40 53", corpus)
-        self.assertIn("Professional telephone: +33 7 59 54 40 53", corpus)
-        self.assertIn("86 rue de Montagny", corpus)
-        self.assertIn("69008 Lyon", corpus)
-        for locale in ("en", "fr"):
-            for key, page in legal.LEGAL_SOURCE["documents"][locale].items():
-                if key == "legalNotice":
-                    continue
-                self.assertNotRegex(
-                    page["markdown"],
-                    re.compile(r"rue de Montagny|69008 Lyon|07 59 54 40 53|\+33 7 59 54 40 53", re.IGNORECASE),
-                )
+    def test_the_legal_bundle_contains_only_the_manifest(self):
         self.assertEqual(
-            set(re.findall(r"\b\d{5}\s+[A-Za-zÀ-ÿ-]+", markdown_corpus)),
-            {"69008 Lyon", "94107 USA", "94107 États-Unis"},
+            sorted(path.name for path in legal.LEGAL_DATA_DIR.glob("*.json")),
+            ["legal-manifest.json"],
         )
-        self.assertNotRegex(corpus, re.compile(r"\bSIRET\b|\b(?:APE|NAF|RCS|RNE)\b|\bDPO\b", re.IGNORECASE))
-        self.assertNotRegex(corpus, re.compile(r"\bVAT\s*(?:number|ID)?\s*[:#]", re.IGNORECASE))
 
     def test_startup_does_not_block_without_an_explicit_acceptance_requirement(self):
         state = legal.AcceptanceState()

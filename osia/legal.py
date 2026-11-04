@@ -1,4 +1,4 @@
-"""Bundled legal text and local acceptance state for OSIA PC."""
+"""Canonical legal links, version metadata, and local acceptance state."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +25,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 LEGAL_DATA_DIR = Path(__file__).resolve().parent / "legal_documents"
-LEGAL_SOURCE_FILE = LEGAL_DATA_DIR / "legal-source.json"
 LEGAL_MANIFEST_FILE = LEGAL_DATA_DIR / "legal-manifest.json"
-LEGAL_SOURCE = _load_json(LEGAL_SOURCE_FILE)
 LEGAL_MANIFEST = _load_json(LEGAL_MANIFEST_FILE)
 
 TERMS_VERSION = str(LEGAL_MANIFEST.get("termsVersion", ""))
@@ -44,30 +43,19 @@ PRIVACY_NOTICE_REQUIRED = bool(
 )
 MINIMUM_AGE: int | None = LEGAL_MANIFEST.get("minimumAge")
 CANONICAL_SHA256 = str(LEGAL_MANIFEST.get("contentSha256", ""))
-TERMS_URL = str(LEGAL_MANIFEST.get("canonicalUrls", {}).get("fr", {}).get("terms", ""))
-PRIVACY_URL = str(LEGAL_MANIFEST.get("canonicalUrls", {}).get("fr", {}).get("privacy", ""))
-LEGAL_MANIFEST_URL = str(
-    LEGAL_MANIFEST.get("canonicalUrls", {}).get("fr", {}).get("manifest", "")
-)
 ACCEPTANCE_FILE = Path(CONFIG_DIR) / "legal_acceptance.json"
-
-
-def get_document(document: str, locale: str = "en") -> dict[str, Any]:
-    """Return a bundled Terms or Privacy document without network access."""
-    selected_locale = "fr" if locale.lower().startswith("fr") else "en"
-    documents = LEGAL_SOURCE.get("documents", {})
-    localized = documents.get(selected_locale, {})
-    result = localized.get(document)
-    if not isinstance(result, dict):
-        raise KeyError(f"Bundled legal document is unavailable: {selected_locale}/{document}")
-    return result
 
 
 def online_url(document: str, locale: str = "en") -> str:
     selected_locale = "fr" if locale.lower().startswith("fr") else "en"
     urls = LEGAL_MANIFEST.get("canonicalUrls", {}).get(selected_locale, {})
-    key = "terms" if document == "terms" else "privacy"
-    return str(urls.get(key, ""))
+    return str(urls.get(document) or "")
+
+
+def open_online_document(document: str, locale: str = "en") -> None:
+    url = online_url(document, locale)
+    if url:
+        webbrowser.open(url)
 
 
 @dataclass(frozen=True)

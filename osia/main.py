@@ -1980,9 +1980,7 @@ def wake_mode():
     popup = MainPopup()
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
-    # Release-only legal gate. The bundled documents are currently review
-    # drafts, so this is a no-op. Developer/test runs stay unblocked even after
-    # approval unless they explicitly opt into OSIA_RELEASE_BUILD=1.
+    # The release-only gate follows the acceptance flags in the legal manifest.
     def _run_release_legal_gate() -> None:
         from osia.gui.legal_dialog import maybe_show_release_legal_gate
 

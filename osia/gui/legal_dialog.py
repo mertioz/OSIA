@@ -12,7 +12,6 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import i18n, legal
-from osia.gui.legal_viewer import LegalDocumentDialog
 
 
 class LegalAcceptanceDialog(QDialog):
@@ -29,11 +28,11 @@ class LegalAcceptanceDialog(QDialog):
 
         terms = QPushButton(i18n.t("legal.open_terms"))
         terms.clicked.connect(
-            lambda: LegalDocumentDialog(self, "terms").exec()
+            lambda: legal.open_online_document("terms", i18n.get_language())
         )
         privacy = QPushButton(i18n.t("legal.open_privacy"))
         privacy.clicked.connect(
-            lambda: LegalDocumentDialog(self, "privacy").exec()
+            lambda: legal.open_online_document("privacy", i18n.get_language())
         )
         layout.addWidget(terms)
         layout.addWidget(privacy)
@@ -59,7 +58,7 @@ class LegalAcceptanceDialog(QDialog):
 def maybe_show_release_legal_gate(parent=None) -> bool:
     decision = legal.startup_decision(legal.load_acceptance())
     if decision.show_privacy_update:
-        webbrowser.open(legal.PRIVACY_URL)
+        legal.open_online_document("privacy", i18n.get_language())
         legal.record_privacy_seen()
     if not decision.require_terms_acceptance:
         return True

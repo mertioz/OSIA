@@ -246,16 +246,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "settings.cat.legal": {"en": "Legal", "fr": "Légal"},
     "settings.legal": {"en": "Legal and privacy", "fr": "Informations légales"},
     "settings.legal_sub": {
-        "en": "Bundled versions and canonical documents",
-        "fr": "Versions intégrées et documents canoniques",
+        "en": "Official documents on the OSIA website",
+        "fr": "Documents officiels sur le site OSIA",
     },
     "settings.legal_desc": {
-        "en": "The full Terms and Privacy Policy are included for offline reading. Startup acceptance is controlled separately.",
-        "fr": "Les textes intégraux des Conditions et de la Politique sont disponibles hors ligne. L’acceptation au démarrage est gérée séparément.",
-    },
-    "legal.offline_summary": {
-        "en": "The complete English and French legal texts are bundled with OSIA.",
-        "fr": "Les textes juridiques complets en anglais et en français sont intégrés à OSIA.",
+        "en": "Links open in your default browser.",
+        "fr": "Les liens s’ouvrent dans votre navigateur par défaut.",
     },
     "legal.terms_version": {"en": "Terms: {version}", "fr": "Conditions : {version}"},
     "legal.privacy_version": {"en": "Privacy: {version}", "fr": "Confidentialité : {version}"},
@@ -268,9 +264,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "French law applies, subject to mandatory consumer protections",
         "fr": "Le droit français s’applique, sous réserve des protections impératives des consommateurs",
     },
-    "legal.open_terms": {"en": "Read Terms offline", "fr": "Lire les Conditions hors ligne"},
-    "legal.open_privacy": {"en": "Read Privacy Policy offline", "fr": "Lire la Politique hors ligne"},
-    "legal.open_manifest": {"en": "Online legal manifest", "fr": "Manifeste juridique en ligne"},
+    "legal.open_terms": {"en": "Terms of Service", "fr": "Conditions d’utilisation"},
+    "legal.open_privacy": {"en": "Privacy Policy", "fr": "Politique de confidentialité"},
+    "legal.open_notice": {"en": "Legal Notice", "fr": "Mentions légales"},
     "legal.gate_title": {"en": "Before continuing", "fr": "Avant de continuer"},
     "legal.gate_desc": {
         "en": "Read the Terms and Privacy Policy. Accepting the Terms does not turn every privacy processing operation into consent.",
