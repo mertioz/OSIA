@@ -5175,21 +5175,26 @@ class _SettingsPanel(QWidget):
         self._theme_group = QButtonGroup(self)
         self._theme_group.setExclusive(True)
         self._theme_buttons: dict[str, QPushButton] = {}
+        swatch_size = QSize(18, 12)
         for index, palette in enumerate(PALETTES.values()):
             button = QPushButton(i18n.t(palette.name_key))
             button.setObjectName("themeChoice")
             button.setCheckable(True)
             button.setProperty("themeKey", palette.key)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            preview = QPixmap(36, 12)
+            preview = QPixmap(swatch_size * 2)
+            preview.setDevicePixelRatio(2)
             preview.fill(Qt.GlobalColor.transparent)
             painter = QPainter(preview)
-            painter.fillRect(0, 0, 12, 12, palette.color("background"))
-            painter.fillRect(12, 0, 12, 12, palette.color("surface"))
-            painter.fillRect(24, 0, 12, 12, palette.color("primary"))
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(palette.color("primary"))
+            painter.drawRoundedRect(
+                QRectF(0, 0, swatch_size.width(), swatch_size.height()), 3, 3,
+            )
             painter.end()
             button.setIcon(QIcon(preview))
-            button.setIconSize(QSize(36, 12))
+            button.setIconSize(swatch_size)
             button.clicked.connect(
                 lambda checked=False, key=palette.key:
                 self._on_theme_selected(key) if checked else None
