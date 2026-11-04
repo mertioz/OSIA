@@ -132,7 +132,7 @@ def test_capability_identities_are_config_free_and_surface_scoped():
     }
 
 
-def test_native_osia_and_mcp_are_voluntary_direct_peers():
+def test_native_osia_and_mcp_are_voluntary_direct_peers(tmp_path):
     registered = register_dynamic_tool(
         name="mcp__wor250__read",
         dispatcher=lambda **_kwargs: "synthetic",
@@ -174,6 +174,31 @@ def test_native_osia_and_mcp_are_voluntary_direct_peers():
             "arguments": {"path": "synthetic.txt", "content": "one"},
         }
         assert "write_file" in [tool["name"] for tool in _canonical_native_tools()]
+        mcp_tool = next(tool for tool in _canonical_native_tools() if tool["name"] == registered.name)
+        assert mcp_tool["inputSchema"] == registered.input_schema
+        mcp_call = {
+            "callId": "call:mcp",
+            "tool": registered.name,
+            "arguments": {"query": "fixture"},
+        }
+        expected_handoff = {
+            "call_id": "call:mcp",
+            "tool": registered.name,
+            "arguments": {"query": "fixture"},
+        }
+        assert _exact_canonical_native_call(mcp_call) == expected_handoff
+        client, sent = _client(tmp_path, "native-mcp")
+        client._send_request_no_wait = lambda *_: None
+        attempt = _native_attempt(
+            conversation_id="mcp-chat", turn_id="mcp-turn", user_request="Read fixture state.",
+        )
+        client._attempts[attempt.thread_id] = attempt
+        client._handle_server_request({
+            "id": 1, "method": "item/tool/call",
+            "params": {**mcp_call, "threadId": attempt.thread_id, "turnId": attempt.turn_id},
+        })
+        assert attempt.native_tool_call == expected_handoff
+        assert sent[0]["result"]["success"] is False
     finally:
         unregister_dynamic_tools((registered.name,))
 

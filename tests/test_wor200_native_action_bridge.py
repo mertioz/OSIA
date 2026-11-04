@@ -390,7 +390,7 @@ def test_mapped_outcome_unknown_continues_without_replaying_action():
     assert "uncertain" in result.lower()
 
 
-def test_successful_mapped_side_effect_blocks_provider_fallback():
+def test_successful_mapped_side_effect_keeps_provider_and_retries_response():
     calls = []
     switches = []
     late_error = AccountProviderError(AppServerError(
@@ -402,7 +402,7 @@ def test_successful_mapped_side_effect_blocks_provider_fallback():
         '<tool_call>{"tool":"write_file","path":"C:\\\\synthetic\\\\once.txt",'
         '"content":"one"}</tool_call>'
     )
-    agent, client = _agent_with_account_outcomes([tool_xml, late_error])
+    agent, client = _agent_with_account_outcomes([tool_xml, late_error, "The file was written."])
 
     def retain_account_model(model, provider=None):
         switches.append((provider, model))
@@ -437,8 +437,10 @@ def test_successful_mapped_side_effect_blocks_provider_fallback():
 
     assert calls == [{"path": r"C:\synthetic\once.txt", "content": "one"}]
     assert switches == [("chatgpt_account", "account-model")]
-    assert len(client.completions.calls) == 2
-    assert "did not replay" in result.lower()
+    assert len(client.completions.calls) == 3
+    assert result == "The file was written."
+    assert any("write verified" in str(message["content"])
+               for message in client.completions.calls[-1]["messages"])
 
 
 def test_api_provider_does_not_gain_native_reformulation_behavior():

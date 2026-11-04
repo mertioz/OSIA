@@ -731,22 +731,6 @@ _LOCALIZED = {
         "de": "Das Speichern im Gedächtnis ist fehlgeschlagen.",
         "es": "No se pudo guardar en la memoria.",
     },
-    "outcome_unknown": {
-        "en": "The outcome of {action} is uncertain: it was dispatched and may still complete. I did not retry it or replay it on another provider. Check its effect before trying again.",
-        "fr": "Le résultat de {action} est incertain : l’action a été lancée et peut encore se terminer. Je ne l’ai ni relancée ni rejouée sur un autre fournisseur. Vérifiez son effet avant toute nouvelle tentative.",
-        "zh": "我无法确认{action}是否已完成。该操作已发出，仍可能完成。我没有重试，也没有通过其他提供商重放。再次尝试前，请先检查其效果。",
-        "ja": "{action}が完了したことを確認できませんでした。この操作は送信済みで、まだ完了する可能性があります。再試行も別のプロバイダーでの再実行もしていません。もう一度試す前に結果を確認してください。",
-        "de": "Ich konnte nicht bestätigen, dass {action} abgeschlossen wurde. Die Aktion wurde ausgelöst und kann noch abgeschlossen werden. Ich habe sie weder wiederholt noch über einen anderen Anbieter erneut ausgeführt. Prüfen Sie die Wirkung, bevor Sie es erneut versuchen.",
-        "es": "No pude confirmar que {action} terminara. La acción se envió y aún podría completarse. No la reintenté ni la repetí con otro proveedor. Comprueba su efecto antes de volver a intentarlo.",
-    },
-    "effect_provider_failure": {
-        "en": "{action} was already dispatched. The response provider then failed, and I did not replay the turn to avoid duplicating the action.",
-        "fr": "{action} avait déjà été lancée. Le fournisseur de réponse a ensuite échoué ; je n’ai pas rejoué le tour afin d’éviter de dupliquer l’action.",
-        "zh": "{action}已发出。随后响应提供商失败；为避免重复执行该操作，我没有重放本轮请求。",
-        "ja": "{action}はすでに送信されていました。その後、応答プロバイダーでエラーが発生しました。操作の重複を避けるため、このターンは再実行していません。",
-        "de": "{action} war bereits ausgelöst worden. Danach ist der Antwortanbieter fehlgeschlagen; ich habe den Durchlauf nicht wiederholt, um die Aktion nicht zu duplizieren.",
-        "es": "{action} ya se había enviado. Después falló el proveedor de respuesta; no repetí el turno para evitar duplicar la acción.",
-    },
     "stt_not_understood": {
         "en": "I didn't understand. Please repeat.",
         "fr": "Je n’ai pas compris. Répétez, s’il vous plaît.",

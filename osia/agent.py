@@ -10902,55 +10902,6 @@ class OSIAAgent:
             }
         return localized_text("empty_completion", self.lang)
 
-    def _finish_execution_barrier_stop(
-        self,
-        *,
-        outcome_unknown: bool,
-        timed_out: bool = False,
-        tool_name: str = "",
-        on_sentence=None,
-    ) -> str:
-        """Produce one canonical safe final without replaying a committed turn."""
-        prior_reason = (
-            self.last_run_diagnostic.get("reason_code")
-            if isinstance(self.last_run_diagnostic, dict) else None
-        )
-        reason_code = (
-            "tool_timeout" if timed_out
-            else "provider_timeout" if prior_reason == "provider_timeout"
-            else "task_execution_failure"
-        )
-        self.last_run_diagnostic = {
-            "stage": "task_execution",
-            "error_category": reason_code,
-            "reason_code": reason_code,
-        }
-        safe_tool_name = (
-            str(tool_name)
-            if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", str(tool_name or ""))
-            else "requested_action"
-        )
-        action = f"`{safe_tool_name}`"
-        content = localized_text(
-            "outcome_unknown" if outcome_unknown else "effect_provider_failure",
-            self.lang,
-            action=action,
-        )
-        content = clean_response(content)
-        if on_sentence is not None:
-            try:
-                on_sentence(content)
-            except Exception:
-                pass
-        self._mark_document_private_history()
-        final_message = {"role": "assistant", "content": content}
-        if self._document_private_run:
-            final_message["_document_private"] = True
-        self.messages.append(final_message)
-        if self.turn_context is not None:
-            log_final(self.turn_context, content)
-        return content
-
     def _finish_cancelled_tool_stop(self, *, on_sentence=None) -> str:
         """Return one canonical final after a proven pre-effect cancellation."""
         content = clean_response(localized_text(
@@ -12754,18 +12705,16 @@ class OSIAAgent:
                 return wait_value
             except Exception as exc:
                 candidate = ""
+                typed_reason = str(getattr(exc, "reason_code", "") or "")
+                fact_reason = (
+                    typed_reason if typed_reason in _PROVIDER_FACT_BLOCKER_CODES
+                    else _provider_terminal_fact(exc)
+                )
+                if fact_reason:
+                    controller.mark_provider_fact_blocker(fact_reason)
                 if not controller.snapshot().get("unknown_effects"):
-                    typed_reason = str(
-                        getattr(exc, "reason_code", "") or ""
-                    )
                     provider_reason = _provider_seam_failure_code(
                         getattr(exc, "category", "") or ""
-                    )
-                    terminal_fact = _provider_terminal_fact(exc)
-                    fact_reason = (
-                        typed_reason
-                        if typed_reason in _PROVIDER_FACT_BLOCKER_CODES
-                        else terminal_fact
                     )
                     controller.record_typed_evidence(
                         outcome="failed_before_effect",
@@ -12783,10 +12732,6 @@ class OSIAAgent:
                             "provider_invocation_failed_before_effect"
                         ),
                     )
-                    if fact_reason:
-                        # WOR-303: one explicit non-retryable provider fact may
-                        # reserve a blocked final; it never depends on a count.
-                        controller.mark_provider_fact_blocker(fact_reason)
                     if typed_reason in {
                         "IMAGE_REF_EXPIRED", "IMAGE_REF_UNAVAILABLE",
                         "IMAGE_OWNER_MISMATCH", "IMAGE_REF_METADATA_MISMATCH",
@@ -13797,11 +13742,8 @@ class OSIAAgent:
         # Once an account response emits an OSIA textual tool call, the attempt
         # is committed. A later tool-result turn must never replay via an API.
         _account_attempt_committed = False
-        # A provider fallback may replay the complete turn. Once a mutating,
-        # dynamic or otherwise ambiguous tool has actually been dispatched,
-        # replay is forbidden for the rest of this turn (WOR-178).
+        # Keep provider-bound continuation history on its current route.
         tool_execution_barrier_committed = bool(self._resume_effect_barrier)
-        turn_has_unknown_outcome = False
         # If a defensive/legacy execution path reports uncertainty without a
         # durable attempt identity, there is no canonical action record from
         # which independence can be proven. Keep read-only reconciliation
@@ -13811,7 +13753,6 @@ class OSIAAgent:
         # Empty-response guard: whether the one allowed "your reply was
         # empty after stripping markup" retry has been spent.
         empty_retry_used = False
-        attempted_model_tool_name = ""
 
         def _record_computer_argument_diagnostic(
             *, tool_name: str, spec, arguments: dict, details: dict,
@@ -14027,8 +13968,6 @@ class OSIAAgent:
                     tool_execution_barrier_committed = True
                 if event_summary["provider_terminal"]:
                     provider_execution_terminal = True
-                if event_summary["unknown"]:
-                    turn_has_unknown_outcome = True
                 self._raise_if_execution_generation_cancelled()
             except _ExecutionGenerationCancelled:
                 raise
@@ -14054,8 +13993,6 @@ class OSIAAgent:
                     tool_execution_barrier_committed = True
                 if event_summary["provider_terminal"]:
                     provider_execution_terminal = True
-                if event_summary["unknown"]:
-                    turn_has_unknown_outcome = True
                 if reasoning_request is not None and not reasoning_outcome_recorded:
                     from osia.reasoning import record_reasoning_outcome
                     record_reasoning_outcome(
@@ -14201,12 +14138,6 @@ class OSIAAgent:
                         "error_category": "provider_timeout",
                         "reason_code": "provider_timeout",
                     }
-                if tool_execution_barrier_committed:
-                    return self._finish_execution_barrier_stop(
-                        outcome_unknown=turn_has_unknown_outcome,
-                        tool_name=attempted_model_tool_name,
-                        on_sentence=on_sentence,
-                    )
                 # Provider-native tool attempt rejected by the transport: when
                 # the provider reports the exact failed generation (Groq
                 # `tool_use_failed`), normalize it into the canonical call and
@@ -14223,7 +14154,31 @@ class OSIAAgent:
                     )
                     message = recovered_native
                     content = ""
-                elif not reformulatable_native_action:
+                elif (
+                    (
+                        self._terminality_controller is not None
+                        or tool_execution_barrier_committed
+                    )
+                    and not getattr(e, "native_action", False)
+                    and not _provider_terminal_fact(e)
+                    and (
+                        failure_category in {
+                            "transient_transport", "transient_timeout",
+                            "transient_rate_limit", "provider_unavailable",
+                        }
+                        or (
+                            self.provider == "chatgpt_account"
+                            and getattr(e, "category", "") in {
+                                "request_timeout", "process_crash", "process_stopped",
+                            }
+                        )
+                    )
+                ):
+                    # Retry this provider round with the same messages and
+                    # receipts. Tool dispatch remains driven by fresh calls.
+                    time.sleep(max(0.25, retry_after) if retry_after is not None else 0.5)
+                    continue
+                else:
                     raise
 
 
@@ -14372,7 +14327,6 @@ class OSIAAgent:
                 # that depended on the failed one.
                 tool_results = []
                 tool_screenshots: list[dict] = []
-                attempted_model_tool_name = ""
                 attempted_model_kwargs = {}
                 for i, tc in enumerate(tool_calls):
                     tool_name = tc.get("tool", "")
@@ -14592,7 +14546,6 @@ class OSIAAgent:
                                 round_number,
                             )
                         argument_repair_active = False
-                    attempted_model_tool_name = tool_name
                     attempted_model_kwargs = dict(kwargs)
                     strategy_decision = None
                     if self._terminality_controller is None:
@@ -15084,7 +15037,6 @@ class OSIAAgent:
                         and execution_record.tool_attempt_id
                     ):
                         tool_execution_barrier_committed = True
-                        turn_has_unknown_outcome = True
                         if execution_record.timed_out:
                             turn_has_tool_timeout = True
                         return self._suspend_tool_turn(
@@ -15145,7 +15097,6 @@ class OSIAAgent:
                         tool_execution_barrier_committed = True
                     if execution_record.outcome == ExecutionOutcome.OUTCOME_UNKNOWN:
                         tool_execution_barrier_committed = True
-                        turn_has_unknown_outcome = True
                         if execution_record.timed_out:
                             turn_has_tool_timeout = True
                     elif (
@@ -15153,7 +15104,6 @@ class OSIAAgent:
                         and _requires_postcondition_reconciliation(execution_record)
                     ):
                         tool_execution_barrier_committed = True
-                        turn_has_unknown_outcome = True
                     text_part = _model_result_text(result, tool_name)
                     document_reference = _document_reference_from_result(
                         tool_name, result,
@@ -15692,8 +15642,7 @@ class OSIAAgent:
             # max_tokens (the unclosed-tag pattern strips it to end-of-text)
             # or a reply that was nothing but echoed tool markup. Returning
             # "" here would mean an empty bubble, an empty mobile reply, and
-            # no TTS — instead retry once asking for a plain-text answer,
-            # then fall back to a deterministic reply.
+            # no TTS. Keep the current turn and its receipts for the retry.
             if not content:
                 print(
                     "[WARN] final response empty after stripping "
@@ -15729,24 +15678,21 @@ class OSIAAgent:
                         "content": (
                             "Ta réponse précédente était vide une fois le "
                             "balisage retiré (bloc <think> non fermé ou "
-                            "balises d'outils). Tous les outils ont terminé. "
-                            "Écris maintenant ta réponse finale complète en "
-                            "te basant sur tout ce que tu as trouvé, en "
-                            "texte simple, sans bloc <think> ni balise "
-                            "<tool_call>."
+                            "balises d'outils). Poursuis le même objectif à "
+                            "partir des résultats déjà reçus et donne une "
+                            "réponse en texte simple quand elle est prête."
                             if self.lang == "fr" else
                             "Your previous reply was empty once markup was "
                             "removed (an unterminated <think> block or tool "
-                            "tags). All tools are done. Write your complete "
-                            "final answer now based on everything you found, "
-                            "in plain text, with no <think> block and no "
-                            "<tool_call> tags."
+                            "tags). Continue the same objective using the "
+                            "results already received, and provide a plain "
+                            "text answer when ready."
                         ),
                     })
                     continue
-                # Retry also produced nothing usable — deterministic
-                # fallback so the user always gets a reply and TTS always
-                # has one canonical text to speak.
+                if self._terminality_controller is not None:
+                    time.sleep(0.5)
+                    continue
                 content = self._empty_response_fallback()
             language_content = content
             if self._terminality_controller is not None:
@@ -15836,6 +15782,9 @@ class OSIAAgent:
             if canonical_output:
                 content = clean_response(content)
             if not content:
+                if self._terminality_controller is not None:
+                    time.sleep(0.5)
+                    continue
                 content = self._empty_response_fallback()
             if on_sentence is not None and not visible_round_sentences:
                 try:

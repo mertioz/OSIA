@@ -183,6 +183,24 @@ def _normalized_model_id(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _native_mcp_name(name: object) -> bool:
+    return isinstance(name, str) and bool(re.fullmatch(r"mcp__[A-Za-z0-9_-]{1,59}", name))
+
+
+def _is_canonical_native_handoff(name: object) -> bool:
+    if name in _CANONICAL_NATIVE_TOOL_NAMES:
+        return True
+    if not _native_mcp_name(name):
+        return False
+    from osia.tool_contracts import get_tool_spec
+
+    spec = get_tool_spec(name)
+    return bool(
+        spec and spec.dynamic and spec.connector_id
+        and (not spec.providers or "chatgpt_account" in spec.providers)
+    )
+
+
 def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     """Expose every available native capability for this provider.
 
@@ -199,7 +217,7 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     import sys
 
     from osia.capability_federation import federated_capabilities
-    from osia.tool_contracts import get_static_registry
+    from osia.tool_contracts import dynamic_tool_specs, get_static_registry
 
     registry = get_static_registry()
     available_osia = {
@@ -254,6 +272,19 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
                 "inputSchema": input_schema,
             }
         )
+    # MCP requests use the same canonical handoff as other OSIA tools.
+    # Names outside the provider's native format remain available via text.
+    tools.extend(
+        {
+            "type": "function",
+            "name": spec.name,
+            "description": spec.capability,
+            "inputSchema": deepcopy(spec.input_schema),
+        }
+        for spec in dynamic_tool_specs()
+        if spec.connector_id and _native_mcp_name(spec.name)
+        and (not spec.providers or "chatgpt_account" in spec.providers)
+    )
     return tools
 
 
@@ -266,7 +297,7 @@ def _exact_canonical_native_call(params: dict) -> dict | None:
     call_id = params.get("callId") or params.get("call_id")
     if namespace not in {None, ""}:
         return None
-    if tool not in _CANONICAL_NATIVE_TOOL_NAMES:
+    if not _is_canonical_native_handoff(tool):
         return None
     if not isinstance(arguments, dict) or "tool" in arguments:
         return None
@@ -3540,7 +3571,7 @@ class AppServerClient:
                     return
             if (
                 dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
-                or dynamic_call["tool"] not in _CANONICAL_NATIVE_TOOL_NAMES
+                or not _is_canonical_native_handoff(dynamic_call["tool"])
             ):
                 attempt.events.put(("dynamic_tool_call", {
                     "call": dynamic_call,
@@ -3930,7 +3961,7 @@ class AppServerClient:
                         attempt.dynamic_items[call_id] = deepcopy(dynamic_call)
                     if (
                         dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
-                        or dynamic_call["tool"] not in _CANONICAL_NATIVE_TOOL_NAMES
+                        or not _is_canonical_native_handoff(dynamic_call["tool"])
                     ):
                         return
                     if call_id in attempt.dynamic_tool_responses:

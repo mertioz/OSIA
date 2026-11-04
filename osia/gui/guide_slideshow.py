@@ -645,8 +645,8 @@ class GuideSlideshowDialog(QDialog):
             QLabel#guideVisualNode {{ color: {palette.muted_text}; background: {palette.elevated_surface};
                 border: 1px solid {palette.border}; border-radius: 12px; padding: 8px; }}
             QLabel#guideVisualNode[active="true"] {{ color: {palette.primary}; border-color: {palette.primary}; }}
-            QScrollBar:vertical {{ background: transparent; width: 9px; margin: 2px; }}
-            QScrollBar::handle:vertical {{ background: {palette.border}; min-height: 28px; border-radius: 4px; }}
+            QScrollBar:vertical {{ background: transparent; width: 3px; }}
+            QScrollBar::handle:vertical {{ background: {palette.border}; min-height: 28px; border-radius: 1px; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
         """)
 

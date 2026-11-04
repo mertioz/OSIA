@@ -668,8 +668,8 @@ def mcp_tool_prompt_block(lang: str = "en") -> str:
     del lang
     lines = [
         "## Connected MCP tools (available now)",
-        "Call these with the same textual <tool_call> JSON protocol and top-level "
-        "arguments as OSIA tools. Their connector permissions and execution correlation rules apply.",
+        "Use a native call when the provider exposes one. For textual calls, "
+        "use the same <tool_call> JSON protocol and top-level arguments as OSIA tools.",
     ]
     for full, meta in items:
         desc = _one_line(meta.get("description") or "")

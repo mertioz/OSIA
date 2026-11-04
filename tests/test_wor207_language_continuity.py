@@ -185,30 +185,6 @@ def test_tool_failure_receipt_is_localized_without_exposing_arguments(
     assert receipts[0].rstrip().endswith(language_instruction(_context(language)))
 
 
-@pytest.mark.parametrize("language", ["fr", "en"])
-def test_outcome_unknown_is_contextual_localized_and_never_replayed(language):
-    agent = OSIAAgent(lang=language)
-    agent.set_turn_context(_context(language))
-    visible = []
-
-    final = agent._finish_execution_barrier_stop(
-        outcome_unknown=True,
-        timed_out=True,
-        tool_name="read_document",
-        on_sentence=visible.append,
-    )
-
-    assert final == localized_text(
-        "outcome_unknown", language, action="read_document",
-    )
-    assert visible == [final]
-    assert agent.last_run_diagnostic == {
-        "stage": "task_execution",
-        "error_category": "tool_timeout",
-        "reason_code": "tool_timeout",
-    }
-
-
 class _NativeActionRefusal(RuntimeError):
     native_action = True
     reformulatable_native_action = True

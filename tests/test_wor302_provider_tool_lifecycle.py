@@ -144,6 +144,50 @@ def test_canonical_turn_dispatches_and_reinjects_without_strategy(
         for message in calls[1]["messages"]
     )
 
+
+@pytest.mark.parametrize(("provider", "model"), [
+    ("deepseek", "deepseek-flash"),
+    ("groq", "fixture-groq-model"),
+])
+def test_canonical_provider_retries_with_the_mcp_receipt_in_context(
+    monkeypatch, tmp_path, provider, model,
+):
+    from osia.mcp_client import registry
+
+    dispatched = []
+
+    def call_tool(server_id, tool_name, arguments, *, timeout):
+        dispatched.append((server_id, tool_name, arguments))
+        return "Project Alpha is active."
+
+    server_id = "wor302_retry"
+    names = registry.register_server_tools(SimpleNamespace(call_tool=call_tool), server_id, [{
+        "name": "list_projects",
+        "description": "Read project data",
+        "inputSchema": {"type": "object", "properties": {}},
+    }])
+    monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path))
+    try:
+        agent = _agent(
+            monkeypatch,
+            [_tool_call(names[0]), TimeoutError("transport timeout"), "", "",
+             "Project Alpha is active."],
+            provider=provider, model=model, lang="en",
+        )
+        assert agent.run_terminal_turn(
+            "List the projects.", turn_id=f"mcp-retry-{provider}", history=[],
+        ) == "Project Alpha is active."
+        calls = agent.client.chat.completions.calls
+        assert len(calls) == 5
+        assert all(call["model"] == model for call in calls)
+        assert dispatched == [(server_id, "list_projects", {})]
+        for call in calls[1:]:
+            assert any("Project Alpha is active." in str(message.get("content"))
+                       for message in call["messages"])
+    finally:
+        registry.unregister_server_tools(server_id)
+
+
 def _fake_stream(agent, items):
     remaining = iter(items)
     calls = []

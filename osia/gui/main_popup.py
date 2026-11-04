@@ -13033,6 +13033,9 @@ class MainPopup(QWidget):
                 width: 0px;
                 margin: 0;
             }
+            QScrollBar:horizontal {
+                height: 4px;
+            }
             QScrollBar::handle:vertical {
                 background: transparent;
                 border-radius: 0px;
@@ -13046,15 +13049,15 @@ class MainPopup(QWidget):
             }
             #chatScroll QScrollBar:vertical, #conversationScroll QScrollBar:vertical,
             #settingsScroll QScrollBar:vertical, #settingsNav QScrollBar:vertical {
-                width: 8px;
+                width: 2px;
             }
             #chatScroll QScrollBar::handle:vertical,
             #conversationScroll QScrollBar::handle:vertical,
             #settingsScroll QScrollBar::handle:vertical,
             #settingsNav QScrollBar::handle:vertical {
                 background: rgba(196, 181, 245, 0.35);
-                border: 1px solid transparent;
-                border-radius: 4px;
+                border: none;
+                border-radius: 1px;
                 min-height: 22px;
             }
             #chatScroll QScrollBar::handle:vertical:hover,
