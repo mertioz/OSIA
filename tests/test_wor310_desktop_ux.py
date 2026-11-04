@@ -210,6 +210,7 @@ class DesktopUxV2Tests(unittest.TestCase):
         self.assertIsNotNone(rename)
         self.assertIsNotNone(move)
         self.assertIsNotNone(delete)
+        self.assertIsNone(row.findChild(QPushButton, "convOpen"))
 
         opened = QSignalSpy(row.open_clicked)
         renamed = QSignalSpy(row.rename_clicked)
@@ -219,6 +220,8 @@ class DesktopUxV2Tests(unittest.TestCase):
             return_value=("Renamed conversation", True),
         ):
             QTest.mouseClick(rename, Qt.MouseButton.LeftButton)
+        with patch("osia.gui.main_popup.QMenu.exec"):
+            QTest.mouseClick(move, Qt.MouseButton.LeftButton)
         QTest.mouseClick(delete, Qt.MouseButton.LeftButton)
 
         self.assertEqual(len(opened), 0)
@@ -230,13 +233,15 @@ class DesktopUxV2Tests(unittest.TestCase):
         self.assertEqual(len(deleted), 1)
         self.assertEqual(deleted[0][0], "conversation-actions")
         for button in (rename, move, delete):
-            self.assertGreaterEqual(button.width(), 26)
-            self.assertGreaterEqual(button.height(), 26)
+            self.assertGreater(button.width(), 30)
+            self.assertEqual(button.width(), button.height())
             self.assertTrue(button.toolTip())
             self.assertEqual(button.accessibleName(), button.toolTip())
-        self.assertEqual((rename.width(), rename.height()), (30, 30))
-        self.assertEqual((move.width(), move.height()), (30, 30))
-        self.assertEqual((delete.width(), delete.height()), (30, 30))
+        title = row.findChild(QWidget, "convTitle")
+        QTest.mouseClick(title, Qt.MouseButton.LeftButton)
+        row.setFocus()
+        QTest.keyClick(row, Qt.Key.Key_Return)
+        self.assertEqual(list(opened), [["conversation-actions"]] * 2)
         row.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()

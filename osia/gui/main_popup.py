@@ -18,6 +18,7 @@ signals/slots so the host can wire up the actual behaviour without the
 GUI knowing about threads or persistence.
 """
 
+import html
 import json
 import math
 import re
@@ -37,7 +38,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
-    QTextCursor, QTextDocument, QTextOption, QImage,
+    QTextCursor, QTextDocument, QTextOption, QImage, QBrush, QLinearGradient,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -2258,7 +2259,81 @@ class _ChatPage(QWidget):
 
 # ── Conversations panel ────────────────────────────────────────────────────
 
-class _ConvRow(QFrame):
+class _ConversationTitle(QLabel):
+    """Fade only the overflowing edge of a single-line title."""
+
+    def paintEvent(self, event) -> None:
+        rect = self.contentsRect()
+        if self.fontMetrics().horizontalAdvance(self.text()) <= rect.width():
+            super().paintEvent(event)
+            return
+        right = rect.right() + 1
+        fade_width = min(28, max(1, rect.width() // 3))
+        fade = QLinearGradient(right - fade_width, 0, right, 0)
+        ink = self.palette().color(self.foregroundRole())
+        fade.setColorAt(0, ink)
+        ink.setAlpha(0)
+        fade.setColorAt(1, ink)
+        painter = QPainter(self)
+        painter.setClipRect(rect)
+        painter.setPen(QPen(QBrush(fade), 1))
+        painter.drawText(
+            rect,
+            self.alignment().value | Qt.TextFlag.TextSingleLine.value,
+            self.text(),
+        )
+        painter.end()
+
+
+class _ConversationAction(QPushButton):
+    """Paint consistent, centered icons across desktop font stacks."""
+
+    def __init__(self, kind: str, object_name: str, label: str):
+        super().__init__()
+        self._kind = kind
+        self.setObjectName(object_name)
+        self.setFixedSize(34, 34)
+        self.setToolTip(label)
+        self.setAccessibleName(label)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        path = QPainterPath()
+        if self._kind == "rename":
+            path.moveTo(3, 13)
+            path.lineTo(13.5, 2.5)
+            path.lineTo(17.5, 6.5)
+            path.lineTo(7, 17)
+            path.lineTo(2, 18)
+            path.closeSubpath()
+            path.moveTo(11.5, 4.5)
+            path.lineTo(15.5, 8.5)
+        elif self._kind == "move":
+            path.moveTo(4, 3)
+            path.lineTo(4, 10)
+            path.quadTo(4, 13, 7, 13)
+            path.lineTo(16, 13)
+            path.moveTo(12, 9)
+            path.lineTo(16, 13)
+            path.lineTo(12, 17)
+        else:
+            path.moveTo(5, 5)
+            path.lineTo(15, 15)
+            path.moveTo(15, 5)
+            path.lineTo(5, 15)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.width() / 2 - 10, self.height() / 2 - 10)
+        pen = QPen(self.palette().color(self.foregroundRole()), 1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        painter.end()
+
+
+class _ConvRow(QPushButton):
     """One row in the conversations list."""
 
     open_clicked = pyqtSignal(str)
@@ -2277,26 +2352,29 @@ class _ConvRow(QFrame):
         super().__init__()
         self.setObjectName("convRow")
         self.setProperty("active", is_active)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._conv_id = conv.get("id", "")
         self._folder_id = conv.get("folder_id")
         self._folders = list(folders or [])
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(24 if indented else 12, 3, 6, 3)
-        row.setSpacing(10)
+        row.setContentsMargins(24 if indented else 12, 8, 9, 8)
+        row.setSpacing(12)
         summary = QVBoxLayout()
         summary.setSpacing(3)
 
         self._full_title = conv.get("title") or i18n.t("conversations.new_conversation")
-        title = QLabel(self._full_title)
+        self.setAccessibleName(self._full_title)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clicked.connect(lambda: self.open_clicked.emit(self._conv_id))
+        title = _ConversationTitle(self._full_title)
         title.setObjectName("convTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
         title.setWordWrap(False)
         title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        # Width is ignored so a long title never widens the row; it is elided
-        # with an ellipsis (…) in resizeEvent instead of overflowing.
+        # Width is ignored so the title can shrink beside the actions.
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        title.setToolTip(self._full_title)
-        self._title_label = title
+        title.setToolTip(f"<qt>{html.escape(self._full_title)}</qt>")
         count = i18n.t("conversations.msg_count", count=conv.get("message_count", 0))
         updated_at = _format_time(conv.get("updated_at"))
         self._metadata = f"{count} · {updated_at}" if updated_at else count
@@ -2306,49 +2384,44 @@ class _ConvRow(QFrame):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
         self._subtitle_label.setToolTip(self._metadata)
-        open_btn = QPushButton("↗")
-        open_btn.setObjectName("convOpen")
-        open_btn.setFixedSize(30, 30)
-        open_btn.setToolTip(i18n.t("conversations.open"))
-        open_btn.setAccessibleName(i18n.t("conversations.open"))
-        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        open_btn.clicked.connect(lambda: self.open_clicked.emit(self._conv_id))
-
-        rename_btn = QPushButton("✎")
-        rename_btn.setObjectName("convRename")
-        rename_btn.setFixedSize(30, 30)
-        rename_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        rename_btn.setToolTip(i18n.t("conversations.rename"))
-        rename_btn.setAccessibleName(i18n.t("conversations.rename"))
+        self.setAccessibleDescription(self._metadata)
+        rename_btn = _ConversationAction(
+            "rename", "convRename", i18n.t("conversations.rename"),
+        )
         rename_btn.clicked.connect(self._prompt_rename)
 
-        move_btn = QPushButton("↳")
-        move_btn.setObjectName("convMove")
-        move_btn.setFixedSize(30, 30)
-        move_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        move_btn.setToolTip(i18n.t("conversations.move_to_folder"))
-        move_btn.setAccessibleName(i18n.t("conversations.move_to_folder"))
+        move_btn = _ConversationAction(
+            "move", "convMove", i18n.t("conversations.move_to_folder"),
+        )
         move_btn.clicked.connect(self._show_move_menu)
 
-        del_btn = QPushButton("×")
-        del_btn.setObjectName("convActionDel")
-        del_btn.setFixedSize(30, 30)
-        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        del_btn.setToolTip(i18n.t("conversations.delete"))
-        del_btn.setAccessibleName(i18n.t("conversations.delete"))
+        del_btn = _ConversationAction(
+            "delete", "convActionDel", i18n.t("conversations.delete"),
+        )
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self._conv_id))
 
         summary.addWidget(title)
         summary.addWidget(self._subtitle_label)
         row.addLayout(summary, 1)
         row.setAlignment(summary, Qt.AlignmentFlag.AlignVCenter)
-        actions = QGridLayout()
-        actions.setSpacing(2)
-        actions.addWidget(open_btn, 0, 0)
-        actions.addWidget(move_btn, 0, 1)
-        actions.addWidget(rename_btn, 1, 0)
-        actions.addWidget(del_btn, 1, 1)
+        actions = QHBoxLayout()
+        actions.setSpacing(7)
+        actions.addWidget(move_btn)
+        actions.addWidget(rename_btn)
+        actions.addWidget(del_btn)
         row.addLayout(actions)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt method name)
+        layout = self.layout()
+        return layout.sizeHint() if layout is not None else super().sizeHint()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not event.isAutoRepeat():
+                self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _show_move_menu(self) -> None:
         menu = QMenu(self)
@@ -2392,15 +2465,12 @@ class _ConvRow(QFrame):
         self.rename_clicked.emit(self._conv_id, new_title)
 
     def resizeEvent(self, event):
-        for label, text in (
-            (self._title_label, self._full_title),
-            (self._subtitle_label, self._metadata),
-        ):
-            label.setText(
-                label.fontMetrics().elidedText(
-                    text, Qt.TextElideMode.ElideRight, label.contentsRect().width(),
-                )
+        label = self._subtitle_label
+        label.setText(
+            label.fontMetrics().elidedText(
+                self._metadata, Qt.TextElideMode.ElideRight, label.contentsRect().width(),
             )
+        )
         super().resizeEvent(event)
 
 
@@ -12319,18 +12389,21 @@ class MainPopup(QWidget):
             }
 
             /* Conversations list ────────────────────────────────────── */
-            QFrame#convRow {
+            QPushButton#convRow {
                 background: #0f0d16;
                 border: 1px solid rgba(196, 181, 245, 0.12);
                 border-radius: 12px;
             }
-            QFrame#convRow:hover {
+            QPushButton#convRow:hover {
                 border: 1px solid rgba(196, 181, 245, 0.35);
                 background: #13111a;
             }
-            QFrame#convRow[active="true"] {
+            QPushButton#convRow[active="true"] {
                 background: rgba(196, 181, 245, 0.13);
                 border: 1px solid rgba(196, 181, 245, 0.38);
+            }
+            QPushButton#convRow:focus {
+                border-color: rgba(196, 181, 245, 0.72);
             }
             QFrame#folderRow {
                 background: rgba(196, 181, 245, 0.10);
@@ -12358,10 +12431,6 @@ class MainPopup(QWidget):
             QPushButton#convMore:hover, QPushButton#convRename:hover {
                 background: rgba(196, 181, 245, 0.22);
             }
-            QPushButton#convRename, QPushButton#convMove {
-                font-size: 14px;
-                font-weight: 600;
-            }
             QPushButton#convRename:hover, QPushButton#convRename:focus,
             QPushButton#convMove:hover, QPushButton#convMove:focus {
                 background: rgba(196, 181, 245, 0.22);
@@ -12384,17 +12453,6 @@ class MainPopup(QWidget):
                 font-size: 11px;
                 color: #9d9aad;
             }
-            QPushButton#convOpen {
-                background: rgba(196, 181, 245, 0.13);
-                border: 1px solid rgba(196, 181, 245, 0.24);
-                color: #c4b5f5;
-                border-radius: 8px;
-                padding: 0;
-                font-size: 15px;
-            }
-            QPushButton#convOpen:hover {
-                background: rgba(196, 181, 245, 0.35);
-            }
             QPushButton#convDel {
                 background: rgba(196, 181, 245, 0.04);
                 border: 1px solid rgba(196, 181, 245, 0.12);
@@ -12412,8 +12470,6 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.12);
                 color: rgba(232, 230, 240, 0.72);
                 border-radius: 8px;
-                font-size: 16px;
-                font-weight: 600;
             }
             QPushButton#convActionDel:hover {
                 background: rgba(220, 80, 80, 0.25);
