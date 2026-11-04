@@ -37,7 +37,6 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
-    QLinearGradient,
     QTextCursor, QTextDocument, QTextOption, QImage,
 )
 from PyQt6.QtWidgets import (
@@ -11091,9 +11090,7 @@ class MainPopup(QWidget):
         self._onboarding_dialog = None
 
         # Bottom nav
-        nav_frame = QFrame()
-        nav_frame.setObjectName("popupNav")
-        nav = QHBoxLayout(nav_frame)
+        nav = QHBoxLayout()
         nav.setContentsMargins(4, 3, 4, 3)
         nav.setSpacing(20)
         self._nav_group = QButtonGroup(self)
@@ -11127,7 +11124,7 @@ class MainPopup(QWidget):
         for btn in self._nav_buttons.values():
             nav.addWidget(btn)
         nav.addStretch()
-        outer.addWidget(nav_frame)
+        outer.addLayout(nav)
 
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._apply_style()
@@ -11986,11 +11983,9 @@ class MainPopup(QWidget):
             RADIUS, RADIUS,
         )
         palette = self._theme.palette
-        fill = QLinearGradient(0, card.top(), 0, card.bottom())
-        fill.setColorAt(0, palette.color("glass", 248))
-        fill.setColorAt(0.65, palette.color("background", 248))
-        painter.fillPath(path, fill)
-        painter.setPen(palette.color("primary", 75))
+        painter.fillPath(path, palette.color("background", 125))
+        painter.fillPath(path, palette.color("glass", 85))
+        painter.setPen(palette.color("primary", 70))
         painter.drawPath(path)
         painter.end()
 
@@ -12318,11 +12313,6 @@ class MainPopup(QWidget):
             }
 
             /* Bottom nav (icons are painted by _NavButton) ───────────── */
-            QFrame#popupNav {
-                background: rgba(19, 17, 26, 0.75);
-                border: 1px solid rgba(196, 181, 245, 0.12);
-                border-radius: 15px;
-            }
             QPushButton#navBtn {
                 background: transparent;
                 border: none;
