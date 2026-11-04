@@ -5649,10 +5649,10 @@ class _SettingsPanel(QWidget):
         l.setContentsMargins(14, 12, 14, 12)
         l.setSpacing(8)
 
-        self._wake_title = QLabel(i18n.t("settings.wake_greeting"))
+        self._wake_title = QLabel(i18n.t("settings.cat.wake"))
         self._wake_title.setObjectName("sectionTitle")
         self._wake_title.setWordWrap(True)
-        self._wake_sub = QLabel(i18n.t("settings.wake_greeting_sub"))
+        self._wake_sub = QLabel(i18n.t("settings.wake_development"))
         self._wake_sub.setObjectName("sectionSub")
         self._wake_sub.setWordWrap(True)
         l.addWidget(self._wake_title)
@@ -5686,6 +5686,7 @@ class _SettingsPanel(QWidget):
         self._wake_enabled_label.setObjectName("providerName")
         self._wake_enabled_label.setWordWrap(True)
         self._wake_enabled_toggle = OsiaSwitch()
+        self._wake_enabled_toggle.setEnabled(False)
         self._wake_enabled_toggle.stateChanged.connect(self._on_wake_enabled_changed)
         enable_row.addWidget(self._wake_enabled_label)
         enable_row.addStretch()
@@ -5694,6 +5695,7 @@ class _SettingsPanel(QWidget):
 
         self._wake_text_input = QLineEdit()
         self._wake_text_input.setObjectName("keyInput")
+        self._wake_text_input.setEnabled(False)
         self._wake_text_input.setPlaceholderText(i18n.t("wake.greeting_placeholder"))
         self._wake_text_input.editingFinished.connect(self._on_wake_text_changed)
         l.addWidget(self._wake_text_input)
@@ -5707,6 +5709,8 @@ class _SettingsPanel(QWidget):
         self.wake_word_enabled_changed.emit(False)
 
     def _on_wake_enabled_changed(self, _state) -> None:
+        if not self._wake_enabled_toggle.isEnabled():
+            return
         enabled = self._wake_enabled_toggle.isChecked()
         set_setting("wake_greeting_enabled", enabled)
         if enabled:
@@ -5718,6 +5722,8 @@ class _SettingsPanel(QWidget):
             set_setting("wake_greeting_text", text)
 
     def _on_wake_text_changed(self) -> None:
+        if not self._wake_text_input.isEnabled():
+            return
         set_setting("wake_greeting_text", self._wake_text_input.text().strip())
 
     # ── Section 3: Whisper providers (speech-to-text) ──────────────────────
@@ -9700,9 +9706,7 @@ class _SettingsPanel(QWidget):
         self._wake_word_toggle.setEnabled(False)
         self._wake_word_toggle.blockSignals(False)
 
-        # Wake-word greeting — empty stored text shows the active language's
-        # default as a hint; it's only persisted once the toggle is enabled or
-        # the user edits the field.
+        # Keep the saved greeting visible while its controls are disabled.
         self._wake_enabled_toggle.blockSignals(True)
         self._wake_enabled_toggle.setChecked(
             bool(settings.get("wake_greeting_enabled", False)))
@@ -10103,8 +10107,8 @@ class _SettingsPanel(QWidget):
         self._kokoro_tag.setText(i18n.t("tts.kokoro_desc"))
         self._tts_provider_combo.setItemText(0, i18n.t("tts.local_option"))
 
-        self._wake_title.setText(i18n.t("settings.wake_greeting"))
-        self._wake_sub.setText(i18n.t("settings.wake_greeting_sub"))
+        self._wake_title.setText(i18n.t("settings.cat.wake"))
+        self._wake_sub.setText(i18n.t("settings.wake_development"))
         self._wake_desc.setText(i18n.t("settings.wake_greeting_desc"))
         self._wake_word_label.setText(i18n.t("settings.wake_word_enabled"))
         self._wake_word_toggle.setToolTip(

@@ -257,7 +257,7 @@ def _package_smoke() -> int:
                 raise RuntimeError("onboarding completion did not persist")
         step = "onboarding_ui"
         onboarding = OnboardingDialog(automatic=False)
-        if onboarding.SLIDE_COUNT < 4 or onboarding.findChild(QLabel, "guideCaption") is None:
+        if onboarding.SLIDE_COUNT != 14 or onboarding.findChild(QLabel, "guideCaption") is None:
             raise RuntimeError("packaged OSIA Settings guide is incomplete")
         onboarding.deleteLater()
         qt_app.processEvents()

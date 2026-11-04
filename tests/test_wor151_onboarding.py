@@ -239,14 +239,14 @@ def test_frozen_smoke_covers_complete_guide_and_assets():
     assert "create_fresh_install_marker(state_path)" in launcher
     assert 'mark_onboarding_handled("completed", state_path)' in launcher
     assert "OnboardingDialog(automatic=False)" in launcher
-    assert "onboarding.SLIDE_COUNT < 4" in launcher
+    assert "onboarding.SLIDE_COUNT != 14" in launcher
     assert '"guideCaption"' in launcher
     assert "guide asset" in launcher
     assert '(str(ROOT / "assets"), "assets")' in spec
 
 
 @pytest.mark.parametrize("language", ["en", "fr"])
-def test_settings_guide_has_one_image_two_lines_and_one_arrow(tmp_path, language):
+def test_settings_guide_has_fourteen_illustrated_steps_and_one_arrow(tmp_path, language):
     marker = tmp_path / "onboarding.json"
     i18n.set_language(language, persist=False)
     dialog = OnboardingDialog(state_path=marker)
@@ -257,21 +257,20 @@ def test_settings_guide_has_one_image_two_lines_and_one_arrow(tmp_path, language
         assert dialog.findChildren(QPushButton) == [dialog._next]
         assert dialog._next.text() == "→"
         assert dialog._next.shortcut().toString() == "Right"
+        assert dialog._next.isFlat()
+        assert dialog.SLIDE_COUNT == 14
         assert dialog._illustration.geometry().bottom() < dialog._caption.geometry().top()
         captions = []
         frames = []
         for _ in range(dialog.SLIDE_COUNT):
-            lines = dialog._caption.text().splitlines()
-            assert len(lines) == 2
-            assert all(
-                dialog._caption.fontMetrics().horizontalAdvance(line) <= dialog._caption.width()
-                for line in lines
-            )
+            caption = dialog._caption.text()
+            assert 1 <= caption.count(".") <= 4
+            assert dialog._caption.heightForWidth(dialog._caption.width()) <= dialog._caption.height()
             captions.append(dialog._caption.text())
             frames.append(dialog._illustration.grab().toImage())
             dialog._next.click()
             _QT_APP.processEvents()
-        assert len(set(captions)) == 4
+        assert len(set(captions)) == 14
         assert all(frame != frames[0] for frame in frames[1:])
         assert not dialog.isVisible()
         assert not marker.exists()

@@ -23,7 +23,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox, QWidget
 
-from osia.gui.main_popup import _OsiaPanel
+from osia.gui.main_popup import _OsiaPanel, _SettingsPanel
 from osia.gui.switch import OsiaSwitch
 from osia.gui.theme import PALETTES, ThemeManager
 from osia.gui.update_ui import UpdateSettingsSection
@@ -302,6 +302,26 @@ class TestCanonicalSwitch:
 
 
 class TestSensitiveIntegrationContracts:
+    def test_wake_controls_are_disabled_and_voice_controls_stay_available(self):
+        with (
+            patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher"),
+            patch.object(_SettingsPanel, "_load_state"),
+            patch("osia.gui.main_popup.set_setting") as save,
+        ):
+            panel = _SettingsPanel()
+            try:
+                assert all(not control.isEnabled() for control in (
+                    panel._wake_word_toggle, panel._wake_enabled_toggle, panel._wake_text_input,
+                ))
+                assert panel._tts_provider_combo.isEnabled()
+                assert panel._stt_provider_combo.isEnabled()
+                panel._wake_word_toggle.click()
+                panel._wake_enabled_toggle.click()
+                panel._wake_text_input.editingFinished.emit()
+                save.assert_not_called()
+            finally:
+                panel.deleteLater()
+
     def test_skills_switch_calls_the_existing_persistence_callback_once(self):
         switch = OsiaSwitch(reduced_motion=lambda: True, theme_manager=_manager())
         switch.setChecked(True)
