@@ -37,6 +37,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
+    QLinearGradient,
     QTextCursor, QTextDocument, QTextOption, QImage,
 )
 from PyQt6.QtWidgets import (
@@ -44,7 +45,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
     QSizePolicy, QFileDialog, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
-    QToolTip, QMessageBox, QTextBrowser,
+    QToolTip, QMessageBox, QTextBrowser, QBoxLayout, QListView, QListWidgetItem,
+    QStyledItemDelegate,
 )
 
 from osia import conversations
@@ -123,13 +125,10 @@ POPUP_W = 440
 POPUP_H = 560
 # WOR-48 P3 — the window width is dynamic per page: COMPACT (POPUP_W) for
 # chat/conversations/models/OSIA, WIDE for the Settings master-detail layout
-# (110px category nav + ~415px detail panel; the settings form fields carry no
-# hard minimum width, so they adapt to this pane without clipping). Height never
+# (category navigation alongside a scrollable detail panel). Height never
 # changes. WOR-48 audit #2: the width now SNAPS to its target in
 # MainPopup._animate_width (no tween — the old animation slid the settings nav
-# under the cursor and swallowed the first category click). The ~415px figure is
-# narrower than the pre-audit ~470px because the card is now inset by
-# SHADOW_MARGIN for the hand-painted drop shadow (see below).
+# under the cursor and swallowed the first category click).
 POPUP_W_WIDE = 640
 RADIUS = 16     # WOR-48 P3: 20 → 16, lightly-rounded rectangle (not pill-like)
 COMPOSER_BUTTON_SIZE = 34
@@ -151,14 +150,6 @@ SHADOW_ALPHA = 45     # alpha of the innermost (darkest) ring; fades to 0 outwar
 # WOR-237: Windows must not paint the broad external halo.  The inset, window
 # geometry, translucent clear and rounded glass card remain unchanged.
 _PAINT_EXTERNAL_WINDOW_SHADOW = sys.platform != "win32"
-# Dark, semi-transparent glassmorphism fill so the popup reads as a floating
-# glass panel rather than an opaque window. Lower alpha → more transparent;
-# a second, slightly lighter layer painted on top fakes a soft blur/frost.
-# WOR-48: alpha lowered 220 → 160 → 125 for a clearly translucent "glass"
-# panel where the desktop shows through (Arch-Linux translucent-terminal look).
-# Inner surfaces (assistant bubble, input frame) keep a higher alpha so text
-# stays legible while this outer card is strongly translucent.
-
 STARTUP_SERVICES = ("osia-server.service",)
 
 # Official API-key pages opened by the "Get API key" → Browse button on each
@@ -417,8 +408,7 @@ class _Bubble(QFrame):
         self._streaming = bool(streaming)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(13, 10, 13, 10)
 
         self._source_text = text or ""
         self._available_width = _BUBBLE_MAX_WIDTH
@@ -567,8 +557,16 @@ class _ComposerInput(QTextEdit):
         self.setFixedHeight(42)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setTabChangesFocus(True)
+        self.document().setDocumentMargin(7)
+        self.document().documentLayout().documentSizeChanged.connect(
+            self._fit_document_height,
+        )
         self.palette_key_handler = None
+
+    def _fit_document_height(self, size) -> None:
+        height = max(42, min(96, math.ceil(size.height()) + 8))
+        if self.height() != height:
+            self.setFixedHeight(height)
 
     def text(self) -> str:
         """Compatibility accessor for the former QLineEdit composer."""
@@ -1235,17 +1233,16 @@ class _ChatPage(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        # WOR-48: hide the vertical bar too (scrolling stays fully functional
-        # via wheel/drag/trackpad); the QSS below makes it 0px/transparent.
+        # Reserve a slim gutter so wrapping stays stable as history grows.
         self._scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
 
         self._messages_host = QWidget()
         self._messages_host.setObjectName("chatHost")
         self._messages_layout = QVBoxLayout(self._messages_host)
-        self._messages_layout.setContentsMargins(14, 14, 14, 14)
-        self._messages_layout.setSpacing(8)
+        self._messages_layout.setContentsMargins(12, 12, 7, 12)
+        self._messages_layout.setSpacing(10)
         self._messages_layout.addStretch(1)
         self._scroll.setWidget(self._messages_host)
         self._syncing_bubble_geometry = False
@@ -1261,8 +1258,8 @@ class _ChatPage(QWidget):
         input_wrap = QFrame()
         input_wrap.setObjectName("inputWrap")
         input_layout = QVBoxLayout(input_wrap)
-        input_layout.setContentsMargins(10, 8, 10, 10)
-        input_layout.setSpacing(4)
+        input_layout.setContentsMargins(8, 5, 8, 5)
+        input_layout.setSpacing(5)
 
         self._slash_palette = SlashCommandPalette()
         settings = load_settings() or {}
@@ -1337,9 +1334,9 @@ class _ChatPage(QWidget):
         self._input.textChanged.connect(self._on_input_changed)
         self._sync_send_state()
 
-        row.addWidget(self._file_btn)
+        row.addWidget(self._file_btn, 0, Qt.AlignmentFlag.AlignBottom)
         row.addWidget(self._input, 1)
-        row.addWidget(self._send_btn)
+        row.addWidget(self._send_btn, 0, Qt.AlignmentFlag.AlignBottom)
         input_layout.addLayout(row)
         outer.addWidget(input_wrap)
 
@@ -1718,7 +1715,7 @@ class _ChatPage(QWidget):
                         "assistant_message_id", message.get("_message_id"),
                     )
                     self.set_thinking_trace(historical, historical=True)
-                self._append_bubble(role, text)
+                self._append_bubble(role, text, animate=False)
             self._scroll_timer.start(0)
         except RuntimeError:
             pass
@@ -2027,10 +2024,12 @@ class _ChatPage(QWidget):
         label = QLabel(i18n.t("chat.empty"), parent)
         label.setObjectName("chatEmpty")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
         return label
 
     def _append_bubble(
         self, role: str, text: str, *, streaming: bool = False,
+        animate: bool = True,
     ) -> tuple[QWidget, _Bubble] | None:
         # Defense in depth: never create a bubble (or its wrapper row
         # widget) for empty text — a blank QFrame collapses into a thin
@@ -2070,7 +2069,9 @@ class _ChatPage(QWidget):
             self._messages_layout.count() - 1, wrap
         )
         self._fit_messages_host_to_viewport()
-        self._motion.fade_in(wrap, MOTION.appearance_ms)
+        if animate:
+            wrap.show()
+            self._motion.fade_in(wrap, MOTION.appearance_ms)
         return wrap, bubble
 
     def _maximum_bubble_width(self) -> int:
@@ -2281,13 +2282,12 @@ class _ConvRow(QFrame):
         self._folder_id = conv.get("folder_id")
         self._folders = list(folders or [])
 
-        row = QHBoxLayout(self)
+        row = QGridLayout(self)
         row.setContentsMargins(28 if indented else 16, 10, 10, 10)
-        row.setSpacing(8)
+        row.setHorizontalSpacing(8)
+        row.setVerticalSpacing(4)
+        row.setColumnStretch(0, 1)
 
-        title_col = QVBoxLayout()
-        title_col.setContentsMargins(0, 0, 0, 0)
-        title_col.setSpacing(2)
         self._full_title = conv.get("title") or i18n.t("conversations.new_conversation")
         title = QLabel(self._full_title)
         title.setObjectName("convTitle")
@@ -2296,16 +2296,17 @@ class _ConvRow(QFrame):
         # Width is ignored so a long title never widens the row; it is elided
         # with an ellipsis (…) in resizeEvent instead of overflowing.
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        title.setToolTip(self._full_title)
         self._title_label = title
-        sub = QLabel(
-            i18n.t("conversations.msg_count", count=conv.get("message_count", 0))
-            + " · "
-            + _format_time(conv.get("updated_at"))
+        count = i18n.t("conversations.msg_count", count=conv.get("message_count", 0))
+        updated_at = _format_time(conv.get("updated_at"))
+        self._metadata = f"{count} · {updated_at}" if updated_at else count
+        self._subtitle_label = QLabel(self._metadata)
+        self._subtitle_label.setObjectName("convSub")
+        self._subtitle_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
-        sub.setObjectName("convSub")
-        title_col.addWidget(title)
-        title_col.addWidget(sub)
-
+        self._subtitle_label.setToolTip(self._metadata)
         open_btn = QPushButton(i18n.t("conversations.open"))
         open_btn.setObjectName("convOpen")
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2335,11 +2336,12 @@ class _ConvRow(QFrame):
         del_btn.setAccessibleName(i18n.t("conversations.delete"))
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self._conv_id))
 
-        row.addLayout(title_col, 1)
-        row.addWidget(open_btn)
-        row.addWidget(move_btn)
-        row.addWidget(rename_btn)
-        row.addWidget(del_btn)
+        row.addWidget(title, 0, 0, 1, 5)
+        row.addWidget(self._subtitle_label, 1, 0)
+        row.addWidget(open_btn, 1, 1)
+        row.addWidget(move_btn, 1, 2)
+        row.addWidget(rename_btn, 1, 3)
+        row.addWidget(del_btn, 1, 4)
 
     def _show_move_menu(self) -> None:
         menu = QMenu(self)
@@ -2383,13 +2385,15 @@ class _ConvRow(QFrame):
         self.rename_clicked.emit(self._conv_id, new_title)
 
     def resizeEvent(self, event):
-        fm = self._title_label.fontMetrics()
-        self._title_label.setText(
-            fm.elidedText(
-                self._full_title, Qt.TextElideMode.ElideRight,
-                max(0, self._title_label.width()),
+        for label, text in (
+            (self._title_label, self._full_title),
+            (self._subtitle_label, self._metadata),
+        ):
+            label.setText(
+                label.fontMetrics().elidedText(
+                    text, Qt.TextElideMode.ElideRight, label.contentsRect().width(),
+                )
             )
-        )
         super().resizeEvent(event)
 
 
@@ -2595,14 +2599,14 @@ class _ConversationsPanel(QWidget):
         self._delete_notice_timer.timeout.connect(self._delete_notice.hide)
 
         scroll = QScrollArea()
-        scroll.setObjectName("panelScroll")
+        scroll.setObjectName("conversationScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
 
         self._host = QWidget()
@@ -3579,11 +3583,29 @@ class _ModelPanel(QWidget):
 
 # ── Settings panel ──────────────────────────────────────────────────────────
 
+class _SettingsCategoryDelegate(QStyledItemDelegate):
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 (Qt method name)
+        hint = super().sizeHint(option, index)
+        view = self.parent()
+        # Allow for the horizontal item padding, border and Qt's text inset.
+        text_width = max(1, view.viewport().width() - 24)
+        metrics = option.fontMetrics
+        wrapped = metrics.boundingRect(
+            QRect(0, 0, text_width, 0),
+            Qt.TextFlag.TextWordWrap.value,
+            index.data(Qt.ItemDataRole.DisplayRole),
+        )
+        hint.setHeight(hint.height() + max(0, wrapped.height() - metrics.height()))
+        return hint
+
+
 class _SettingsNavigationList(QListWidget):
     """Category list whose wheel events stay inside the Settings navigation."""
 
     def __init__(self):
         super().__init__()
+        self.setItemDelegate(_SettingsCategoryDelegate(self))
+        self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
     def wheelEvent(self, event) -> None:  # noqa: N802 (Qt method name)
@@ -4646,32 +4668,38 @@ class _SettingsPanel(QWidget):
         # of which address widgets via the self._xxx attributes the builders set.
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(10)
+        body.setSpacing(12)
 
         # LEFT — category navigation.
         self._settings_nav = _SettingsNavigationList()
         self._settings_nav.setObjectName("settingsNav")
-        self._settings_nav.setFixedWidth(110)
+        self._settings_nav.setFixedWidth(128)
+        self._settings_nav.setAccessibleName(i18n.t("settings.title"))
         self._settings_nav.setWordWrap(True)
         self._settings_nav.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._settings_nav.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
         body.addWidget(self._settings_nav)
 
-        # RIGHT — keep a QScrollArea#panelScroll (so the transparent-bg QSS and
-        # ScrollBarAlwaysOff still apply) wrapping a QStackedWidget of pages.
+        # Keep the current category visible while its cards scroll.
+        detail = QVBoxLayout()
+        detail.setSpacing(8)
+        self._settings_category_title = QLabel()
+        self._settings_category_title.setObjectName("settingsCategoryTitle")
+        self._settings_category_title.setWordWrap(True)
+        detail.addWidget(self._settings_category_title)
         self._settings_scroll = QScrollArea()
-        self._settings_scroll.setObjectName("panelScroll")
+        self._settings_scroll.setObjectName("settingsScroll")
         self._settings_scroll.setWidgetResizable(True)
         self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._settings_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._settings_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
 
         self._settings_stack = _SettingsDetailStack()
@@ -4738,10 +4766,13 @@ class _SettingsPanel(QWidget):
                 self._settings_extent_watchers.add(_sec)
             pv.addStretch(1)
             self._settings_stack.addWidget(page)
-            self._settings_nav.addItem(i18n.t(_key))
+            item = QListWidgetItem(i18n.t(_key))
+            item.setToolTip(item.text())
+            self._settings_nav.addItem(item)
 
         self._settings_scroll.setWidget(self._settings_stack)
-        body.addWidget(self._settings_scroll, 1)
+        detail.addWidget(self._settings_scroll, 1)
+        body.addLayout(detail, 1)
         outer.addLayout(body, 1)
 
         # Wire the nav -> stack, default to the first category.
@@ -4794,6 +4825,7 @@ class _SettingsPanel(QWidget):
     def _on_settings_category_changed(self, row: int) -> None:
         if row < 0:
             return
+        self._settings_category_title.setText(self._settings_nav.item(row).text())
         self._settings_stack.setCurrentIndex(row)
         self._schedule_settings_detail_extent()
         # WOR-198: reset only the independently owned right detail pane.
@@ -4827,6 +4859,13 @@ class _SettingsPanel(QWidget):
         width = self._settings_scroll.viewport().width()
         if width <= 0:
             return
+        if self._settings_stack.currentIndex() == 0:
+            direction = (
+                QBoxLayout.Direction.LeftToRight if width >= 350
+                else QBoxLayout.Direction.TopToBottom
+            )
+            if self._locale_fields.direction() != direction:
+                self._locale_fields.setDirection(direction)
         layout = page.layout()
         if layout is not None:
             layout.activate()
@@ -4856,6 +4895,9 @@ class _SettingsPanel(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt method name)
         super().resizeEvent(event)
+        nav_width = max(96, min(144, round(event.size().width() * 0.25)))
+        if self._settings_nav.width() != nav_width:
+            self._settings_nav.setFixedWidth(nav_width)
         self._schedule_settings_detail_extent()
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt method name)
@@ -4942,20 +4984,34 @@ class _SettingsPanel(QWidget):
         for code, name in i18n.available_languages().items():
             self._language_combo.addItem(name, code)
         self._language_combo.currentIndexChanged.connect(self._on_language_changed)
-        l.addWidget(self._language_combo)
 
-        # Time format (12h / 24h) — applies to every wall-clock time OSIA shows
-        # (conversation timestamps, cron daily schedules, heartbeat alerts).
+        self._locale_fields = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self._locale_fields.setSpacing(10)
+        language_field = QVBoxLayout()
+        language_field.setSpacing(5)
+        self._language_label = QLabel(i18n.t("settings.language"))
+        self._language_label.setObjectName("fieldLabel")
+        self._language_label.setWordWrap(True)
+        self._language_label.setBuddy(self._language_combo)
+        language_field.addWidget(self._language_label)
+        language_field.addWidget(self._language_combo)
+
+        time_field = QVBoxLayout()
+        time_field.setSpacing(5)
         self._timefmt_label = QLabel(i18n.t("settings.time_format"))
-        self._timefmt_label.setObjectName("sectionSub")
+        self._timefmt_label.setObjectName("fieldLabel")
         self._timefmt_label.setWordWrap(True)
-        l.addWidget(self._timefmt_label)
         self._timefmt_combo = QComboBox()
         self._timefmt_combo.setObjectName("voiceCombo")
         self._timefmt_combo.addItem(i18n.t("settings.time_format_24h"), "24h")
         self._timefmt_combo.addItem(i18n.t("settings.time_format_12h"), "12h")
         self._timefmt_combo.currentIndexChanged.connect(self._on_time_format_changed)
-        l.addWidget(self._timefmt_combo)
+        self._timefmt_label.setBuddy(self._timefmt_combo)
+        time_field.addWidget(self._timefmt_label)
+        time_field.addWidget(self._timefmt_combo)
+        self._locale_fields.addLayout(language_field, 1)
+        self._locale_fields.addLayout(time_field, 1)
+        l.addLayout(self._locale_fields)
 
         # Keep this section's own labels translated on language change.
         i18n.add_listener(self._retranslate_language_section)
@@ -5037,6 +5093,7 @@ class _SettingsPanel(QWidget):
 
     def _retranslate_language_section(self) -> None:
         self._language_title.setText(i18n.t("settings.language"))
+        self._language_label.setText(i18n.t("settings.language"))
         self._language_sub.setText(i18n.t("settings.language_sub"))
         self._language_desc.setText(i18n.t("settings.language_desc"))
         self._timefmt_label.setText(i18n.t("settings.time_format"))
@@ -10039,6 +10096,11 @@ class _SettingsPanel(QWidget):
             item = self._settings_nav.item(_row)
             if item is not None:
                 item.setText(i18n.t(_key))
+                item.setToolTip(item.text())
+        current = self._settings_nav.currentItem()
+        if current is not None:
+            self._settings_category_title.setText(current.text())
+        self._settings_nav.setAccessibleName(i18n.t("settings.title"))
 
     def _on_startup_toggle_changed(self, unit: str, toggle: OsiaSwitch) -> None:
         if self._startup_refresh_guard:
@@ -10514,7 +10576,7 @@ class _NavButton(QPushButton):
     itself switches to the violet accent; hover shows a softer violet wash.
     """
 
-    ICON_PX = 29    # WOR-48 P3: 33 → 29, slightly smaller nav glyphs
+    ICON_PX = 23
 
     def __init__(self, kind: str, tooltip: str):
         super().__init__()
@@ -10524,44 +10586,46 @@ class _NavButton(QPushButton):
         self._tip_key: str | None = None
         self.setObjectName("navBtn")
         self.setCheckable(True)
-        # The button must stay taller than the painted glyphs — notably the
-        # speech-bubble tail, which reaches ~0.22*ICON_PX below the bubble
-        # body — so they never clip against its bottom edge. WOR-48 P3:
-        # 52×56 → 46×50, slightly smaller buttons to match the smaller icons
-        # (ICON_PX 29: the tail bottoms out ~17px below centre, well inside
-        # the 25px half-height).
         self.setFixedSize(46, 50)
         self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._hovered = False
+        self._hover_target = 0.0
         self._hover_progress = 0.0
+        self._selection_progress = 0.0
         self._hover_anim = QVariantAnimation(self)
-        self._hover_anim.setDuration(MOTION.micro_ms)
         self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._hover_anim.valueChanged.connect(self._on_hover_progress)
+        self._hover_anim.valueChanged.connect(self._update_highlight)
+        self.toggled.connect(lambda: self._animate_highlight(MOTION.page_ms))
 
     def enterEvent(self, event):
-        self._hovered = True
         self._animate_hover(1.0)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self._hovered = False
         self._animate_hover(0.0)
         super().leaveEvent(event)
 
     def _animate_hover(self, target: float) -> None:
+        self._hover_target = target
+        self._animate_highlight(MOTION.micro_ms)
+
+    def _animate_highlight(self, duration_ms: int) -> None:
+        target = QPointF(self._hover_target, float(self.isChecked()))
         self._hover_anim.stop()
-        if reduced_motion_requested(self):
-            self._hover_progress = target
-            self.update()
+        if reduced_motion_requested(self) or not self.isVisible():
+            self._update_highlight(target)
             return
-        self._hover_anim.setStartValue(self._hover_progress)
+        self._hover_anim.setDuration(duration_ms)
+        self._hover_anim.setStartValue(
+            QPointF(self._hover_progress, self._selection_progress),
+        )
         self._hover_anim.setEndValue(target)
         self._hover_anim.start()
 
-    def _on_hover_progress(self, value) -> None:
-        self._hover_progress = float(value)
+    def _update_highlight(self, value: QPointF) -> None:
+        self._hover_progress = value.x()
+        self._selection_progress = value.y()
         self.update()
 
     def paintEvent(self, event):
@@ -10572,22 +10636,26 @@ class _NavButton(QPushButton):
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         active = self.isChecked()
 
-        # Rounded pill background — a subtle violet wash when active (no border
-        # line), a softer one on hover.
-        if self.isDown():
+        highlight = (
+            55 if self.isDown()
+            else round(max(35 * self._selection_progress, 24 * self._hover_progress))
+        )
+        if highlight:
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(palette.color("primary", 55))
-            p.drawRoundedRect(rect, 9, 9)
-        elif active:
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(palette.color("primary", 31))
-            p.drawRoundedRect(rect, 10, 10)
-        elif self._hover_progress > 0.0:
+            p.setBrush(palette.color("primary", highlight))
+            p.drawRoundedRect(rect, 12, 12)
+
+        if self._selection_progress > 0:
+            marker_width = 18 * self._selection_progress
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(
-                palette.color("primary", round(36 * self._hover_progress))
+                palette.color("primary", round(255 * self._selection_progress))
             )
-            p.drawRoundedRect(rect, 12, 12)
+            p.drawRoundedRect(
+                QRectF((self.width() - marker_width) / 2, self.height() - 8,
+                       marker_width, 2.5),
+                1.25, 1.25,
+            )
 
         if self.hasFocus():
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -10599,7 +10667,7 @@ class _NavButton(QPushButton):
                  else palette.color("text", 200))
 
         cx = self.width() / 2
-        cy = self.height() / 2
+        cy = self.height() / 2 - 2
         s = self.ICON_PX
         if self._kind == "conv":
             self._paint_bubble(p, cx, cy, s, color)
@@ -11023,8 +11091,11 @@ class MainPopup(QWidget):
         self._onboarding_dialog = None
 
         # Bottom nav
-        nav = QHBoxLayout()
-        nav.setSpacing(22)   # WOR-48 P3: 12 → 22, icons spaced further apart
+        nav_frame = QFrame()
+        nav_frame.setObjectName("popupNav")
+        nav = QHBoxLayout(nav_frame)
+        nav.setContentsMargins(4, 3, 4, 3)
+        nav.setSpacing(20)
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
 
@@ -11056,7 +11127,7 @@ class MainPopup(QWidget):
         for btn in self._nav_buttons.values():
             nav.addWidget(btn)
         nav.addStretch()
-        outer.addLayout(nav)
+        outer.addWidget(nav_frame)
 
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._apply_style()
@@ -11774,7 +11845,9 @@ class MainPopup(QWidget):
         for btn in self._nav_buttons.values():
             tip_key = getattr(btn, "_tip_key", None)
             if tip_key:
-                btn.setToolTip(i18n.t(tip_key))
+                label = i18n.t(tip_key)
+                btn.setToolTip(label)
+                btn.setAccessibleName(label)
 
     def _apply_current_busy(self) -> None:
         active_id = self._active_conversation_id
@@ -11913,12 +11986,11 @@ class MainPopup(QWidget):
             RADIUS, RADIUS,
         )
         palette = self._theme.palette
-        painter.fillPath(path, palette.color("background", 125))
-        # A second, slightly lighter wash layered on top fakes a frosted-glass
-        # blur — the panel reads as semi-transparent glass rather than a flat
-        # dark fill.
-        painter.fillPath(path, palette.color("glass", 85))
-        painter.setPen(palette.color("primary", 70))
+        fill = QLinearGradient(0, card.top(), 0, card.bottom())
+        fill.setColorAt(0, palette.color("glass", 248))
+        fill.setColorAt(0.65, palette.color("background", 248))
+        painter.fillPath(path, fill)
+        painter.setPen(palette.color("primary", 75))
         painter.drawPath(path)
         painter.end()
 
@@ -11957,7 +12029,7 @@ class MainPopup(QWidget):
 
             /* Panels ─────────────────────────────────────────────────── */
             QLabel#panelTitle {
-                font-size: 15px;
+                font-size: 19px;
                 font-weight: 600;
             }
             QLabel#panelSub {
@@ -12005,6 +12077,7 @@ class MainPopup(QWidget):
             }
 
             QScrollArea#chatScroll, QScrollArea#panelScroll,
+            QScrollArea#conversationScroll, QScrollArea#settingsScroll,
             QWidget#chatHost, QWidget#panelHost {
                 background: transparent;
                 border: none;
@@ -12014,28 +12087,31 @@ class MainPopup(QWidget):
                layer (viewport + host) back to transparent with no border so
                panels sit on the app's dark #0d0b12 glass and no stray rule
                shows through when the list is empty and no rows cover it. */
-            QScrollArea#chatScroll > QWidget,
-            QScrollArea#panelScroll > QWidget,
             QScrollArea#chatScroll > QWidget > QWidget,
-            QScrollArea#panelScroll > QWidget > QWidget {
+            QScrollArea#panelScroll > QWidget > QWidget,
+            QScrollArea#conversationScroll > QWidget > QWidget,
+            QScrollArea#settingsScroll > QWidget > QWidget {
                 background: transparent;
                 border: none;
             }
 
-            /* WOR-48 P2 — settings category nav (master-detail). Transparent
-               list; selected row is a violet accent pill in the existing
-               rgba(196,181,245,…) palette, hover is a subtler wash. */
             QListWidget#settingsNav {
-                background: transparent;
-                border: none;
+                background: rgba(13, 11, 18, 0.48);
+                border: 1px solid rgba(196, 181, 245, 0.13);
+                border-radius: 13px;
+                padding: 4px;
                 outline: 0;
                 font-size: 12px;
             }
+            QListWidget#settingsNav:focus {
+                border-color: rgba(196, 181, 245, 0.48);
+            }
             QListWidget#settingsNav::item {
-                color: #9d9aad;
-                padding: 7px 8px;
-                margin: 2px 1px;
-                border-radius: 9px;
+                color: rgba(232, 230, 240, 0.78);
+                padding: 8px 7px;
+                margin: 1px 0;
+                border: 1px solid transparent;
+                border-radius: 8px;
             }
             QListWidget#settingsNav::item:hover {
                 background: rgba(196, 181, 245, 0.08);
@@ -12043,27 +12119,35 @@ class MainPopup(QWidget):
             }
             QListWidget#settingsNav::item:selected {
                 background: rgba(196, 181, 245, 0.16);
-                color: #e8e6f0;
+                border-color: rgba(196, 181, 245, 0.22);
+                color: #c4b5f5;
+            }
+            QLabel#settingsCategoryTitle {
+                color: #c4b5f5;
+                font-size: 14px;
+                font-weight: 600;
+                padding: 2px 3px;
             }
 
             /* Chat ───────────────────────────────────────────────────── */
             QLabel#chatEmpty {
-                color: #9d9aad;
-                font-size: 12px;
-                padding: 40px 12px;
+                color: rgba(232, 230, 240, 0.80);
+                font-size: 15px;
+                padding: 46px 14px 24px;
             }
             QFrame#msgBubble {
                 border-radius: 14px;
                 padding: 0px;
             }
-            /* WOR-48: softer bubble borders for a lighter, glassier look. */
             QFrame#msgBubble[role="user"] {
-                background: rgba(196, 181, 245, 0.18);
+                background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.22);
+                border-bottom-right-radius: 5px;
             }
             QFrame#msgBubble[role="assistant"] {
-                background: rgba(15, 13, 22, 0.62);
-                border: 1px solid rgba(196, 181, 245, 0.08);
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-bottom-left-radius: 5px;
             }
             QFrame#msgBubble[streaming="true"] {
                 border: 1px solid rgba(196, 181, 245, 0.22);
@@ -12073,10 +12157,12 @@ class MainPopup(QWidget):
             }
             QLabel#msgText, QTextBrowser#msgText {
                 color: #e8e6f0;
-                font-size: 12px;
+                font-size: 14px;
                 background: transparent;
                 border: none;
                 padding: 0px;
+                selection-background-color: #c4b5f5;
+                selection-color: #0d0b12;
             }
             QFrame#chatThinkingTrace {
                 background: transparent;
@@ -12119,11 +12205,10 @@ class MainPopup(QWidget):
                 color: #ffffff;
             }
 
-            /* WOR-48: lighter input frame — translucent fill, softer border. */
             QFrame#inputWrap {
-                background: rgba(19, 17, 26, 0.62);
-                border: 1px solid rgba(196, 181, 245, 0.10);
-                border-radius: 14px;
+                background: #1a1625;
+                border: 1px solid rgba(196, 181, 245, 0.19);
+                border-radius: 16px;
             }
             QFrame#inputWrap:hover {
                 border: 1px solid rgba(196, 181, 245, 0.26);
@@ -12132,8 +12217,8 @@ class MainPopup(QWidget):
                 background: transparent;
                 border: none;
                 color: #e8e6f0;
-                font-size: 12px;
-                padding: 4px 2px;
+                font-size: 14px;
+                padding: 4px 0;
             }
             QPushButton#iconBtn, QPushButton#sendBtn {
                 border: 1px solid rgba(196, 181, 245, 0.18);
@@ -12233,6 +12318,11 @@ class MainPopup(QWidget):
             }
 
             /* Bottom nav (icons are painted by _NavButton) ───────────── */
+            QFrame#popupNav {
+                background: rgba(19, 17, 26, 0.75);
+                border: 1px solid rgba(196, 181, 245, 0.12);
+                border-radius: 15px;
+            }
             QPushButton#navBtn {
                 background: transparent;
                 border: none;
@@ -12249,9 +12339,8 @@ class MainPopup(QWidget):
                 background: #13111a;
             }
             QFrame#convRow[active="true"] {
-                background: rgba(196, 181, 245, 0.16);
-                border: 1px solid rgba(196, 181, 245, 0.5);
-                border-left: 3px solid #c4b5f5;
+                background: rgba(196, 181, 245, 0.13);
+                border: 1px solid rgba(196, 181, 245, 0.38);
             }
             QFrame#folderRow {
                 background: rgba(196, 181, 245, 0.10);
@@ -12298,21 +12387,20 @@ class MainPopup(QWidget):
                 color: #858291;
             }
             QLabel#convTitle {
-                font-size: 13px;
+                font-size: 14px;
                 font-weight: 600;
-                padding-left: 2px;
             }
             QLabel#convSub {
                 font-size: 11px;
                 color: #9d9aad;
             }
             QPushButton#convOpen {
-                background: rgba(196, 181, 245, 0.20);
-                border: 1px solid rgba(196, 181, 245, 0.40);
-                color: #e8e6f0;
+                background: rgba(196, 181, 245, 0.13);
+                border: 1px solid rgba(196, 181, 245, 0.24);
+                color: #c4b5f5;
                 border-radius: 10px;
-                padding: 8px 16px;
-                font-size: 11px;
+                padding: 7px 10px;
+                font-size: 12px;
             }
             QPushButton#convOpen:hover {
                 background: rgba(196, 181, 245, 0.35);
@@ -12467,12 +12555,9 @@ class MainPopup(QWidget):
 
             /* Settings sections ─────────────────────────────────────── */
             QFrame#section {
-                background: #0f0d16;
-                border: 1px solid rgba(196, 181, 245, 0.12);
-                border-radius: 12px;
-            }
-            QFrame#section:hover {
-                border: 1px solid rgba(196, 181, 245, 0.32);
+                background: #13111a;
+                border: 1px solid rgba(196, 181, 245, 0.15);
+                border-radius: 14px;
             }
             QDialog#onboardingDialog {
                 background: #0d0b12;
@@ -12529,20 +12614,16 @@ class MainPopup(QWidget):
                 border: 1px solid rgba(196, 181, 245, 0.62);
             }
             QLabel#sectionTitle {
-                font-size: 13px;
+                font-size: 15px;
                 font-weight: 600;
-                background: rgba(196, 181, 245, 0.06);
-                border-radius: 10px;
-                padding: 5px 10px;
             }
             QLabel#sectionSub {
-                font-size: 11px;
-                color: #9d9aad;
+                font-size: 12px;
+                color: rgba(232, 230, 240, 0.88);
             }
             QLabel#sectionDesc {
-                font-size: 11px;
-                color: #8a8798;
-                line-height: 1.35;
+                font-size: 12px;
+                color: #9d9aad;
             }
             QLabel#fieldLabel {
                 font-size: 12px;
@@ -12816,12 +12897,7 @@ class MainPopup(QWidget):
                 font-size: 12px;
             }
 
-            /* WOR-48: scrollbars are fully hidden everywhere (the per-area
-               ScrollBarAlwaysOff policy does the hiding). This QSS is a
-               belt-and-suspenders fallback so no bar ever renders — including
-               in child dialogs that don't set the policy: zero width and a
-               fully transparent track + handle. Scrolling stays functional
-               (wheel/drag/trackpad). */
+            /* Opt the main reading panes into a slim, draggable scrollbar. */
             QScrollBar:vertical {
                 background: transparent;
                 width: 0px;
@@ -12837,6 +12913,33 @@ class MainPopup(QWidget):
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0;
+            }
+            #chatScroll QScrollBar:vertical, #conversationScroll QScrollBar:vertical,
+            #settingsScroll QScrollBar:vertical, #settingsNav QScrollBar:vertical {
+                width: 8px;
+            }
+            #chatScroll QScrollBar::handle:vertical,
+            #conversationScroll QScrollBar::handle:vertical,
+            #settingsScroll QScrollBar::handle:vertical,
+            #settingsNav QScrollBar::handle:vertical {
+                background: rgba(196, 181, 245, 0.35);
+                border: 1px solid transparent;
+                border-radius: 4px;
+                min-height: 22px;
+            }
+            #chatScroll QScrollBar::handle:vertical:hover,
+            #conversationScroll QScrollBar::handle:vertical:hover,
+            #settingsScroll QScrollBar::handle:vertical:hover,
+            #settingsNav QScrollBar::handle:vertical:hover {
+                background: rgba(196, 181, 245, 0.62);
+            }
+            #chatScroll QScrollBar::handle:vertical:disabled,
+            #conversationScroll QScrollBar::handle:vertical:disabled,
+            #settingsScroll QScrollBar::handle:vertical:disabled {
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
             }
         """, self._theme.palette))
 
