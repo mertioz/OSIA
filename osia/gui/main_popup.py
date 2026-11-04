@@ -75,7 +75,7 @@ from osia.utils.systemd_manager import (
     is_service_enabled, enable_service, disable_service, get_service_status,
     restart_service, stop_service,
 )
-from osia.utils.assets import LOGO_PATH, autostart_enabled, set_autostart
+from osia.utils.assets import autostart_enabled, set_autostart
 from osia import i18n
 from osia import timefmt
 from osia.perf import perf_timer
@@ -11057,28 +11057,6 @@ class MainPopup(QWidget):
         outer.setContentsMargins(_m, _m, _m, _m)
         outer.setSpacing(6)
 
-        # Header — OSIA logo on the left, close button on the right. The logo
-        # alone represents OSIA, so no separate "OSIA" wordmark is shown.
-        header = QHBoxLayout()
-        header.setSpacing(8)
-
-        logo = QLabel()
-        logo.setObjectName("popupLogo")
-        logo_pix = QPixmap(LOGO_PATH)
-        if not logo_pix.isNull():
-            # Render at the screen's device-pixel ratio so the logo stays crisp
-            # on high-DPI / fractionally-scaled Windows displays: scale to
-            # 44·dpr physical px and tag the pixmap with that ratio, so Qt shows
-            # it at 44 logical px from native-resolution pixels (no upscale
-            # blur). dpr == 1.0 reproduces the previous result exactly.
-            dpr = logo.devicePixelRatioF() or 1.0
-            scaled = logo_pix.scaledToHeight(
-                max(1, round(44 * dpr)),
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            scaled.setDevicePixelRatio(dpr)
-            logo.setPixmap(scaled)
-
         close_btn = QPushButton("✕")
         close_btn.setObjectName("closeBtn")
         # WOR-48 P3: slightly larger, SQUARE with lightly rounded corners
@@ -11087,10 +11065,7 @@ class MainPopup(QWidget):
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self._hide_animated)
 
-        header.addWidget(logo)
-        header.addStretch()
-        header.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        outer.addLayout(header)
+        outer.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
 
         self._update_banner = UpdateBanner(self)
         outer.addWidget(self._update_banner)
