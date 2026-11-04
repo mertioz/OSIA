@@ -188,6 +188,25 @@ FREETIER_INFO_KEYS = {
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+def _paint_gear(painter: QPainter, cx: float, cy: float, size: float, color: QColor) -> None:
+    """Paint a toothed ring with a hollow center."""
+    outer = size / 2
+    inner = outer * 0.62
+    teeth = 8
+    path = QPainterPath()
+    path.moveTo(cx + outer, cy)
+    for index in range(1, teeth * 2):
+        angle = index * math.pi / teeth
+        radius = inner if index % 2 else outer
+        path.lineTo(cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+    path.closeSubpath()
+    hole = QPainterPath()
+    hole.addEllipse(QPointF(cx, cy), outer * 0.40, outer * 0.40)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawPath(path.subtracted(hole))
+
+
 def _format_time(ts: str | None) -> str:
     if not ts:
         return ""
@@ -3181,11 +3200,23 @@ class _ModelRow(QFrame):
         actions_lay.setSpacing(8)
         actions_width = btn_width
         if self._reasoning_options:
-            self._reasoning_btn = QPushButton("\u2699")
+            self._reasoning_btn = QPushButton()
             self._reasoning_btn.setObjectName("modelReasoning")
             self._reasoning_btn.setFixedSize(30, 30)
             self._reasoning_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._reasoning_btn.setToolTip(i18n.t("reasoning.tooltip"))
+            label = i18n.t("reasoning.tooltip")
+            self._reasoning_btn.setToolTip(label)
+            self._reasoning_btn.setAccessibleName(label)
+            icon_size = QSize(14, 14)
+            icon = QPixmap(icon_size * 2)
+            icon.setDevicePixelRatio(2)
+            icon.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(icon)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            _paint_gear(painter, 7, 7, 13, QColor(Qt.GlobalColor.white))
+            painter.end()
+            self._reasoning_btn.setIcon(QIcon(icon))
+            self._reasoning_btn.setIconSize(icon_size)
             self._reasoning_btn.clicked.connect(self._show_reasoning_menu)
             actions_lay.addWidget(self._reasoning_btn)
             actions_width += 38
@@ -3328,7 +3359,9 @@ class _ModelRow(QFrame):
 
     def _retranslate_reasoning(self) -> None:
         if self._reasoning_btn is not None:
-            self._reasoning_btn.setToolTip(i18n.t("reasoning.tooltip"))
+            label = i18n.t("reasoning.tooltip")
+            self._reasoning_btn.setToolTip(label)
+            self._reasoning_btn.setAccessibleName(label)
         self._refresh_reasoning_chip()
 
 
@@ -10787,7 +10820,7 @@ class _NavButton(QPushButton):
         elif self._kind == "models":
             self._paint_sparkle(p, cx, cy, s, color)
         elif self._kind == "settings":
-            self._paint_gear(p, cx, cy, s, color)
+            _paint_gear(p, cx, cy, s, color)
         elif self._kind == "osia":
             self._paint_person(p, cx, cy, s, color)
         p.end()
@@ -10826,32 +10859,6 @@ class _NavButton(QPushButton):
         path.lineTo(cx - r, cy)                 # left
         path.lineTo(cx - waist, cy - waist)
         path.closeSubpath()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(color)
-        p.drawPath(path)
-
-    def _paint_gear(self, p, cx, cy, s, color) -> None:
-        """A gear — toothed ring with a hollow centre."""
-        outer = s / 2
-        inner = outer * 0.62
-        teeth = 8
-        path = QPainterPath()
-        steps = teeth * 2
-        for k in range(steps + 1):
-            ang = k * math.pi / teeth
-            rad = outer if (k % 2 == 0) else inner
-            x = cx + rad * math.cos(ang)
-            y = cy + rad * math.sin(ang)
-            if k == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-        path.closeSubpath()
-        # Hollow hub
-        hub = outer * 0.40
-        hole = QPainterPath()
-        hole.addEllipse(QPointF(cx, cy), hub, hub)
-        path = path.subtracted(hole)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         p.drawPath(path)
@@ -12557,20 +12564,16 @@ class MainPopup(QWidget):
             QPushButton#modelReasoning {
                 background: rgba(196, 181, 245, 0.06);
                 border: 1px solid rgba(196, 181, 245, 0.16);
-                color: rgba(232, 230, 240, 0.68);
                 border-radius: 10px;
-                font-size: 13px;
                 padding: 0;
             }
             QPushButton#modelReasoning:hover {
                 background: rgba(196, 181, 245, 0.14);
                 border: 1px solid rgba(196, 181, 245, 0.34);
-                color: #e8e6f0;
             }
             QPushButton#modelReasoning[selected="true"] {
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.44);
-                color: #c4b5f5;
             }
             QPushButton#modelUse {
                 background: rgba(196, 181, 245, 0.18);
