@@ -49,23 +49,27 @@ def test_begin_turn_activity_and_terminal_projection_do_not_raise():
     _LIVE_APPS.append(app)
     page = _ChatPage()
     widget = _ChatThinkingTrace()
+    binding = {
+        "conversation_id": "crash-conv", "request_id": "crash-request",
+        "turn_id": "crash-turn", "run_id": "crash-run",
+        "provider_id": "deepseek", "model_id": "deepseek-flash",
+        "effective_reasoning": "high",
+    }
     try:
         widget.set_active(True)
-        assert widget._stop.isEnabled()
+        assert not widget.can_cancel
+        assert widget.apply_trace({**binding, "snapshot": []})
+        widget.set_active(True)
+        assert widget.can_cancel
         widget._cancel_pending = True
         widget.set_active(True)
-        assert not widget._stop.isEnabled()
+        assert not widget.can_cancel
         widget._cancel_pending = False
         widget._binding["terminal"] = True
         widget.set_active(True)
-        assert not widget._stop.isEnabled()
+        assert not widget.can_cancel
         widget.mark_inactive()
-        page.begin_turn({
-            "conversation_id": "crash-conv", "request_id": "crash-request",
-            "turn_id": "crash-turn", "run_id": "crash-run",
-            "provider_id": "deepseek", "model_id": "deepseek-flash",
-            "effective_reasoning": "high",
-        })
+        page.begin_turn(binding)
         assert page._thinking_widgets
         app.processEvents()
     finally:

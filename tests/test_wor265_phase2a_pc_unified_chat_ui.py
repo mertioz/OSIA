@@ -8,6 +8,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QFrame
 
 from osia import i18n
@@ -174,7 +176,8 @@ def test_begin_turn_shows_minimal_thinking_before_detailed_activity(app):
         assert trace._detail.toPlainText() == ""
         assert trace._toggle.isEnabled() is True
         assert trace._expanded
-        assert trace._stop.isHidden() is False
+        assert chat._send_btn.stop_mode
+        assert chat._send_btn.isEnabled()
         assert trace._toggle.isHidden()
         assert not trace._orbs.isHidden()
     finally:
@@ -293,13 +296,20 @@ def test_final_result_follows_thinking_in_the_same_chat(app):
 
 def test_stop_emits_the_exact_chat_turn_binding_once(app):
     ledger = _ledger(suffix="stop")
-    trace = main_popup._ChatThinkingTrace()
+    chat = main_popup._ChatPage()
     emitted = []
-    trace.cancel_requested.connect(emitted.append)
+    commands = []
+    chat.execution_cancel_requested.connect(emitted.append)
+    chat.send_text.connect(commands.append)
     try:
-        assert trace.apply_trace(_payload(ledger))
-        trace._request_cancel()
-        trace._request_cancel()
+        assert chat.begin_turn(ledger.binding_dict())
+        chat.set_tool_status("waiting_tool_result")
+        chat._input.setPlainText("status")
+        QTest.keyClick(chat._input, Qt.Key.Key_Return)
+        assert commands == ["status"]
+        assert chat._send_btn.stop_mode
+        chat._send_btn.click()
+        chat._send_btn.click()
         app.processEvents()
 
         assert len(emitted) == 1
@@ -310,9 +320,10 @@ def test_stop_emits_the_exact_chat_turn_binding_once(app):
                 "provider_id", "model_id", "effective_reasoning",
             )
         } == ledger.binding_dict()
-        assert not trace._stop.isVisible()
+        assert chat._send_btn.stop_mode
+        assert not chat._send_btn.isEnabled()
     finally:
-        trace.deleteLater()
+        chat.deleteLater()
 
 
 def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup):
@@ -321,6 +332,9 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
     binding = ledger.binding_dict()
     popup.refresh_conversations(binding["conversation_id"])
     popup._active_conversation_id = binding["conversation_id"]
+    requested = []
+    capture_request = requested.append
+    popup.chat_execution_cancel_requested.connect(capture_request)
     try:
         popup.set_conversation_busy(binding["conversation_id"], True)
         assert popup.begin_chat_turn(binding)
@@ -329,10 +343,18 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         trace = popup._chat._thinking_widgets[key]
         assert not trace.isHidden()
 
+        popup.refresh_conversations("different-conversation")
+        assert not popup._chat._send_btn.stop_mode
+        popup._on_chat_execution_cancel_requested(binding)
+        assert not requested
+        popup.refresh_conversations(binding["conversation_id"])
+        popup._chat._send_btn.click()
+        assert len(requested) == 1
+
         assert popup.confirm_chat_execution_cancellation(binding)
         app.processEvents()
         assert not trace._expanded
-        assert trace._stop.isHidden()
+        assert not popup._chat._send_btn.stop_mode
         assert popup._chat._active_thinking_key is None
         assert binding["conversation_id"] not in (
             popup._active_thinking_key_by_conversation
@@ -351,8 +373,10 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         ledger.record_public_reasoning_summary("Late summary")
         assert not popup.update_chat_execution_activity(_payload(ledger))
         assert not trace._expanded
-        assert trace._stop.isHidden()
+        assert not trace.can_cancel
+        assert popup._chat._send_btn.stop_mode
     finally:
+        popup.chat_execution_cancel_requested.disconnect(capture_request)
         popup._busy_conversation_ids.discard(binding["conversation_id"])
 
 
@@ -411,7 +435,7 @@ def test_historical_completed_trace_is_inspectable_but_never_active(app):
         traces = chat.findChildren(main_popup._ChatThinkingTrace)
         assert len(traces) == 1
         assert traces[0].terminal is True
-        assert not traces[0]._stop.isVisible()
+        assert not chat._send_btn.stop_mode
         assert chat._active_thinking_key is None
     finally:
         chat.deleteLater()
@@ -490,9 +514,9 @@ def test_chunked_turns_keep_thinking_and_stream_buffers_strictly_isolated(app):
         assert len(traces) == 2
         assert traces[0]._detail.toPlainText() == ""
         assert traces[1]._detail.toPlainText() == "Public summary for turn B."
-        assert traces[0]._stop.isHidden()
-        assert traces[1]._stop.isHidden()
-        assert not traces[1]._stop.isEnabled()
+        assert not traces[0].can_cancel
+        assert not traces[1].can_cancel
+        assert not chat._send_btn.stop_mode
     finally:
         chat.deleteLater()
 
@@ -611,8 +635,8 @@ def test_cancelled_turn_stop_and_projection_state_do_not_leak_to_next_turn(app):
         traces = chat.findChildren(main_popup._ChatThinkingTrace)
         trace_b = next(trace for trace in traces if trace.key == key_b)
         assert key_b not in chat._cancelled_stream_keys
-        assert trace_b._stop.isHidden()  # canonical completion disables Stop
-        assert not trace_b._stop.isEnabled()
+        assert not trace_b.can_cancel
+        assert not chat._send_btn.stop_mode
         assert trace_b._detail.toPlainText() == ""
         assert _bubble_texts(chat).count("NEW_UNIQUE_TOKEN") == 1
     finally:

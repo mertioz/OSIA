@@ -103,13 +103,13 @@ def test_canonical_completion_collapses_even_without_terminal_trace(app, failure
         finish = chat.fail_assistant_stream if failure else chat.finalize_assistant_stream
         assert finish("The unchanged final answer.", binding)
         assert not widget._expanded
-        assert widget._stop.isHidden()
+        assert not chat._send_btn.stop_mode
         widget._toggle.click()
         assert widget._expanded
         assert widget.apply_trace(payload(trace))
         widget.set_active(True)
         assert widget._expanded
-        assert widget._stop.isHidden()
+        assert not widget.can_cancel
     finally:
         chat.deleteLater()
 
@@ -273,7 +273,7 @@ def test_stop_tap_does_not_collapse_until_cancellation_is_committed(app):
         assert chat.begin_turn(trace.binding_dict())
         assert chat.set_thinking_trace(payload(trace))
         widget = chat._thinking_widgets[trace.key]
-        widget._request_cancel()
+        chat._send_btn.click()
         assert widget._expanded
         assert chat.tombstone_cancelled_turn(trace.binding_dict())
         assert not widget._expanded

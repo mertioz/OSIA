@@ -496,7 +496,13 @@ class _ComposerButton(QPushButton):
         if kind not in ("attach", "send"):
             raise ValueError(f"Unsupported composer button kind: {kind}")
         self._kind = kind
+        self.stop_mode = False
         self.setFixedSize(COMPOSER_BUTTON_SIZE, COMPOSER_BUTTON_SIZE)
+
+    def set_stop_mode(self, enabled: bool) -> None:
+        if enabled != self.stop_mode:
+            self.stop_mode = enabled
+            self.update()
 
     def _icon_bounds(self) -> QRectF:
         side = float(COMPOSER_ICON_SIZE)
@@ -511,7 +517,9 @@ class _ComposerButton(QPushButton):
         bounds = self._icon_bounds()
         center = bounds.center()
         path = QPainterPath()
-        if self._kind == "attach":
+        if self.stop_mode:
+            path.addRoundedRect(bounds.adjusted(2.5, 2.5, -2.5, -2.5), 1.5, 1.5)
+        elif self._kind == "attach":
             path.moveTo(bounds.left() + 2.0, center.y())
             path.lineTo(bounds.right() - 2.0, center.y())
             path.moveTo(center.x(), bounds.top() + 2.0)
@@ -536,11 +544,12 @@ class _ComposerButton(QPushButton):
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(self._icon_color(), 2.0)
+        color = self._icon_color()
+        pen = QPen(color, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setBrush(color if self.stop_mode else Qt.BrushStyle.NoBrush)
         painter.drawPath(self._icon_path())
         painter.end()
 
@@ -744,14 +753,9 @@ class _ChatThinkingTrace(QFrame):
         self._orbs = ThinkingOrbs(self)
         self._orbs.setToolTip(i18n.t("chat.thinking.title"))
         self._orbs.clicked.connect(self._toggle_expanded)
-        self._stop = QPushButton(i18n.t("chat.thinking.stop"))
-        self._stop.setObjectName("chatThinkingStop")
-        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stop.clicked.connect(self._request_cancel)
         header.addWidget(self._orbs, 0)
         header.addWidget(self._toggle, 0)
         header.addStretch(1)
-        header.addWidget(self._stop, 0)
         outer.addLayout(header)
 
         self._detail = QTextEdit()
@@ -794,6 +798,16 @@ class _ChatThinkingTrace(QFrame):
     @property
     def cancelled_terminal(self) -> bool:
         return bool(self._binding.get("cancelled_terminal"))
+
+    @property
+    def unfinished(self) -> bool:
+        return bool(
+            self._binding and not self.terminal and not self._auto_collapsed_for_final
+        )
+
+    @property
+    def can_cancel(self) -> bool:
+        return self.unfinished and not self._cancel_pending
 
     @classmethod
     def _safe_id(cls, value: object, *, required: bool = True) -> str:
@@ -1054,21 +1068,12 @@ class _ChatThinkingTrace(QFrame):
                 min(180, max(1, self._detail.sizeHint().height()))
                 if detail and self._expanded else 0
             )
-        cancellable = not self.terminal and not self._cancel_pending and not self._auto_collapsed_for_final
-        self._stop.setVisible(cancellable)
-        self._stop.setEnabled(cancellable)
         self._refresh_toggle()
         return True
 
     def set_active(self, active: bool) -> None:
         """Project this turn's activity without reviving terminal/cancelled UI."""
-        cancellable = (
-            bool(active) and not self.terminal and not self._cancel_pending
-            and not self._auto_collapsed_for_final
-        )
-        self._stop.setVisible(cancellable)
-        self._stop.setEnabled(cancellable)
-        self._orbs.set_active(cancellable)
+        self._orbs.set_active(active and self.can_cancel)
         self.setVisible(True)
         self._refresh_toggle()
 
@@ -1095,7 +1100,6 @@ class _ChatThinkingTrace(QFrame):
 
     def retranslate(self) -> None:
         self.setAccessibleName(i18n.t("chat.thinking.title"))
-        self._stop.setText(i18n.t("chat.thinking.stop"))
         if self._source_payload:
             self.apply_trace(dict(self._source_payload))
         self._refresh_toggle()
@@ -1148,11 +1152,10 @@ class _ChatThinkingTrace(QFrame):
             self._detail.hide()
 
     def _request_cancel(self) -> None:
-        if not self._binding or self._cancel_pending or self.terminal:
+        if not self.can_cancel:
             return
         self._cancel_pending = True
         self._binding["cancel_requested"] = True
-        self._stop.hide()
         self._source_payload["cancel_requested"] = True
         self.cancel_requested.emit(dict(self._binding))
 
@@ -1328,9 +1331,7 @@ class _ChatPage(QWidget):
         self._send_btn = _ComposerButton("send")
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._send_btn.setToolTip(i18n.t("chat.send"))
-        self._send_btn.setAccessibleName(i18n.t("chat.send"))
-        self._send_btn.clicked.connect(self._on_send)
+        self._send_btn.clicked.connect(self._on_composer_action)
         self._input.textChanged.connect(self._on_input_changed)
         self._sync_send_state()
 
@@ -1349,8 +1350,7 @@ class _ChatPage(QWidget):
         self._file_btn.setAccessibleName(i18n.t("chat.attach_file"))
         self._apply_composer_state()
         self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
-        self._send_btn.setToolTip(i18n.t("chat.send"))
-        self._send_btn.setAccessibleName(i18n.t("chat.send"))
+        self._sync_send_state()
         self._rebuild_attachment_chips()
         self._rebuild_directive_chips()
         if not _is_deleted(self._empty):
@@ -1666,6 +1666,7 @@ class _ChatPage(QWidget):
         self._thinking_widgets.clear()
         self._active_thinking_key = None
         self._pending_thinking_widget = None
+        self._sync_send_state()
         # Keep the trailing stretch and the owned empty label. Removed message
         # widgets are hidden immediately so queued input cannot reach them.
         while self._messages_layout.count() > 1:
@@ -1798,6 +1799,8 @@ class _ChatPage(QWidget):
             self._stream.begin()
         if key not in self._thinking_widgets:
             self.set_thinking_trace({**dict(binding), "snapshot": []})
+        else:
+            self._sync_send_state()
         return True
 
     def set_thinking_trace(
@@ -1842,6 +1845,7 @@ class _ChatPage(QWidget):
         else:
             widget.set_active(not bool(safe.get("cancel_requested")))
             self._active_thinking_key = key
+        self._sync_send_state()
         if following:
             self._scroll_timer.start(0)
         return True
@@ -1903,6 +1907,7 @@ class _ChatPage(QWidget):
         trace = self._thinking_widgets.get(self._binding_key(binding))
         if trace is not None:
             trace.mark_completed()
+        self._sync_send_state()
         self._stream_finish_error = False
         self._discard_stream_on_complete = not bool(final)
         if not final:
@@ -1923,6 +1928,7 @@ class _ChatPage(QWidget):
         trace = self._thinking_widgets.get(self._binding_key(binding))
         if trace is not None:
             trace.mark_completed()
+        self._sync_send_state()
         if not error:
             self.cancel_assistant_stream(flush=True)
             return True
@@ -1949,6 +1955,7 @@ class _ChatPage(QWidget):
             trace.mark_inactive()
         if self._active_thinking_key == key:
             self._active_thinking_key = None
+        self._sync_send_state()
         return True
 
     # ── Internals ─────────────────────────────────────────────────────────
@@ -1999,19 +2006,44 @@ class _ChatPage(QWidget):
             self._notice.hide()
 
     def _sync_send_state(self, _text: str | None = None) -> None:
+        trace = self._composer_turn()
+        stop_mode = trace is not None
         text = self._input.toPlainText().strip()
         waiting = bool(
             self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
         )
-        enabled = (
-            (not self._busy and bool(text or self._pending_attachments))
-            or (waiting and bool(text) and len(text) <= 160)
-        )
+        if trace is not None:
+            enabled = trace.can_cancel
+        else:
+            enabled = (
+                (not self._busy and bool(text or self._pending_attachments))
+                or (waiting and bool(text) and len(text) <= 160)
+            )
+        self._send_btn.set_stop_mode(stop_mode)
+        label = i18n.t("chat.thinking.stop" if stop_mode else "chat.send")
+        self._send_btn.setToolTip(label)
+        self._send_btn.setAccessibleName(label)
         self._send_btn.setEnabled(enabled)
         self._send_btn.setCursor(
             Qt.CursorShape.ArrowCursor
             if not enabled else Qt.CursorShape.PointingHandCursor
         )
+
+    def _composer_turn(self) -> _ChatThinkingTrace | None:
+        key = self._active_thinking_key
+        if key is None or self._draft_context not in (None, key[0]):
+            return None
+        trace = self._thinking_widgets.get(key)
+        return trace if trace is not None and trace.unfinished else None
+
+    def _on_composer_action(self) -> None:
+        if not self._send_btn.stop_mode:
+            self._on_send()
+            return
+        trace = self._composer_turn()
+        if trace is not None:
+            trace._request_cancel()
+        self._sync_send_state()
 
     def show_notice(self, text: str, *, duration_ms: int = 2600) -> None:
         self._notice.setText(text)
@@ -11735,7 +11767,7 @@ class MainPopup(QWidget):
 
     def _on_chat_execution_cancel_requested(self, payload: dict) -> None:
         key = _ChatPage._binding_key(payload)
-        if key is None:
+        if key is None or key[0] != self._active_conversation_id:
             return
         if self._active_thinking_key_by_conversation.get(key[0]) != key:
             return
@@ -12260,21 +12292,6 @@ class MainPopup(QWidget):
                 padding: 3px 7px;
                 font-size: 10px;
             }
-            QPushButton#chatThinkingStop {
-                background: transparent;
-                border: 1px solid rgba(220, 140, 140, 0.32);
-                border-radius: 6px;
-                color: rgba(224, 163, 163, 0.88);
-                padding: 3px 7px;
-                font-size: 9px;
-            }
-            QPushButton#chatThinkingStop:hover,
-            QPushButton#chatThinkingStop:focus {
-                background: rgba(220, 80, 80, 0.10);
-                border-color: rgba(220, 120, 120, 0.58);
-                color: #ffffff;
-            }
-
             QFrame#inputWrap {
                 background: rgba(19, 17, 26, 0.34);
                 border: 1px solid rgba(196, 181, 245, 0.16);
