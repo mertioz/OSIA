@@ -1670,14 +1670,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Senden",
         "es": "Enviar",
     },
-    "chat.empty": {
-        "en": "Say “OSIA” or type below to start.",
-        "fr": "Dites « OSIA » ou écrivez ci-dessous pour commencer.",
-        "zh": "说「OSIA」或在下方输入以开始。",
-        "ja": "「OSIA」と話しかけるか、下に入力して始めましょう。",
-        "de": "Sagen Sie „OSIA“ oder tippen Sie unten, um zu beginnen.",
-        "es": "Di «OSIA» o escribe abajo para empezar.",
-    },
     "chat.thinking.title": {
         "en": "Thinking", "fr": "Réflexion", "zh": "思考",
         "ja": "思考", "de": "Denken", "es": "Razonamiento",

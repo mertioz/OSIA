@@ -384,6 +384,27 @@ class QtUiLifecycleTests(unittest.TestCase):
         self.assertEqual(error_bubble.text(), "Error: simulated")
         self.assertFalse(chat._stream.timer_active)
 
+    def test_final_reply_fades_as_its_first_text_appears(self):
+        chat = self.popup._chat
+        binding = _chat_binding("fade-final")
+        text = "A final answer that appears in one bubble."
+        with (
+            patch.dict(os.environ, {"OSIA_REDUCED_MOTION": "0"}),
+            patch.object(chat._motion, "fade_in", wraps=chat._motion.fade_in) as fade,
+        ):
+            self.assertTrue(chat.begin_turn(binding))
+            self.assertTrue(chat.finalize_assistant_stream(text, binding))
+            chat._stream._on_tick()
+            wrap, bubble = chat._stream_wrap, chat._stream_bubble
+            fade.assert_called_once_with(wrap, chat._FINAL_REPLY_FADE_MS)
+            effect = wrap.graphicsEffect()
+            self.assertIsNotNone(effect)
+            self.assertLess(effect.opacity(), 1.0)
+            _finish_reveal(chat._stream)
+            self.assertEqual(bubble.text(), text)
+            QTest.qWait(chat._FINAL_REPLY_FADE_MS + 50)
+            self.assertIsNone(wrap.graphicsEffect())
+
     def test_widget_disposal_deletes_the_only_stream_timer(self):
         host = QWidget()
         controller = DesktopTextStreamController(

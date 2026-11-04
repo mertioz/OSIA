@@ -1198,6 +1198,7 @@ class _ChatPage(QWidget):
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
+    _FINAL_REPLY_FADE_MS = 260
     _TOOL_WAITING_STATUSES = frozenset({
         "action_starting", "action_in_progress", "waiting_tool_result",
         "waiting_verification", "verifying", "resuming",
@@ -1271,11 +1272,6 @@ class _ChatPage(QWidget):
         self._syncing_bubble_geometry = False
         self._scroll.viewport().installEventFilter(self)
         outer.addWidget(self._scroll, 1)
-
-        # Empty-state placeholder, swapped out as soon as a message arrives.
-        self._empty = self._build_empty_label(self._messages_host)
-        self._empty_idx = self._messages_layout.count() - 1
-        self._messages_layout.insertWidget(self._empty_idx, self._empty)
 
         # Input row
         input_wrap = QFrame()
@@ -1361,7 +1357,7 @@ class _ChatPage(QWidget):
         input_layout.addLayout(row)
         outer.addWidget(input_wrap)
 
-        # Re-translate the input chrome + empty-state label on language change.
+        # Re-translate the input chrome on language change.
         i18n.add_listener(self._retranslate)
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
 
@@ -1373,8 +1369,6 @@ class _ChatPage(QWidget):
         self._sync_send_state()
         self._rebuild_attachment_chips()
         self._rebuild_directive_chips()
-        if not _is_deleted(self._empty):
-            self._empty.setText(i18n.t("chat.empty"))
         for trace in self._thinking_widgets.values():
             trace.retranslate()
 
@@ -1687,18 +1681,13 @@ class _ChatPage(QWidget):
         self._active_thinking_key = None
         self._pending_thinking_widget = None
         self._sync_send_state()
-        # Keep the trailing stretch and the owned empty label. Removed message
-        # widgets are hidden immediately so queued input cannot reach them.
+        # Keep the trailing stretch and hide removed widgets immediately.
         while self._messages_layout.count() > 1:
             item = self._messages_layout.takeAt(0)
             w = item.widget()
-            if w is not None and w is not self._empty:
+            if w is not None:
                 w.hide()
                 w.deleteLater()
-        if _is_deleted(self._empty):
-            self._empty = self._build_empty_label(self._messages_host)
-        self._messages_layout.insertWidget(0, self._empty)
-        self._empty.show()
 
     def set_messages(self, messages: list[dict]) -> None:
         self.clear_messages()
@@ -1716,8 +1705,6 @@ class _ChatPage(QWidget):
         if not renderable:
             return
         try:
-            if not _is_deleted(self._empty):
-                self._empty.hide()
             for role, text, message in renderable:
                 trace = message.get("_execution_trace_v1")
                 if role == "assistant" and isinstance(trace, dict):
@@ -1736,7 +1723,7 @@ class _ChatPage(QWidget):
                         "assistant_message_id", message.get("_message_id"),
                     )
                     self.set_thinking_trace(historical, historical=True)
-                self._append_bubble(role, text, animate=False)
+                self._append_bubble(role, text, appearance_ms=0)
             self._scroll_timer.start(0)
         except RuntimeError:
             pass
@@ -1747,7 +1734,6 @@ class _ChatPage(QWidget):
         text = _display_text(text)
         if not text:
             return
-        self._empty.hide()
         self._append_bubble(role, text)
         self._scroll_timer.start(0)
 
@@ -1853,7 +1839,6 @@ class _ChatPage(QWidget):
             )
             self._thinking_widgets[key] = widget
             self._pending_thinking_widget = widget
-            self._empty.hide()
         elif not widget.apply_trace(payload):
             return False
         if historical:
@@ -2071,17 +2056,9 @@ class _ChatPage(QWidget):
         self._motion.fade_in(self._notice, MOTION.state_ms)
         self._notice_timer.start(max(0, int(duration_ms)))
 
-    @staticmethod
-    def _build_empty_label(parent: QWidget | None = None) -> QLabel:
-        label = QLabel(i18n.t("chat.empty"), parent)
-        label.setObjectName("chatEmpty")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWordWrap(True)
-        return label
-
     def _append_bubble(
         self, role: str, text: str, *, streaming: bool = False,
-        animate: bool = True,
+        appearance_ms: int = MOTION.appearance_ms,
     ) -> tuple[QWidget, _Bubble] | None:
         # Defense in depth: never create a bubble (or its wrapper row
         # widget) for empty text — a blank QFrame collapses into a thin
@@ -2121,9 +2098,9 @@ class _ChatPage(QWidget):
             self._messages_layout.count() - 1, wrap
         )
         self._fit_messages_host_to_viewport()
-        if animate:
+        if appearance_ms:
             wrap.show()
-            self._motion.fade_in(wrap, MOTION.appearance_ms)
+            self._motion.fade_in(wrap, appearance_ms)
         return wrap, bubble
 
     def _maximum_bubble_width(self) -> int:
@@ -2172,11 +2149,14 @@ class _ChatPage(QWidget):
         if self._stream_bubble is None:
             if not text:
                 return
-            try:
-                self._empty.hide()
-            except RuntimeError:
-                return
-            created = self._append_bubble("assistant", text, streaming=True)
+            appearance_ms = (
+                self._FINAL_REPLY_FADE_MS
+                if self._stream.provider_complete and not self._stream_finish_error
+                else MOTION.appearance_ms
+            )
+            created = self._append_bubble(
+                "assistant", text, streaming=True, appearance_ms=appearance_ms,
+            )
             if created is None:
                 return
             self._stream_wrap, self._stream_bubble = created
@@ -2207,9 +2187,8 @@ class _ChatPage(QWidget):
         self._stream_wrap = None
         if wrap is not None:
             self._messages_layout.removeWidget(wrap)
+            wrap.hide()
             wrap.deleteLater()
-        if self._messages_layout.count() <= 2:
-            self._empty.show()
         self._scroll_to_bottom()
 
     def _mark_stream_finished(self, *, error: bool = False) -> None:
@@ -12231,11 +12210,6 @@ class MainPopup(QWidget):
             }
 
             /* Chat ───────────────────────────────────────────────────── */
-            QLabel#chatEmpty {
-                color: rgba(232, 230, 240, 0.80);
-                font-size: 15px;
-                padding: 46px 14px 24px;
-            }
             QFrame#msgBubble {
                 border-radius: 14px;
                 padding: 0px;

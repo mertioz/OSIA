@@ -8,7 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent, QObject, Qt
+from PyQt6.QtCore import QCoreApplication, QEvent, Qt
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
@@ -191,42 +191,24 @@ def test_last_delete_keeps_empty_state_inside_existing_chat_window():
         after = set(APP.topLevelWidgets())
         assert after == before
         assert popup._convs.findChild(QLabel, "panelEmpty").window() is popup
-        assert popup._chat._empty.window() is popup
-        assert popup._chat._empty.parent() is popup._chat._messages_host
+        assert popup._chat._messages_host.window() is popup
+        assert popup._chat._messages_layout.count() == 1
         assert popup._stack.currentIndex() == popup.PAGE_CONVS
     popup.close()
     popup.deleteLater()
     _drain()
 
 
-def test_rebuilt_chat_empty_label_is_parented_before_show():
-    class ShowProbe(QObject):
-        def __init__(self):
-            super().__init__()
-            self.orphan_shows = []
-
-        def eventFilter(self, watched, event):
-            if (
-                event.type() == QEvent.Type.Show
-                and isinstance(watched, QLabel)
-                and watched.objectName() == "chatEmpty"
-                and watched.parent() is None
-            ):
-                self.orphan_shows.append(watched)
-            return False
-
-    probe = ShowProbe()
-    APP.installEventFilter(probe)
+def test_reset_chat_leaves_a_blank_history_in_the_same_window():
     page = _ChatPage()
     page.show()
-    page._empty.deleteLater()
-    _drain()
+    before = set(APP.topLevelWidgets())
+    page.append_message("user", "A message before reset")
+    assert page._messages_layout.count() == 2
     page.set_messages([])
-    APP.processEvents()
-    assert probe.orphan_shows == []
-    assert page._empty.parent() is page._messages_host
-    assert set(APP.topLevelWidgets()) >= {page}
+    _drain()
+    assert page._messages_layout.count() == 1
+    assert set(APP.topLevelWidgets()) == before
     page.close()
     page.deleteLater()
     _drain()
-    APP.removeEventFilter(probe)
