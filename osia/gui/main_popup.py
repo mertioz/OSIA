@@ -12092,14 +12092,11 @@ class MainPopup(QWidget):
 
             QListWidget#settingsNav {
                 background: rgba(13, 11, 18, 0.48);
-                border: 1px solid rgba(196, 181, 245, 0.13);
+                border: 1px solid transparent;
                 border-radius: 13px;
                 padding: 4px;
                 outline: 0;
                 font-size: 12px;
-            }
-            QListWidget#settingsNav:focus {
-                border-color: rgba(196, 181, 245, 0.48);
             }
             QListWidget#settingsNav::item {
                 color: rgba(232, 230, 240, 0.78);
