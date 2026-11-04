@@ -6,10 +6,10 @@ import types
 from unittest.mock import patch
 
 import pytest
-from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtCore import QAbstractAnimation, QPoint, QPointF, Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QAbstractItemView
+from PyQt6.QtWidgets import QApplication, QAbstractItemView, QWidget
 
 from osia import updater
 from osia.gui import main_popup
@@ -120,6 +120,77 @@ def _show_category(panel, key: str) -> None:
     panel.show_category(key)
     QApplication.processEvents()
     assert panel._settings_pages[panel._settings_nav.currentRow()][0] == key
+
+
+def test_hierarchy_reorder_recovers_from_failed_save_and_keeps_live_rows(
+    settings_panel, qt_app, monkeypatch,
+):
+    panel = settings_panel
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "0")
+    values = ["ollama:first:latest", "ollama:second:latest", "ollama:third:latest"]
+    monkeypatch.setattr(panel, "_hier_values", {"heavy": values, "medium": []})
+    monkeypatch.setattr(panel, "_hier_model_choices", lambda: [(value, value) for value in values])
+    saved = []
+
+    def save(key, value):
+        saved.append((key, value))
+        if len(saved) == 1:
+            raise PermissionError("shared settings file is busy")
+
+    monkeypatch.setattr(main_popup, "set_setting", save)
+    _show_category(panel, "settings.cat.models")
+    panel._render_hier_category("heavy")
+    qt_app.processEvents()
+    first, second, third = panel._hier_rows["heavy"]
+    buttons = {button.kind: button for button in first.parentWidget().findChildren(main_popup._HierarchyAction)}
+    assert all(button.accessibleName() for button in buttons.values())
+    assert not buttons["up"].isEnabled()
+
+    buttons["down"].click()
+    assert panel._hier_save_notice.isVisible()
+    assert panel._hier_values["heavy"] == values
+    assert panel._hier_rows["heavy"] == [first, second, third]
+
+    buttons["down"].click()
+    animation = panel._hier_motion["heavy"]
+    assert animation.state() == QAbstractAnimation.State.Running
+    buttons["down"].click()  # A second click while the same row is still sliding.
+    assert panel._hier_rows["heavy"] == [second, third, first]
+    assert not buttons["down"].isEnabled()
+    assert not panel._hier_save_notice.isVisible()
+    assert saved[-1] == ("ai_hierarchy", {"heavy": [values[1], values[2], values[0]], "medium": []})
+    QTest.qWait(260)
+    assert animation.state() == QAbstractAnimation.State.Stopped
+    rows = [combo.parentWidget().y() for combo in panel._hier_rows["heavy"]]
+    assert rows == sorted(set(rows))
+
+
+def test_theme_crossfade_tracks_rapid_changes_and_reduced_motion(qt_app, monkeypatch):
+    from osia.gui.motion import ThemeTransition
+    from osia.gui.theme import ThemeManager
+
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "0")
+    window = QWidget()
+    window.resize(120, 80)
+    window.show()
+    transition = ThemeTransition(window)
+    manager = ThemeManager(lambda: {}, lambda *_args: None)
+    manager.theme_changing.connect(transition.capture)
+    manager.theme_changed.connect(transition.start)
+    qt_app.processEvents()
+    manager.set_theme("azure")
+    assert transition.isVisible()
+    assert transition._animation.state() == QAbstractAnimation.State.Running
+    QTest.qWait(40)
+    assert 0.0 < transition._alpha < 1.0
+    manager.set_theme("rose")
+    assert transition.isVisible()
+    QTest.qWait(270)
+    assert not transition.isVisible()
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    manager.set_theme("osia")
+    assert not transition.isVisible()
+    window.close()
 
 
 def test_rapid_settings_section_changes_coalesce_extent_recalculation(

@@ -1742,42 +1742,14 @@ def _next_durable_turn_event_sequence(turn_meta: dict) -> int:
         return sequence
 
 
-def _resolve_chat_route_binding(turn_directives=None) -> dict[str, str]:
-    """Resolve the exact provider route before a canonical Chat turn is accepted."""
-
+def _resolve_chat_route_binding(turn_directives=None, *, task_text="") -> dict[str, str]:
     from osia.agent import MODEL as DEFAULT_MODEL
     from osia.config import load_settings
-    from osia.models import provider_for_model_cached
-    from osia.reasoning import resolve_reasoning_option_id
+    from osia.task_router import resolve_chat_route_binding
 
-    settings = load_settings()
-    model_override = getattr(turn_directives, "model_override", None)
-    if model_override is not None:
-        provider_id = str(model_override.provider_id or "").strip().lower()
-        model_id = str(model_override.model_id or "").strip()
-    else:
-        model_id = str(settings.get("selected_model") or DEFAULT_MODEL).strip()
-        provider_id = str(
-            settings.get("selected_model_provider") or ""
-        ).strip().lower()
-        if not provider_id and model_id:
-            provider_id = str(
-                provider_for_model_cached(model_id) or ""
-            ).strip().lower()
-    reasoning_override = getattr(turn_directives, "reasoning_override", None)
-    effective_reasoning = str(
-        reasoning_override
-        if reasoning_override is not None else
-        resolve_reasoning_option_id(provider_id, model_id, settings)
-    ).strip().lower()
-    binding = {
-        "provider_id": provider_id,
-        "model_id": model_id,
-        "effective_reasoning": effective_reasoning,
-    }
-    if any(not value for value in binding.values()):
-        raise RuntimeError("canonical Chat route binding is incomplete")
-    return binding
+    return resolve_chat_route_binding(
+        load_settings(), DEFAULT_MODEL, turn_directives, task_text=task_text,
+    )
 
 
 def _new_turn_meta(
@@ -1785,10 +1757,11 @@ def _new_turn_meta(
     client_request_id: str | None,
     *,
     turn_directives=None,
+    task_text: str = "",
 ) -> dict:
     request_id = client_request_id or ""
     turn_id = _new_turn_id()
-    route = _resolve_chat_route_binding(turn_directives)
+    route = _resolve_chat_route_binding(turn_directives, task_text=task_text)
     from osia.turn_terminality import live_process_identity
 
     _owner_alive, owner_process_identity = live_process_identity(os.getpid())
@@ -10935,6 +10908,7 @@ async def websocket_endpoint(ws: WebSocket):
                             _conv,
                             client_request_id,
                             turn_directives=turn_directives,
+                            task_text=(user_text if not created_source_refs and not turn_image_artifacts else ""),
                         )
                         turn_meta["_document_owner_device"] = mobile_device_id
                         turn_meta["_execution_origin_ref"] = (

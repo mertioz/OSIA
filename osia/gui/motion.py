@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable
 
-from PyQt6.QtCore import QObject, QVariantAnimation
+from PyQt6.QtCore import QEasingCurve, QObject, Qt, QVariantAnimation
+from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QGraphicsOpacityEffect,
@@ -145,3 +146,55 @@ class MotionController(QObject):
     def settle(self) -> None:
         for key in tuple(self._states):
             self._finish(key, force_opacity=1.0)
+
+
+class ThemeTransition(QWidget):
+    """Fade the previous frame while the live window adopts its new palette."""
+
+    def __init__(self, window: QWidget) -> None:
+        super().__init__(window)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._frame = QPixmap()
+        self._alpha = 1.0
+        self._animation = QVariantAnimation(self)
+        self._animation.setDuration(220)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.setStartValue(1.0)
+        self._animation.setEndValue(0.0)
+        self._animation.valueChanged.connect(self._set_alpha)
+        self._animation.finished.connect(self._clear)
+        self.hide()
+
+    def capture(self, _key: str) -> None:
+        window = self.parentWidget()
+        if not window.isVisible() or reduced_motion_requested(window):
+            self._animation.stop()
+            self._clear()
+            return
+        # A second switch starts from the frame the user currently sees.
+        frame = window.grab()
+        self._animation.stop()
+        self._frame = frame
+        self._alpha = 1.0
+        self.setGeometry(window.rect())
+        self.raise_()
+        self.show()
+
+    def start(self, _key: str) -> None:
+        if self.isVisible() and not self._frame.isNull():
+            self._animation.start()
+
+    def _set_alpha(self, value: float) -> None:
+        self._alpha = value
+        self.update()
+
+    def _clear(self) -> None:
+        self.hide()
+        self._frame = QPixmap()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setOpacity(self._alpha)
+        painter.drawPixmap(0, 0, self._frame)
+        painter.end()

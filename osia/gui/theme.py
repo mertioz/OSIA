@@ -227,6 +227,7 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
 class ThemeManager(QObject):
     """Own the active palette and persist its local PC preference."""
 
+    theme_changing = pyqtSignal(str)
     theme_changed = pyqtSignal(str)
 
     def __init__(
@@ -261,6 +262,7 @@ class ThemeManager(QObject):
         next_palette = palette_for_key(key)
         if next_palette.key == self._palette.key:
             return False
+        self.theme_changing.emit(next_palette.key)
         self._palette = next_palette
         if persist:
             try:

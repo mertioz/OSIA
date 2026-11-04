@@ -802,26 +802,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "es": "Jerarquía de tareas IA",
     },
     "settings.ai_hierarchy_sub": {
-        "en": "Ordered fallback chains. OSIA routes each task to the first "
-              "model, then down the list if it hits a technical error.",
-        "fr": "Chaînes de secours ordonnées. OSIA dirige chaque tâche vers le "
-              "premier modèle, puis descend la liste en cas d'erreur technique.",
-        "zh": "有序的备用链。OSIA 将每个任务路由到第一个模型，遇到技术错误时依次"
-              "向下尝试。",
-        "ja": "順序付きフォールバックチェーン。OSIA は各タスクを最初のモデルに振り"
-              "分け、技術的エラー時はリストを順に下ります。",
-        "de": "Geordnete Ausweichketten. OSIA leitet jede Aufgabe an das erste "
-              "Modell und geht bei einem technischen Fehler die Liste hinab.",
-        "es": "Cadenas de respaldo ordenadas. OSIA dirige cada tarea al primer "
-              "modelo y baja por la lista si encuentra un error técnico.",
+        "en": "OSIA chooses the first available model in the task’s list.",
+        "fr": "OSIA choisit le premier modèle disponible dans la liste de la tâche.",
+        "zh": "OSIA 选择对应任务列表中第一个可用的模型。",
+        "ja": "OSIA はタスクに対応するリストの先頭から利用可能なモデルを選びます。",
+        "de": "OSIA wählt das erste verfügbare Modell aus der Liste für die Aufgabe.",
+        "es": "OSIA elige el primer modelo disponible de la lista de la tarea.",
     },
     "settings.ai_hierarchy_desc": {
-        "en": "OSIA can route each task down an ordered list of models, falling back to the next one on a technical error like a rate limit or outage. Leave it off to use a single model, or turn it on for resilience across the Heavy and Medium tiers.",
-        "fr": "OSIA peut acheminer chaque tâche le long d'une liste ordonnée de modèles, en passant au suivant en cas d'erreur technique comme une limite de débit ou une panne. Laissez-le désactivé pour n'utiliser qu'un seul modèle, ou activez-le pour plus de robustesse sur les niveaux Heavy et Medium.",
-        "zh": "OSIA 可以按顺序尝试多个模型执行每项任务，在遇到限流或宕机等技术错误时自动切换到下一个。不需要时可保持关闭，或启用它以在 Heavy 和 Medium 两个层级获得更强的容错能力。",
-        "ja": "OSIA は各タスクを順序付きのモデルリストに沿って処理し、レート制限や障害などの技術的エラー時には次のモデルへ切り替えます。単一モデルだけを使う場合はオフのままにし、Heavy と Medium の各階層で耐障害性を高めたい場合はオンにします。",
-        "de": "OSIA kann jede Aufgabe durch eine geordnete Liste von Modellen leiten und bei einem technischen Fehler wie einem Ratenlimit oder Ausfall zum nächsten wechseln. Lassen Sie es aus, um ein einziges Modell zu nutzen, oder aktivieren Sie es für erhöhte Ausfallsicherheit über die Stufen Heavy und Medium.",
-        "es": "OSIA puede encaminar cada tarea por una lista ordenada de modelos, pasando al siguiente ante un error técnico como un límite de tasa o una caída. Déjalo desactivado para usar un único modelo, o actívalo para mayor resiliencia en los niveles Heavy y Medium.",
+        "en": "The chosen model handles the entire turn. When a list has no available model, OSIA uses your manual selection.",
+        "fr": "Le modèle choisi traite tout le tour. Si aucun modèle de la liste n’est disponible, OSIA utilise ta sélection manuelle.",
+        "zh": "选定的模型负责整个对话轮次。列表中没有可用模型时，OSIA 会使用你手动选择的模型。",
+        "ja": "選ばれたモデルがターン全体を担当します。リストに利用可能なモデルがない場合、手動で選んだモデルを使用します。",
+        "de": "Das gewählte Modell bearbeitet den gesamten Turn. Ist kein Modell aus der Liste verfügbar, verwendet OSIA deine manuelle Auswahl.",
+        "es": "El modelo elegido se encarga de todo el turno. Si la lista no tiene modelos disponibles, OSIA usa tu selección manual.",
     },
     "settings.hierarchy_heavy": {
         "en": "Heavy tasks",
@@ -878,6 +872,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "自動タスクルーティングを有効化",
         "de": "Automatisches Aufgaben-Routing aktivieren",
         "es": "Activar el enrutamiento automático de tareas",
+    },
+    "hierarchy.up": {"en": "Move model up", "fr": "Monter le modèle", "zh": "上移模型", "ja": "モデルを上へ", "de": "Modell nach oben", "es": "Subir modelo"},
+    "hierarchy.down": {"en": "Move model down", "fr": "Descendre le modèle", "zh": "下移模型", "ja": "モデルを下へ", "de": "Modell nach unten", "es": "Bajar modelo"},
+    "hierarchy.remove": {"en": "Remove model", "fr": "Retirer le modèle", "zh": "移除模型", "ja": "モデルを削除", "de": "Modell entfernen", "es": "Quitar modelo"},
+    "hierarchy.save_failed": {
+        "en": "OSIA couldn’t save the hierarchy. Try again.",
+        "fr": "OSIA n’a pas pu enregistrer la hiérarchie. Réessaie.",
+        "zh": "OSIA 无法保存任务层级。请重试。",
+        "ja": "タスク階層を保存できませんでした。もう一度お試しください。",
+        "de": "OSIA konnte die Hierarchie nicht speichern. Versuche es erneut.",
+        "es": "OSIA no pudo guardar la jerarquía. Inténtalo de nuevo.",
     },
     # — Section 4: Live API (voice-to-voice) (Bloc 4) —
     "settings.liveapi": {

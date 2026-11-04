@@ -35,6 +35,7 @@ import qrcode
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
+    QParallelAnimationGroup,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
@@ -80,7 +81,7 @@ from osia import i18n
 from osia import timefmt
 from osia.perf import perf_timer
 from osia.gui.motion import (
-    MOTION, MotionController, reduced_motion_requested,
+    MOTION, MotionController, ThemeTransition, reduced_motion_requested,
 )
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
@@ -4629,6 +4630,49 @@ class _McpCustomDialog(_PopoverDialog):
         self.accept()
 
 
+class _HierarchyAction(QPushButton):
+    """Font-independent arrow or remove control for a model row."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        self.kind = kind
+        self.setObjectName("hierarchyRemove" if kind == "remove" else "hierarchyAction")
+        self.setFixedSize(30, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        label = i18n.t(f"hierarchy.{kind}")
+        self.setToolTip(label)
+        self.setAccessibleName(label)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.width() / 2, self.height() / 2)
+        palette = get_theme_manager().palette
+        color = "disabled" if not self.isEnabled() else "text"
+        if self.kind == "remove" and self.isEnabled() and self.underMouse():
+            color = "error"
+        pen = QPen(palette.color(color), 1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        path = QPainterPath()
+        if self.kind == "remove":
+            path.moveTo(-4, -4)
+            path.lineTo(4, 4)
+            path.moveTo(4, -4)
+            path.lineTo(-4, 4)
+        else:
+            direction = -1 if self.kind == "up" else 1
+            path.moveTo(0, -5 * direction)
+            path.lineTo(0, 5 * direction)
+            path.moveTo(-4, direction)
+            path.lineTo(0, 5 * direction)
+            path.lineTo(4, direction)
+        painter.drawPath(path)
+        painter.end()
+
+
 class _SettingsPanel(QWidget):
     """Settings page — organised into three clearly separated provider
     sections plus mobile-token management.
@@ -4965,6 +5009,8 @@ class _SettingsPanel(QWidget):
 
     def set_remote_models(self, remote: list) -> None:
         self._remote_models = remote or []
+        for category in self._hier_values:
+            self._render_hier_category(category)
         if hasattr(self, "_cron_host"):
             self._render_cron()
 
@@ -5233,8 +5279,6 @@ class _SettingsPanel(QWidget):
             state = getattr(pill, "_mcp_state", "disconnected")
             pill._mcp_state = None
             self._set_mcp_pill(pill, state)
-        if hasattr(self, "_theme_title"):
-            self._motion.fade_in(self._theme_title, MOTION.state_ms)
 
     def _sync_theme_buttons(self) -> None:
         for key, button in getattr(self, "_theme_buttons", {}).items():
@@ -6015,8 +6059,7 @@ class _SettingsPanel(QWidget):
     # ── AI Task Hierarchy (Bloc 3) ──────────────────────────────────────────
     # Two ordered "provider:model" fallback chains (heavy / medium). The value
     # lists in ``self._hier_values`` are the source of truth; the editable row
-    # widgets are a rendering of them. Any add/remove/reorder/selection rebuilds
-    # the lists and writes them through to ``ai_hierarchy`` in settings.json.
+    # widgets are a rendering of them. Reordering moves the existing rows.
 
     def _build_ai_hierarchy_section(self) -> QFrame:
         wrap = QFrame()
@@ -6042,6 +6085,7 @@ class _SettingsPanel(QWidget):
         self._hier_values = {"heavy": [], "medium": []}
         self._hier_hosts = {}        # cat -> QVBoxLayout holding the rows
         self._hier_rows = {"heavy": [], "medium": []}   # cat -> [QComboBox]
+        self._hier_motion = {}
         self._hier_labels = {}       # cat -> header QLabel (for retranslate)
         self._hier_sublabels = {}    # cat -> hint QLabel
         self._hier_add_btns = {}     # cat -> "add" QPushButton
@@ -6050,6 +6094,12 @@ class _SettingsPanel(QWidget):
             l, "heavy", "settings.hierarchy_heavy", "settings.hierarchy_heavy_sub")
         self._build_hier_subsection(
             l, "medium", "settings.hierarchy_medium", "settings.hierarchy_medium_sub")
+
+        self._hier_save_notice = QLabel(i18n.t("hierarchy.save_failed"))
+        self._hier_save_notice.setObjectName("hierarchySaveNotice")
+        self._hier_save_notice.setWordWrap(True)
+        self._hier_save_notice.hide()
+        l.addWidget(self._hier_save_notice)
 
         # Master switch (bottom of the section): when OFF, OSIA ignores the
         # chains above and always uses the manually selected model. The chain
@@ -6083,6 +6133,8 @@ class _SettingsPanel(QWidget):
         host.setContentsMargins(0, 0, 0, 0)
         host.setSpacing(6)
         self._hier_hosts[cat] = host
+        self._hier_motion[cat] = QParallelAnimationGroup(self)
+        self._hier_motion[cat].finished.connect(lambda: self._layout_hierarchy_rows(cat))
         parent_layout.addWidget(host_wrap)
 
         add_btn = QPushButton("＋ " + i18n.t("settings.hierarchy_add"))
@@ -6096,44 +6148,30 @@ class _SettingsPanel(QWidget):
         self._hier_add_btns[cat] = add_btn
 
     def _hier_model_choices(self) -> list:
-        """Return ``[(display, "provider:model"), …]`` for usable providers."""
-        keys = load_api_keys()
-        choices = []
-        models = list(get_all_models())
+        from osia.task_router import available_hierarchy_models
+
         account_status = self._chatgpt_last_status or {}
-        if account_status.get("connected") and account_status.get("available"):
-            for item in account_status.get("models") or []:
-                if not isinstance(item, dict) or item.get("hidden"):
-                    continue
-                model_id = str(item.get("id") or item.get("model") or "").strip()
-                modalities = item.get("inputModalities") or ["text", "image"]
-                if not model_id or "text" not in modalities:
-                    continue
-                models.append({
-                    "id": model_id,
-                    "provider": "chatgpt_account",
-                    "label": str(item.get("displayName") or model_id),
-                })
-        for m in models:
-            provider = m["provider"]
-            if (provider not in ("ollama", "chatgpt_account")
-                    and not keys.get(provider)):
-                continue
-            pname = PROVIDERS.get(provider, {}).get("name", provider)
-            choices.append((f"{pname} · {m.get('label', m['id'])}",
-                            f"{provider}:{m['id']}"))
-        choices.sort(key=lambda c: c[0].lower())
-        return choices
+        account_models = (account_status.get("models") or []) if (
+            account_status.get("connected") and account_status.get("available")
+        ) else []
+        return sorted(
+            ((f"{entry['provider_display_name']} · {entry['model_display_name']}", entry["stable_key"])
+             for entry in available_hierarchy_models(account_models)),
+            key=lambda choice: choice[0].casefold(),
+        )
 
     def _render_hier_category(self, cat: str) -> None:
         host = self._hier_hosts.get(cat)
         if host is None:
             return
-        # Wipe & rebuild the rows for this category from the value list.
+        animation = self._hier_motion[cat]
+        animation.stop()
+        animation.clear()
         while host.count():
             item = host.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
                 w.deleteLater()
         self._hier_rows[cat] = []
 
@@ -6144,10 +6182,12 @@ class _SettingsPanel(QWidget):
             empty.setWordWrap(True)
             host.addWidget(empty)
             return
-        for idx, value in enumerate(values):
-            host.addWidget(self._build_hier_row(cat, idx, value))
+        choices = self._hier_model_choices()
+        for value in values:
+            host.addWidget(self._build_hier_row(cat, value, choices))
+        self._sync_hierarchy_actions(cat)
 
-    def _build_hier_row(self, cat: str, index: int, value: str) -> QWidget:
+    def _build_hier_row(self, cat: str, value: str, choices: list) -> QWidget:
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
@@ -6157,7 +6197,6 @@ class _SettingsPanel(QWidget):
         combo.setObjectName("voiceCombo")
         _cap_combo_width(combo)   # WOR-48 P3 — created at runtime, cap it here
         self._guard_settings_wheel(combo)
-        choices = self._hier_model_choices()
         # Preserve a stored model whose provider is no longer configured by
         # showing its raw "provider:model" value so the chain isn't silently
         # dropped when the user opens settings.
@@ -6178,67 +6217,119 @@ class _SettingsPanel(QWidget):
         h.addWidget(combo, 1)
         self._hier_rows[cat].append(combo)
 
-        up = QPushButton("▲")
-        up.setObjectName("ghostBtn")
-        up.setFixedSize(28, 28)
-        up.setCursor(Qt.CursorShape.PointingHandCursor)
-        up.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_move(c, i, -1))
-        down = QPushButton("▼")
-        down.setObjectName("ghostBtn")
-        down.setFixedSize(28, 28)
-        down.setCursor(Qt.CursorShape.PointingHandCursor)
-        down.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_move(c, i, 1))
-        rm = QPushButton("✕")
-        rm.setObjectName("convDel")
-        rm.setFixedSize(28, 28)
-        rm.setCursor(Qt.CursorShape.PointingHandCursor)
-        rm.clicked.connect(lambda _=False, c=cat, i=index: self._on_hier_remove(c, i))
-        h.addWidget(up)
-        h.addWidget(down)
-        h.addWidget(rm)
+        for kind, delta in (("up", -1), ("down", 1), ("remove", 0)):
+            button = _HierarchyAction(kind)
+            button.clicked.connect(lambda _checked=False, d=delta: self._on_hier_action(cat, combo, d))
+            h.addWidget(button)
         return row
 
-    def _persist_hierarchy(self) -> None:
-        clean = {
-            "heavy": [v for v in self._hier_values.get("heavy", []) if v],
-            "medium": [v for v in self._hier_values.get("medium", []) if v],
-        }
-        set_setting("ai_hierarchy", clean)
+    def _on_hier_action(self, cat: str, combo: QComboBox, delta: int) -> None:
+        rows = self._hier_rows[cat]
+        if combo not in rows:
+            return
+        index = rows.index(combo)
+        if delta:
+            self._on_hier_move(cat, index, delta)
+        else:
+            self._on_hier_remove(cat, index)
+
+    def _layout_hierarchy_rows(self, cat: str) -> None:
+        host = self._hier_hosts[cat]
+        host.invalidate()
+        host.activate()
+
+    def _sync_hierarchy_actions(self, cat: str) -> None:
+        rows = self._hier_rows[cat]
+        for index, combo in enumerate(rows):
+            for button in combo.parentWidget().findChildren(_HierarchyAction):
+                if button.kind == "up":
+                    button.setEnabled(index > 0)
+                elif button.kind == "down":
+                    button.setEnabled(index + 1 < len(rows))
+
+    def _save_hierarchy_setting(self, key: str, value) -> bool:
+        try:
+            set_setting(key, value)
+        except OSError as exc:
+            print(f"[SETTINGS] {key} save failed: {type(exc).__name__}")
+            self._hier_save_notice.show()
+            return False
+        self._hier_save_notice.hide()
+        return True
+
+    def _persist_hierarchy(self, cat: str, values: list[str]) -> bool:
+        updated = {**self._hier_values, cat: values}
+        if not self._save_hierarchy_setting("ai_hierarchy", updated):
+            return False
+        self._hier_values = updated
+        return True
 
     def _on_hier_add(self, cat: str) -> None:
         choices = self._hier_model_choices()
         if not choices:
             # No configured provider to pick from — don't seed a dead empty row.
             return
-        self._hier_values.setdefault(cat, []).append(choices[0][1])
-        self._persist_hierarchy()
-        self._render_hier_category(cat)
+        if self._persist_hierarchy(cat, [*self._hier_values[cat], choices[0][1]]):
+            self._render_hier_category(cat)
 
     def _on_hier_remove(self, cat: str, index: int) -> None:
-        values = self._hier_values.get(cat, [])
+        values = list(self._hier_values[cat])
         if 0 <= index < len(values):
             values.pop(index)
-            self._persist_hierarchy()
-            self._render_hier_category(cat)
+            if self._persist_hierarchy(cat, values):
+                self._render_hier_category(cat)
 
     def _on_hier_move(self, cat: str, index: int, delta: int) -> None:
-        values = self._hier_values.get(cat, [])
+        values = list(self._hier_values[cat])
         target = index + delta
-        if 0 <= index < len(values) and 0 <= target < len(values):
-            values[index], values[target] = values[target], values[index]
-            self._persist_hierarchy()
-            self._render_hier_category(cat)
+        if not (0 <= index < len(values) and 0 <= target < len(values)):
+            return
+        values[index], values[target] = values[target], values[index]
+        if not self._persist_hierarchy(cat, values):
+            return
+
+        rows = self._hier_rows[cat]
+        host = self._hier_hosts[cat]
+        animation = self._hier_motion[cat]
+        animation.stop()
+        animation.clear()
+        start_positions = {combo.parentWidget(): combo.parentWidget().pos() for combo in rows}
+        rows[index], rows[target] = rows[target], rows[index]
+        for i in (index, target):
+            host.removeWidget(rows[i].parentWidget())
+        for i in sorted((index, target)):
+            host.insertWidget(i, rows[i].parentWidget())
+        self._layout_hierarchy_rows(cat)
+        self._sync_hierarchy_actions(cat)
+        if not host.parentWidget().isVisible() or reduced_motion_requested(self):
+            return
+        for row, start in start_positions.items():
+            end = row.pos()
+            if start == end:
+                continue
+            slide = QPropertyAnimation(row, b"pos")
+            slide.setDuration(MOTION.page_ms)
+            slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+            slide.setStartValue(start)
+            slide.setEndValue(end)
+            animation.addAnimation(slide)
+        animation.start()
 
     def _on_hier_row_changed(self, cat: str) -> None:
         # Re-read the chain straight from the current row order so a selection
         # change stays consistent with any pending reorder.
-        self._hier_values[cat] = [
+        values = [
             c.currentData() for c in self._hier_rows.get(cat, []) if c.currentData()
         ]
-        self._persist_hierarchy()
+        if not self._persist_hierarchy(cat, values):
+            self._render_hier_category(cat)
 
     def _on_hier_enabled_changed(self, _state) -> None:
-        set_setting("ai_hierarchy_enabled", self._hier_enabled_toggle.isChecked())
+        checked = self._hier_enabled_toggle.isChecked()
+        if not self._save_hierarchy_setting("ai_hierarchy_enabled", checked):
+            blocked = self._hier_enabled_toggle.blockSignals(True)
+            self._hier_enabled_toggle.setChecked(not checked)
+            self._hier_enabled_toggle.blockSignals(blocked)
 
     # ── Scheduled Tasks / Cron (Bloc 5) ─────────────────────────────────────
     # A dynamic list of cron jobs mirroring the AI-hierarchy editor: the list
@@ -10152,6 +10243,7 @@ class _SettingsPanel(QWidget):
         self._hier_sublabels["heavy"].setText(i18n.t("settings.hierarchy_heavy_sub"))
         self._hier_sublabels["medium"].setText(i18n.t("settings.hierarchy_medium_sub"))
         self._hier_enabled_label.setText(i18n.t("hierarchy.enabled"))
+        self._hier_save_notice.setText(i18n.t("hierarchy.save_failed"))
         for _btn in self._hier_add_btns.values():
             _btn.setText("＋ " + i18n.t("settings.hierarchy_add"))
         # Rebuild the rows so the "no models" placeholder re-translates too.
@@ -11258,7 +11350,10 @@ class MainPopup(QWidget):
         nav.addStretch()
         outer.addLayout(nav)
 
+        self._theme_transition = ThemeTransition(self)
+        self._theme.theme_changing.connect(self._theme_transition.capture)
         self._theme.theme_changed.connect(self._on_theme_changed)
+        self._theme.theme_changed.connect(self._theme_transition.start)
         self._apply_style()
         self._stack.setCurrentIndex(self.PAGE_CHAT)
         QTimer.singleShot(0, self._request_local_models_refresh)
@@ -12922,6 +13017,29 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
                 color: #e8e6f0;
+            }
+            QPushButton#hierarchyAction, QPushButton#hierarchyRemove {
+                background: rgba(196, 181, 245, 0.06);
+                border: 1px solid rgba(196, 181, 245, 0.16);
+                border-radius: 8px;
+                padding: 0;
+            }
+            QPushButton#hierarchyAction:hover, QPushButton#hierarchyAction:focus,
+            QPushButton#hierarchyRemove:focus {
+                background: rgba(196, 181, 245, 0.18);
+                border-color: rgba(196, 181, 245, 0.45);
+            }
+            QPushButton#hierarchyRemove:hover {
+                background: rgba(220, 80, 80, 0.16);
+                border-color: rgba(220, 80, 80, 0.48);
+            }
+            QPushButton#hierarchyAction:disabled {
+                background: transparent;
+                border-color: rgba(196, 181, 245, 0.09);
+            }
+            QLabel#hierarchySaveNotice {
+                color: #e0a3a3;
+                font-size: 12px;
             }
             QPushButton#primaryBtn {
                 background: rgba(196, 181, 245, 0.22);

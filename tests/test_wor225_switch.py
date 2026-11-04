@@ -355,7 +355,7 @@ class TestSensitiveIntegrationContracts:
     def test_provider_and_voice_binary_settings_keep_their_existing_callbacks(self):
         source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
         assert "self._hier_enabled_toggle = OsiaSwitch()" in source
-        assert 'set_setting("ai_hierarchy_enabled"' in source
+        assert '_save_hierarchy_setting("ai_hierarchy_enabled"' in source
         assert "self._wake_word_toggle = OsiaSwitch()" in source
         assert "self._wake_enabled_toggle = OsiaSwitch()" in source
         assert 'set_setting("wake_greeting_enabled", enabled)' in source

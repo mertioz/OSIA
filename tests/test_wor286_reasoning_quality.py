@@ -7,7 +7,7 @@ import pytest
 from osia import reasoning
 from osia.agent import OSIAAgent, ProviderOutputTruncatedError
 from osia.chatgpt_account import provider as account_provider
-from osia.main import _resolve_desktop_chat_route_binding
+from osia.main import _new_desktop_turn_meta, _resolve_desktop_chat_route_binding
 from osia.server import server
 
 
@@ -90,6 +90,67 @@ def test_desktop_cold_route_keeps_explicit_effort(monkeypatch):
 
     assert _resolve_desktop_chat_route_binding()["effective_reasoning"] == "high"
     assert catalogue.refreshes == 1
+
+
+@pytest.mark.parametrize(("prompt", "category"), [
+    ("Envoie le code de confirmation à Camille.", "medium"),
+    ("Ouvre Visual Studio Code.", "medium"),
+    ("Compile a list of today's meetings.", "medium"),
+    ("Explain how to use the confirmation code.", "medium"),
+    ("Résume ce mail et prépare une réponse.", "medium"),
+    ("Présente cette liste en Markdown.\n```\n- option\n```", "medium"),
+    ("Fais un script pour ranger les photos.", "heavy"),
+    ("Corrige le code qui se bloque au démarrage.", "heavy"),
+    ("Compare plusieurs sources indépendantes et vérifie leurs contradictions.", "heavy"),
+    ("Review the API design and explain the deployment risks.", "heavy"),
+    ("Regarde ça :\ndef check(value):\n    return value > 0", "heavy"),
+])
+def test_task_categories_use_intent_and_complexity(prompt, category):
+    from osia.task_router import classify_task
+
+    assert classify_task(prompt) == category
+
+
+def test_pc_and_mobile_bind_the_same_eligible_model_before_acceptance(monkeypatch):
+    settings = {
+        "selected_model": "manual:latest", "selected_model_provider": "ollama",
+        "ai_hierarchy_enabled": True,
+        "ai_hierarchy": {
+            "heavy": ["openai:unavailable", "deepseek:deepseek-flash", "ollama:backup:latest"],
+            "medium": ["local:latest"],
+        },
+        "reasoning": {"models": {"deepseek-flash": "high"}},
+    }
+    monkeypatch.setattr("osia.config.load_settings", lambda: settings)
+    monkeypatch.setattr("osia.config.load_api_keys", lambda: {})
+    monkeypatch.setattr("osia.mobile_model_catalogue.configured_api_providers", lambda _: {"openai", "deepseek"})
+    monkeypatch.setattr(account_provider, "get_cached_account_models", lambda: [])
+    monkeypatch.setattr("osia.models.get_all_models_cached", lambda: [
+        {"provider": "openai", "id": "unavailable", "available": False},
+        {"provider": "deepseek", "id": "deepseek-flash", "available": False,
+         "source": "provider_discovery", "availability": "stale"},
+        {"provider": "ollama", "id": "backup:latest"},
+        {"provider": "ollama", "id": "local:latest"},
+    ])
+
+    def admit(task_text="", directives=None):
+        pc = _new_desktop_turn_meta("fixture", task_text=task_text, turn_directives=directives)
+        mobile = server._new_turn_meta("fixture", "request", task_text=task_text, turn_directives=directives)
+        for key in ("provider_id", "model_id", "effective_reasoning"):
+            assert pc[key] == mobile[key] == pc[f"_pinned_{key}"] == mobile[f"_pinned_{key}"]
+        return pc
+
+    heavy = admit("Corrige le code qui bloque l’application.")
+    assert (heavy["provider_id"], heavy["model_id"], heavy["effective_reasoning"]) == ("deepseek", "deepseek-flash", "high")
+    assert admit("Ouvre Steam.")["model_id"] == "local:latest"
+    assert admit()["model_id"] == "manual:latest"
+    explicit = SimpleNamespace(model_override=SimpleNamespace(provider_id="ollama", model_id="explicit:latest"))
+    assert admit("Corrige le code.", explicit)["model_id"] == "explicit:latest"
+    settings["ai_hierarchy"]["heavy"].reverse()
+    assert admit("Corrige le code.")["model_id"] == "backup:latest"
+    assert heavy["_pinned_model_id"] == "deepseek-flash"
+    settings["ai_hierarchy_enabled"] = False
+    assert admit("Corrige le code.")["model_id"] == "manual:latest"
 
 
 def test_account_none_option_keeps_provider_wire_spelling(monkeypatch):

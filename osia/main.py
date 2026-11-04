@@ -280,50 +280,25 @@ def _notify_mobile_conversation_changed(
     ).start()
 
 
-def _resolve_desktop_chat_route_binding(turn_directives=None) -> dict[str, str]:
+def _resolve_desktop_chat_route_binding(turn_directives=None, *, task_text="") -> dict[str, str]:
     from osia.agent import MODEL as DEFAULT_MODEL
     from osia.config import load_settings
-    from osia.models import provider_for_model_cached
-    from osia.reasoning import resolve_reasoning_option_id
+    from osia.task_router import resolve_chat_route_binding
 
-    settings = load_settings()
-    model_override = getattr(turn_directives, "model_override", None)
-    if model_override is not None:
-        provider_id = str(model_override.provider_id or "").strip().lower()
-        model_id = str(model_override.model_id or "").strip()
-    else:
-        model_id = str(settings.get("selected_model") or DEFAULT_MODEL).strip()
-        provider_id = str(
-            settings.get("selected_model_provider") or ""
-        ).strip().lower()
-        if not provider_id and model_id:
-            provider_id = str(
-                provider_for_model_cached(model_id) or ""
-            ).strip().lower()
-    reasoning_override = getattr(turn_directives, "reasoning_override", None)
-    effective_reasoning = str(
-        reasoning_override
-        if reasoning_override is not None else
-        resolve_reasoning_option_id(provider_id, model_id, settings)
-    ).strip().lower()
-    binding = {
-        "provider_id": provider_id,
-        "model_id": model_id,
-        "effective_reasoning": effective_reasoning,
-    }
-    if any(not value for value in binding.values()):
-        raise RuntimeError("desktop Chat route binding is incomplete")
-    return binding
+    return resolve_chat_route_binding(
+        load_settings(), DEFAULT_MODEL, turn_directives, task_text=task_text,
+    )
 
 
 def _new_desktop_turn_meta(
     conv_id: str,
     *,
     turn_directives=None,
+    task_text: str = "",
 ) -> dict:
     request_id = f"desktop_req_{uuid.uuid4().hex}"
     turn_id = f"desktop_turn_{uuid.uuid4().hex}"
-    route = _resolve_desktop_chat_route_binding(turn_directives)
+    route = _resolve_desktop_chat_route_binding(turn_directives, task_text=task_text)
     from osia.turn_terminality import live_process_identity
 
     _owner_alive, owner_process_identity = live_process_identity(os.getpid())
@@ -454,12 +429,14 @@ def _persist_desktop_user_turn(
     turn_meta: dict | None = None,
     metadata: dict | None = None,
     turn_directives=None,
+    use_task_hierarchy: bool = False,
 ) -> dict:
     """Durably accept a desktop user turn before any agent/tool callback."""
 
     meta = turn_meta or _new_desktop_turn_meta(
         conv_id,
         turn_directives=turn_directives,
+        task_text=content if use_task_hierarchy else "",
     )
     semantic_objective = str(content or "")[:32_000]
     user_metadata = dict(metadata or {})
@@ -2716,7 +2693,6 @@ def wake_mode():
                 },
             ) != pinned_reasoning:
                 raise RuntimeError("persisted desktop Chat reasoning unavailable")
-            turn_agent._reasoning_override_for_turn = pinned_reasoning
         elif selected_model and not (
             turn_directives is not None
             and turn_directives.model_override is not None
@@ -2729,6 +2705,8 @@ def wake_mode():
             from osia.slash_commands import apply_to_agent
 
             apply_to_agent(turn_agent, turn_directives)
+        if pinned_route:
+            turn_agent._reasoning_override_for_turn = pinned_reasoning
 
         authoritative_text = (
             language_text
@@ -3951,6 +3929,7 @@ def wake_mode():
                     turn_meta = _persist_desktop_user_turn(
                         conv_id,
                         user_text,
+                        use_task_hierarchy=True,
                     )
                 except Exception as exc:
                     print(
@@ -4036,6 +4015,7 @@ def wake_mode():
                 display_text,
                 metadata=persistence_metadata or None,
                 turn_directives=turn_directives,
+                use_task_hierarchy=not attachment_turn,
             )
         except Exception as exc:
             if isinstance(exc, SlashDirectiveError):

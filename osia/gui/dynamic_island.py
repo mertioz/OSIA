@@ -33,7 +33,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from osia.gui.motion import MOTION, reduced_motion_requested
+from osia.gui.motion import MOTION, ThemeTransition, reduced_motion_requested
 from osia.gui.theme import get_theme_manager
 
 
@@ -100,7 +100,10 @@ class DynamicIsland(QWidget):
         super().__init__()
 
         self._theme = get_theme_manager()
+        self._theme_transition = ThemeTransition(self)
+        self._theme.theme_changing.connect(self._theme_transition.capture)
         self._theme.theme_changed.connect(self._on_theme_changed)
+        self._theme.theme_changed.connect(self._theme_transition.start)
         self._refresh_theme_colors()
 
         flags = (

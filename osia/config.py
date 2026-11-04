@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from collections.abc import Callable
 
@@ -658,7 +659,16 @@ def save_settings(settings: dict) -> None:
                 os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
             except Exception:
                 pass
-        os.replace(tmp, SETTINGS_FILE)
+        for delay in (0.02, 0.05, 0.10, None):
+            try:
+                os.replace(tmp, SETTINGS_FILE)
+                break
+            except PermissionError as exc:
+                # Windows can temporarily deny replacement while another process reads.
+                if (delay is None or sys.platform != "win32"
+                        or getattr(exc, "winerror", None) not in (5, 32, 33)):
+                    raise
+                time.sleep(delay)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
