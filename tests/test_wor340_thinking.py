@@ -1,9 +1,11 @@
 """Honest public Thinking projection and exact-turn disclosure regressions."""
+import math
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from osia import i18n
@@ -83,6 +85,51 @@ def test_history_stays_collapsed_and_activity_is_not_model_text(app):
         safe = widget._safe_payload(malformed)
         assert safe["lines"] == [wording]
     finally:
+        widget.deleteLater()
+
+
+def test_thinking_detail_fits_live_text_and_reflows_with_width(app, monkeypatch):
+    monkeypatch.setenv("OSIA_REDUCED_MOTION", "1")
+    trace = ledger()
+    widget = _ChatThinkingTrace(auto_expand=False)
+    detail = widget._detail
+    detail.setStyleSheet("QTextEdit { border: none; padding: 3px 7px; }")
+    widget.resize(330, 240)
+    widget.show()
+    try:
+        trace.record_public_reasoning_summary("I checked the first value.")
+        assert widget.apply_trace(payload(trace))
+        widget._toggle_expanded()
+        QTest.qWait(20)
+        single_line = detail.height()
+        assert single_line == math.ceil(detail.document().size().height()) + 6
+        assert detail.verticalScrollBar().maximum() == 0
+
+        trace.record_public_reasoning_summary(
+            "I checked the first value. The second value appears in the table "
+            "and is consistent with the result on the previous page."
+        )
+        assert widget.apply_trace(payload(trace))
+        QTest.qWait(20)
+        wide_height = detail.height()
+        assert wide_height > single_line
+
+        widget.resize(160, 240)
+        QTest.qWait(20)
+        assert detail.height() > wide_height
+        widget.resize(330, 240)
+        QTest.qWait(20)
+        assert detail.height() == wide_height
+
+        trace.record_public_reasoning_summary(
+            "I checked the values against the available totals. " * 20
+        )
+        assert widget.apply_trace(payload(trace))
+        QTest.qWait(20)
+        assert detail.height() == widget._DETAIL_MAX_HEIGHT
+        assert detail.verticalScrollBar().maximum() > 0
+    finally:
+        widget.close()
         widget.deleteLater()
 
 

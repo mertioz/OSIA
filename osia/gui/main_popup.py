@@ -726,6 +726,7 @@ class _ChatThinkingTrace(QFrame):
 
     cancel_requested = pyqtSignal(dict)
     _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
+    _DETAIL_MAX_HEIGHT = 180
 
     def __init__(self, *, auto_expand: bool = True) -> None:
         super().__init__()
@@ -782,6 +783,12 @@ class _ChatThinkingTrace(QFrame):
         self._detail_anim.setDuration(MOTION.state_ms)
         self._detail_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._detail_anim.finished.connect(self._on_detail_animation_finished)
+        self._detail_resize_timer = QTimer(self)
+        self._detail_resize_timer.setSingleShot(True)
+        self._detail_resize_timer.timeout.connect(self._sync_detail_height)
+        self._detail.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self._detail_resize_timer.start(0),
+        )
         self._refresh_toggle()
 
     @property
@@ -1057,17 +1064,13 @@ class _ChatThinkingTrace(QFrame):
                 self._detail.setPlainText(detail)
             scrollbar.setValue(scrollbar.maximum() if following else previous_scroll)
         self._toggle.setEnabled(bool(detail) or not self._auto_collapsed_for_final)
-        # Height alone does not undo QTextEdit.hide(). The empty trace starts
-        # explicitly hidden; every live update must project visibility too.
-        # Update the existing document/widget, without recreating the trace.
-        detail_visible = bool(detail and self._expanded)
-        if detail != previous_detail or self._detail.isHidden() == detail_visible:
+        if not detail:
             self._detail_anim.stop()
-            self._detail.setVisible(detail_visible)
-            self._detail.setMaximumHeight(
-                min(180, max(1, self._detail.sizeHint().height()))
-                if detail and self._expanded else 0
-            )
+            self._detail.hide()
+            self._detail.setMaximumHeight(0)
+        elif self._expanded:
+            self._detail.show()
+            self._sync_detail_height()
         self._refresh_toggle()
         return True
 
@@ -1123,6 +1126,23 @@ class _ChatThinkingTrace(QFrame):
     def _toggle_expanded(self) -> None:
         self._set_expanded(not self._expanded)
 
+    def _detail_content_height(self) -> int:
+        margins = self._detail.contentsMargins()
+        text_height = math.ceil(self._detail.document().size().height())
+        return min(
+            self._DETAIL_MAX_HEIGHT, text_height + margins.top() + margins.bottom(),
+        )
+
+    def _sync_detail_height(self) -> None:
+        if not self._expanded or self._detail.isHidden():
+            return
+        height = self._detail_content_height()
+        if self._detail_anim.state() == QPropertyAnimation.State.Running:
+            if self._detail_anim.endValue() != height:
+                self._detail_anim.setEndValue(height)
+        elif self._detail.maximumHeight() != height:
+            self._detail.setMaximumHeight(height)
+
     def _set_expanded(self, expanded: bool) -> None:
         if self._expanded == expanded:
             return
@@ -1135,7 +1155,7 @@ class _ChatThinkingTrace(QFrame):
             return
         self._detail.show()
         start = self._detail.maximumHeight()
-        end = min(180, max(1, self._detail.sizeHint().height())) if self._expanded else 0
+        end = self._detail_content_height() if self._expanded else 0
         if reduced_motion_requested(self):
             self._detail.setMaximumHeight(end)
             if not self._expanded:
