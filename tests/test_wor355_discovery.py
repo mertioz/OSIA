@@ -134,3 +134,34 @@ def test_supported_older_openai_models_and_published_snapshots_are_preserved(mon
     phone = mobile._mobile_model(mobile.build_model_inventory([pro], {"openai"})[0])
     assert phone["capabilities"]["streaming"] is False
     assert not any(entry["id"] == "gpt-4o" for entry in models.HARDCODED_MODELS)
+
+
+def test_recent_openai_models_require_the_exact_provider_listing(monkeypatch):
+    fallback = {m["id"]: m for m in models.get_all_models_cached() if m["provider"] == "openai"}
+    assert fallback["gpt-6.1-terra"]["available"] is False
+    assert "gpt-5.6-cyber" not in fallback
+    monkeypatch.setattr(models.requests, "get", lambda *a, **kw: reply({"data": [
+        {"id": "gpt-6.1-terra"}, {"id": "gpt-5.6-cyber"}, {"id": "gpt-6.1-luna"},
+    ]}))
+
+    found = models.discover_all_remote_models({"openai": "fixture-key"})
+
+    assert [entry["id"] for entry in found] == ["gpt-6.1-terra", "gpt-5.6-cyber"]
+    assert all(entry["api_protocol"] == "responses" and entry["vision"] for entry in found)
+    inventory = mobile.build_model_inventory(found, {"openai"})
+    assert all(mobile._mobile_model(entry)["selectable"] for entry in inventory)
+
+
+@pytest.mark.parametrize(("provider", "model_id"), [
+    ("anthropic", "claude-mythos-5-1"),
+    ("groq", "meta-models/muse-spark-open"),
+    ("groq", "minimaxai/minimax-m2.7"),
+])
+def test_restricted_models_are_only_projected_for_a_listing_account(monkeypatch, provider, model_id):
+    assert model_id not in {m["id"] for m in models.get_all_models_cached()}
+    monkeypatch.setattr(models.requests, "get", lambda *a, **kw: reply({"data": [{"id": model_id}]}))
+
+    found = models.discover_all_remote_models({provider: "fixture-key"})
+
+    assert [m["id"] for m in found if m["available"]] == [model_id]
+    assert models.provider_for_model(model_id, models=[]) == provider

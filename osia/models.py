@@ -85,16 +85,16 @@ HARDCODED_MODELS = [
     {"id": "gpt-4.1",             "label": "GPT-4.1",             "provider": "openai",    "tier": "mid",   "vision": True},
     {"id": "gpt-4.1-mini",        "label": "GPT-4.1 Mini",        "provider": "openai",    "tier": "light", "vision": True},
     {"id": "gpt-4.1-nano",        "label": "GPT-4.1 Nano",        "provider": "openai",    "tier": "light", "vision": True},
-    # DeepSeek — one native text/image model (official API, 2026-09-10).
-    {"id": "deepseek-flash", "label": "DeepSeek V4.1 Flash", "provider": "deepseek",
-     "tier": "light", "vision": True, "inputModalities": ["text", "image"],
+    # DeepSeek updates the served revision behind this stable API ID.
+    {"id": "deepseek-flash", "label": "DeepSeek V4.1 Flash 1017", "provider": "deepseek",
+     "tier": "light", "vision": True, "inputModalities": ["text", "image"], "context_window": 1_000_000,
      "tool_calls": True, "supportedReasoningEfforts": ["auto", "off", "low", "high", "max"]},
     # Google — all Gemini models are multimodal.
-    {"id": "gemini-3.5-flash",        "label": "Gemini 3.5 Flash",      "provider": "google", "tier": "mid",   "vision": True},
+    {"id": "gemini-3.5-flash",        "label": "Gemini 3.5 Flash",      "provider": "google", "tier": "mid",   "vision": True, "lifecycle": "deprecated"},
     {"id": "gemini-3.1-pro-preview",  "label": "Gemini 3.1 Pro",        "provider": "google", "tier": "best",  "vision": True},
     {"id": "gemini-3-flash-preview",  "label": "Gemini 3 Flash",        "provider": "google", "tier": "mid",   "vision": True},
     {"id": "gemini-3.1-flash-lite",   "label": "Gemini 3.1 Flash Lite", "provider": "google", "tier": "light", "vision": True},
-    {"id": "gemini-2.5-flash",        "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light", "vision": True},  # GA; shutting down Oct 2026
+    {"id": "gemini-2.5-flash",        "label": "Gemini 2.5 Flash",      "provider": "google", "tier": "light", "vision": True, "lifecycle": "deprecated"},
     {"id": "gemini-2.5-flash-lite",   "label": "Gemini 2.5 Flash Lite", "provider": "google", "tier": "light", "vision": True},
     # xAI's May 2026 retirement removed the old Grok 3 API IDs.
     {"id": "grok-4.7", "label": "Grok 4.7", "provider": "xai", "tier": "best",
@@ -104,53 +104,71 @@ HARDCODED_MODELS = [
     # text-only, unlike the erroneous old generic Grok vision declaration.
     {"id": "grok-3-mini", "label": "Grok 3 Mini", "provider": "xai", "tier": "light",
      "vision": False, "tool_calls": True, "api_protocol": "chat_completions"},
-    # Groq — ids must match Groq's /models API exactly (some are namespaced).
-    # These Groq-hosted chat models are text-only.
-    {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid",   "vision": False},
-    {"id": "llama-3.1-8b-instant",                      "label": "Llama 3.1 8B Instant",    "provider": "groq", "tier": "light", "vision": False},
-    {"id": "qwen/qwen3-32b",                            "label": "Qwen 3 32B",              "provider": "groq", "tier": "mid",   "vision": False},
+    # Groq — the older Llamas remain available for eligible Enterprise accounts.
+    {"id": "llama-3.3-70b-versatile",                   "label": "Llama 3.3 70B Versatile", "provider": "groq", "tier": "mid",   "vision": False, "discovery_only": True},
+    {"id": "llama-3.1-8b-instant",                      "label": "Llama 3.1 8B Instant",    "provider": "groq", "tier": "light", "vision": False, "discovery_only": True},
     {"id": "openai/gpt-oss-120b",                       "label": "GPT-OSS 120B",            "provider": "groq", "tier": "best",  "vision": False},
     {"id": "openai/gpt-oss-20b",                        "label": "GPT-OSS 20B",             "provider": "groq", "tier": "light", "vision": False},
-    {"id": "moonshotai/kimi-k2-instruct",               "label": "Kimi K2",                 "provider": "groq", "tier": "best",  "vision": False},
     # Mistral — OpenAI-compatible chat API (cf. DeepSeek/Groq). The Large/Medium/
     # Small lines are multimodal; Codestral is a text-only coding model.
-    {"id": "mistral-large-2512",  "label": "Mistral Large 3",    "provider": "mistral", "tier": "best",  "vision": True},
-    {"id": "mistral-medium-3-5",  "label": "Mistral Medium 3.5", "provider": "mistral", "tier": "mid",   "vision": True},
-    {"id": "mistral-small-2603",  "label": "Mistral Small 4",    "provider": "mistral", "tier": "light", "vision": True},
+    {"id": "mistral-large-2512",  "label": "Mistral Large 3",    "provider": "mistral", "tier": "best",  "vision": True, "lifecycle": "deprecated"},
+    {"id": "mistral-medium-3-5",  "label": "Mistral Medium 3.5", "provider": "mistral", "tier": "mid",   "vision": True, "lifecycle": "deprecated"},
+    {"id": "mistral-small-2603",  "label": "Mistral Small 4",    "provider": "mistral", "tier": "light", "vision": True, "tool_calls": True, "context_window": 256_000},
     {"id": "codestral-2508",      "label": "Codestral",          "provider": "mistral", "tier": "mid",   "vision": False},
 ]
 
-# Small documented contract fallback, verified 2026-10-20. These records
+# Documented contract fallback, verified 2026-11-04. These records
 # describe capabilities; only discovery proves current account availability.
 HARDCODED_MODELS.extend([
-    {"id": mid, "label": label, "provider": "openai", "tier": "best",
+    {"id": mid, "label": label, "provider": "openai", "tier": tier,
      "vision": True, "tool_calls": True, "api_protocol": "responses", "context_window": 1_050_000}
-    for mid, label in (
-        ("gpt-6.1-sol", "GPT-6.1 Sol"), ("gpt-6-astra", "GPT-6 Astra"),
-        ("gpt-6-sol", "GPT-6 Sol"), ("gpt-6-luna", "GPT-6 Luna"),
-        ("gpt-5.6-sol", "GPT-5.6 Sol"), ("gpt-5.6-terra", "GPT-5.6 Terra"),
-        ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    for mid, label, tier in (
+        ("gpt-6-astra", "GPT-6 Astra", "best"), ("gpt-6.1-sol", "GPT-6.1 Sol", "best"),
+        ("gpt-6.1-terra", "GPT-6.1 Terra", "mid"), ("gpt-6-luna", "GPT-6 Luna", "light"),
+        ("gpt-6-sol", "GPT-6 Sol", "best"), ("gpt-5.6-sol", "GPT-5.6 Sol", "best"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", "mid"), ("gpt-5.6-luna", "GPT-5.6 Luna", "light"),
     )
 ])
 HARDCODED_MODELS.extend([
-    {"id": mid, "label": label, "provider": "anthropic", "tier": "best",
-     "vision": True, "tool_calls": True, "context_window": 1_000_000}
-    for mid, label in (("claude-fable-5-1", "Claude Fable 5.1"),
-                       ("claude-opus-5-5", "Claude Opus 5.5"),
-                       ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
-                       ("claude-haiku-5-5", "Claude Haiku 5.5"))
+    {"id": mid, "label": label, "provider": "anthropic", "tier": tier,
+     "vision": True, "tool_calls": True, "context_window": 1_000_000,
+     "adaptive_thinking": True, "thinking_disabled": mid == "claude-haiku-5-5",
+     "supportedReasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+     "discovery_only": mid == "claude-mythos-5-1"}
+    for mid, label, tier in (("claude-fable-5-1", "Claude Fable 5.1", "best"),
+                             ("claude-opus-5-5", "Claude Opus 5.5", "best"),
+                             ("claude-sonnet-5-5", "Claude Sonnet 5.5", "mid"),
+                             ("claude-haiku-5-5", "Claude Haiku 5.5", "light"),
+                             ("claude-mythos-5-1", "Claude Mythos 5.1", "best"))
 ])
 HARDCODED_MODELS.extend([
-    {"id": mid, "label": label, "provider": "google", "tier": "best",
+    {"id": mid, "label": label, "provider": "google", "tier": tier,
      "vision": True, "tool_calls": True, "context_window": 1_048_576}
-    for mid, label in (("gemini-4-argon", "Gemini 4 Argon"),
-                       ("gemini-3.8-flash", "Gemini 3.8 Flash"))
+    for mid, label, tier in (("gemini-4-argon", "Gemini 4 Argon", "best"),
+                             ("gemini-3.8-flash", "Gemini 3.8 Flash", "mid"),
+                             ("gemini-3.6-flash", "Gemini 3.6 Flash", "mid"),
+                             ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", "light"))
 ])
 HARDCODED_MODELS.extend([
+    {"id": "grok-4.6", "label": "Grok 4.6", "provider": "xai", "tier": "best",
+     "vision": True, "tool_calls": True, "api_protocol": "responses", "context_window": 500_000},
     {"id": "qwen/qwen3.8-27b", "label": "Qwen 3.8 27B", "provider": "groq",
      "tier": "mid", "vision": True, "tool_calls": True, "context_window": 131_072},
+    {"id": "meta-models/muse-spark-open", "label": "Muse Spark Open", "provider": "groq",
+     "tier": "best", "vision": True, "tool_calls": True, "context_window": 131_072, "discovery_only": True},
+    {"id": "minimaxai/minimax-m2.7", "label": "MiniMax M2.7", "provider": "groq",
+     "tier": "best", "vision": False, "tool_calls": True, "context_window": 196_608, "discovery_only": True},
     {"id": "mistral-large-4", "label": "Mistral Large 4", "provider": "mistral",
      "tier": "best", "vision": True, "tool_calls": True, "context_window": 1_000_000},
+    {"id": "mistral-large-4-0", "label": "Mistral Large 4", "provider": "mistral",
+     "tier": "best", "vision": True, "tool_calls": True, "context_window": 1_000_000, "discovery_only": True},
+    {"id": "zai-glm-5-3", "label": "GLM 5.3", "provider": "mistral",
+     "tier": "best", "vision": False, "tool_calls": True, "context_window": 1_000_000},
+    {"id": "zai-glm-5-3-flash", "label": "GLM 5.3 Flash", "provider": "mistral",
+     "tier": "mid", "vision": True, "tool_calls": True, "context_window": 1_000_000},
+    *({"id": f"ministral-{size}b-2512", "label": f"Ministral 3 {size}B", "provider": "mistral",
+       "tier": "light", "vision": True, "tool_calls": True, "context_window": 256_000}
+      for size in (14, 8, 3)),
 ])
 
 # ── Vision capability (WOR-25) ─────────────────────────────────────────────
@@ -436,7 +454,9 @@ def _discovered_model(provider, item):
             result["adaptive_thinking"] = True
             result["thinking_disabled"] = _supported(types.get("disabled"))
             result["supportedReasoningEfforts"] = [k for k in ("low", "medium", "high", "xhigh", "max") if _supported(effort.get(k))]
-    limit = item.get("max_input_tokens") or item.get("inputTokenLimit") or item.get("context_window") or item.get("max_context_length")
+    limit = (item.get("max_input_tokens") or item.get("inputTokenLimit")
+             or item.get("context_window") or item.get("max_context_length")
+             or item.get("context_length"))
     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
         result["context_window"] = limit
     if item.get("lifecycle") in {"active", "deprecated"}:
@@ -564,7 +584,8 @@ def _combined_models(local, remote_models=None):
             result.extend(provided[provider])
         else:
             result.extend({**m, "source": "static_fallback", "availability": "unverified", "available": False}
-                          for m in HARDCODED_MODELS if m["provider"] == provider)
+                          for m in HARDCODED_MODELS
+                          if m["provider"] == provider and not m.get("discovery_only"))
     result.extend(local)
     return list({(m["provider"], m["id"]): m for m in result
                  if m["provider"] != "deepseek" or m["id"] == "deepseek-flash"}.values())
@@ -716,7 +737,7 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
     # Groq-hosted models — the exact-match loop above resolves the hardcoded
     # entries; these patterns catch remote-discovered Groq ids. Checked before
     # the generic "gpt" match so "openai/gpt-oss-*" routes to Groq, not OpenAI.
-    if (lower.startswith(("meta-llama/", "moonshotai/", "qwen/", "groq/", "playai/"))
+    if (lower.startswith(("meta-llama/", "moonshotai/", "qwen/", "groq/", "playai/", "meta-models/", "minimaxai/"))
             or "gpt-oss" in lower
             or "kimi" in lower
             or lower.endswith(("-versatile", "-instant"))):
@@ -729,7 +750,7 @@ def provider_for_model(model_id: str, models: list | None = None) -> str:
     # DeepSeek case so non-hardcoded Mistral ids resolve to the right endpoint.
     if lower.startswith(("mistral", "codestral", "pixtral", "ministral",
                          "magistral", "devstral", "mixtral", "open-mistral",
-                         "open-mixtral")):
+                         "open-mixtral", "zai-glm-")):
         return "mistral"
     if "gemini" in lower:
         return "google"

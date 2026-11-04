@@ -157,7 +157,7 @@ def test_catalog_one_model_even_with_stale_remote_cache(monkeypatch):
         assert len(entries) == 1
         entry = entries[0]
         assert entry["id"] == MODEL_ID
-        assert entry["label"] == "DeepSeek V4.1 Flash"
+        assert entry["label"] == "DeepSeek V4.1 Flash 1017"
         assert entry["vision"] and entry["tool_calls"]
         assert entry["inputModalities"] == ["text", "image"]
     capabilities = effective_route_capabilities("deepseek", MODEL_ID)
@@ -175,7 +175,7 @@ def test_pc_mobile_parity_and_stale_catalog_rejection():
     pc = entries[0]
     phone = mobile._mobile_model(pc)
     assert pc["model_id"] == phone["id"] == MODEL_ID
-    assert pc["model_display_name"] == phone["displayName"] == "DeepSeek V4.1 Flash"
+    assert pc["model_display_name"] == phone["displayName"] == "DeepSeek V4.1 Flash 1017"
     assert pc["input_modalities"] == phone["inputModalities"] == ["text", "image"]
     assert phone["vision"] and phone["selectable"] and pc["capabilities"]["vision"]
     assert pc["reasoning_options"] == phone["reasoning"]["options"]
@@ -183,7 +183,7 @@ def test_pc_mobile_parity_and_stale_catalog_rejection():
     assert [o["label"] for o in pc["reasoning_options"]] == ["Default", "Non-thinking", "Low", "High", "Max"]
 
 
-def test_non_deepseek_before_after_snapshot_identical():
+def test_non_deepseek_snapshot_preserves_existing_provider_contracts():
     baseline = json.loads((Path(__file__).parent / "fixtures/wor298_non_deepseek.json").read_text(encoding="utf-8"))
     actual = {
         "models": [m for m in models.HARDCODED_MODELS if m["provider"] != "deepseek"],
@@ -199,12 +199,18 @@ def test_non_deepseek_before_after_snapshot_identical():
     # test's real boundary: DeepSeek cannot modify their established contracts.
     for key in ("complex", "simple", "image_adapters", "provider_order"):
         assert json.loads(json.dumps(actual[key])) == baseline[key]
+    current = {(entry["provider"], entry["id"]): entry for entry in actual["models"]}
+    retired_groq = {"qwen/qwen3-32b", "moonshotai/kimi-k2-instruct"}
     for old in baseline["models"]:
-        if old["provider"] == "xai":
+        provider, model_id = old["provider"], old["id"]
+        if provider == "xai":
             continue  # WOR-356: documented Grok retirement and Mini vision fix.
-        assert old in actual["models"]
+        if provider == "groq" and model_id in retired_groq:
+            assert (provider, model_id) not in current
+            continue
+        assert all(current[provider, model_id].get(key) == value for key, value in old.items())
     for pair, capability in baseline["reasoning"].items():
-        assert actual["reasoning"][pair] == capability
+        assert actual["reasoning"][pair]["options"] == capability["options"]
 
 
 

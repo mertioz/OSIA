@@ -157,7 +157,7 @@ MODEL_REASONING_CAPABILITIES[("deepseek", "deepseek-flash")].update({
 _register(
     MODEL_REASONING_CAPABILITIES,
     "google",
-    ("gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"),
+    ("gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"),
     _options(
         _AUTO_OPTION,
         _option("minimal", "Minimal", {"reasoning_effort": "minimal"}),
@@ -218,13 +218,13 @@ _register(
 _register(
     MODEL_REASONING_CAPABILITIES,
     "mistral",
-    ("mistral-medium-3-5",),
+    ("mistral-medium-3-5", "mistral-small-2603"),
     _options(
         _AUTO_OPTION,
         _option("off", "Off", {"reasoning_effort": "none"}),
         _option("high", "High", {"reasoning_effort": "high"}),
     ),
-    "https://docs.mistral.ai/studio-api/conversations/reasoning",
+    "https://docs.mistral.ai/inference/conversations/reasoning",
 )
 
 
@@ -243,6 +243,13 @@ _register(
     "https://developers.openai.com/api/docs/models/gpt-6-luna",
 )
 _register(
+    MODEL_REASONING_CAPABILITIES, "openai", ("gpt-6.1-terra",),
+    _options(_AUTO_OPTION, _option("off", "Off", {"reasoning_effort": "none"}),
+             *[_option(level, level.title(), {"reasoning_effort": level})
+               for level in ("low", "medium", "high", "xhigh", "max")]),
+    "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+)
+_register(
     MODEL_REASONING_CAPABILITIES, "google", ("gemini-4-argon", "gemini-3.8-flash"),
     _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
                            for level in ("low", "medium", "high")]),
@@ -257,10 +264,28 @@ _register(
 )
 
 _register(
-    MODEL_REASONING_CAPABILITIES, "xai", ("grok-4.7",),
+    MODEL_REASONING_CAPABILITIES, "groq", ("meta-models/muse-spark-open",),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                            for level in ("low", "medium", "high", "xhigh")]),
+    "https://console.groq.com/docs/reasoning",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "xai", ("grok-4.7", "grok-4.6"),
     _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
                            for level in ("low", "medium", "high", "xhigh")]),
     "https://docs.x.ai/developers/model-capabilities/text/reasoning",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "mistral", ("mistral-large-4", "mistral-large-4-0"),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                            for level in ("low", "medium", "high")]),
+    "https://docs.mistral.ai/inference/conversations/reasoning",
+)
+_register(
+    MODEL_REASONING_CAPABILITIES, "mistral", ("zai-glm-5-3", "zai-glm-5-3-flash"),
+    _options(_AUTO_OPTION, *[_option(level, level.title(), {"reasoning_effort": level})
+                            for level in ("low", "high", "max")]),
+    "https://docs.mistral.ai/inference/conversations/reasoning",
 )
 
 def normalize_level(value) -> str:

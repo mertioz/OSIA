@@ -27,7 +27,7 @@ def sse(output, model=MODEL):
     return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
 
 
-@pytest.mark.parametrize("provider,model", [("openai", MODEL), ("xai", "grok-4.7")])
+@pytest.mark.parametrize("provider,model", [("openai", MODEL), ("openai", "gpt-6.1-terra"), ("xai", "grok-4.7")])
 @pytest.mark.parametrize("streaming", [False, True])
 def test_canonical_read_and_native_reinjection(monkeypatch, tmp_path, streaming, provider, model):
     fixture = tmp_path / "fixture.txt"

@@ -1,4 +1,4 @@
-"""Documented discovery-only contracts, verified 2026-10-20.
+"""Documented discovery-only contracts, verified 2026-11-04.
 
 Source: https://developers.openai.com/api/docs/models/<model-id>
 These records supplement capability-poor /models responses. They never add
@@ -18,6 +18,7 @@ _CONTRACTS = [
     ("gpt-5.4-nano", 400000, True, True, "responses", ["gpt-5.4-nano-2026-03-17"]),
     ("gpt-daybreak-blue-latest", 1050000, True, True, "responses", []),
     ("gpt-daybreak-red-latest", 400000, True, True, "responses", []),
+    ("gpt-5.6-cyber", 400000, True, True, "responses", []),
     ("gpt-5-pro", 400000, True, True, "responses", ["gpt-5-pro-2025-10-06"]),
     ("gpt-5.2-pro", 400000, True, True, "responses", ["gpt-5.2-pro-2025-12-11"]),
     ("gpt-5.4-pro", 1050000, True, True, "responses", ["gpt-5.4-pro-2026-03-05"]),
