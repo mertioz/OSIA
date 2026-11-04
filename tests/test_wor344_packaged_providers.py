@@ -5,7 +5,7 @@ from osia.provider_smoke import run_claude_messages_smoke
 
 
 def test_launch_gates_match_reviewed_runtime_versions(tmp_path):
-    for version, enabled in [("0.144.1", False), ("0.156.1", True)]:
+    for version, enabled in [("0.144.1", False), ("0.156.1", True), ("0.166.0", True)]:
         client = AppServerClient(base_dir=tmp_path, runtime_version_override="codex-cli " + version)
         command = client._app_server_command(Path("codex.exe"))
         assert ("in_app_local_automation" in command) is enabled

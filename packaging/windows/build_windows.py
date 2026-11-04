@@ -37,9 +37,9 @@ LEGAL_STAGE = STAGE / "legal"
 DIST = ROOT / "dist" / "OSIA"
 RELEASE = ROOT / "release" / "windows"
 CODEX_RUNTIME_STAGE = STAGE / "runtimes" / "codex"
-CODEX_RUNTIME_VERSION = "0.144.1"
+CODEX_RUNTIME_VERSION = "0.166.0"
 CODEX_RUNTIME_ARCHIVE = "codex-package-x86_64-pc-windows-msvc.tar.gz"
-CODEX_RUNTIME_SHA256 = "ce94e1fb84693d3f7332ceeab5be73e93de38725da4b82dff863cd2c795b4730"
+CODEX_RUNTIME_SHA256 = "d559bb88e74d471265857b93b7f19bc250dae527673b9191b33534478093f6bc"
 CODEX_RUNTIME_URL = (
     "https://github.com/openai/codex/releases/download/"
     f"rust-v{CODEX_RUNTIME_VERSION}/{CODEX_RUNTIME_ARCHIVE}"
@@ -320,6 +320,7 @@ def _stage_codex_runtime() -> dict:
         "codex-package.json",
         "bin/codex.exe",
         "bin/codex-code-mode-host.exe",
+        "bin/codex-exec-server.exe",
         "codex-path/rg.exe",
         "codex-resources/codex-command-runner.exe",
         "codex-resources/codex-windows-sandbox-setup.exe",

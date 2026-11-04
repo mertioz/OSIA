@@ -44,10 +44,10 @@ from .rate_limits import (
 SUPPORTED_MIN_VERSION = (0, 144, 1)
 SUPPORTED_MAX_VERSION = (0, 145, 0)
 _DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE = ((0, 144, 1), (0, 145, 0))
-# The original interval remains pinned for the 0.144 dynamic-image bridge.
-# Codex 0.156.1 is separately supported after checking its generated App Server
-# contract; unreviewed releases stay fail-closed.
-_ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1)})
+# Review each App Server contract before accepting it. Keep the legacy bridge
+# available for existing 0.144 installations.
+CURRENT_RUNTIME_VERSION = (0, 166, 0)
+_ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1), CURRENT_RUNTIME_VERSION})
 CLIENT_VERSION = PRODUCT_VERSION
 _IMAGE_LOG_REDACTION_POLL_SECONDS = 0.5
 
@@ -607,6 +607,8 @@ def _native_candidates(base_dir: Path | None = None) -> list[Path]:
         candidates.append(Path(override))
 
     if sys.platform == "win32":
+        version = ".".join(map(str, CURRENT_RUNTIME_VERSION))
+        candidates.append(resource_path("build", "codex-runtime", version, "bin", "codex.exe"))
         wrapper = shutil.which("codex")
         if wrapper:
             npm_root = Path(wrapper).resolve().parent / "node_modules" / "@openai" / "codex"
@@ -873,9 +875,8 @@ class AppServerClient:
             "--config", 'web_search="disabled"',
             "--config", "tools.web_search=false",
         ))
-        # 0.144 is the shipped Windows runtime. It predates this gate and
-        # rejects unknown feature names before JSONL initialization. The
-        # source-supported 0.156 runtime has the gate and must disable it.
+        # The legacy 0.144 runtime predates this gate and rejects unknown
+        # feature names before JSONL initialization.
         version = _version_tuple(self._runtime_version_override or _probe_executable(executable) or "")
         if version in _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS:
             command.extend(("--disable", "in_app_local_automation"))

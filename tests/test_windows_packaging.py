@@ -997,7 +997,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     assert 'PRODUCT_VERSION = "0.9.0"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
-    assert 'CODEX_RUNTIME_VERSION = "0.144.1"' in build
+    assert 'CODEX_RUNTIME_VERSION = "0.166.0"' in build
     assert "def _stage_codex_runtime" in build
     assert "CODEX_RUNTIME_SHA256" in build
 
