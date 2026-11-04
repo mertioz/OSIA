@@ -22,7 +22,8 @@ def test_thinking_layout_stream_completion_cancel_and_history(monkeypatch):
         for index in range(chat._messages_layout.count()):
             widget = chat._messages_layout.itemAt(index).widget()
             if isinstance(widget, _ChatThinkingTrace):
-                result.append("thinking")
+                if not widget.isHidden():
+                    result.append("thinking")
             elif widget is not None:
                 bubbles = widget.findChildren(_Bubble)
                 if bubbles:
@@ -71,11 +72,23 @@ def test_thinking_layout_stream_completion_cancel_and_history(monkeypatch):
             {"role": "assistant", "content": "Legacy answer"},
         ])
         app.processEvents()
-        assert composition() == ["Legacy question", "thinking", "Legacy answer"]
-        empty = chat._messages_host.findChildren(_ChatThinkingTrace)
-        visible = [w for w in empty if not w.isHidden()]
-        assert len(visible) == 1
-        assert visible[0]._detail.toPlainText() == ""
+        assert composition() == ["Legacy question", "Legacy answer"]
+
+        empty_trace = ExecutionTraceLedger(
+            conversation_id="composition", request_id="r3", turn_id="t3",
+            run_id="run3", provider_id="deepseek", model_id="deepseek-flash",
+            effective_reasoning="high",
+        )
+        binding = empty_trace.binding_dict()
+        chat.append_message("user", "Question 3")
+        assert chat.begin_turn(binding)
+        widget = chat._thinking_widgets[empty_trace.key]
+        assert not widget._orbs.isHidden()
+        assert chat.finalize_assistant_stream("Answer 3", binding)
+        app.processEvents()
+        assert widget.isHidden()
+        assert widget._toggle.isHidden()
+        assert composition()[-2:] == ["Question 3", "Answer 3"]
     finally:
         chat.close()
         chat.deleteLater()

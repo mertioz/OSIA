@@ -174,11 +174,14 @@ def test_native_osia_and_mcp_are_voluntary_direct_peers(tmp_path):
             "arguments": {"path": "synthetic.txt", "content": "one"},
         }
         assert "write_file" in [tool["name"] for tool in _canonical_native_tools()]
-        mcp_tool = next(tool for tool in _canonical_native_tools() if tool["name"] == registered.name)
+        advertised = {tool["name"]: tool for tool in _canonical_native_tools()}
+        alias = f"osia_{registered.name}"
+        assert registered.name not in advertised
+        mcp_tool = advertised[alias]
         assert mcp_tool["inputSchema"] == registered.input_schema
         mcp_call = {
             "callId": "call:mcp",
-            "tool": registered.name,
+            "tool": alias,
             "arguments": {"query": "fixture"},
         }
         expected_handoff = {

@@ -183,8 +183,20 @@ def _normalized_model_id(value: Any) -> str:
     return str(value or "").strip()
 
 
+_NATIVE_MCP_ALIAS_PREFIX = "osia_"
+
+
 def _native_mcp_name(name: object) -> bool:
-    return isinstance(name, str) and bool(re.fullmatch(r"mcp__[A-Za-z0-9_-]{1,59}", name))
+    # Leave room for the alias prefix within the native name's 64 characters.
+    return isinstance(name, str) and bool(re.fullmatch(r"mcp__[A-Za-z0-9_-]{1,54}", name))
+
+
+def _canonical_dynamic_tool_name(name: Any) -> Any:
+    if isinstance(name, str) and name.startswith(_NATIVE_MCP_ALIAS_PREFIX):
+        candidate = name.removeprefix(_NATIVE_MCP_ALIAS_PREFIX)
+        if _native_mcp_name(candidate):
+            return candidate
+    return name
 
 
 def _is_canonical_native_handoff(name: object) -> bool:
@@ -277,7 +289,7 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     tools.extend(
         {
             "type": "function",
-            "name": spec.name,
+            "name": _NATIVE_MCP_ALIAS_PREFIX + spec.name,
             "description": spec.capability,
             "inputSchema": deepcopy(spec.input_schema),
         }
@@ -292,7 +304,7 @@ def _exact_canonical_native_call(params: dict) -> dict | None:
     """Return one value-only exact handoff; never infer from native commands."""
 
     namespace = params.get("namespace")
-    tool = params.get("tool")
+    tool = _canonical_dynamic_tool_name(params.get("tool"))
     arguments = params.get("arguments")
     call_id = params.get("callId") or params.get("call_id")
     if namespace not in {None, ""}:
@@ -1931,7 +1943,7 @@ class AppServerClient:
         """Parse one provider dynamic call without treating unknown tools as holes."""
 
         namespace = params.get("namespace")
-        tool = params.get("tool")
+        tool = _canonical_dynamic_tool_name(params.get("tool"))
         arguments = params.get("arguments")
         call_id = params.get("callId") or params.get("call_id")
         if namespace not in {None, ""}:

@@ -35,7 +35,9 @@ _CONTAINMENT_INSTRUCTIONS = """
 capabilities are both available. The same permission, ActionTruth,
 and evidence rules apply to either path. A capability exposed as a native
 dynamic tool is invoked only through that native call, never duplicated as an
-XML/text tool call. Do not infer local paths unless needed.]
+XML/text tool call. A connected MCP tool exposed natively has an
+`osia_mcp__` alias for the corresponding `mcp__` tool in the inventory.
+Do not infer local paths unless needed.]
 """
 
 _DEVELOPER_INSTRUCTIONS = (
