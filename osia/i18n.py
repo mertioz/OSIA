@@ -1684,6 +1684,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "Stop", "fr": "Arrêter", "zh": "停止", "ja": "停止",
         "de": "Stopp", "es": "Detener",
     },
+    "chat.stop_failed": {
+        "en": "Couldn't stop this turn. Try again.",
+        "fr": "Impossible d’arrêter ce tour. Réessaie.",
+    },
     "chat.status_cancelled_proven": {
         "en": "The action was cancelled before any effect was confirmed.",
         "fr": "L’action a été annulée avant tout effet confirmé.",

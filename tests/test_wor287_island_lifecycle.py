@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import threading
 from pathlib import Path
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -171,26 +172,71 @@ def test_durable_retry_keeps_admission_without_fake_thinking(scheduler):
 def test_cancel_and_late_worker_cleanup_preserve_other_conversation():
     ns, _, _ = _runtime()
     cancelled = threading.Event()
-    agent = SimpleNamespace(request_turn_cancellation_intent=lambda _: True,
+    started = threading.Event()
+    commit = threading.Event()
+    completed = Queue()
+
+    def record_intent(_turn_id):
+        started.set()
+        return commit.wait(2)
+
+    agent = SimpleNamespace(request_turn_cancellation_intent=record_intent,
                             request_turn_cancellation=lambda _: cancelled.set())
     binding = _binding()
     _start(ns, binding, agent)
     other = _binding("b", "other")
     _start(ns, other)
     ns["threading"] = threading
+    ns["bridge"].chat_cancel_finished = SimpleNamespace(emit=lambda *args: completed.put(args))
+    confirmed = []
     ns["popup"] = SimpleNamespace(
-        confirm_chat_execution_cancellation=lambda _: None,
-        cancel_assistant_stream=lambda **_: None,
+        confirm_chat_execution_cancellation=lambda payload, **_: confirmed.append(payload),
     )
-    _callbacks(ns, "handle_chat_execution_cancel")
+    _callbacks(ns, "handle_chat_execution_cancel", "handle_chat_execution_cancel_finished")
     ns["handle_chat_execution_cancel"](binding)
+    try:
+        assert started.wait(1)
+        assert confirmed == []
+        assert ns["busy_conversations"] == {"chat", "other"}
+    finally:
+        commit.set()
+    ns["handle_chat_execution_cancel_finished"](*completed.get(timeout=2))
     assert cancelled.wait(2)
+    assert confirmed == [binding]
     ns["_release_chat_turn"](binding, agent)
     ns["_set_chat_island_state"](binding, "thinking")
     assert ns["busy_conversations"] == {"other"}
     assert ns["island_lifecycle"].current_state() == "thinking"
     ns["_set_conversation_busy"]("other", False, owner=other)
     assert ns["island_lifecycle"].current_state() == "idle"
+
+
+def test_stop_error_releases_pending_request_without_releasing_the_turn(monkeypatch):
+    from osia import turn_terminality
+
+    monkeypatch.setattr(turn_terminality, "load_persisted_terminal_result", lambda _: None)
+    ns, _, _ = _runtime()
+    completed = Queue()
+    rejected = []
+
+    def fail(_turn_id):
+        raise OSError("simulated storage contention")
+
+    agent = SimpleNamespace(
+        request_turn_cancellation_intent=fail,
+        request_turn_cancellation=lambda _: pytest.fail("Uncommitted Stop propagated"),
+    )
+    binding = _binding()
+    _start(ns, binding, agent)
+    ns["threading"] = threading
+    ns["bridge"].chat_cancel_finished = SimpleNamespace(emit=lambda *args: completed.put(args))
+    ns["popup"] = SimpleNamespace(reject_chat_execution_cancellation=rejected.append)
+    _callbacks(ns, "handle_chat_execution_cancel", "handle_chat_execution_cancel_finished")
+    ns["handle_chat_execution_cancel"](binding)
+    ns["handle_chat_execution_cancel_finished"](*completed.get(timeout=2))
+    assert rejected == [binding]
+    assert ns["busy_conversations"] == {"chat"}
+    assert not ns["active_chat_turns"][tuple(binding.values())].get("cancel_pending")
 
 
 def test_voice_and_cron_finish_restore_only_current_activity():

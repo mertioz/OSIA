@@ -1197,6 +1197,15 @@ class _ChatThinkingTrace(QFrame):
         self._source_payload["cancel_requested"] = True
         self.cancel_requested.emit(dict(self._binding))
 
+    def reject_cancel_request(self) -> bool:
+        if not self.unfinished or not self._cancel_pending:
+            return False
+        self._cancel_pending = False
+        self._binding["cancel_requested"] = False
+        self._source_payload["cancel_requested"] = False
+        self.set_active(True)
+        return True
+
 
 @dataclass
 class _ComposerDraft:
@@ -11800,7 +11809,20 @@ class MainPopup(QWidget):
             return
         self.chat_execution_cancel_requested.emit(dict(payload))
 
-    def confirm_chat_execution_cancellation(self, payload: dict) -> bool:
+    def reject_chat_execution_cancellation(self, payload: dict) -> None:
+        if not self._stream_binding_is_current(payload):
+            return
+        key = _ChatPage._binding_key(payload)
+        if key in self._cancelled_thinking_keys or key in self._terminal_thinking_keys:
+            return
+        trace = self._chat._thinking_widgets.get(key)
+        if trace is not None and trace.reject_cancel_request():
+            self._chat._sync_send_state()
+            self._chat.show_notice(i18n.t("chat.stop_failed"))
+
+    def confirm_chat_execution_cancellation(
+        self, payload: dict, *, discard_stream: bool = False,
+    ) -> bool:
         """Apply Stop presentation only after the durable intent was accepted."""
 
         key = _ChatPage._binding_key(payload)
@@ -11821,6 +11843,8 @@ class MainPopup(QWidget):
         self._cancelled_thinking_keys.add(key)
         self._terminal_thinking_keys.add(key)
         self._chat.tombstone_cancelled_turn(payload)
+        if discard_stream and self._chat._stream_key == key:
+            self._chat.cancel_assistant_stream(flush=False)
         projected = dict(self._thinking_by_key.get(key) or payload)
         projected["cancel_requested"] = True
         projected["terminal"] = True

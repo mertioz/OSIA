@@ -350,6 +350,11 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(app, popup)
         popup.refresh_conversations(binding["conversation_id"])
         popup._chat._send_btn.click()
         assert len(requested) == 1
+        assert not popup._chat._send_btn.isEnabled()
+        popup.reject_chat_execution_cancellation(binding)
+        assert popup._chat._send_btn.isEnabled()
+        popup._chat._send_btn.click()
+        assert len(requested) == 2
 
         assert popup.confirm_chat_execution_cancellation(binding)
         app.processEvents()

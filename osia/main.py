@@ -1647,20 +1647,6 @@ def _shutdown_voice_runtime(
     return worker_stopped
 
 
-def _exec_desktop_with_cleanup(app, cleanup) -> int:
-    """Dismiss the desktop windows before waiting for runtime cleanup."""
-
-    def _hide_windows() -> None:
-        for window in app.topLevelWidgets():
-            if window.isVisible():
-                window.hide()
-
-    app.aboutToQuit.connect(_hide_windows)
-    exit_code = app.exec()
-    cleanup()
-    return exit_code
-
-
 # â”€â”€ Modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def text_mode():
@@ -1928,6 +1914,7 @@ def wake_mode():
         assistant_stream_final = pyqtSignal(dict, str)
         assistant_stream_error = pyqtSignal(dict, str)
         chat_turn_started = pyqtSignal(dict)
+        chat_cancel_finished = pyqtSignal(dict, object, bool, bool)
         execution_trace = pyqtSignal(dict)
         # Request GUI reprojection without carrying a possibly stale state.
         island_state = pyqtSignal()
@@ -5044,53 +5031,81 @@ def wake_mode():
     def handle_chat_execution_cancel(
         binding: dict, *, discard_stream: bool = True,
     ) -> None:
-        """Cancel only the exact active Chat run, or a correlated legacy run."""
-
         key = _chat_turn_key(binding)
         with active_chat_turns_lock:
-            direct = (
-                dict(active_chat_turns.get(key) or {})
-                if key is not None else {}
-            )
-        if direct:
-            turn_agent = direct.get("agent")
-            record_intent = getattr(
-                turn_agent, "request_turn_cancellation_intent", None,
-            )
-            if not callable(record_intent) or not record_intent(
-                str((binding or {}).get("turn_id") or "")
-            ):
+            direct = active_chat_turns.get(key)
+            if direct is not None and direct.get("cancel_pending"):
                 return
-            # Durable user_cancelled is now authoritative.  The cancelled turn
-            # remains in history, but it no longer owns Chat admission or the
-            # composer while its fenced worker/provider callbacks drain.
-            _release_chat_turn(binding, turn_agent)
-            _set_conversation_busy(
-                str((binding or {}).get("conversation_id") or ""),
-                False,
-                owner=binding,
-            )
-            # Only a Stop from the rendered Thinking row owns the current
-            # presentation buffer. Deletion may target a different chat.
-            popup.confirm_chat_execution_cancellation(binding)
+            if direct is not None:
+                direct["cancel_pending"] = True
+        if direct is None:
             if discard_stream:
-                popup.cancel_assistant_stream(flush=False)
+                popup.reject_chat_execution_cancellation(binding)
+            return
+        turn_agent = direct["agent"]
+        exact_binding = dict(direct["binding"])
+        turn_id = exact_binding["turn_id"]
 
-            def _cancel_direct() -> None:
-                request_cancel = getattr(
-                    turn_agent, "request_turn_cancellation", None,
+        def _cancel_direct() -> None:
+            accepted = False
+            try:
+                accepted = bool(turn_agent.request_turn_cancellation_intent(turn_id))
+            except Exception as exc:
+                print(f"[OSIA] Stop intent failed: {type(exc).__name__}", flush=True)
+                # A failure while projecting Stop can follow a successful
+                # durable write. Check the exact persisted result in that case.
+                from osia.turn_terminality import load_persisted_terminal_result
+
+                terminal = load_persisted_terminal_result(turn_id) or {}
+                persisted_binding = terminal.get("execution_binding") or {}
+                accepted = (
+                    terminal.get("terminal_state") == "user_cancelled"
+                    and bool(persisted_binding)
+                    and all(
+                        exact_binding.get(field) == value
+                        for field, value in persisted_binding.items()
+                    )
                 )
-                if callable(request_cancel):
-                    request_cancel(str((binding or {}).get("turn_id") or ""))
+            try:
+                bridge.chat_cancel_finished.emit(
+                    exact_binding, turn_agent, accepted, discard_stream,
+                )
+            except RuntimeError:
+                pass  # The GUI was disposed while cancellation was pending.
+            if accepted:
+                try:
+                    turn_agent.request_turn_cancellation(turn_id)
+                except Exception as exc:
+                    print(f"[OSIA] Stop propagation failed: {type(exc).__name__}", flush=True)
 
+        try:
             threading.Thread(
                 target=_cancel_direct,
                 name="osia-chat-turn-cancel",
                 daemon=True,
             ).start()
+        except RuntimeError:
+            handle_chat_execution_cancel_finished(exact_binding, turn_agent, False, discard_stream)
+
+    def handle_chat_execution_cancel_finished(
+        binding: dict, turn_agent, accepted: bool, discard_stream: bool,
+    ) -> None:
+        if not accepted:
+            with active_chat_turns_lock:
+                direct = active_chat_turns.get(_chat_turn_key(binding))
+                if direct is not None and direct.get("agent") is turn_agent:
+                    direct.pop("cancel_pending", None)
+            if discard_stream:
+                popup.reject_chat_execution_cancellation(binding)
             return
+        _release_chat_turn(binding, turn_agent)
+        popup.confirm_chat_execution_cancellation(binding, discard_stream=discard_stream)
+        _set_conversation_busy(binding["conversation_id"], False, owner=binding)
 
     popup.chat_execution_cancel_requested.connect(handle_chat_execution_cancel)
+    bridge.chat_cancel_finished.connect(
+        handle_chat_execution_cancel_finished, Qt.ConnectionType.QueuedConnection,
+    )
 
     trigger_label = "Press Ctrl+Alt+P to talk to OSIA"
 
@@ -5101,7 +5116,7 @@ def wake_mode():
     print("  Ctrl+Alt+O: show/hide the OSIA window")
     print("=" * 60)
 
-    def cleanup_after_quit():
+    def on_quit():
         voice_ui_lifecycle.close()
         island_lifecycle.close()
         owned_stops = [
@@ -5146,11 +5161,13 @@ def wake_mode():
         except Exception:
             pass
 
+    app.aboutToQuit.connect(on_quit)
+
     # Reattach exact local direct-Chat receipts.
     QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
-    sys.exit(_exec_desktop_with_cleanup(app, cleanup_after_quit))
+    sys.exit(app.exec())
 
 
 def main():
