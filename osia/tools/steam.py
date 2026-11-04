@@ -217,13 +217,21 @@ def _manifest_record(app: dict, library: str):
         flags = int((app.get("stateflags") or "0").strip())
     except (TypeError, ValueError):
         flags = 0
-    return {
+    record = {
         "appid": appid,
         "name": (app.get("name") or "").strip(),
         "installdir": (app.get("installdir") or "").strip(),
         "stateflags": flags,
         "library": library,
     }
+    try:
+        total = int(app.get("bytestodownload", ""))
+        downloaded = int(app.get("bytesdownloaded", ""))
+    except (TypeError, ValueError):
+        return record
+    if total > 0 and 0 <= downloaded <= total:
+        record.update(bytes_to_download=total, bytes_downloaded=downloaded)
+    return record
 
 
 def _iter_installed_games(steam_root: str):
@@ -307,7 +315,8 @@ def steam_game_state(name):
 
     Returns ``{appid, name, installed, running, installdir}`` for the best match
     among installed appmanifests, or ``None`` when Steam isn't installed, has no
-    manifests, or nothing matches ``name`` confidently. Never raises.
+    manifests, or nothing matches ``name`` confidently. Includes the Steam
+    manifest's byte counters when present and consistent. Never raises.
 
       * ``installed`` — the manifest's StateFlags has bit 4 (StateFullyInstalled):
         the game's files are fully installed on disk and launchable. A pending
@@ -382,4 +391,5 @@ def steam_game_state(name):
         "installed": bool(best["stateflags"] & STATE_FULLY_INSTALLED),
         "running": _game_running(best),
         "installdir": best["installdir"],
+        **{key: best[key] for key in ("bytes_to_download", "bytes_downloaded") if key in best},
     }

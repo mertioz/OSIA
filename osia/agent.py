@@ -3131,10 +3131,7 @@ def tool_has_window(app: str) -> str:
 
 
 def tool_steam_game_state(name: str) -> str:
-    """Deterministic install/run state of a Steam game (by name or appid), read
-    from Steam's own manifests — no vision. Tells the model whether the game is
-    installed and whether it is running, so it never claims it launched a game
-    that isn't installed (WOR-87)."""
+    """Read install, run and download state by title or app ID from Steam."""
     from osia.tools import verify
     st = verify.steam_game_state(name)
     if st is None:
@@ -3144,9 +3141,18 @@ def tool_steam_game_state(name: str) -> str:
                     f"cannot verify '{name}'.")
         return (f"steam: '{name}' is NOT installed (no Steam appmanifest matches "
                 "it). It must be installed before it can launch.")
-    return (f"steam: '{st['name']}' (appid {st['appid']}) — "
-            f"installed: {'yes' if st['installed'] else 'no'}, "
-            f"running: {'yes' if st['running'] else 'no'}.")
+    result = (f"steam: '{st['name']}' (appid {st['appid']}) — "
+              f"installed: {'yes' if st['installed'] else 'no'}, "
+              f"running: {'yes' if st['running'] else 'no'}.")
+    total = st.get("bytes_to_download", 0)
+    downloaded = st.get("bytes_downloaded", 0)
+    if total:
+        percent = (downloaded * 1000 // total) / 10
+        result += (
+            f" Steam manifest download: {downloaded}/{total} bytes "
+            f"({percent:.1f}%)."
+        )
+    return result
 
 
 def tool_web_state(expect_url: str = None, expect_text: str = None,
@@ -13157,9 +13163,6 @@ class OSIAAgent:
             canonical_controller.turn_id if canonical_controller is not None else
             str((getattr(self, "_tool_attempt_metadata", None) or {}).get("turn_id") or ""),
         )
-        self._continuation_resolution_pending = isinstance(
-            getattr(self, "_unfinished_execution", None), dict,
-        )
         self._continuation_resume_selected = False
         self._continuation_reconcile_required = False
         self._continuation_reconciled = False
@@ -13371,6 +13374,16 @@ class OSIAAgent:
         repetition, action identity, or prior outcomes.
         """
         scheduled_execution = _SCHEDULED_EXECUTION_CONTEXT.get()
+        # Canonical segments already receive the correlated tool receipt. An
+        # unknown effect is evidence for the selected model, not a request to
+        # resolve an old operation through the legacy text-only control.
+        legacy_continuation = (
+            _CURRENT_TERMINALITY_CONTROLLER.get() is None
+            or self._terminality_strategy is not None
+        )
+        self._continuation_resolution_pending = legacy_continuation and isinstance(
+            self._unfinished_execution, dict,
+        )
         user_text = _history_text_for_hygiene(user_input)
         self._chatgpt_conversation_id = current_conversation_id
         if history is not None:
@@ -13560,8 +13573,9 @@ class OSIAAgent:
                 "_execution_strategy": True,
                 "content": active_execution_strategy.model_instruction(),
             })
-        continuation_prompt = _unfinished_execution_prompt(
-            self._unfinished_execution,
+        continuation_prompt = (
+            _unfinished_execution_prompt(self._unfinished_execution)
+            if legacy_continuation else ""
         )
         if continuation_prompt:
             self.messages.append({
@@ -14228,9 +14242,11 @@ class OSIAAgent:
             public_narration = _public_progress_from_tool_response(
                 content, tool_calls,
             )
-            tool_calls, continuation_decision = (
-                _apply_unfinished_execution_decision(self, tool_calls)
-            )
+            continuation_decision = ""
+            if legacy_continuation:
+                tool_calls, continuation_decision = (
+                    _apply_unfinished_execution_decision(self, tool_calls)
+                )
             if continuation_decision in {
                 "keep_pending", "cancel", "reconcile", "invalid",
             } and not tool_calls:

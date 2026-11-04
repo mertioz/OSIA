@@ -2,9 +2,13 @@
 
 import json
 
+import pytest
+
 from osia import agent as runtime
 from osia import execution_strategy as legacy
-from osia.tool_contracts import ExecutionOutcome
+from osia.tool_contracts import (
+    ExecutionOutcome, ToolExecutionRecord, effective_contract, get_tool_spec,
+)
 from tests.test_wor305_phase3a_no_replay import dispatch
 from wor305_test_support import call, controller, scripted
 
@@ -135,6 +139,76 @@ def test_failure_and_unknown_receipts_keep_their_factual_outcomes(
     assert uncertain["status"] == "unknown_after_start"
     assert uncertain["terminal_outcome"] == "outcome_unknown"
     assert uncertain["dispatch_state"] == "effect_unknown"
+
+
+@pytest.mark.parametrize("read_again", [False, True])
+def test_canonical_resume_leaves_unknown_click_to_the_selected_model(
+    dispatch, monkeypatch, tmp_path, read_again,
+):
+    import osia.tool_attempts as attempts
+    from osia.turn_terminality import TurnTerminalityController
+
+    objective = "Check the installation progress after clicking Install."
+    final = "The download is in progress. Installation is still incomplete."
+    responses = [call("steam_game_state", name="Fixture Game")] if read_again else []
+    agent, provider_calls = scripted(monkeypatch, [*responses, final, final])
+    agent.provider, agent.model = "chatgpt_account", "gpt-6-luna"
+    reads = []
+
+    def read_state(name):
+        reads.append(name)
+        return "Download in progress."
+
+    monkeypatch.setitem(runtime.TOOL_MAP, "steam_game_state", read_state)
+    store = dispatch.store
+    monkeypatch.setattr(attempts, "get_tool_attempt_store", lambda: store)
+    contract = effective_contract(get_tool_spec("computer_click"), {}, objective)
+    click = store.create_attempt(
+        conversation_id="3b", turn_id="3b", request_id="3b", tool_call_id="click",
+        tool_name="computer_click", provider_id=agent.provider, model_id=agent.model,
+        turn_context={}, argument_fingerprint=store.fingerprint_arguments({}),
+        side_effect=contract.side_effect.value, idempotence=contract.idempotency.value,
+        retry_policy=contract.retry.value,
+    )["tool_attempt_id"]
+    store.mark_accepted(click)
+    store.arm_owner_dispatch_boundary(click)
+    store.mark_running(click)
+    store.claim_owner_dispatch(click)
+    store.record_terminal_result(
+        click, status="unknown_after_start", terminal_outcome="outcome_unknown",
+        dispatch_state="effect_unknown", reason_code="post_action_screenshot_required",
+    )
+    terminality = TurnTerminalityController(
+        turn_id="3b", objective=objective, execution_required=True, storage_dir=tmp_path,
+    )
+    terminality.bind_outcome_contract(())
+    agent._bind_canonical_turn_execution_state(terminality.turn_id)
+    agent._terminality_controller = terminality
+    agent._record_unfinished_execution("computer_click", {}, ToolExecutionRecord(
+        result="Click dispatched. Inspect the target.", is_error=True,
+        outcome=ExecutionOutcome.OUTCOME_UNKNOWN, attempts=1, dispatched=True,
+        timed_out=False, contract=contract,
+        tool_attempt_id=click, reason_code="post_action_screenshot_required",
+    ))
+    receipt = (
+        "[Internal terminality continuation. "
+        "The fresh observation shows a download in progress.]"
+    )
+
+    answer = agent._drive_terminal_turn(
+        terminality, None, initial_input=receipt, initial_strategy_id="tool_receipt_continuation",
+        history=[], on_sentence=None, on_first_token=None, current_conversation_id="3b",
+        turn_context=None, canonical_output=True, client_locale="en",
+    )
+
+    assert answer == final
+    assert reads == (["Fixture Game"] if read_again else [])
+    assert len(provider_calls) == 1 + len(responses)
+    assert all(request["model"] == "gpt-6-luna" for request in provider_calls)
+    wire = json.dumps(provider_calls[0]["messages"])
+    assert "fresh observation shows a download in progress" in wire
+    assert "resolve_unfinished_execution" not in wire
+    assert terminality.snapshot()["unknown_effects"][click]["outcome"] == "outcome_unknown"
 
 
 def test_legacy_strategy_remains_available_without_canonical_chat_receipts(

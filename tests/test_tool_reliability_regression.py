@@ -107,8 +107,50 @@ def test_invalid_shell_then_alternative_app_and_url_continue_once(monkeypatch, p
 
 def test_account_app_tools_have_exact_native_contracts():
     tools = {t["name"]: t for t in _canonical_native_tools()}
-    for name in ("open_application", "open_uri", "is_installed", "is_running", "has_window"):
+    for name in ("open_application", "open_uri", "is_installed", "is_running", "has_window", "steam_game_state"):
         assert tools[name]["inputSchema"] == get_static_registry().get(name).input_schema
+
+
+@pytest.mark.parametrize(("downloaded", "progress"), [
+    ("0", "0.0%"), ("9999", "99.9%"), ("10000", "100.0%"), ("invalid", None),
+])
+def test_account_can_read_steam_download_progress(monkeypatch, tmp_path, downloaded, progress):
+    from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
+    from osia.tool_attempts import ToolAttemptStore
+    from osia.tools import steam
+
+    monkeypatch.setattr(steam, "steam_path", lambda: str(tmp_path))
+    monkeypatch.setattr(steam, "_game_running", lambda _: False)
+    apps = tmp_path / "steamapps"
+    apps.mkdir()
+    (apps / "appmanifest_264710.acf").write_text(
+        '"AppState" { "appid" "264710" "name" "Fixture Game" '
+        f'"StateFlags" "1026" "BytesToDownload" "10000" "BytesDownloaded" "{downloaded}" }}',
+        encoding="utf-8",
+    )
+    store = ToolAttemptStore(tmp_path / "attempts")
+    client = AppServerClient(base_dir=tmp_path / "account", tool_attempt_store=store)
+    sent = []
+    client._send = sent.append
+    attempt = _TurnAttempt(thread_id="fixture-thread", turn_id="fixture-turn", model_id="gpt-6-luna")
+    client._attempts[attempt.thread_id] = attempt
+    client._handle_server_request({"id": 42, "method": "item/tool/call", "params": {
+        "threadId": attempt.thread_id, "turnId": attempt.turn_id, "callId": "steam-state",
+        "tool": "steam_game_state", "arguments": {"name": "264710"},
+    }})
+    kind, payload = attempt.events.get_nowait()
+    assert kind == "dynamic_tool_call"
+    client._resolve_dynamic_tool_call(attempt, payload)
+
+    assert sent[0]["id"] == 42
+    assert sent[0]["result"]["success"] is True
+    result = json.dumps(sent[0]["result"])
+    assert "installed: no" in result
+    if progress is None:
+        assert "Steam manifest download" not in result
+    else:
+        assert progress in result
+    assert attempt.native_tool_call is None
 
 
 def test_account_dynamic_rejection_supplies_precise_same_turn_feedback(monkeypatch):
