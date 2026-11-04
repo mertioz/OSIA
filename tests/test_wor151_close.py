@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt6.QtWidgets import QApplication
 
+from osia import main
 from osia.gui import main_popup
 from osia.runtime import SERVER_MODE
 from osia.utils import systemd_manager
@@ -118,6 +119,35 @@ def test_shutdown_failure_is_retryable(monkeypatch, panel):
     assert panel._restart_btn.isEnabled()
     assert panel._close_osia_btn.isEnabled()
     assert panel._power_status_key == "settings.close_error"
+
+
+def test_desktop_quit_hides_windows_before_blocking_cleanup():
+    calls = []
+    quit_callbacks = []
+    visible = types.SimpleNamespace(
+        isVisible=lambda: True,
+        hide=lambda: calls.append("hide"),
+    )
+    hidden = types.SimpleNamespace(
+        isVisible=lambda: False,
+        hide=lambda: pytest.fail("Already hidden window was hidden again"),
+    )
+
+    def run_loop():
+        for callback in quit_callbacks:
+            callback()
+        assert calls == ["hide"]
+        calls.append("loop exited")
+        return 7
+
+    app = types.SimpleNamespace(
+        aboutToQuit=types.SimpleNamespace(connect=quit_callbacks.append),
+        topLevelWidgets=lambda: [visible, hidden],
+        exec=run_loop,
+    )
+    exit_code = main._exec_desktop_with_cleanup(app, lambda: calls.append("cleanup"))
+    assert exit_code == 7
+    assert calls == ["hide", "loop exited", "cleanup"]
 
 
 def test_windows_stop_preserves_scheduled_task_and_never_relaunches(monkeypatch):

@@ -1647,6 +1647,20 @@ def _shutdown_voice_runtime(
     return worker_stopped
 
 
+def _exec_desktop_with_cleanup(app, cleanup) -> int:
+    """Dismiss the desktop windows before waiting for runtime cleanup."""
+
+    def _hide_windows() -> None:
+        for window in app.topLevelWidgets():
+            if window.isVisible():
+                window.hide()
+
+    app.aboutToQuit.connect(_hide_windows)
+    exit_code = app.exec()
+    cleanup()
+    return exit_code
+
+
 # â”€â”€ Modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def text_mode():
@@ -5087,7 +5101,7 @@ def wake_mode():
     print("  Ctrl+Alt+O: show/hide the OSIA window")
     print("=" * 60)
 
-    def on_quit():
+    def cleanup_after_quit():
         voice_ui_lifecycle.close()
         island_lifecycle.close()
         owned_stops = [
@@ -5132,13 +5146,11 @@ def wake_mode():
         except Exception:
             pass
 
-    app.aboutToQuit.connect(on_quit)
-
     # Reattach exact local direct-Chat receipts.
     QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
-    sys.exit(app.exec())
+    sys.exit(_exec_desktop_with_cleanup(app, cleanup_after_quit))
 
 
 def main():

@@ -71,6 +71,8 @@ def test_static_and_connected_capabilities_are_injected_once_when_available():
     assert prompt.count("## Available OSIA capabilities") == 1
     assert prompt.count("## Connected MCP tools (available now)") == 1
     assert prompt.count("- mcp__fixture__read:") == 1
+    assert prompt.count("first inspect the connected MCP tools listed for this turn") == 1
+    assert "If no suitable MCP is connected, choose the best available capability." in prompt
     for spec in effective_static_tool_specs():
         pattern = re.compile(rf"^- {re.escape(spec.name)}\(")
         assert sum(bool(pattern.match(line)) for line in signature_lines) == 1, spec.name
