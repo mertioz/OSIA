@@ -44,10 +44,12 @@ from .rate_limits import (
 SUPPORTED_MIN_VERSION = (0, 144, 1)
 SUPPORTED_MAX_VERSION = (0, 145, 0)
 _DYNAMIC_IMAGE_BRIDGE_RUNTIME_RANGE = ((0, 144, 1), (0, 145, 0))
-# Review each App Server contract before accepting it. Keep the legacy bridge
-# available for existing 0.144 installations.
+# Unmanaged executables must match a reviewed version. The OSIA updater verifies
+# the App Server contract before publishing newer, OSIA-owned packages.
 CURRENT_RUNTIME_VERSION = (0, 166, 0)
 _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS = frozenset({(0, 156, 1), CURRENT_RUNTIME_VERSION})
+_UPDATE_VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})")
+_UPDATE_READY_FILE = ".osia-verified-v1"
 CLIENT_VERSION = PRODUCT_VERSION
 _IMAGE_LOG_REDACTION_POLL_SECONDS = 0.5
 
@@ -581,6 +583,31 @@ def _is_supported_runtime_version(version: tuple[int, int, int] | None) -> bool:
     )
 
 
+def _updated_runtime_dir(base_dir: Path) -> Path:
+    return base_dir / "runtime" / "updates"
+
+
+def _updated_runtime_candidates(base_dir: Path) -> dict[Path, str]:
+    executable = "codex.exe" if sys.platform == "win32" else "codex"
+    candidates = []
+    try:
+        root = _updated_runtime_dir(base_dir)
+        if root.resolve() != base_dir.resolve() / "runtime" / "updates":
+            return {}
+        for package in root.iterdir():
+            match = _UPDATE_VERSION_PATTERN.fullmatch(package.name)
+            if (
+                match and (package / _UPDATE_READY_FILE).is_file()
+                and package.resolve() == root.resolve() / package.name
+            ):
+                version = tuple(map(int, match.groups()))
+                if version >= CURRENT_RUNTIME_VERSION:
+                    candidates.append((version, package / "bin" / executable, package.name))
+    except OSError:
+        pass
+    return {path: f"codex-cli {version}" for _, path, version in sorted(candidates, reverse=True)}
+
+
 def _managed_runtime_candidates(base_dir: Path | None = None) -> list[Path]:
     """Return OSIA-owned runtimes before any machine-global installation."""
     executable = "codex.exe" if sys.platform == "win32" else "codex"
@@ -690,6 +717,8 @@ class AppServerClient:
 
         self._process = None
         self._start_lock = threading.RLock()
+        self._runtime_lock = threading.Lock()
+        self._resolved_runtime: tuple[Path, str] | None = None
         self._write_lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._next_id = 1
@@ -740,6 +769,12 @@ class AppServerClient:
             return None
 
     def _resolve_runtime(self) -> tuple[Path, str]:
+        with self._runtime_lock:
+            if self._resolved_runtime is None:
+                self._resolved_runtime = self._select_runtime()
+            return self._resolved_runtime
+
+    def _select_runtime(self) -> tuple[Path, str]:
         if self._runtime_executable is not None:
             version = self._runtime_version_override or _probe_executable(self._runtime_executable)
             if not version:
@@ -756,12 +791,20 @@ class AppServerClient:
             return self._runtime_executable, version
 
         incompatible = False
-        for candidate in _native_candidates(self.base_dir):
+        updates = (
+            _updated_runtime_candidates(self.base_dir)
+            if is_frozen() or not os.environ.get("OSIA_CODEX_EXECUTABLE") else {}
+        )
+        for candidate in dict.fromkeys((*updates, *_native_candidates(self.base_dir))):
             version = _probe_executable(candidate)
             if not version:
                 continue
-            parsed = _version_tuple(version)
-            if _is_supported_runtime_version(parsed):
+            expected = updates.get(candidate)
+            supported = (
+                version == expected if expected is not None
+                else _is_supported_runtime_version(_version_tuple(version))
+            )
+            if supported:
                 self._runtime_executable = candidate
                 self._runtime_version_override = version
                 return candidate, version
@@ -878,7 +921,9 @@ class AppServerClient:
         # The legacy 0.144 runtime predates this gate and rejects unknown
         # feature names before JSONL initialization.
         version = _version_tuple(self._runtime_version_override or _probe_executable(executable) or "")
-        if version in _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS:
+        if version in _ADDITIONAL_SUPPORTED_RUNTIME_VERSIONS or (
+            version is not None and version >= CURRENT_RUNTIME_VERSION
+        ):
             command.extend(("--disable", "in_app_local_automation"))
         if self._disable_code_mode_host:
             # Keep ordinary code-mode-only account turns unchanged.  This

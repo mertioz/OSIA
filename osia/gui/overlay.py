@@ -176,6 +176,12 @@ class OSIAOverlay(QWidget):
             }
             QComboBox#modelCombo::drop-down {
                 border: none;
+                background: transparent;
+            }
+            QComboBox#modelCombo::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
             }
             QComboBox#modelCombo QAbstractItemView {
                 background: rgba(25, 25, 25, 230);

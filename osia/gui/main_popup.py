@@ -13288,8 +13288,8 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.45);
             }
 
-            /* Voice combos ──────────────────────────────────────────── */
-            QComboBox#voiceCombo {
+            /* Dropdowns ─────────────────────────────────────────────── */
+            QComboBox {
                 background: rgba(196, 181, 245, 0.07);
                 border: none;
                 border-radius: 10px;
@@ -13297,21 +13297,20 @@ class MainPopup(QWidget):
                 color: #e8e6f0;
                 font-size: 12px;
             }
-            QComboBox#voiceCombo:focus {
+            QComboBox:focus {
                 background: rgba(196, 181, 245, 0.14);
             }
-            QComboBox#voiceCombo::drop-down {
+            QComboBox::drop-down {
                 border: none;
+                background: transparent;
                 width: 20px;
             }
-            QComboBox#voiceCombo::down-arrow {
+            QComboBox::down-arrow {
                 image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid #9d9aad;
-                margin-right: 6px;
+                width: 0;
+                height: 0;
             }
-            QComboBox#voiceCombo QAbstractItemView {
+            QComboBox QAbstractItemView {
                 background: #13111a;
                 color: #e8e6f0;
                 border: none;

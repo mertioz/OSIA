@@ -5097,7 +5097,12 @@ def wake_mode():
     print("  Ctrl+Alt+O: show/hide the OSIA window")
     print("=" * 60)
 
+    from osia.chatgpt_account.runtime_update import start_runtime_update_worker
+
+    codex_update_stop = start_runtime_update_worker()
+
     def on_quit():
+        codex_update_stop.set()
         voice_ui_lifecycle.close()
         island_lifecycle.close()
         owned_stops = [
