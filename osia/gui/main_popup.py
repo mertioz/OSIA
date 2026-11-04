@@ -12607,44 +12607,35 @@ class MainPopup(QWidget):
                 padding: 11px 4px;
             }
             QPushButton#iconBtn, QPushButton#sendBtn {
-                border: 1px solid rgba(196, 181, 245, 0.18);
+                border: none;
                 border-radius: 8px;
                 padding: 0px;
             }
             QPushButton#iconBtn {
-                background: rgba(196, 181, 245, 0.06);
+                background: rgba(19, 17, 26, 0.60);
                 color: rgba(232, 230, 240, 0.8);
             }
-            QPushButton#iconBtn:hover {
-                background: rgba(196, 181, 245, 0.16);
-                border-color: rgba(196, 181, 245, 0.42);
+            QPushButton#iconBtn:hover, QPushButton#iconBtn:focus {
+                background: rgba(19, 17, 26, 0.42);
                 color: #e8e6f0;
             }
             QPushButton#iconBtn:pressed {
-                background: rgba(196, 181, 245, 0.10);
-                border-color: rgba(196, 181, 245, 0.58);
+                background: rgba(19, 17, 26, 0.72);
             }
             QPushButton#sendBtn {
-                background: rgba(196, 181, 245, 0.85);
-                border-color: rgba(196, 181, 245, 0.85);
+                background: rgba(196, 181, 245, 0.72);
                 color: #0d0b12;
             }
-            QPushButton#sendBtn:hover {
-                background: rgba(196, 181, 245, 1.0);
-                border-color: rgba(196, 181, 245, 1.0);
+            QPushButton#sendBtn:hover, QPushButton#sendBtn:focus {
+                background: rgba(196, 181, 245, 0.84);
             }
             QPushButton#sendBtn:pressed {
-                background: rgba(196, 181, 245, 0.70);
-                border-color: rgba(196, 181, 245, 0.70);
+                background: rgba(196, 181, 245, 0.66);
                 color: #0d0b12;
-            }
-            QPushButton#iconBtn:focus, QPushButton#sendBtn:focus {
-                border: 2px solid rgba(196, 181, 245, 0.72);
             }
             /* Disabled composer controls stay visually inactive. */
             QPushButton#iconBtn:disabled, QPushButton#sendBtn:disabled {
-                background: rgba(133, 130, 145, 0.14);
-                border: 1px solid rgba(133, 130, 145, 0.32);
+                background: rgba(19, 17, 26, 0.36);
                 color: #858291;
             }
             QTextEdit#chatInput:disabled {

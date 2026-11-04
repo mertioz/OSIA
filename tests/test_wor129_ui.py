@@ -148,7 +148,7 @@ class ThemeTests(unittest.TestCase):
                     )
 
             pressed_background = _blend(
-                QColor(palette.primary), QColor(palette.background), 0.70,
+                QColor(palette.primary), QColor(palette.background), 0.66,
             )
             self.assertGreaterEqual(
                 _contrast_ratio(QColor(palette.background), pressed_background),
