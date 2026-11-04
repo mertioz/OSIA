@@ -502,18 +502,20 @@ def _path_has_active_canonical_chat_lease(path: Path) -> bool:
     )
 
 
-def _cancel_dead_owner_turns_for_deletion(path: Path) -> bool:
-    """Install exact Stop tombstones for orphaned turns before user deletion.
-
-    A live or unproven owner remains protected. The file is rechecked by the
-    caller after cancellation; this never treats an unknown tool effect as a
-    verified success or invents an assistant response.
-    """
+def _cancel_chat_turns_for_deletion(
+    path: Path, *, cancel_active_turn: bool = False,
+) -> bool:
+    """Install exact Stop tombstones before removing a conversation."""
     try:
         conversation = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     if not isinstance(conversation, dict):
+        return False
+    if (
+        _background_execution_lease_active(conversation)
+        or _post_turn_media_lease_active(conversation)
+    ):
         return False
     unresolved = list(_unresolved_canonical_chat_users(conversation))
     if not unresolved:
@@ -526,25 +528,28 @@ def _cancel_dead_owner_turns_for_deletion(path: Path) -> bool:
 
     controllers = []
     for message, binding in unresolved:
-        try:
-            owner_pid = int(message.get("_execution_owner_pid") or 0)
-        except (TypeError, ValueError, OverflowError):
+        if binding["conversation_id"] != str(conversation.get("id") or ""):
             return False
-        if owner_pid <= 0:
-            return False
-        alive, current_identity = live_process_identity(owner_pid)
-        expected_identity = str(
-            message.get("_execution_owner_process_identity") or ""
-        )
-        if alive and (
-            not expected_identity
-            or not current_identity
-            or expected_identity == current_identity
-        ):
-            return False
+        if not cancel_active_turn:
+            try:
+                owner_pid = int(message.get("_execution_owner_pid") or 0)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if owner_pid <= 0:
+                return False
+            alive, current_identity = live_process_identity(owner_pid)
+            expected_identity = str(
+                message.get("_execution_owner_process_identity") or ""
+            )
+            if alive and (
+                not expected_identity
+                or not current_identity
+                or expected_identity == current_identity
+            ):
+                return False
         turn_id = binding["turn_id"]
         objective = str(message.get("_terminality_objective") or "")
-        if not persisted_turn_state_exists(turn_id):
+        if not cancel_active_turn and not persisted_turn_state_exists(turn_id):
             return False
         try:
             controller = TurnTerminalityController(
@@ -553,16 +558,21 @@ def _cancel_dead_owner_turns_for_deletion(path: Path) -> bool:
                 execution_required=True,
             )
             state = controller.snapshot()
-        except (OSError, TypeError, ValueError):
+            if state.get("terminal_state") not in (None, "", "user_cancelled"):
+                return False
+            durable_binding = state.get("execution_binding") or {}
+            if (
+                cancel_active_turn
+                and not durable_binding
+                and not state.get("final_reservation")
+            ):
+                # An accepted user record can survive a worker that stopped
+                # before initializing its durable turn state.
+                controller.set_execution_binding(binding)
+                durable_binding = controller.snapshot().get("execution_binding") or {}
+        except (OSError, RuntimeError, TypeError, ValueError):
             return False
-        durable_binding = state.get("execution_binding") or {}
-        if (
-            state.get("terminal_state") not in (None, "", "user_cancelled")
-            or any(
-                str(durable_binding.get(field) or "") != value
-                for field, value in binding.items()
-            )
-        ):
+        if durable_binding != binding:
             return False
         controllers.append(controller)
     for controller in controllers:
@@ -572,6 +582,23 @@ def _cancel_dead_owner_turns_for_deletion(path: Path) -> bool:
         ):
             return False
     return not _path_has_active_canonical_chat_lease(path)
+
+
+def was_cancelled_for_conversation_delete(binding: dict) -> bool:
+    """Recognize the exact durable cancellation used by single deletion."""
+    from osia.turn_terminality import load_persisted_terminal_result
+
+    terminal = load_persisted_terminal_result(str(binding.get("turn_id") or ""))
+    expected = {
+        field: str(binding.get(field) or "")
+        for field in _CANONICAL_CHAT_BINDING_FIELDS
+    }
+    return bool(
+        terminal
+        and terminal.get("execution_binding") == expected
+        and terminal.get("terminal_state") == "user_cancelled"
+        and terminal.get("cancellation_reason") == "conversation_delete"
+    )
 
 
 def _folder_state_path() -> Path:
@@ -1636,7 +1663,7 @@ def delete_folder_with_conversations(
         busy_ids = [
             conv_id for conv_id, path in candidates
             if _path_has_active_canonical_chat_lease(path)
-            and not _cancel_dead_owner_turns_for_deletion(path)
+            and not _cancel_chat_turns_for_deletion(path)
         ]
         if busy_ids:
             return _folder_receipt(
@@ -1791,7 +1818,7 @@ def _delete_all_ungrouped_conversations(
         busy_ids = [
             conv_id for conv_id, path in candidates
             if _path_has_active_canonical_chat_lease(path)
-            and not _cancel_dead_owner_turns_for_deletion(path)
+            and not _cancel_chat_turns_for_deletion(path)
         ]
         if busy_ids:
             return _folder_receipt(
@@ -2478,12 +2505,14 @@ def delete_conversation_with_receipt(
     conv_id: str,
     *,
     operation_id: str | None = None,
+    cancel_active_turn: bool = False,
 ) -> dict:
     """Delete one conversation and durably advance the list revision.
 
     The versioned receipt is shared by the Desktop and WebSocket callers so a
     success acknowledgement can be tied to the file removal and metadata
-    commit that completed under the canonical store lock.
+    commit that completed under the canonical store lock. Desktop single-delete
+    can also commit cancellation of an accepted Chat turn under that lock.
     """
     stable_id = str(conv_id or "")
     op_id = str(operation_id or "").strip()[:200]
@@ -2505,7 +2534,9 @@ def delete_conversation_with_receipt(
             )
         if (
             _path_has_active_canonical_chat_lease(path)
-            and not _cancel_dead_owner_turns_for_deletion(path)
+            and not _cancel_chat_turns_for_deletion(
+                path, cancel_active_turn=cancel_active_turn,
+            )
         ):
             return _folder_receipt(
                 state,

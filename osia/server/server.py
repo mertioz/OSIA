@@ -1159,6 +1159,15 @@ async def _broadcast_canonical_conversation_change(
                     flush=True,
                 )
                 return False
+            turn_meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+            if isinstance(turn_meta, dict) and (
+                conversations.was_cancelled_for_conversation_delete(turn_meta)
+            ):
+                await _commit_canonical_chat_cancellation(
+                    turn_meta,
+                    reason_code="conversation_delete",
+                    send_busy_false=True,
+                )
             _LAST_BROADCAST_REVISIONS.pop(conv_id, None)
             await _send_conversation_frame(
                 {

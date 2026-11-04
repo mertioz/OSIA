@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import importlib.util
+import json
 from types import SimpleNamespace
 
 from osia import conversations, main, tool_attempts, turn_terminality
 
 
-def _persist_orphaned_turn(tmp_path, monkeypatch, *, live: bool = False):
+def _persist_orphaned_turn(
+    tmp_path, monkeypatch, *, live: bool = False, persist_state: bool = True,
+):
     monkeypatch.setattr(
         turn_terminality, "CONFIG_DIR", str(tmp_path / "config"),
     )
@@ -37,13 +40,14 @@ def _persist_orphaned_turn(tmp_path, monkeypatch, *, live: bool = False):
     data = json.loads(path.read_text(encoding="utf-8"))
     data["messages"] = [message]
     path.write_text(json.dumps(data), encoding="utf-8")
-    controller = turn_terminality.TurnTerminalityController(
-        turn_id=binding["turn_id"],
-        objective=message["_terminality_objective"],
-        execution_required=True,
-        storage_dir=tmp_path / "config" / "turn_terminality",
-    )
-    controller.set_execution_binding(binding)
+    if persist_state:
+        controller = turn_terminality.TurnTerminalityController(
+            turn_id=binding["turn_id"],
+            objective=message["_terminality_objective"],
+            execution_required=True,
+            storage_dir=tmp_path / "config" / "turn_terminality",
+        )
+        controller.set_execution_binding(binding)
     monkeypatch.setattr(
         turn_terminality, "live_process_identity",
         lambda _pid: (live, "original-owner" if live else ""),
@@ -191,6 +195,79 @@ def test_live_turn_blocks_single_delete_with_factual_reason(
     assert turn_terminality.load_persisted_terminal_result(
         binding["turn_id"]
     ) is None
+
+
+def test_desktop_single_delete_cancels_live_turn_with_exact_binding(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    conv, path, binding = _persist_orphaned_turn(tmp_path, monkeypatch, live=True)
+    other = conversations.create_conversation("Keep this conversation")
+
+    receipt = conversations.delete_conversation_with_receipt(
+        conv["id"], cancel_active_turn=True,
+    )
+
+    assert receipt["success"] is True
+    assert not path.exists()
+    assert conversations.get_conversation(other["id"]) is not None
+    assert conversations.was_cancelled_for_conversation_delete(binding)
+    assert not conversations.was_cancelled_for_conversation_delete({
+        **binding, "run_id": "different-run",
+    })
+
+
+def test_desktop_single_delete_can_cancel_before_turn_state_exists(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    conv, path, binding = _persist_orphaned_turn(
+        tmp_path, monkeypatch, persist_state=False,
+    )
+
+    assert not turn_terminality.persisted_turn_state_exists(binding["turn_id"])
+    receipt = conversations.delete_conversation_with_receipt(
+        conv["id"], cancel_active_turn=True,
+    )
+
+    assert receipt["success"] is True
+    assert not path.exists()
+    assert conversations.was_cancelled_for_conversation_delete(binding)
+
+
+def test_desktop_delete_notification_stops_the_exact_server_task(
+    tmp_path, monkeypatch,
+):
+    from osia.server import server
+
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    conv, _, binding = _persist_orphaned_turn(tmp_path, monkeypatch, live=True)
+    stopped_generations = []
+    turn_meta = {**binding, "_execution_generation_cancel": stopped_generations.append}
+    monkeypatch.setattr(server, "_CONVERSATION_BROADCAST_LOCK", None)
+    monkeypatch.setattr(server, "_LAST_BROADCAST_REVISIONS", {})
+    monkeypatch.setattr(server, "_ACTIVE_TURN_META_BY_CONV", {conv["id"]: turn_meta})
+    monkeypatch.setattr(server, "_ACTIVE_CONV_BY_REQUEST", {})
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+
+    async def delete_and_notify():
+        task = asyncio.create_task(asyncio.Event().wait())
+        monkeypatch.setattr(server, "_ACTIVE_TURNS_BY_CONV", {conv["id"]: task})
+        try:
+            receipt = conversations.delete_conversation_with_receipt(
+                conv["id"], cancel_active_turn=True,
+            )
+            assert receipt["success"] is True
+            assert await server._broadcast_canonical_conversation_change(
+                conv["id"], action="delete",
+            )
+            assert task.cancelling()
+            assert stopped_generations == [binding["turn_id"]]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(delete_and_notify())
 
 
 def test_mixed_real_store_single_and_confirmed_bulk_survive_reload(

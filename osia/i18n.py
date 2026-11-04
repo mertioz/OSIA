@@ -1655,12 +1655,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "fr": "Le brouillon de pièces jointes est invalide. Retirez le fichier concerné puis réessayez.",
     },
     "chat.input_placeholder": {
-        "en": "Message OSIA…",
-        "fr": "Écrire à OSIA…",
-        "zh": "给 OSIA 发消息…",
-        "ja": "OSIA にメッセージ…",
-        "de": "Nachricht an OSIA…",
-        "es": "Mensaje a OSIA…",
+        "en": "Message…",
+        "fr": "Message…",
+        "zh": "消息…",
+        "ja": "メッセージ…",
+        "de": "Nachricht…",
+        "es": "Mensaje…",
     },
     "chat.send": {
         "en": "Send",

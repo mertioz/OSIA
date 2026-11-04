@@ -4210,6 +4210,7 @@ def wake_mode():
                     deletion = conversations.delete_conversation_with_receipt(
                         conv_id,
                         operation_id=operation_id,
+                        cancel_active_turn=True,
                     )
                     result.update(deletion)
                     result["success"] = bool(deletion.get("success"))
@@ -4287,6 +4288,17 @@ def wake_mode():
             return
         conv_ids = set(context.get("conv_ids") or ())
         pending_delete_ids.difference_update(conv_ids)
+
+        if context.get("action") == "single":
+            for conv_id in conv_ids:
+                active = _active_chat_turn_for_conversation(conv_id)
+                binding = active.get("binding")
+                if isinstance(binding, dict) and (
+                    conversations.was_cancelled_for_conversation_delete(binding)
+                ):
+                    handle_chat_execution_cancel(binding, discard_stream=False)
+                elif result.get("success") and not active:
+                    _set_conversation_busy(conv_id, False)
 
         if not result.get("success"):
             try:
@@ -4433,12 +4445,6 @@ def wake_mode():
         nonlocal active_conv
         if str(conv_id) in pending_delete_ids:
             popup.show_conversation_delete_in_progress()
-            return
-        if _is_conversation_busy(conv_id):
-            popup.show_conversation_delete_busy()
-            print(
-                f"Delete rejected while conversation {conv_id} is active."
-            )
             return
         cached_items = popup.conversation_snapshot().get("items") or []
         if not any(str(item.get("id") or "") == str(conv_id) for item in cached_items):
@@ -5023,7 +5029,9 @@ def wake_mode():
     cron_manager.start()
     heartbeat_monitor.start()
 
-    def handle_chat_execution_cancel(binding: dict) -> None:
+    def handle_chat_execution_cancel(
+        binding: dict, *, discard_stream: bool = True,
+    ) -> None:
         """Cancel only the exact active Chat run, or a correlated legacy run."""
 
         key = _chat_turn_key(binding)
@@ -5050,12 +5058,11 @@ def wake_mode():
                 False,
                 owner=binding,
             )
-            # This signal originated from the currently rendered exact-key
-            # Thinking row, so discarding the presentation buffer cannot touch
-            # another conversation/turn. The durable Stop/final CAS has already
-            # won synchronously above.
+            # Only a Stop from the rendered Thinking row owns the current
+            # presentation buffer. Deletion may target a different chat.
             popup.confirm_chat_execution_cancellation(binding)
-            popup.cancel_assistant_stream(flush=False)
+            if discard_stream:
+                popup.cancel_assistant_stream(flush=False)
 
             def _cancel_direct() -> None:
                 request_cancel = getattr(

@@ -556,14 +556,14 @@ class _ComposerInput(QTextEdit):
         self.setFixedHeight(42)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.document().setDocumentMargin(7)
+        self.document().setDocumentMargin(0)
         self.document().documentLayout().documentSizeChanged.connect(
             self._fit_document_height,
         )
         self.palette_key_handler = None
 
     def _fit_document_height(self, size) -> None:
-        height = max(42, min(96, math.ceil(size.height()) + 8))
+        height = max(42, min(96, math.ceil(size.height()) + 22))
         if self.height() != height:
             self.setFixedHeight(height)
 
@@ -1333,9 +1333,9 @@ class _ChatPage(QWidget):
         self._input.textChanged.connect(self._on_input_changed)
         self._sync_send_state()
 
-        row.addWidget(self._file_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self._file_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(self._input, 1)
-        row.addWidget(self._send_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self._send_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         input_layout.addLayout(row)
         outer.addWidget(input_wrap)
 
@@ -2281,11 +2281,11 @@ class _ConvRow(QFrame):
         self._folder_id = conv.get("folder_id")
         self._folders = list(folders or [])
 
-        row = QGridLayout(self)
-        row.setContentsMargins(28 if indented else 16, 10, 10, 10)
-        row.setHorizontalSpacing(8)
-        row.setVerticalSpacing(4)
-        row.setColumnStretch(0, 1)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(24 if indented else 12, 3, 6, 3)
+        row.setSpacing(10)
+        summary = QVBoxLayout()
+        summary.setSpacing(3)
 
         self._full_title = conv.get("title") or i18n.t("conversations.new_conversation")
         title = QLabel(self._full_title)
@@ -2306,8 +2306,11 @@ class _ConvRow(QFrame):
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
         self._subtitle_label.setToolTip(self._metadata)
-        open_btn = QPushButton(i18n.t("conversations.open"))
+        open_btn = QPushButton("↗")
         open_btn.setObjectName("convOpen")
+        open_btn.setFixedSize(30, 30)
+        open_btn.setToolTip(i18n.t("conversations.open"))
+        open_btn.setAccessibleName(i18n.t("conversations.open"))
         open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         open_btn.clicked.connect(lambda: self.open_clicked.emit(self._conv_id))
 
@@ -2335,12 +2338,17 @@ class _ConvRow(QFrame):
         del_btn.setAccessibleName(i18n.t("conversations.delete"))
         del_btn.clicked.connect(lambda: self.delete_clicked.emit(self._conv_id))
 
-        row.addWidget(title, 0, 0, 1, 5)
-        row.addWidget(self._subtitle_label, 1, 0)
-        row.addWidget(open_btn, 1, 1)
-        row.addWidget(move_btn, 1, 2)
-        row.addWidget(rename_btn, 1, 3)
-        row.addWidget(del_btn, 1, 4)
+        summary.addWidget(title)
+        summary.addWidget(self._subtitle_label)
+        row.addLayout(summary, 1)
+        row.setAlignment(summary, Qt.AlignmentFlag.AlignVCenter)
+        actions = QGridLayout()
+        actions.setSpacing(2)
+        actions.addWidget(open_btn, 0, 0)
+        actions.addWidget(move_btn, 0, 1)
+        actions.addWidget(rename_btn, 1, 0)
+        actions.addWidget(del_btn, 1, 1)
+        row.addLayout(actions)
 
     def _show_move_menu(self) -> None:
         menu = QMenu(self)
@@ -12198,9 +12206,9 @@ class MainPopup(QWidget):
             }
 
             QFrame#inputWrap {
-                background: #1a1625;
-                border: 1px solid rgba(196, 181, 245, 0.19);
-                border-radius: 16px;
+                background: rgba(19, 17, 26, 0.34);
+                border: 1px solid rgba(196, 181, 245, 0.16);
+                border-radius: 13px;
             }
             QFrame#inputWrap:hover {
                 border: 1px solid rgba(196, 181, 245, 0.26);
@@ -12210,7 +12218,7 @@ class MainPopup(QWidget):
                 border: none;
                 color: #e8e6f0;
                 font-size: 14px;
-                padding: 4px 0;
+                padding: 11px 4px;
             }
             QPushButton#iconBtn, QPushButton#sendBtn {
                 border: 1px solid rgba(196, 181, 245, 0.18);
@@ -12247,11 +12255,6 @@ class MainPopup(QWidget):
             QPushButton#iconBtn:focus, QPushButton#sendBtn:focus {
                 border: 2px solid rgba(196, 181, 245, 0.72);
             }
-            QTextEdit#chatInput:focus {
-                background: rgba(196, 181, 245, 0.06);
-                border-radius: 6px;
-            }
-
             /* Disabled composer controls stay visually inactive. */
             QPushButton#iconBtn:disabled, QPushButton#sendBtn:disabled {
                 background: rgba(133, 130, 145, 0.14);
@@ -12385,9 +12388,9 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.13);
                 border: 1px solid rgba(196, 181, 245, 0.24);
                 color: #c4b5f5;
-                border-radius: 10px;
-                padding: 7px 10px;
-                font-size: 12px;
+                border-radius: 8px;
+                padding: 0;
+                font-size: 15px;
             }
             QPushButton#convOpen:hover {
                 background: rgba(196, 181, 245, 0.35);
