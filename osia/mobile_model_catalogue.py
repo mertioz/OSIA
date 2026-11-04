@@ -15,10 +15,11 @@ from osia.config import (
 from osia.chatgpt_account.rate_limits import quota_windows
 from osia.models import (
     API_PROVIDERS,
+    LOCAL_PROVIDERS,
     PROVIDERS,
     discover_models_async,
     get_all_models,
-    invalidate_ollama_models_cache,
+    invalidate_local_models_cache,
 )
 from osia.reasoning import (
     get_reasoning_options, model_reasoning_settings_key, resolve_reasoning_option_id,
@@ -36,7 +37,7 @@ PROVIDER_ORDER = (
     "groq",
     "mistral",
     "openrouter",
-    "ollama",
+    *LOCAL_PROVIDERS,
 )
 _SAFE_ACCOUNT_ERRORS = {
     "",
@@ -231,7 +232,7 @@ def _mobile_model(entry: dict) -> dict:
 def _provider_entry(provider_id: str, entries: list[dict]) -> dict:
     kind = (
         "chatgpt_account" if provider_id == ACCOUNT_PROVIDER_ID
-        else "local" if provider_id == "ollama"
+        else "local" if provider_id in LOCAL_PROVIDERS
         else "api"
     )
     name = (
@@ -416,7 +417,7 @@ def build_model_inventory(
             if provider_id not in configured:
                 continue
             grouped.setdefault(provider_id, []).append(raw)
-        elif provider_id == "ollama":
+        elif provider_id in LOCAL_PROVIDERS:
             grouped.setdefault(provider_id, []).append(raw)
 
     status = account_status if isinstance(account_status, dict) else {}
@@ -439,7 +440,7 @@ def build_model_inventory(
                     if isinstance(raw, dict) and not raw.get("hidden"):
                         append(raw, provider_id, "chatgpt_account")
             continue
-        source_type = "local" if provider_id == "ollama" else "api"
+        source_type = "local" if provider_id in LOCAL_PROVIDERS else "api"
         for raw in grouped.get(provider_id, []):
             append(raw, provider_id, source_type)
     return entries
@@ -456,7 +457,7 @@ def build_model_inventory(
 def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True) -> dict:
     """Build the deterministic safe catalogue from current PC-owned state."""
     if refresh_local:
-        invalidate_ollama_models_cache()
+        invalidate_local_models_cache()
     keys = load_api_keys()
     raw_models = get_all_models(api_keys=keys, remote_models=cached_remote_models())
     account = account_snapshot(refresh_models=refresh_account)

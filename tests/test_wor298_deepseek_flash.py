@@ -148,8 +148,8 @@ def image_file(tmp_path):
 def test_catalog_one_model_even_with_stale_remote_cache(monkeypatch):
     models.invalidate_remote_models()
     stale = [{"provider": "deepseek", "id": old} for old in LEGACY_API_IDS | {"deepseek-future"}]
-    monkeypatch.setattr(models, "get_ollama_models", lambda: [])
-    monkeypatch.setattr(models, "cached_ollama_models", lambda: [])
+    monkeypatch.setattr(models, "get_local_models", lambda: [])
+    monkeypatch.setattr(models, "cached_local_models", lambda: [])
     for inventory in (models.HARDCODED_MODELS,
                       models.get_all_models({}, remote_models=stale),
                       models.get_all_models_cached({}, remote_models=stale)):
@@ -191,9 +191,9 @@ def test_non_deepseek_snapshot_preserves_existing_provider_contracts():
         "reasoning": {p + ":" + m: v for (p, m), v in reasoning.MODEL_REASONING_CAPABILITIES.items() if p != "deepseek"},
         "complex": [m for m in models.COMPLEX_PREFERENCE if m[1] != "deepseek"],
         "simple": [m for m in models.SIMPLE_API_FALLBACK if m[1] != "deepseek"],
-        "image_adapters": {p: [v[0], sorted(v[1])] for p, v in image_inputs._ADAPTERS.items() if p not in {"deepseek", "openrouter"}},
+        "image_adapters": {p: [v[0], sorted(v[1])] for p, v in image_inputs._ADAPTERS.items() if p not in {"deepseek", "openrouter", "lmstudio"}},
         "pc_inventory": [m for m in mobile.build_model_inventory(models.HARDCODED_MODELS, models.API_PROVIDERS) if m["provider_id"] != "deepseek"],
-        "provider_order": [p for p in mobile.PROVIDER_ORDER if p != "openrouter"],
+        "provider_order": [p for p in mobile.PROVIDER_ORDER if p not in {"openrouter", "lmstudio"}],
     }
     # WOR-355 intentionally evolves other providers. Preserve this historical
     # test's real boundary: DeepSeek cannot modify their established contracts.
@@ -336,7 +336,7 @@ def test_runtime_and_scheduled_model_loading_keep_deepseek(monkeypatch):
     from osia.scheduled_tasks import _resolve_model_metadata
     monkeypatch.setattr(agent_module, "OpenAI", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
     monkeypatch.setattr(OSIAAgent, "_provider_key_chain", lambda *args: ["test-only"])
-    monkeypatch.setattr(models, "get_ollama_models", lambda: [])
+    monkeypatch.setattr(models, "get_local_models", lambda: [])
     agent = probe_agent("Hello", None)
     agent.set_model("deepseek-v4-pro", provider="deepseek")
     assert (agent.provider, agent.model) == ("deepseek", MODEL_ID)

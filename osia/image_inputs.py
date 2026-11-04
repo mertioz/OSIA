@@ -61,6 +61,7 @@ _ADAPTERS = {
         "openai_image_url",
         frozenset({"image/jpeg", "image/png"}),
     ),
+    "lmstudio": ("openai_image_url", frozenset({"image/jpeg", "image/png"})),
     "mistral": (
         "mistral_image_url",
         frozenset({"image/jpeg", "image/png"}),

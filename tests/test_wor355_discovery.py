@@ -12,8 +12,8 @@ def isolated(monkeypatch):
     models.invalidate_remote_models()
     monkeypatch.setattr(models, "_DISCOVERY_INVALIDATED", set())
     monkeypatch.setattr("osia.utils.key_chain.iter_keys", lambda provider: [])
-    monkeypatch.setattr(models, "get_ollama_models", lambda: [])
-    monkeypatch.setattr(models, "cached_ollama_models", lambda: [])
+    monkeypatch.setattr(models, "get_local_models", lambda: [])
+    monkeypatch.setattr(models, "cached_local_models", lambda: [])
     yield
     models.invalidate_remote_models()
 

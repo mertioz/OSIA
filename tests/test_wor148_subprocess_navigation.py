@@ -134,25 +134,25 @@ def test_background_probe_keeps_stdout_stderr_and_exit_code():
 
 
 @pytest.fixture
-def clean_ollama_cache(monkeypatch):
-    monkeypatch.setattr(models, "_OLLAMA_CACHE", None)
-    monkeypatch.setattr(models, "_OLLAMA_CACHE_AT", 0.0)
-    monkeypatch.setattr(models, "_OLLAMA_CACHE_EPOCH", 0)
-    monkeypatch.setattr(models, "_OLLAMA_REFRESH_IN_FLIGHT", False)
-    monkeypatch.setattr(models, "_OLLAMA_REFRESH_PENDING", False)
-    monkeypatch.setattr(models, "_OLLAMA_REFRESH_CALLBACKS", [])
+def clean_local_cache(monkeypatch):
+    monkeypatch.setattr(models, "_LOCAL_CACHE", None)
+    monkeypatch.setattr(models, "_LOCAL_CACHE_AT", 0.0)
+    monkeypatch.setattr(models, "_LOCAL_CACHE_EPOCH", 0)
+    monkeypatch.setattr(models, "_LOCAL_REFRESH_IN_FLIGHT", False)
+    monkeypatch.setattr(models, "_LOCAL_REFRESH_PENDING", False)
+    monkeypatch.setattr(models, "_LOCAL_REFRESH_CALLBACKS", [])
 
 
-def test_cached_registry_never_launches_a_probe(monkeypatch, clean_ollama_cache):
+def test_cached_registry_never_launches_a_probe(monkeypatch, clean_local_cache):
     monkeypatch.setattr(
         models,
-        "_query_ollama_models",
+        "_query_local_models",
         lambda: (_ for _ in ()).throw(AssertionError("synchronous probe")),
     )
     assert models.get_all_models_cached()
 
 
-def test_rapid_refresh_requests_share_one_probe(monkeypatch, clean_ollama_cache):
+def test_rapid_refresh_requests_share_one_probe(monkeypatch, clean_local_cache):
     threads = []
     delivered = []
 
@@ -167,21 +167,21 @@ def test_rapid_refresh_requests_share_one_probe(monkeypatch, clean_ollama_cache)
     monkeypatch.setattr(models.threading, "Thread", ControlledThread)
     monkeypatch.setattr(
         models,
-        "_query_ollama_models",
+        "_query_local_models",
         lambda: [{"id": "local", "provider": "ollama"}],
     )
 
-    models.refresh_ollama_models_async(delivered.append)
-    models.refresh_ollama_models_async(delivered.append)
+    models.refresh_local_models_async(delivered.append)
+    models.refresh_local_models_async(delivered.append)
 
     assert len(threads) == 1
     threads[0].target()
-    assert models.cached_ollama_models() == [{"id": "local", "provider": "ollama"}]
+    assert models.cached_local_models() == [{"id": "local", "provider": "ollama"}]
     assert delivered == [[{"id": "local", "provider": "ollama"}]]
 
 
 def test_stale_ollama_result_cannot_overwrite_newer_refresh(
-    monkeypatch, clean_ollama_cache,
+    monkeypatch, clean_local_cache,
 ):
     threads = []
     results = iter(
@@ -200,15 +200,15 @@ def test_stale_ollama_result_cannot_overwrite_newer_refresh(
             return
 
     monkeypatch.setattr(models.threading, "Thread", ControlledThread)
-    monkeypatch.setattr(models, "_query_ollama_models", lambda: next(results))
+    monkeypatch.setattr(models, "_query_local_models", lambda: next(results))
 
-    models.refresh_ollama_models_async()
-    models.invalidate_ollama_models_cache()
+    models.refresh_local_models_async()
+    models.invalidate_local_models_cache()
     threads[0].target()
-    assert models.cached_ollama_models() == []
+    assert models.cached_local_models() == []
     assert len(threads) == 2
     threads[1].target()
-    assert models.cached_ollama_models() == [{"id": "fresh", "provider": "ollama"}]
+    assert models.cached_local_models() == [{"id": "fresh", "provider": "ollama"}]
 
 
 @pytest.fixture(scope="module")
@@ -239,7 +239,7 @@ def test_page_navigation_starts_no_synchronous_process(
     )
     monkeypatch.setattr(
         main_popup,
-        "refresh_ollama_models_async",
+        "refresh_local_models_async",
         lambda callback: refresh_requests.append(callback),
     )
     monkeypatch.setattr(
@@ -267,7 +267,7 @@ def test_page_navigation_starts_no_synchronous_process(
     assert refresh_requests
 
     observed_threads = []
-    popup._ollama_models_ready.connect(
+    popup._local_models_ready.connect(
         lambda _items: observed_threads.append(QThread.currentThread())
     )
     worker = threading.Thread(

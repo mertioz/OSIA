@@ -36,7 +36,7 @@ def popup(app):
             "_probe_chatgpt_account",
             lambda _self, force=False: None,
         ),
-        patch.object(main_popup, "refresh_ollama_models_async"),
+        patch.object(main_popup, "refresh_local_models_async"),
         patch.object(main_popup, "autostart_enabled", return_value=False),
     ):
         value = main_popup.MainPopup()

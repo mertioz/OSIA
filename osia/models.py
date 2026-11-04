@@ -12,7 +12,6 @@ import time
 import requests
 
 from osia.perf import perf_timer
-from osia.utils.subprocess_policy import run_background_probe
 
 # ── Provider configurations ───────────────────────────────────────────────
 
@@ -69,10 +68,16 @@ PROVIDERS = {
         "base_url": "http://localhost:11434/v1",
         "models_endpoint": None,
     },
+    "lmstudio": {
+        "name": "LM Studio",
+        "base_url": "http://localhost:1234/v1",
+        "models_endpoint": None,
+    },
 }
 
 # Providers that take an API key (ollama doesn't).
 API_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "xai", "groq", "mistral", "openrouter")
+LOCAL_PROVIDERS = ("ollama", "lmstudio")
 
 # ── Hardcoded models (2026) ───────────────────────────────────────────────
 
@@ -189,86 +194,85 @@ def model_has_vision(provider: str | None, model_id: str) -> bool:
     return bool(metadata and metadata.get("vision") is True)
 
 
-# ── Local Ollama discovery ────────────────────────────────────────────────
+# ── Local model discovery ───────────────────────────────────────────────
 
-# ``ollama list`` spawns a subprocess that is slow on Windows (~30-50ms, and up
-# to the timeout if the ollama service is installed-but-hung). The GUI hits it on
-# many main-thread paths (model panel grid, AI-hierarchy rows, provider_for_model
-# → get_all_models, the settings _load_state pass), so a single settings open or
-# tab switch used to fan out into a dozen subprocess spawns. Cache the result for
-# a short TTL so those repeated calls are served from memory (WOR perf fix). The
-# timeout is also lowered (10s → 2s) so an unresponsive ollama can never stall
-# the UI for ten seconds.
-_OLLAMA_CACHE: list | None = None
-_OLLAMA_CACHE_AT: float = 0.0
-_OLLAMA_TTL = 30.0  # seconds
-_OLLAMA_CACHE_LOCK = threading.Lock()
-_OLLAMA_CACHE_EPOCH = 0
-_OLLAMA_REFRESH_IN_FLIGHT = False
-_OLLAMA_REFRESH_PENDING = False
-_OLLAMA_REFRESH_CALLBACKS: list = []
+# Keep slow runtime probes off the GUI thread and coalesce concurrent refreshes.
+_LOCAL_CACHE: list | None = None
+_LOCAL_CACHE_AT: float = 0.0
+_LOCAL_TTL = 30.0  # seconds
+_LOCAL_CACHE_LOCK = threading.Lock()
+_LOCAL_CACHE_EPOCH = 0
+_LOCAL_REFRESH_IN_FLIGHT = False
+_LOCAL_REFRESH_PENDING = False
+_LOCAL_REFRESH_CALLBACKS: list = []
 
 
-def invalidate_ollama_models_cache() -> None:
+def invalidate_local_models_cache(*, discard_snapshot: bool = False) -> None:
     """Force the next local-model lookup to query the PC runtime again."""
-    global _OLLAMA_CACHE_AT, _OLLAMA_CACHE_EPOCH, _OLLAMA_REFRESH_PENDING
-    with _OLLAMA_CACHE_LOCK:
-        _OLLAMA_CACHE_AT = 0.0
-        _OLLAMA_CACHE_EPOCH += 1
-        if _OLLAMA_REFRESH_IN_FLIGHT:
-            _OLLAMA_REFRESH_PENDING = True
+    global _LOCAL_CACHE, _LOCAL_CACHE_AT, _LOCAL_CACHE_EPOCH, _LOCAL_REFRESH_PENDING
+    with _LOCAL_CACHE_LOCK:
+        if discard_snapshot:
+            _LOCAL_CACHE = None
+        _LOCAL_CACHE_AT = 0.0
+        _LOCAL_CACHE_EPOCH += 1
+        if _LOCAL_REFRESH_IN_FLIGHT:
+            _LOCAL_REFRESH_PENDING = True
 
 
 def _query_ollama_models() -> list:
-    with perf_timer("models.get_ollama_models (ollama list subprocess)"):
-        try:
-            result = run_background_probe(
-                ["ollama", "list"], capture_output=True, text=True, timeout=2
-            )
-            out = []
-            for line in result.stdout.strip().split("\n")[1:]:
-                parts = line.split()
-                if parts:
-                    mid = parts[0]
-                    out.append({
-                        "id": mid,
-                        "label": mid,
-                        "provider": "ollama",
-                        "tier": "light",
-                    })
-            return out
-        except Exception:
-            return []
+    from osia.local_model_discovery import query_ollama_models
+
+    return query_ollama_models(endpoint_for_provider("ollama"))
 
 
-def cached_ollama_models() -> list:
+def _query_lmstudio_models() -> list:
+    from osia.local_model_discovery import query_lmstudio_models
+    from osia.utils.key_chain import iter_keys
+
+    key = next(iter(iter_keys("lmstudio")), None)
+    headers = {"Authorization": f"Bearer {key}"} if key else None
+    return query_lmstudio_models(endpoint_for_provider("lmstudio"), headers)
+
+
+def _query_local_models() -> list:
+    with perf_timer("models.get_local_models (runtime discovery)"):
+        out = []
+        for probe in (_query_ollama_models, _query_lmstudio_models):
+            try:
+                out.extend(probe())
+            except Exception:
+                continue
+        return out
+
+
+def cached_local_models() -> list:
     """Return the last known local-model snapshot without starting a process."""
-    with _OLLAMA_CACHE_LOCK:
-        return list(_OLLAMA_CACHE or [])
+    with _LOCAL_CACHE_LOCK:
+        return list(_LOCAL_CACHE or [])
 
 
-def _ollama_cache_fresh(now: float | None = None) -> bool:
+def _local_cache_fresh(now: float | None = None) -> bool:
     now = time.monotonic() if now is None else now
-    return _OLLAMA_CACHE is not None and (now - _OLLAMA_CACHE_AT) < _OLLAMA_TTL
+    return _LOCAL_CACHE is not None and (now - _LOCAL_CACHE_AT) < _LOCAL_TTL
 
 
-def _finish_ollama_refresh(out: list, epoch: int) -> None:
-    global _OLLAMA_CACHE, _OLLAMA_CACHE_AT, _OLLAMA_REFRESH_IN_FLIGHT
-    global _OLLAMA_REFRESH_PENDING
+def _finish_local_refresh(out: list, epoch: int) -> None:
+    global _LOCAL_CACHE, _LOCAL_CACHE_AT, _LOCAL_REFRESH_IN_FLIGHT
+    global _LOCAL_REFRESH_PENDING
 
     callbacks = []
     follow_up = False
-    with _OLLAMA_CACHE_LOCK:
-        if epoch == _OLLAMA_CACHE_EPOCH:
-            _OLLAMA_CACHE = list(out)
-            _OLLAMA_CACHE_AT = time.monotonic()
-            callbacks = list(_OLLAMA_REFRESH_CALLBACKS)
-            _OLLAMA_REFRESH_CALLBACKS.clear()
+    with _LOCAL_CACHE_LOCK:
+        if epoch == _LOCAL_CACHE_EPOCH:
+            _LOCAL_CACHE = list(out)
+            _LOCAL_CACHE_AT = time.monotonic()
+            callbacks = list(_LOCAL_REFRESH_CALLBACKS)
+            _LOCAL_REFRESH_CALLBACKS.clear()
         else:
-            _OLLAMA_REFRESH_PENDING = True
-        _OLLAMA_REFRESH_IN_FLIGHT = False
-        if _OLLAMA_REFRESH_PENDING:
-            _OLLAMA_REFRESH_PENDING = False
+            _LOCAL_REFRESH_PENDING = True
+        _LOCAL_REFRESH_IN_FLIGHT = False
+        if _LOCAL_REFRESH_PENDING:
+            _LOCAL_REFRESH_PENDING = False
             follow_up = True
     for callback in callbacks:
         try:
@@ -276,56 +280,61 @@ def _finish_ollama_refresh(out: list, epoch: int) -> None:
         except Exception:
             pass
     if follow_up:
-        refresh_ollama_models_async()
+        refresh_local_models_async()
 
 
-def refresh_ollama_models_async(callback=None, *, force: bool = False):
+def refresh_local_models_async(callback=None, *, force: bool = False):
     """Refresh local models on one daemon thread, coalescing concurrent callers."""
-    global _OLLAMA_CACHE_AT, _OLLAMA_CACHE_EPOCH, _OLLAMA_REFRESH_IN_FLIGHT
-    global _OLLAMA_REFRESH_PENDING
+    global _LOCAL_CACHE_AT, _LOCAL_CACHE_EPOCH, _LOCAL_REFRESH_IN_FLIGHT
+    global _LOCAL_REFRESH_PENDING
 
-    with _OLLAMA_CACHE_LOCK:
+    with _LOCAL_CACHE_LOCK:
         if force:
-            _OLLAMA_CACHE_AT = 0.0
-            _OLLAMA_CACHE_EPOCH += 1
-            if _OLLAMA_REFRESH_IN_FLIGHT:
-                _OLLAMA_REFRESH_PENDING = True
-        if _ollama_cache_fresh() and not force:
+            _LOCAL_CACHE_AT = 0.0
+            _LOCAL_CACHE_EPOCH += 1
+            if _LOCAL_REFRESH_IN_FLIGHT:
+                _LOCAL_REFRESH_PENDING = True
+        if _local_cache_fresh() and not force:
             return None
-        if callback is not None and callback not in _OLLAMA_REFRESH_CALLBACKS:
-            _OLLAMA_REFRESH_CALLBACKS.append(callback)
-        if _OLLAMA_REFRESH_IN_FLIGHT:
+        if callback is not None and callback not in _LOCAL_REFRESH_CALLBACKS:
+            _LOCAL_REFRESH_CALLBACKS.append(callback)
+        if _LOCAL_REFRESH_IN_FLIGHT:
             return None
-        _OLLAMA_REFRESH_IN_FLIGHT = True
-        epoch = _OLLAMA_CACHE_EPOCH
+        _LOCAL_REFRESH_IN_FLIGHT = True
+        epoch = _LOCAL_CACHE_EPOCH
 
     def worker():
-        _finish_ollama_refresh(_query_ollama_models(), epoch)
+        _finish_local_refresh(_query_local_models(), epoch)
 
     thread = threading.Thread(
-        target=worker, name="osia-ollama-models", daemon=True
+        target=worker, name="osia-local-models", daemon=True
     )
     thread.start()
     return thread
 
 
-def get_ollama_models() -> list:
-    """List locally-installed Ollama models (cached for ``_OLLAMA_TTL`` seconds).
+def get_local_models() -> list:
+    """List models from local runtimes (cached for ``_LOCAL_TTL`` seconds).
 
     Returns a fresh copy each call so callers may mutate the result without
     corrupting the cache.
     """
-    global _OLLAMA_REFRESH_IN_FLIGHT
-    with _OLLAMA_CACHE_LOCK:
-        if _ollama_cache_fresh():
-            return list(_OLLAMA_CACHE or [])
-        if _OLLAMA_REFRESH_IN_FLIGHT:
-            return list(_OLLAMA_CACHE or [])
-        _OLLAMA_REFRESH_IN_FLIGHT = True
-        epoch = _OLLAMA_CACHE_EPOCH
-    out = _query_ollama_models()
-    _finish_ollama_refresh(out, epoch)
-    return cached_ollama_models()
+    global _LOCAL_REFRESH_IN_FLIGHT
+    with _LOCAL_CACHE_LOCK:
+        if _local_cache_fresh():
+            return list(_LOCAL_CACHE or [])
+        if _LOCAL_REFRESH_IN_FLIGHT:
+            return list(_LOCAL_CACHE or [])
+        _LOCAL_REFRESH_IN_FLIGHT = True
+        epoch = _LOCAL_CACHE_EPOCH
+    out = _query_local_models()
+    _finish_local_refresh(out, epoch)
+    return cached_local_models()
+
+
+def get_ollama_models() -> list:
+    """Compatibility inventory for callers that specifically use Ollama."""
+    return [model for model in get_local_models() if model["provider"] == "ollama"]
 
 
 # ── Remote model discovery ────────────────────────────────────────────────
@@ -374,6 +383,10 @@ def discovery_status() -> dict:
 
 
 def model_metadata(provider, model_id):
+    if provider in LOCAL_PROVIDERS:
+        entry = next((item for item in cached_local_models()
+                      if item["provider"] == provider and item["id"] == model_id), None)
+        return copy.deepcopy(entry)
     with _DISCOVERY_LOCK:
         remote = _DISCOVERY.get(provider, {}).get("models", [])
         entry = next((m for m in remote if m["id"] == model_id), None)
@@ -615,11 +628,11 @@ def get_all_models(api_keys=None, include_remote=False, remote_models=None):
             from osia.config import load_api_keys
             api_keys = load_api_keys()
         remote_models = discover_all_remote_models(api_keys)
-    return _combined_models(get_ollama_models(), remote_models)
+    return _combined_models(get_local_models(), remote_models)
 
 
 def get_all_models_cached(api_keys=None, remote_models=None):
-    return _combined_models(cached_ollama_models(), remote_models)
+    return _combined_models(cached_local_models(), remote_models)
 
 
 def discover_models_async(callback, api_keys: dict | None = None) -> threading.Thread:
@@ -690,11 +703,11 @@ def select_model(prompt: str, fallback_model: str = "llama3") -> str:
         for model_id, provider in COMPLEX_PREFERENCE:
             if keys.get(provider):
                 return model_id
-        local = get_ollama_models()
+        local = [model for model in get_ollama_models() if model.get("available", True)]
         if local:
             return local[0]["id"]
     else:
-        local = get_ollama_models()
+        local = [model for model in get_ollama_models() if model.get("available", True)]
         if local:
             return local[0]["id"]
         for model_id, provider in SIMPLE_API_FALLBACK:
@@ -718,6 +731,10 @@ def endpoint_for_provider(provider: str) -> str:
     set and non-empty, otherwise the provider's built-in ``base_url``.
     """
     default = PROVIDERS.get(provider, {}).get("base_url", "")
+    if provider == "ollama":
+        from osia.local_model_discovery import ollama_loopback_endpoint
+
+        default = ollama_loopback_endpoint(default)
     try:
         from osia.config import get_setting
         entry = (get_setting("api_fallbacks", {}) or {}).get(provider) or {}
@@ -783,11 +800,22 @@ def provider_for_model_cached(model_id: str) -> str:
 
 
 from osia.config import add_api_key_change_listener as _listen_for_key_changes
-_listen_for_key_changes(invalidate_remote_models)
+
+
+def _discovery_key_changed(provider):
+    if provider is None or provider in LOCAL_PROVIDERS:
+        invalidate_local_models_cache(discard_snapshot=True)
+    if provider not in LOCAL_PROVIDERS:
+        invalidate_remote_models(provider)
+
+
+_listen_for_key_changes(_discovery_key_changed)
 
 from osia.config import add_setting_change_listener as _listen_for_setting_changes
 
 def _discovery_setting_changed(key):
+    if key in {"api_key_fallbacks", "api_fallbacks"}:
+        invalidate_local_models_cache(discard_snapshot=True)
     if key in {"api_key_fallbacks", "anthropic_workspace_id", "api_fallbacks"}:
         invalidate_remote_models()
 

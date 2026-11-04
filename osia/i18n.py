@@ -2015,6 +2015,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "en": "ChatGPT account models are temporarily unavailable.",
         "fr": "Les modèles du compte ChatGPT sont temporairement indisponibles.",
     },
+    "models.local_not_served": {"en": "Installed, unavailable in local server", "fr": "Installé, indisponible sur le serveur local", "zh": "已安装，本地服务器不可用", "ja": "インストール済み・ローカルサーバーでは利用不可", "de": "Installiert, auf lokalem Server nicht verfügbar", "es": "Instalado, no disponible en el servidor local"},
     "models.openrouter_search": {"en": "Search OpenRouter models…", "fr": "Rechercher un modèle OpenRouter…", "zh": "搜索 OpenRouter 模型…", "ja": "OpenRouter のモデルを検索…", "de": "OpenRouter-Modelle suchen…", "es": "Buscar modelos de OpenRouter…"},
     "models.openrouter_no_match": {"en": "No matching models", "fr": "Aucun modèle correspondant", "zh": "没有匹配的模型", "ja": "一致するモデルがありません", "de": "Keine passenden Modelle", "es": "No hay modelos que coincidan"},
     "models.openrouter_more": {"en": "Show more models ({count} left)", "fr": "Afficher plus de modèles ({count} restants)", "zh": "显示更多模型（剩余 {count} 个）", "ja": "さらに表示（残り {count} 件）", "de": "Weitere Modelle anzeigen ({count} übrig)", "es": "Mostrar más modelos (quedan {count})"},

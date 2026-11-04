@@ -56,8 +56,8 @@ from osia import legal
 from osia.agent import strip_tool_artifacts
 from osia.memory import MemoryStore
 from osia.models import (
-    PROVIDERS, get_all_models_cached as get_all_models, provider_for_model_cached,
-    refresh_ollama_models_async,
+    LOCAL_PROVIDERS, PROVIDERS, get_all_models_cached as get_all_models,
+    provider_for_model_cached, refresh_local_models_async,
 )
 from osia.config import (
     load_api_keys, save_api_keys, load_settings, set_setting, set_api_key,
@@ -177,6 +177,7 @@ PROVIDER_COLORS = {
     "mistral":   "#FA520F",   # Mistral orange
     "openrouter": "#a99cff",
     "ollama":    "#69c88c",   # Local green
+    "lmstudio":  "#81b7dc",
 }
 
 # Providers with a free tier worth calling out — provider key → i18n key of
@@ -3142,6 +3143,8 @@ class _ModelRow(QFrame):
         self._provider = model.get("provider", "")
         self._name_text = str(model.get("label") or model["id"])
         self._sub_text = str(model.get("id", ""))
+        if self._provider in LOCAL_PROVIDERS and model.get("available") is False:
+            self._sub_text = i18n.t("models.local_not_served") + " · " + self._sub_text
         self._reasoning_chip_text = ""
         if reasoning_options is not None:
             self._reasoning_options = list(reasoning_options)
@@ -3471,7 +3474,7 @@ class _ModelPanel(QWidget):
 
     PROVIDER_ORDER = (
         "chatgpt_account", "anthropic", "openai", "deepseek", "google",
-        "xai", "groq", "mistral", "openrouter", "ollama",
+        "xai", "groq", "mistral", "openrouter", *LOCAL_PROVIDERS,
     )
     _OPENROUTER_PAGE_SIZE = 48
 
@@ -3544,9 +3547,7 @@ class _ModelPanel(QWidget):
 
         self._account_refresh_timer = QTimer(self)
         self._account_refresh_timer.setInterval(5000)
-        self._account_refresh_timer.timeout.connect(
-            self.account_refresh_requested.emit
-        )
+        self._account_refresh_timer.timeout.connect(self._request_visible_refreshes)
 
     def _retranslate(self) -> None:
         self._back_btn.setText("←  " + i18n.t("models.back"))
@@ -6624,7 +6625,10 @@ class _SettingsPanel(QWidget):
             provider = str(m.get("provider") or "").strip()
             if not model_id or not provider:
                 continue
-            if provider != "ollama" and not keys.get(provider):
+            if provider in LOCAL_PROVIDERS:
+                if not m.get("available", True):
+                    continue
+            elif not keys.get(provider):
                 continue
             key = (provider, model_id)
             if key in seen:
@@ -9257,7 +9261,7 @@ class _SettingsPanel(QWidget):
         self._ai_provider_combo.addItem(
             i18n.t("chatgpt_account.title"), "chatgpt_account"
         )
-        for provider in (*self._AI_PROVIDER_ORDER, "ollama"):
+        for provider in (*self._AI_PROVIDER_ORDER, *LOCAL_PROVIDERS):
             self._ai_provider_combo.addItem(
                 "Claude API" if provider == "anthropic" else PROVIDERS[provider]["name"], provider,
             )
@@ -9352,10 +9356,10 @@ class _SettingsPanel(QWidget):
         ol.setContentsMargins(12, 10, 12, 10)
         olh = QHBoxLayout()
         olh.setSpacing(8)
-        ol_name = QLabel(PROVIDERS["ollama"]["name"])
-        ol_name.setObjectName("providerName")
-        ol_name.setWordWrap(True)
-        olh.addWidget(ol_name)
+        self._local_provider_name = QLabel()
+        self._local_provider_name.setObjectName("providerName")
+        self._local_provider_name.setWordWrap(True)
+        olh.addWidget(self._local_provider_name)
         olh.addStretch()
         self._ollama_tag = QLabel(i18n.t("provider.no_key_required"))
         self._ollama_tag.setObjectName("providerSub")
@@ -9789,7 +9793,9 @@ class _SettingsPanel(QWidget):
         self._chatgpt_card.setVisible(provider == "chatgpt_account")
         for p, card in self._provider_cards.items():
             card.setVisible(p == provider)
-        self._ollama_row.setVisible(provider == "ollama")
+        if provider in LOCAL_PROVIDERS:
+            self._local_provider_name.setText(PROVIDERS[provider]["name"])
+        self._ollama_row.setVisible(provider in LOCAL_PROVIDERS)
 
 
     # ── State load / save ─────────────────────────────────────────────────
@@ -11127,7 +11133,7 @@ class MainPopup(QWidget):
     # can only emit False in this release.
     wake_word_enabled_changed = pyqtSignal(bool)
     chat_execution_cancel_requested = pyqtSignal(dict)
-    _ollama_models_ready = pyqtSignal(list)
+    _local_models_ready = pyqtSignal(list)
     _remote_catalogue_ready = pyqtSignal(list)
 
     # Index of the chat page in the QStackedWidget.
@@ -11303,7 +11309,7 @@ class MainPopup(QWidget):
         self._settings.local_models_refresh_requested.connect(
             self._request_local_models_refresh
         )
-        self._ollama_models_ready.connect(self._apply_local_models)
+        self._local_models_ready.connect(self._apply_local_models)
         self._remote_catalogue_ready.connect(self.set_remote_models)
         self._remote_catalogue_timer = QTimer(self)
         self._remote_catalogue_timer.setInterval(10 * 60 * 1000)
@@ -12123,7 +12129,7 @@ class MainPopup(QWidget):
         self._models.set_inventory(self._model_inventory)
 
     def _request_local_models_refresh(self) -> None:
-        refresh_ollama_models_async(self._publish_local_models)
+        refresh_local_models_async(self._publish_local_models)
 
     def _request_remote_catalogue(self) -> None:
         from osia.models import discover_models_async
@@ -12131,7 +12137,7 @@ class MainPopup(QWidget):
         discover_models_async(self._remote_catalogue_ready.emit)
 
     def _publish_local_models(self, models: list) -> None:
-        self._ollama_models_ready.emit(list(models))
+        self._local_models_ready.emit(list(models))
 
     def _apply_local_models(self, _models: list) -> None:
         self._settings._apply_local_models_snapshot()

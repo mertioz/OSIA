@@ -17,7 +17,7 @@ def test_startup_banner_uses_configured_provider_without_ollama_probe(
     )
     monkeypatch.setattr(
         models,
-        "_query_ollama_models",
+        "_query_local_models",
         lambda: (_ for _ in ()).throw(AssertionError("startup probe")),
     )
 
@@ -44,16 +44,16 @@ def test_startup_banner_uses_cached_local_model_while_probe_is_hung(
     )
     monkeypatch.setattr(
         models,
-        "_OLLAMA_CACHE",
+        "_LOCAL_CACHE",
         [{"id": "cached-local-fixture", "provider": "ollama"}],
     )
-    monkeypatch.setattr(models, "_OLLAMA_CACHE_AT", time.monotonic())
+    monkeypatch.setattr(models, "_LOCAL_CACHE_AT", time.monotonic())
 
     def hung_probe():
         time.sleep(5.0)
         return []
 
-    monkeypatch.setattr(models, "_query_ollama_models", hung_probe)
+    monkeypatch.setattr(models, "_query_local_models", hung_probe)
 
     started = time.monotonic()
     server._log_active_model()
@@ -70,14 +70,14 @@ def test_explicit_later_ollama_discovery_still_queries(monkeypatch):
 
     discovered = [{"id": "explicit-local-fixture", "provider": "ollama"}]
     calls = []
-    monkeypatch.setattr(models, "_OLLAMA_CACHE", None)
-    monkeypatch.setattr(models, "_OLLAMA_CACHE_AT", 0.0)
-    monkeypatch.setattr(models, "_OLLAMA_REFRESH_IN_FLIGHT", False)
+    monkeypatch.setattr(models, "_LOCAL_CACHE", None)
+    monkeypatch.setattr(models, "_LOCAL_CACHE_AT", 0.0)
+    monkeypatch.setattr(models, "_LOCAL_REFRESH_IN_FLIGHT", False)
     monkeypatch.setattr(
         models,
-        "_query_ollama_models",
+        "_query_local_models",
         lambda: calls.append(True) or discovered,
     )
 
-    assert models.get_ollama_models() == discovered
+    assert models.get_local_models() == discovered
     assert calls == [True]
