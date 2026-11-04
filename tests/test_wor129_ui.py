@@ -19,6 +19,7 @@ from PyQt6 import sip
 from PyQt6.QtCore import (
     QCoreApplication,
     QEvent,
+    QPoint,
     QRect,
     QTimer,
     Qt,
@@ -26,7 +27,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
 
 from osia.gui.dynamic_island import (
     CIRCLE_SIZE,
@@ -334,6 +335,61 @@ class QtUiLifecycleTests(unittest.TestCase):
             panel.close()
             panel.deleteLater()
             self.app.processEvents()
+
+    def test_composer_and_conversation_buttons_repaint_on_pointer_hover(self):
+        def assert_hover(button):
+            window = button.window()
+            outside = QPoint(window.width() // 2, 45)
+            QTest.mouseMove(window, outside)
+            QTest.qWait(12)
+            resting = button.grab().toImage()
+            QTest.mouseMove(button, button.rect().center())
+            QTest.qWait(12)
+            self.assertTrue(button.underMouse())
+            self.assertNotEqual(button.grab().toImage(), resting, button.objectName())
+            QTest.mouseMove(window, outside)
+            QTest.qWait(12)
+            self.assertEqual(button.grab().toImage(), resting, button.objectName())
+
+        chat = self.popup._chat
+        chat._input.clear()
+        assert_hover(chat._file_btn)
+        self.assertFalse(chat._send_btn.isEnabled())
+        assert_hover(chat._send_btn)
+        self.assertFalse(chat._send_btn.isEnabled())
+        chat._input.setPlainText("Fixture message")
+        self.assertTrue(chat._send_btn.isEnabled())
+        assert_hover(chat._send_btn)
+        chat._input.clear()
+
+        panel = self.popup._convs
+        previous_snapshot = panel._last_snapshot
+        previous_active = panel._active_id
+        was_polling = panel._poll_timer.isActive()
+        panel._poll_timer.stop()
+        panel._active_id = "active"
+        panel.refresh(snapshot={
+            "folders": [{"id": "project", "name": "Project", "collapsed": False}],
+            "items": [
+                {"id": "active", "title": "Current conversation", "folder_id": "project"},
+                {"id": "other", "title": "Another conversation"},
+            ],
+        })
+        try:
+            self.popup._stack.setCurrentWidget(panel)
+            QTest.qWait(30)
+            assert_hover(panel._more_btn)
+            assert_hover(panel._folder_widgets["project"].findChild(QPushButton, "folderMenu"))
+            assert_hover(panel._row_widgets["active"])
+            assert_hover(panel._row_widgets["other"])
+            assert_hover(panel._row_widgets["other"].findChild(QPushButton, "convRename"))
+        finally:
+            self.popup._stack.setCurrentWidget(chat)
+            panel._active_id = previous_active
+            panel._last_snapshot = None
+            panel.refresh(snapshot=previous_snapshot or {"items": []})
+            if was_polling:
+                panel._poll_timer.start()
 
     def test_window_size_and_page_geometry_contracts_are_unchanged(self):
         self.assertEqual((POPUP_W, POPUP_W_WIDE, POPUP_H), (440, 640, 560))

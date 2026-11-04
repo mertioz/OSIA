@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QFileDialog, QComboBox,
     QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
     QToolTip, QMessageBox, QTextBrowser, QBoxLayout, QListView, QListWidgetItem,
-    QStyledItemDelegate,
+    QStyle, QStyleOptionButton, QStylePainter, QStyledItemDelegate,
 )
 
 from osia import conversations
@@ -510,7 +510,25 @@ class _Bubble(QFrame):
 
 # ── Chat page ───────────────────────────────────────────────────────────────
 
-class _ComposerButton(QPushButton):
+class _PointerStyledButton(QPushButton):
+    """Draw hover across the whole button, including child labels."""
+
+    def event(self, event) -> bool:
+        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
+            self.update()
+        return super().event(event)
+
+    def paintEvent(self, _event) -> None:
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        if self.underMouse():
+            option.state |= QStyle.StateFlag.State_MouseOver
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.ControlElement.CE_PushButton, option)
+        painter.end()
+
+
+class _ComposerButton(_PointerStyledButton):
     """Square composer control with a geometry-centred painted icon."""
 
     def __init__(self, kind: str):
@@ -560,12 +578,18 @@ class _ComposerButton(QPushButton):
             return palette.color("disabled")
         if self._kind == "send":
             return palette.color("background")
-        return palette.color("text", 215)
+        return palette.color("text", 255 if self.underMouse() else 215)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._kind == "send" and not self.isEnabled() and self.underMouse():
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(get_theme_manager().palette.color("primary", 24))
+            painter.drawRoundedRect(
+                QRectF(self.rect()), COMPOSER_BUTTON_RADIUS, COMPOSER_BUTTON_RADIUS,
+            )
         color = self._icon_color()
         pen = QPen(color, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -2397,7 +2421,7 @@ class _ConversationAction(QPushButton):
         painter.end()
 
 
-class _ConvRow(QPushButton):
+class _ConvRow(_PointerStyledButton):
     """One row in the conversations list."""
 
     open_clicked = pyqtSignal(str)
@@ -12394,6 +12418,9 @@ class MainPopup(QWidget):
             QPushButton:pressed {
                 color: #e8e6f0;
             }
+            QPushButton:enabled:hover {
+                background-color: rgba(196, 181, 245, 0.18);
+            }
 
             QPushButton#closeBtn {
                 background: transparent;
@@ -12403,6 +12430,7 @@ class MainPopup(QWidget):
                 font-size: 15px;
             }
             QPushButton#closeBtn:hover {
+                background: rgba(196, 181, 245, 0.16);
                 color: #e8e6f0;
             }
             QPushButton#closeBtn:focus {
@@ -12458,6 +12486,7 @@ class MainPopup(QWidget):
             }
             QFrame#publicBetaUpdateBanner QPushButton:hover,
             QFrame#publicBetaUpdateBanner QPushButton:focus {
+                background: rgba(97, 58, 32, 0.68);
                 border-color: #ffd479;
             }
             QFrame#publicBetaUpdateBanner QPushButton#primaryBtn {
@@ -12615,19 +12644,25 @@ class MainPopup(QWidget):
                 background: rgba(19, 17, 26, 0.60);
                 color: rgba(232, 230, 240, 0.8);
             }
-            QPushButton#iconBtn:hover, QPushButton#iconBtn:focus {
-                background: rgba(19, 17, 26, 0.42);
+            QPushButton#iconBtn:focus {
+                background: rgba(196, 181, 245, 0.15);
+            }
+            QPushButton#iconBtn:hover {
+                background: rgba(196, 181, 245, 0.24);
                 color: #e8e6f0;
             }
             QPushButton#iconBtn:pressed {
-                background: rgba(19, 17, 26, 0.72);
+                background: rgba(196, 181, 245, 0.34);
             }
             QPushButton#sendBtn {
                 background: rgba(196, 181, 245, 0.72);
                 color: #0d0b12;
             }
-            QPushButton#sendBtn:hover, QPushButton#sendBtn:focus {
+            QPushButton#sendBtn:focus {
                 background: rgba(196, 181, 245, 0.84);
+            }
+            QPushButton#sendBtn:hover {
+                background: rgba(196, 181, 245, 0.96);
             }
             QPushButton#sendBtn:pressed {
                 background: rgba(196, 181, 245, 0.66);
@@ -12700,14 +12735,20 @@ class MainPopup(QWidget):
                 border: none;
                 border-radius: 12px;
             }
-            QPushButton#convRow:hover {
-                background: #13111a;
-            }
             QPushButton#convRow[active="true"] {
                 background: rgba(196, 181, 245, 0.13);
             }
             QPushButton#convRow:focus {
+                background: rgba(196, 181, 245, 0.14);
+            }
+            QPushButton#convRow:hover {
                 background: rgba(196, 181, 245, 0.19);
+            }
+            QPushButton#convRow[active="true"]:focus {
+                background: rgba(196, 181, 245, 0.21);
+            }
+            QPushButton#convRow[active="true"]:hover {
+                background: rgba(196, 181, 245, 0.29);
             }
             QFrame#folderRow {
                 background: rgba(196, 181, 245, 0.10);
@@ -12733,13 +12774,21 @@ class MainPopup(QWidget):
             QPushButton#folderMenu, QPushButton#convMore {
                 background: transparent;
                 border: none;
+                border-radius: 8px;
                 color: rgba(232, 230, 240, 0.76);
             }
             QPushButton#folderMenu:hover, QPushButton#convMore:hover {
+                background: rgba(196, 181, 245, 0.22);
                 color: #e8e6f0;
             }
             QPushButton#folderMenu:focus, QPushButton#convMore:focus {
+                background: rgba(196, 181, 245, 0.16);
                 color: #c4b5f5;
+            }
+            QPushButton#folderMenu:hover:focus, QPushButton#convMore:hover:focus,
+            QPushButton#folderMenu:pressed, QPushButton#convMore:pressed {
+                background: rgba(196, 181, 245, 0.30);
+                color: #e8e6f0;
             }
             QPushButton#folderToggle:hover, QPushButton#folderToggle:focus,
             QPushButton#convRename:hover, QPushButton#convRename:focus,
@@ -12868,6 +12917,9 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.16);
                 border: 1px solid rgba(196, 181, 245, 0.44);
             }
+            QPushButton#modelReasoning[selected="true"]:hover {
+                background: rgba(196, 181, 245, 0.28);
+            }
             QPushButton#modelUse {
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.40);
@@ -12946,6 +12998,9 @@ class MainPopup(QWidget):
             }
             QPushButton#themeChoice:checked {
                 background: rgba(196, 181, 245, 0.24);
+            }
+            QPushButton#themeChoice:checked:hover {
+                background: rgba(196, 181, 245, 0.34);
             }
             QLabel#sectionTitle {
                 font-size: 15px;
@@ -13155,6 +13210,9 @@ class MainPopup(QWidget):
             QPushButton#primaryBtn[conversationNew="true"]:focus {
                 background: rgba(196, 181, 245, 0.36);
             }
+            QPushButton#primaryBtn[conversationNew="true"]:hover {
+                background: rgba(196, 181, 245, 0.43);
+            }
             QPushButton#destructiveSecondaryBtn {
                 background: rgba(220, 80, 80, 0.06);
                 border: 1px solid rgba(220, 80, 80, 0.28);
@@ -13225,6 +13283,9 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.35);
                 border: 1px solid rgba(196, 181, 245, 0.85);
                 color: #e8e6f0;
+            }
+            QPushButton#saveBtn[saved="true"]:hover {
+                background: rgba(196, 181, 245, 0.45);
             }
 
             /* Voice combos ──────────────────────────────────────────── */
