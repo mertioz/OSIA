@@ -994,7 +994,7 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "0.9.0"' in (ROOT / "osia" / "version.py").read_text("utf-8")
+    assert 'PRODUCT_VERSION = "0.9.1"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.166.0"' in build
@@ -1013,13 +1013,13 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_build_timestamp", lambda: "2026-07-20T10:00:00Z")
 
     baseline = module._resolve_build_identity("internal-preview")
-    assert baseline["version"] == "0.9.0"
+    assert baseline["version"] == "0.9.1"
     assert baseline["override"] is None
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
-    assert embedded.version == "0.9.0"
+    assert embedded.version == "0.9.1"
     assert embedded.release_sequence == module.RELEASE_SEQUENCE
     for channel in ("stable", "internal-preview"):
         with pytest.raises(ValueError, match="forbidden"):
@@ -1251,7 +1251,8 @@ def test_wor149_hotfix_redesign_is_minimal_and_uses_transparent_logo():
 def test_package_smoke_requires_the_managed_codex_runtime():
     launcher = (ROOT / "packaging" / "windows" / "launcher.py").read_text("utf-8")
     assert 'resource_path("runtimes", "codex", "bin", "codex.exe")' in launcher
-    assert "managed Codex runtime did not initialize" in launcher
+    assert 'resource_path("legal", "BUILD_MANIFEST.json")' in launcher
+    assert 'codex_version != f"codex-cli {expected_codex_version}"' in launcher
 
 
 def test_firewall_rule_is_private_local_subnet_and_executable_scoped():
