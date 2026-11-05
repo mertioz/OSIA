@@ -83,7 +83,7 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "0.9.0", "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "0.9.1", "0.9.0", "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
     current = release_for_version("1.1.6")
     assert release_for_version("1.1.8").public is False
@@ -692,7 +692,7 @@ def test_public_beta_uses_its_own_accent_on_cards_banner_and_progress(
     section = update_ui.UpdateSettingsSection(controller)
     banner = update_ui.UpdateBanner()
     state = controller.state
-    state.update(status="available", availableVersion="0.9.0", bannerVisible=True)
+    state.update(status="available", availableVersion=update_ui.PRODUCT_VERSION, bannerVisible=True)
     try:
         section.apply_state(state)
         banner.apply_state(state)
@@ -702,7 +702,7 @@ def test_public_beta_uses_its_own_accent_on_cards_banner_and_progress(
         assert section.progress._accent == "beta"
         assert section.history_layout.itemAt(0).widget().objectName() == "publicBetaUpdateCard"
 
-        state.update(installedVersion="0.9.0", availableVersion="1.1.0")
+        state.update(installedVersion=update_ui.PRODUCT_VERSION, availableVersion="1.1.0")
         section.apply_state(state)
         banner.apply_state(state)
         assert section.current_card.objectName() == "publicBetaUpdateCard"

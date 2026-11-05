@@ -18,9 +18,9 @@ def new_manifest(sequence=RELEASE_SEQUENCE, version=PRODUCT_VERSION):
 @pytest.mark.parametrize('old', ['1.0.0','1.0.6','1.1.0','1.1.7','1.1.8'])
 def test_legacy_identity_can_migrate_by_sequence_despite_lower_semver(old):
     result = updater.parse_manifest(json.dumps(new_manifest()), metadata(old))
-    assert result.version == '0.9.0'
+    assert result.version == PRODUCT_VERSION
     assert result.release_sequence == RELEASE_SEQUENCE
-    assert result.installer.url.endswith('/0.9.0/OSIA-Setup.exe')
+    assert result.installer.url.endswith(f'/{PRODUCT_VERSION}/OSIA-Setup.exe')
     assert result.as_dict()['releaseSequence'] == RELEASE_SEQUENCE
 
 
@@ -34,7 +34,7 @@ def test_new_epoch_refuses_legacy_manifest_equal_sequence_and_wrong_channel():
         updater.parse_manifest(json.dumps(new_manifest()), installed)
     with pytest.raises(updater.ManifestError, match='downgrade'):
         updater.parse_manifest(json.dumps(new_manifest()), replace(installed, release_sequence=RELEASE_SEQUENCE+1))
-    raw = new_manifest(RELEASE_SEQUENCE+1, '0.9.1')
+    raw = new_manifest(RELEASE_SEQUENCE+1, '0.9.2')
     result = updater.parse_manifest(json.dumps(raw), installed)
     assert result.release_sequence == RELEASE_SEQUENCE+1
     raw['channel'] = 'stable'
