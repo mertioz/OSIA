@@ -1,6 +1,9 @@
 #ifndef AppVersion
   #error AppVersion must be supplied by build_windows.py
 #endif
+#ifndef AppDisplayVersion
+  #define AppDisplayVersion AppVersion
+#endif
 #ifndef ReleaseSequence
   #error ReleaseSequence must be supplied by build_windows.py
 #endif
@@ -45,7 +48,7 @@
 AppId={code:InstallerAppId}
 AppName=OSIA
 AppVersion={#AppVersion}
-AppVerName=OSIA Desktop {#AppVersion} — Public Beta
+AppVerName=OSIA Desktop {#AppDisplayVersion} — Public Beta
 AppPublisher=OSIA
 AppPublisherURL=https://osia.space
 AppSupportURL=https://osia.space
@@ -86,7 +89,7 @@ UsePreviousTasks=yes
 UsePreviousLanguage=no
 VersionInfoVersion={#AppVersion}.0
 VersionInfoCompany=OSIA
-VersionInfoDescription=OSIA Desktop {#AppVersion} — Public Beta Installer
+VersionInfoDescription=OSIA Desktop {#AppDisplayVersion} — Public Beta Installer
 VersionInfoProductName=OSIA Desktop — Public Beta
 VersionInfoProductVersion={#AppVersion}
 ChangesAssociations=no
@@ -609,7 +612,7 @@ var
   ContentLeft: Integer;
   ContentWidth: Integer;
 begin
-  ProductVersionText := '{#AppVersion}';
+  ProductVersionText := '{#AppDisplayVersion}';
   if IsUpdateMode then
   begin
     WizardForm.Caption := CustomMessage('UpdateHeading');

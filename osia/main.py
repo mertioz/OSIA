@@ -1941,10 +1941,10 @@ def wake_mode():
 
     app = QApplication(sys.argv)
     app.setApplicationName("OSIA")
-    from osia.version import current_product_version
+    from osia.version import current_product_version, display_version
     app.setApplicationVersion(current_product_version())
     app.setApplicationDisplayName(
-        f"OSIA Desktop {app.applicationVersion()} — Public Beta"
+        f"OSIA Desktop {display_version(app.applicationVersion())} — Public Beta"
     )
     app.setWindowIcon(QIcon(ICON_PATH))
 

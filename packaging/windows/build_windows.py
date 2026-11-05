@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version
+from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version, display_version
 from osia.release_notes import (
     installer_release_notes,
     is_major_update,
@@ -475,7 +475,7 @@ VSVersionInfo(
     mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('040904B0', [
     StringStruct('CompanyName', 'OSIA'),
-    StringStruct('FileDescription', 'OSIA Desktop {version} — Public Beta'),
+    StringStruct('FileDescription', 'OSIA Desktop {display_version(version)} — Public Beta'),
     StringStruct('FileVersion', '{version}'),
     StringStruct('InternalName', 'OSIA'),
     StringStruct('LegalCopyright', 'Copyright OSIA'),
@@ -804,6 +804,7 @@ def build(
     _run([
         str(iscc),
         f"/DAppVersion={version}",
+        f"/DAppDisplayVersion={display_version(version)}",
         f"/DReleaseSequence={RELEASE_SEQUENCE}",
         f"/DAppVersionMajor={parse_product_version(version)[0]}",
         f"/DAppVersionMinor={parse_product_version(version)[1]}",

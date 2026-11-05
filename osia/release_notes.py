@@ -11,7 +11,7 @@ import html
 import re
 from dataclasses import dataclass
 
-from osia.version import parse_product_version, display_version, display_historical_text
+from osia.version import HISTORICAL_DISPLAY_VERSIONS, parse_product_version, display_historical_text
 
 
 @dataclass(frozen=True)
@@ -1110,7 +1110,11 @@ _RELEASES = (
 )
 
 RELEASE_HISTORY = tuple(
-    sorted(_RELEASES, key=lambda entry: parse_product_version(display_version(entry.version)), reverse=True)
+    sorted(
+        _RELEASES,
+        key=lambda entry: parse_product_version(HISTORICAL_DISPLAY_VERSIONS.get(entry.version, entry.version)),
+        reverse=True,
+    )
 )
 
 _INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")

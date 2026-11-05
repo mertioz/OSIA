@@ -50,6 +50,7 @@ def test_bad_sequence_does_not_bypass_manifest_validation(value):
 
 def test_history_is_display_only_and_official_source_leads_history():
     assert PRODUCT_VERSION == '0.9.1'
+    assert display_version(PRODUCT_VERSION) == '0.9.01'
     assert display_version('1.0.0') == '0.8.0'
     assert display_version('1.1.8') == '0.8.952'
     assert len(set(HISTORICAL_DISPLAY_VERSIONS.values())) == len(HISTORICAL_DISPLAY_VERSIONS)

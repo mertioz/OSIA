@@ -116,7 +116,7 @@ def _release_identity_smoke(metadata) -> None:
     card = _ReleaseCard()
     try:
         card.apply(version=PRODUCT_VERSION, released_on=None, notes=())
-        if "OSIA Desktop" not in card.version.text() or PRODUCT_VERSION not in card.version.text():
+        if "OSIA Desktop" not in card.version.text() or display_version(PRODUCT_VERSION) not in card.version.text():
             raise RuntimeError("installed beta identity is missing")
         card.apply(version="1.1.8", released_on=None, notes=())
         if "0.8.952" not in card.version.text() or "1.1.8" not in card.version.toolTip():

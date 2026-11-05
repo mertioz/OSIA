@@ -29,6 +29,8 @@ HISTORICAL_DISPLAY_VERSIONS = {
 
 
 def display_version(version: str) -> str:
+    if version == "0.9.1":
+        return "0.9.01"
     return HISTORICAL_DISPLAY_VERSIONS.get(version, version)
 
 
