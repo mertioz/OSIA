@@ -269,12 +269,18 @@ def _package_smoke() -> int:
             raise RuntimeError("uiautomation native bitmap client did not initialize")
 
         step = "codex_runtime"
+        import json
+
         codex_path = resource_path("runtimes", "codex", "bin", "codex.exe")
+        build_manifest = json.loads(
+            resource_path("legal", "BUILD_MANIFEST.json").read_text(encoding="utf-8")
+        )
+        expected_codex_version = build_manifest["codex_runtime"]["version"]
         codex_version = AppServerClient(
             runtime_executable=codex_path,
         ).get_runtime_version()
-        if not codex_version or "0.144.1" not in codex_version:
-            raise RuntimeError("managed Codex runtime did not initialize")
+        if codex_version != f"codex-cli {expected_codex_version}":
+            raise RuntimeError("managed Codex runtime does not match the build manifest")
         step = "codex_jsonl_boundary"
         with tempfile.TemporaryDirectory(prefix="osia-codex-smoke-") as temporary:
             client = AppServerClient(base_dir=Path(temporary), runtime_executable=codex_path)
