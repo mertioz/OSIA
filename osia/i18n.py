@@ -3395,6 +3395,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Schwebende Kapsel anzeigen",
         "es": "Mostrar la cápsula flotante",
     },
+    "settings.osia_window_shortcut": {
+        "en": "Press Ctrl + Alt + O to show or hide the OSIA window.",
+        "fr": "Appuyez sur Ctrl + Alt + O pour afficher ou masquer la fenêtre OSIA.",
+        "zh": "按 Ctrl + Alt + O 显示或隐藏 OSIA 窗口。",
+        "ja": "Ctrl + Alt + O を押すと OSIA ウィンドウの表示と非表示を切り替えられます。",
+        "de": "Drücken Sie Strg + Alt + O, um das OSIA-Fenster ein- oder auszublenden.",
+        "es": "Pulsa Ctrl + Alt + O para mostrar u ocultar la ventana de OSIA.",
+    },
     "settings.autostart_gui": {
         "en": "Launch OSIA at startup",
         "fr": "Lancer OSIA au démarrage",

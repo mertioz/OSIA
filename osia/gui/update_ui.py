@@ -19,7 +19,7 @@ from PyQt6.QtCore import (
     QVariantAnimation,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath
+from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -781,6 +781,11 @@ class _ReleaseCard(QFrame):
         shape.addRoundedRect(bounds, 11.0, 11.0)
         painter.fillPath(shape, base)
         painter.fillPath(shape, gradient)
+        border = QColor(theme.muted_text)
+        border.setAlphaF(0.20)
+        outline = QPainterPath()
+        outline.addRoundedRect(bounds.adjusted(0.5, 0.5, -0.5, -0.5), 10.5, 10.5)
+        painter.strokePath(outline, QPen(border, 1.0))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

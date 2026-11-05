@@ -5493,11 +5493,17 @@ class _SettingsPanel(QWidget):
         self._show_capsule_label = QLabel(i18n.t("settings.show_capsule"))
         self._show_capsule_label.setObjectName("providerName")
         self._show_capsule_label.setWordWrap(True)
+        self._capsule_shortcut = QLabel("Ctrl + Alt + O")
+        self._capsule_shortcut.setObjectName("sectionDesc")
+        shortcut_help = i18n.t("settings.osia_window_shortcut")
+        self._capsule_shortcut.setToolTip(shortcut_help)
+        self._capsule_shortcut.setAccessibleDescription(shortcut_help)
         self._show_capsule_toggle = OsiaSwitch()
         self._show_capsule_toggle.stateChanged.connect(
             self._on_show_capsule_changed
         )
         show_row.addWidget(self._show_capsule_label)
+        show_row.addWidget(self._capsule_shortcut)
         show_row.addStretch()
         show_row.addWidget(self._show_capsule_toggle)
         l.addLayout(show_row)
@@ -10347,6 +10353,9 @@ class _SettingsPanel(QWidget):
         self._capsule_sub.setText(i18n.t("settings.capsule_sub"))
         self._capsule_desc.setText(i18n.t("settings.capsule_desc"))
         self._show_capsule_label.setText(i18n.t("settings.show_capsule"))
+        shortcut_help = i18n.t("settings.osia_window_shortcut")
+        self._capsule_shortcut.setToolTip(shortcut_help)
+        self._capsule_shortcut.setAccessibleDescription(shortcut_help)
         self._autostart_label.setText(i18n.t("settings.autostart_gui"))
         self._restart_title.setText(i18n.t("settings.restart"))
         self._restart_sub.setText(i18n.t("settings.restart_sub"))
@@ -12983,7 +12992,7 @@ class MainPopup(QWidget):
             }
             QFrame#releaseCard {
                 background: #13111a;
-                border: none;
+                border: 1px solid rgba(157, 154, 173, 0.20);
                 border-radius: 10px;
             }
             QFrame#majorUpdateCard, QFrame#publicBetaUpdateCard {
