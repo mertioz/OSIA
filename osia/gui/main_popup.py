@@ -5077,15 +5077,13 @@ class _SettingsPanel(QWidget):
         sec_memory    = self._build_memory_section()        # Local Memory
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
         sec_legal     = self._build_legal_section()         # Legal versions + links
+        sec_donation  = self._build_donation_section()
         sec_updates   = (
             UpdateSettingsSection(update_controller)
             if update_controller is not None else None
         )
 
-        # (nav i18n key, [sections on that page]) — 9 categories, all 17 frames,
-        # each frame used exactly once. MCP/Connectors gets its OWN category (not
-        # folded into Advanced) — it is a central, growing capability that
-        # warrants top-level discoverability.
+        # Each category maps to its own Settings page.
         self._settings_pages = [
             ("settings.cat.general",  [sec_language, sec_theme, sec_capsule, sec_restart, sec_guide]),
             ("settings.cat.models",   [sec_ai_prov, sec_hierarchy, sec_apikeys]),
@@ -5097,6 +5095,7 @@ class _SettingsPanel(QWidget):
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
             *(([("settings.cat.updates", [sec_updates])]) if sec_updates is not None else []),
             ("settings.cat.legal",    [sec_legal]),
+            ("settings.cat.donation", [sec_donation]),
         ]
 
         for _key, _sections in self._settings_pages:
@@ -9269,6 +9268,33 @@ class _SettingsPanel(QWidget):
         layout.addWidget(self._legal_notice_btn)
         return wrap
 
+    def _build_donation_section(self) -> QFrame:
+        wrap = QFrame()
+        wrap.setObjectName("section")
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        self._donation_title = QLabel(i18n.t("settings.donation_title"))
+        self._donation_title.setObjectName("sectionTitle")
+        self._donation_title.setWordWrap(True)
+        self._donation_desc = QLabel(i18n.t("settings.donation_desc"))
+        self._donation_desc.setObjectName("sectionDesc")
+        self._donation_desc.setWordWrap(True)
+        self._donation_btn = QPushButton(i18n.t("settings.donation_button"))
+        self._donation_btn.setObjectName("ghostBtn")
+        self._donation_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._donation_btn.clicked.connect(
+            lambda: webbrowser.open(
+                "https://osia.space/fr/donate" if i18n.get_language() == "fr"
+                else "https://osia.space/donate"
+            )
+        )
+        layout.addWidget(self._donation_title)
+        layout.addWidget(self._donation_desc)
+        layout.addWidget(self._donation_btn)
+        return wrap
+
     def _build_mobile_section(self) -> QFrame:
         wrap = QFrame()
         wrap.setObjectName("section")
@@ -10468,6 +10494,10 @@ class _SettingsPanel(QWidget):
         self._legal_terms_btn.setText(i18n.t("legal.open_terms"))
         self._legal_privacy_btn.setText(i18n.t("legal.open_privacy"))
         self._legal_notice_btn.setText(i18n.t("legal.open_notice"))
+
+        self._donation_title.setText(i18n.t("settings.donation_title"))
+        self._donation_desc.setText(i18n.t("settings.donation_desc"))
+        self._donation_btn.setText(i18n.t("settings.donation_button"))
 
         self._memory_title.setText(i18n.t("settings.memory"))
         self._memory_sub.setText(i18n.t("settings.memory_sub"))

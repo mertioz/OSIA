@@ -244,6 +244,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "updates.status.error": {"en": "Retry required", "fr": "Nouvel essai requis"},
     "updates.status.pending": {"en": "Installer launching", "fr": "Lancement de l’installateur"},
     "settings.cat.legal": {"en": "Legal", "fr": "Légal"},
+    "settings.cat.donation": {"en": "Donation", "fr": "Don"},
+    "settings.donation_title": {"en": "Support OSIA", "fr": "Soutenir OSIA"},
+    "settings.donation_desc": {
+        "en": "Donations are optional. Your support helps fund OSIA’s development and infrastructure.",
+        "fr": "Faire un don est facultatif. Votre soutien aide à financer le développement d’OSIA et son infrastructure.",
+    },
+    "settings.donation_button": {
+        "en": "Open the donation page",
+        "fr": "Ouvrir la page de don",
+    },
     "settings.legal": {"en": "Legal and privacy", "fr": "Informations légales"},
     "settings.legal_sub": {
         "en": "Official documents on the OSIA website",
