@@ -994,7 +994,6 @@ def test_build_uses_product_version_and_exact_installer_name():
     build = (ROOT / "packaging" / "windows" / "build_windows.py").read_text("utf-8")
     assert "from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, parse_product_version" in build
     assert "SOURCE_VERSION = PRODUCT_VERSION" in build
-    assert 'PRODUCT_VERSION = "0.9.1"' in (ROOT / "osia" / "version.py").read_text("utf-8")
     assert 'installer = RELEASE / "OSIA-Setup.exe"' in build
     assert "def _write_bundle_file_manifest" in build
     assert 'CODEX_RUNTIME_VERSION = "0.166.0"' in build
@@ -1013,13 +1012,13 @@ def test_build_identity_metadata_and_internal_override(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_build_timestamp", lambda: "2026-07-20T10:00:00Z")
 
     baseline = module._resolve_build_identity("internal-preview")
-    assert baseline["version"] == "0.9.1"
+    assert baseline["version"] == module.PRODUCT_VERSION
     assert baseline["override"] is None
     metadata_path = module._write_app_metadata(baseline)
     embedded = __import__("osia.updater", fromlist=["parse_app_metadata"]).parse_app_metadata(
         metadata_path.read_bytes()
     )
-    assert embedded.version == "0.9.1"
+    assert embedded.version == module.PRODUCT_VERSION
     assert embedded.release_sequence == module.RELEASE_SEQUENCE
     for channel in ("stable", "internal-preview"):
         with pytest.raises(ValueError, match="forbidden"):

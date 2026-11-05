@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.248", released_on="2026-11-05", public=True,
+        changes_en=(
+            "OSIA 0.9.0248 can search and read public web pages without opening your browser. It can still open pages when a task requires interaction.",
+            "Messages that begin with Markdown headings stay in conversation history and are available on later turns.",
+            "Desktop settings show the floating capsule shortcut, add a Donation section and give update cards a subtle outline.",
+        ),
+        changes_fr=(
+            "OSIA 0.9.0248 peut rechercher et lire des pages publiques sans ouvrir votre navigateur. Il peut toujours ouvrir une page si la tâche demande d’interagir avec elle.",
+            "Les messages qui commencent par un titre Markdown sont conservés dans l’historique et restent disponibles aux tours suivants.",
+            "Les paramètres indiquent le raccourci de la capsule et ajoutent une section Don. Les cartes de mise à jour ont un contour discret.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.1", released_on="2026-11-05", public=True,
         changes_en=(
             "Updated the ChatGPT Account runtime to Codex 0.166.0 with GPT-6.1 Sol and Terra on eligible accounts. OSIA checks daily for compatible stable Codex releases.",

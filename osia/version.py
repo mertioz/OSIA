@@ -12,9 +12,9 @@ import sys
 from pathlib import Path
 
 
-PRODUCT_VERSION = "0.9.1"
+PRODUCT_VERSION = "0.9.248"
 VERSION = PRODUCT_VERSION
-RELEASE_SEQUENCE = 2026110501
+RELEASE_SEQUENCE = 2026110502
 FIRST_RELEASE_SEQUENCE = 2026102001
 
 # Display aliases only. Original identifiers remain the artifact/diagnostic keys.
@@ -29,6 +29,8 @@ HISTORICAL_DISPLAY_VERSIONS = {
 
 
 def display_version(version: str) -> str:
+    if version == "0.9.248":
+        return "0.9.0248"
     if version == "0.9.1":
         return "0.9.01"
     return HISTORICAL_DISPLAY_VERSIONS.get(version, version)

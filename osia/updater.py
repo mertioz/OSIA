@@ -646,6 +646,7 @@ def _temporary_unsigned_stable_allowed(
     *,
     source_url: str | None,
     version: str,
+    release_sequence: int | None,
     installer_url: str,
     signed: bool,
     signature_publisher: str | None,
@@ -654,6 +655,13 @@ def _temporary_unsigned_stable_allowed(
 
     policy = TEMPORARY_UNSIGNED_STABLE_POLICY
     parsed_installer = urlsplit(installer_url)
+    # Schema 2 already validated the release sequence and excluded legacy IDs.
+    # Its product versions start at 0.9.0, below the old 1.1.0 SemVer floor.
+    meets_release_floor = (
+        parse_product_version(version) >= (0, 9, 0)
+        if release_sequence is not None
+        else compare_versions(version, policy.minimum_version) >= 0
+    )
     return (
         policy.enabled
         and metadata.product == PRODUCT
@@ -661,7 +669,7 @@ def _temporary_unsigned_stable_allowed(
         and metadata.architecture == ARCHITECTURE
         and metadata.channel == policy.channel
         and source_url == policy.manifest_url
-        and compare_versions(version, policy.minimum_version) >= 0
+        and meets_release_floor
         and parsed_installer.hostname == policy.installer_host
         and parsed_installer.path == f"/windows/{version}/OSIA-Setup.exe"
         and signed is False
@@ -758,6 +766,7 @@ def parse_manifest(
                 metadata,
                 source_url=source_url,
                 version=version,
+                release_sequence=release_sequence,
                 installer_url=url,
                 signed=signed,
                 signature_publisher=publisher,

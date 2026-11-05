@@ -49,8 +49,11 @@ def test_bad_sequence_does_not_bypass_manifest_validation(value):
 
 
 def test_history_is_display_only_and_official_source_leads_history():
-    assert PRODUCT_VERSION == '0.9.1'
-    assert display_version(PRODUCT_VERSION) == '0.9.01'
+    assert PRODUCT_VERSION == '0.9.248'
+    assert display_version(PRODUCT_VERSION) == '0.9.0248'
+    assert display_version('0.9.1') == '0.9.01'
+    with pytest.raises(ValueError, match='invalid_product_version'):
+        parse_product_version('0.9.0248')
     assert display_version('1.0.0') == '0.8.0'
     assert display_version('1.1.8') == '0.8.952'
     assert len(set(HISTORICAL_DISPLAY_VERSIONS.values())) == len(HISTORICAL_DISPLAY_VERSIONS)
@@ -59,6 +62,26 @@ def test_history_is_display_only_and_official_source_leads_history():
     old = next(r for r in RELEASE_HISTORY if r.version == '1.1.8')
     assert old.released_on == '2026-10-18'
     assert old.version == '1.1.8'
+
+
+def test_unsigned_stable_successor_uses_the_validated_release_epoch():
+    installed = replace(
+        metadata('0.9.1', channel='stable'),
+        updater_schema_version=2,
+        release_sequence=RELEASE_SEQUENCE - 1,
+    )
+    source_url = updater.CHANNEL_URLS['stable']
+    for version, sequence in ((PRODUCT_VERSION, RELEASE_SEQUENCE), ('0.9.249', RELEASE_SEQUENCE + 1)):
+        raw = new_manifest(sequence, version)
+        raw['channel'] = 'stable'
+        parsed = updater.parse_manifest(json.dumps(raw), installed, source_url=source_url)
+        assert parsed.temporary_unsigned_stable
+        with pytest.raises(updater.ManifestError, match='stable_unsigned'):
+            updater.parse_manifest(json.dumps(raw), installed)
+    below_floor = new_manifest(RELEASE_SEQUENCE + 1, '0.8.999')
+    below_floor['channel'] = 'stable'
+    with pytest.raises(updater.ManifestError, match='stable_unsigned'):
+        updater.parse_manifest(json.dumps(below_floor), installed, source_url=source_url)
 
 
 def test_installer_guards_both_interactive_and_update_mode_and_keeps_identity():
