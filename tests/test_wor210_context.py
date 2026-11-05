@@ -16,6 +16,7 @@ import pytest
 from osia import conversations, document_artifacts, document_sources
 from osia.agent import (
     OSIAAgent,
+    SYSTEM_PROMPT_CORE,
     _latest_persisted_document_references,
 )
 from osia.conversation_context import (
@@ -94,6 +95,36 @@ def test_a_short_history_is_complete_ordered_and_origin_independent():
     assert [item["role"] for item in pc.messages] == [
         "system", "developer", "user", "assistant", "user",
     ]
+
+
+def test_markdown_headings_survive_saving_and_reopening(monkeypatch, tmp_path):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
+    monkeypatch.setattr("osia.main._notify_mobile_conversation_changed", lambda *args, **kwargs: None)
+    conv = conversations.create_conversation()
+    question = "## Demande\nQuel est le résultat ?"
+    answer = "## OSIA\nLe résultat est 42."
+    previous = SimpleNamespace(messages=[
+        {"role": "system", "content": SYSTEM_PROMPT_CORE},
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": SYSTEM_PROMPT_CORE},
+        {"role": "assistant", "content": answer},
+    ])
+    assert _persist_agent_delta(conv["id"], previous, 0)
+    history = conversations.get_conversation(conv["id"])["messages"]
+    assert [message["content"] for message in history] == [question, answer]
+
+    completions = _CaptureCompletions()
+    resumed = OSIAAgent(model="local-test", lang="fr")
+    resumed.provider = "ollama"
+    resumed.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    resumed.run("Peux-tu préciser ?", history=history, current_conversation_id=conv["id"])
+
+    dialogue = [
+        (message["role"], message["content"])
+        for message in completions.calls[0]
+        if message["role"] in {"user", "assistant"}
+    ]
+    assert dialogue[:2] == [("user", question), ("assistant", answer)]
 
 
 def test_b_long_history_preserves_markers_constraints_and_recent_verbatim():

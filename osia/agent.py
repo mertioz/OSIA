@@ -154,6 +154,7 @@ For a textual OSIA tool call, emit top-level JSON inside `<tool_call>` tags; nev
 
 # Compatibility name for callers that imported the former English constant.
 SYSTEM_PROMPT_EN = SYSTEM_PROMPT_CORE
+_SYSTEM_PROMPT_OPENING = SYSTEM_PROMPT_CORE.partition("\n\n")[0]
 
 _PROVIDER_SEAM_FAILURE_CODES = frozenset({
     "CAPABILITY_UNAVAILABLE",
@@ -6754,7 +6755,7 @@ def _sanitize_persisted_history_message(msg: dict) -> dict | None:
             return None
     if "RÈGLES ABSOLUES" in text or "ABSOLUTE RULES" in text:
         return None
-    if text.lstrip().startswith("##"):
+    if text.lstrip().startswith(_SYSTEM_PROMPT_OPENING):
         return None
 
     # Tool results are model-facing feedback for the turn that executed them.
