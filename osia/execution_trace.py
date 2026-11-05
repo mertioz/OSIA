@@ -242,6 +242,8 @@ def display_key_for_tool(tool_name: object) -> str:
     name = str(tool_name or "").strip().lower()
     if not name:
         return "execution.action.capability"
+    if name in {"search_public_web", "read_public_web_page"}:
+        return "execution.action.capability"
     if any(part in name for part in ("browser", "navigate", "page", "tab", "form")):
         return "execution.action.browser"
     if any(part in name for part in ("document", "pdf", "docx", "spreadsheet", "slide")):

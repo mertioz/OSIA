@@ -775,6 +775,7 @@ def apply_to_agent(agent: Any, directives: SlashTurnDirectivesV1) -> None:
 def tool_is_current_web_evidence(tool_name: str) -> bool:
     name = str(tool_name or "")
     return name in {
+        "search_public_web", "read_public_web_page",
         "search_web", "web_search", "open_search_result", "navigate_browser",
         "read_page", "get_page_text", "inspect_browser_page", "web_state",
         "reload_browser_page", "paginate_browser",

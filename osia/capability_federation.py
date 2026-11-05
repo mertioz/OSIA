@@ -99,7 +99,7 @@ def _permission_requirement(spec) -> str:
 
 
 def _equivalence_class(name: str) -> str:
-    if name in {"search_web", "web_search"}:
+    if name in {"search_web", "web_search", "search_public_web"}:
         return "web_search"
     if name in {"bash", "run_command"}:
         return "local_command"

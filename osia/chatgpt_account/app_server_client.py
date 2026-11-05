@@ -148,6 +148,8 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
     "is_running",
     "has_window",
     "steam_game_state",
+    "search_public_web",
+    "read_public_web_page",
     "write_file",
     "navigate",
     "open_browser",
@@ -169,6 +171,8 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
 
 _DIRECT_READ_ONLY_NATIVE_TOOLS = frozenset({
     "steam_game_state",
+    "search_public_web",
+    "read_public_web_page",
     "inspect_desktop_surfaces",
     "request_visual_observation",
     "computer_screenshot",
