@@ -68,7 +68,7 @@ def test_unsigned_stable_successor_uses_the_validated_release_epoch():
     installed = replace(
         metadata('0.9.1', channel='stable'),
         updater_schema_version=2,
-        release_sequence=RELEASE_SEQUENCE - 1,
+        release_sequence=2026110501,
     )
     source_url = updater.CHANNEL_URLS['stable']
     for version, sequence in ((PRODUCT_VERSION, RELEASE_SEQUENCE), ('0.9.249', RELEASE_SEQUENCE + 1)):
@@ -82,6 +82,32 @@ def test_unsigned_stable_successor_uses_the_validated_release_epoch():
     below_floor['channel'] = 'stable'
     with pytest.raises(updater.ManifestError, match='stable_unsigned'):
         updater.parse_manifest(json.dumps(below_floor), installed, source_url=source_url)
+
+
+def test_same_version_repair_requires_the_exact_sequence_in_the_download_url(tmp_path):
+    version = '0.9.248'
+    repair_sequence = 2026110601
+    installed = replace(metadata(version, 'stable'), updater_schema_version=2, release_sequence=2026110502)
+    source_url = updater.CHANNEL_URLS['stable']
+    raw = new_manifest(repair_sequence, version)
+    raw['channel'] = 'stable'
+    base = f'https://download.osia.space/windows/{version}'
+    repair_url = f'{base}/builds/{repair_sequence}/OSIA-Setup.exe'
+    raw['installer']['url'] = repair_url
+    manifest = updater.parse_manifest(json.dumps(raw), installed, source_url=source_url)
+    assert manifest.version == installed.version and manifest.installer.url == repair_url
+    path = updater.installer_path(manifest.version, tmp_path)
+    path.write_bytes(b'installer')
+    store = updater.UpdateStateStore(tmp_path / 'update-state.json')
+    updater.launch_update_installer(manifest, path, store, process_factory=lambda *_a, **_kw: object())
+    assert updater.reconcile_pending_update(installed, store) == 'failed'
+    updater.launch_update_installer(manifest, path, store, process_factory=lambda *_a, **_kw: object())
+    assert updater.reconcile_pending_update(replace(installed, release_sequence=repair_sequence), store) == 'success'
+
+    for url in (f'{base}/builds/2026110502/OSIA-Setup.exe', repair_url + '?next=1'):
+        raw['installer']['url'] = url
+        with pytest.raises(updater.ManifestError, match='invalid_installer_url'):
+            updater.parse_manifest(json.dumps(raw), installed, source_url=source_url)
 
 
 def test_installer_guards_both_interactive_and_update_mode_and_keeps_identity():

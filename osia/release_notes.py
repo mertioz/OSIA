@@ -63,13 +63,15 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
-        version="0.9.248", released_on="2026-11-05", public=True,
+        version="0.9.248", released_on="2026-11-06", public=True,
         changes_en=(
+            "Fixed the Windows upgrade check for earlier OSIA installations with a missing release sequence.",
             "OSIA 0.9.0248 can search and read public web pages without opening your browser. It can still open pages when a task requires interaction.",
             "Messages that begin with Markdown headings stay in conversation history and are available on later turns.",
             "Desktop settings show the floating capsule shortcut, add a Donation section and give update cards a subtle outline.",
         ),
         changes_fr=(
+            "Correction de la mise à jour Windows lorsque l’ancienne installation d’OSIA n’a pas de numéro de séquence.",
             "OSIA 0.9.0248 peut rechercher et lire des pages publiques sans ouvrir votre navigateur. Il peut toujours ouvrir une page si la tâche demande d’interagir avec elle.",
             "Les messages qui commencent par un titre Markdown sont conservés dans l’historique et restent disponibles aux tours suivants.",
             "Les paramètres indiquent le raccourci de la capsule et ajoutent une section Don. Les cartes de mise à jour ont un contour discret.",

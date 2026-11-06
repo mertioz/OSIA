@@ -574,6 +574,7 @@ def test_inno_constant_inventory_and_release_gate_are_deterministic(tmp_path):
 
     assert set(inventory["compile_time_preprocessor"]) == {
         "{#AppVersion}",
+        "{#AppDisplayVersion}",
         "{#ReleaseSequence}",
         "{#AppVersionMajor}",
         "{#AppVersionMinor}",
@@ -752,12 +753,21 @@ def _find_iscc_for_test() -> Path | None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Inno Setup is Windows-only")
-def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
+def test_inno_installs_and_upgrades_an_isolated_payload_without_a_release_sequence(tmp_path):
     iscc = _find_iscc_for_test()
     if iscc is None:
         pytest.skip("Inno Setup 6 is not installed")
 
     from PIL import Image
+    from PyInstaller.utils.win32.versioninfo import FixedFileInfo, VSVersionInfo, write_version_info_to_executable
+    from osia.version import PRODUCT_VERSION, RELEASE_SEQUENCE, display_version, parse_product_version
+
+    def write_versioned_fixture(path, version):
+        components = (*parse_product_version(version), 0)
+        shutil.copyfile(sys.executable, path)
+        write_version_info_to_executable(
+            str(path), VSVersionInfo(ffi=FixedFileInfo(filevers=components, prodvers=components)),
+        )
 
     source = tmp_path / "source"
     payload = source / "dist" / "OSIA"
@@ -766,7 +776,9 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     output = tmp_path / "output"
     for directory in (payload, windows, generated, output):
         directory.mkdir(parents=True)
-    (payload / "OSIA.exe").write_bytes(b"non-installing compile fixture")
+    write_versioned_fixture(payload / "OSIA.exe", PRODUCT_VERSION)
+    (payload / "_internal").mkdir()
+    (payload / "_internal" / "repair.txt").write_text("new payload", "utf-8")
     (windows / "configure_lan_firewall.ps1").write_text("# fixture\n", "utf-8")
     Image.new("RGBA", (64, 64), "#c4b5f5").save(generated / "osia.ico")
     Image.new("RGB", (410, 790), "#0d0b12").save(generated / "wizard-large.png")
@@ -779,15 +791,25 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
     notes_en.write_text("Release notes fixture\n", "utf-8")
     notes_fr.write_text("Notes de version fixture\n", "utf-8")
 
+    # Give the isolated installer its own mutex as well as its own registry key.
+    original_script = ROOT / "packaging" / "windows" / "OSIA.iss"
+    script = tmp_path / "OSIA.iss"
+    script.write_text(original_script.read_text("utf-8").replace(
+        r"AppMutex=Local\OSIA.Desktop", r"AppMutex=Local\OSIA.InstallerValidation",
+    ), encoding="utf-8")
+    shutil.copyfile(original_script.with_name("profile_path.iss"), script.with_name("profile_path.iss"))
+    major, minor, patch = parse_product_version(PRODUCT_VERSION)
+
     completed = subprocess.run(
         [
             str(iscc),
             "/Qp",
-            "/DAppVersion=1.0.0",
-            "/DReleaseSequence=2026102001",
-            "/DAppVersionMajor=1",
-            "/DAppVersionMinor=0",
-            "/DAppVersionPatch=0",
+            f"/DAppVersion={PRODUCT_VERSION}",
+            f"/DAppDisplayVersion={display_version(PRODUCT_VERSION)}",
+            f"/DReleaseSequence={RELEASE_SEQUENCE}",
+            f"/DAppVersionMajor={major}",
+            f"/DAppVersionMinor={minor}",
+            f"/DAppVersionPatch={patch}",
             "/DBuildChannel=internal-preview",
             "/DInternalBuild=1",
             "/DSignedBuild=0",
@@ -797,7 +819,7 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
             f"/DRepoRoot={source}",
             f"/DBuildRoot={tmp_path / 'build'}",
             f"/DReleaseRoot={output}",
-            str(ROOT / "packaging" / "windows" / "OSIA.iss"),
+            str(script),
         ],
         cwd=ROOT,
         capture_output=True,
@@ -831,21 +853,66 @@ def test_inno_script_compiles_with_a_non_installing_minimal_payload(tmp_path):
                 return None
     before_autostart = autostart()
     isolated = tmp_path / "isolated install"
-    setup = subprocess.run([str(output / "OSIA-Setup.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES",
+    args = [str(output / "OSIA-Setup.exe"), "/CURRENTUSER", "/LANG=english", "/VERYSILENT", "/SUPPRESSMSGBOXES",
         "/SP-", "/NORESTART", "/NOICONS", "/NOINTEGRATION=1", "/MERGETASKS=!firewall,!autostart,!desktopicon",
-        "/DIR=" + str(isolated)], capture_output=True, timeout=90)
-    assert setup.returncode == 0
-    assert registration(normal_id) == before
-    assert autostart() == before_autostart
-    assert (isolated / ".osia-no-integration-test").is_file()
-    assert (isolated / "unins000.exe").is_file()
+        "/DIR=" + str(isolated)]
     import hashlib
     isolated_id = "OSIA-Isolated-" + hashlib.md5(str(isolated).lower().encode("utf-8")).hexdigest() + "_is1"
     assert len(isolated_id.removesuffix("_is1")) <= 57
-    assert registration(isolated_id) is not None
-    uninstall = subprocess.run([str(isolated / "unins000.exe"), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-        capture_output=True, timeout=90)
-    assert uninstall.returncode == 0
+    isolated_key = uninstall_root + "\\" + isolated_id
+
+    def run_setup(name, *extra):
+        log = tmp_path / f"{name}.log"
+        process = subprocess.run([*args, f"/LOG={log}", *extra], capture_output=True, timeout=90)
+        return process.returncode, log.read_text("utf-8-sig", errors="replace")
+
+    def assert_registered_release():
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, isolated_key) as key:
+            assert winreg.QueryValueEx(key, "DisplayVersion")[0] == PRODUCT_VERSION
+            assert winreg.QueryValueEx(key, "OSIAReleaseSequence") == (RELEASE_SEQUENCE, winreg.REG_DWORD)
+
+    try:
+        code, log = run_setup("fresh")
+        assert code == 0, log
+        assert (isolated / ".osia-no-integration-test").is_file()
+        assert_registered_release()
+
+        # Both published installations lacked the DWORD. Exercise the manual
+        # installer from 0.9.01 and the updater from the first 0.9.0248 build.
+        for previous, extra in (("0.9.1", ()), ("0.9.248", ("/OSIAUPDATE=1",))):
+            write_versioned_fixture(isolated / "OSIA.exe", previous)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, isolated_key, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, previous)
+                winreg.DeleteValue(key, "OSIAReleaseSequence")
+            code, log = run_setup(f"upgrade-{previous}", *extra)
+            assert code == 0, log
+            assert f"from installed version {previous}" in log
+            assert_registered_release()
+            assert (isolated / "OSIA.exe").read_bytes() == (payload / "OSIA.exe").read_bytes()
+
+        code, log = run_setup("equal-release", "/OSIAUPDATE=1")
+        assert code != 0 and "target version must be newer" in log
+        assert_registered_release()
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, isolated_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "OSIAReleaseSequence", 0, winreg.REG_DWORD, RELEASE_SEQUENCE + 1)
+        code, log = run_setup("downgrade", "/OSIAUPDATE=1")
+        assert code != 0 and "target version must be newer" in log
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, isolated_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "OSIAReleaseSequence", 0, winreg.REG_DWORD, RELEASE_SEQUENCE)
+            winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "0.9.1")
+        code, log = run_setup("mismatched-version", "/OSIAUPDATE=1")
+        assert code != 0 and "different registry and executable versions" in log
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, isolated_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, PRODUCT_VERSION)
+    finally:
+        uninstaller = isolated / "unins000.exe"
+        if uninstaller.is_file():
+            uninstall = subprocess.run([str(uninstaller), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                capture_output=True, timeout=90)
+            assert uninstall.returncode == 0
+    assert registration(isolated_id) is None
     assert registration(normal_id) == before
     assert autostart() == before_autostart
 
@@ -1033,7 +1100,8 @@ def test_pe_inno_and_release_manifest_share_resolved_build_version():
     assert "StringStruct('ProductVersion', '{version}')" in build
     assert 'f"/DAppVersion={version}"' in build
     assert '"version": version' in build
-    assert 'f"https://download.osia.space/windows/{version}/OSIA-Setup.exe"' in build
+    assert 'download_path = f"windows/{version}"' in build
+    assert 'f"https://download.osia.space/{download_path}/OSIA-Setup.exe"' in build
     assert '(str(GENERATED / "app_metadata.json"), ".")' in spec
 
 

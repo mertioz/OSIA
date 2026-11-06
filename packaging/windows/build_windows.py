@@ -758,6 +758,7 @@ def build(
     *,
     channel: str = DEFAULT_BUILD_CHANNEL,
     version_override: str | None = None,
+    revisioned_download: bool = False,
 ) -> Path | None:
     if sys.platform != "win32":
         raise RuntimeError("the Windows package must be built on Windows")
@@ -837,6 +838,9 @@ def build(
     )
     shutil.copy2(release_notes_en, RELEASE / "release-notes-en.txt")
     shutil.copy2(release_notes_fr, RELEASE / "release-notes-fr.txt")
+    download_path = f"windows/{version}"
+    if revisioned_download:
+        download_path += f"/builds/{RELEASE_SEQUENCE}"
     release_manifest = {
         "schemaVersion": UPDATER_SCHEMA_VERSION,
         "releaseSequence": RELEASE_SEQUENCE,
@@ -847,7 +851,7 @@ def build(
         "version": version,
         "publishedAt": identity["timestamp"],
         "installer": {
-            "url": f"https://download.osia.space/windows/{version}/OSIA-Setup.exe",
+            "url": f"https://download.osia.space/{download_path}/OSIA-Setup.exe",
             "sizeBytes": installer.stat().st_size,
             "sha256": checksum,
             "signed": signed_installer,
@@ -876,11 +880,14 @@ def main() -> int:
     parser.add_argument("--channel", choices=sorted(ALLOWED_BUILD_CHANNELS),
                         default=DEFAULT_BUILD_CHANNEL)
     parser.add_argument("--version-override")
+    parser.add_argument("--revisioned-download", action="store_true",
+                        help="Publish a new artifact for an existing product version")
     args = parser.parse_args()
     build(
         skip_installer=args.skip_installer,
         channel=args.channel,
         version_override=args.version_override,
+        revisioned_download=args.revisioned_download,
     )
     return 0
 

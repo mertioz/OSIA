@@ -100,9 +100,6 @@ DisableWelcomePage=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 
-[Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{code:InstallerAppId}_is1"; ValueType: dword; ValueName: "OSIAReleaseSequence"; ValueData: "{#ReleaseSequence}"; Flags: uninsdeletevalue
-
 [CustomMessages]
 english.AutostartTask=Launch OSIA when I sign in
 english.AutostartGroup=Startup
@@ -366,6 +363,20 @@ begin
       Lowercase(ExpandFileName(ExpandConstant('{param:DIR|}'))));
 end;
 
+function InstallerUninstallKey: String;
+begin
+  Result := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    InstallerAppId('') + '_is1';
+end;
+
+procedure RegisterPreviousData(PreviousDataKey: Integer);
+begin
+  { Inno recreates this key after processing the [Registry] section. }
+  if not RegWriteDWordValue(HKEY_AUTO, InstallerUninstallKey,
+    'OSIAReleaseSequence', {#ReleaseSequence}) then
+    Log('OSIA Setup could not save the release sequence in the uninstall key.');
+end;
+
 function InitializeSetup: Boolean;
 var
   UninstallKey: String;
@@ -403,8 +414,7 @@ begin
       exit;
     end;
   end;
-  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
-    InstallerAppId('') + '_is1';
+  UninstallKey := InstallerUninstallKey;
   FreshInstallOnboardingEligible :=
     (not IntegrationSuppressed) and (not DirExists(OsiaProfileDirectory)) and
     (not RegKeyExists(HKCU, UninstallKey));
@@ -439,7 +449,8 @@ begin
     (not GetVersionComponents(ExistingExe, ExistingMajor, ExistingMinor,
       ExistingPatch, ExistingBuild)) then
   begin
-    MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+    Log('OSIA Setup could not read the installed executable or registry version.');
+    SuppressibleMsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK, IDOK);
     Result := False;
     exit;
   end;
@@ -451,7 +462,8 @@ begin
     (CompareStr(RegistryVersion, ExistingVersionText) <> 0) or
     (not SamePackedVersion(RegistryPackedVersion, ExistingPackedVersion)) then
   begin
-    MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+    Log('OSIA Setup found different registry and executable versions.');
+    SuppressibleMsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK, IDOK);
     Result := False;
     exit;
   end;
@@ -460,23 +472,39 @@ begin
     {#AppVersionMajor}, {#AppVersionMinor}, {#AppVersionPatch}, 0);
   if not RegQueryDWordValue(HKCU, UninstallKey, 'OSIAReleaseSequence', ExistingSequence) then
   begin
-    { Only observed legacy version families may enter the new release epoch. }
-    if (ExistingMajor = 1) and
+    if RegValueExists(HKCU, UninstallKey, 'OSIAReleaseSequence') then
+    begin
+      Log('OSIA Setup found a release sequence with the wrong registry type.');
+      SuppressibleMsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK, IDOK);
+      Result := False;
+      exit;
+    end;
+    { Recover only published builds whose validated native version is known. }
+    if ExistingVersionText = '0.9.0' then
+      ExistingSequence := 2026102001
+    else if ExistingVersionText = '0.9.1' then
+      ExistingSequence := 2026110501
+    else if ExistingVersionText = '0.9.248' then
+      ExistingSequence := 2026110502
+    else if (ExistingMajor = 1) and
       (((ExistingMinor = 0) and (ExistingPatch <= 6)) or
        ((ExistingMinor = 1) and (ExistingPatch <= 8))) then
       ExistingSequence := 10000 + ExistingMinor * 100 + ExistingPatch
     else
     begin
-      MsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK);
+      Log('OSIA Setup cannot recover a missing release sequence for ' + ExistingVersionText + '.');
+      SuppressibleMsgBox(CustomMessage('UpdateInvalidVersion'), mbError, MB_OK, IDOK);
       Result := False;
       exit;
     end;
+    Log('OSIA Setup recovered release sequence ' + IntToStr(ExistingSequence) +
+      ' from installed version ' + ExistingVersionText + '.');
   end;
   if ({#ReleaseSequence} < ExistingSequence) or
     (UpdateModeRequested and ({#ReleaseSequence} = ExistingSequence)) then
   begin
-    MsgBox(Format(CustomMessage('UpdateNotNewer'), ['{#AppVersion}',
-      ExistingVersionText]), mbError, MB_OK);
+    SuppressibleMsgBox(Format(CustomMessage('UpdateNotNewer'), ['{#AppVersion}',
+      ExistingVersionText]), mbError, MB_OK, IDOK);
     Result := False;
     exit;
   end;

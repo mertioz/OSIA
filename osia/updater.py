@@ -622,10 +622,14 @@ def _validate_release_notes(value: object) -> tuple[str, ...]:
     return tuple(notes)
 
 
-def _validate_installer_url(value: object, version: str) -> str:
+def _validate_installer_url(value: object, version: str, release_sequence: int | None) -> str:
     if not isinstance(value, str):
         raise ValueError("invalid_installer_url")
     parsed = urlsplit(value)
+    release_path = f"/windows/{version}"
+    allowed_paths = {f"{release_path}/OSIA-Setup.exe"}
+    if release_sequence is not None:
+        allowed_paths.add(f"{release_path}/builds/{release_sequence}/OSIA-Setup.exe")
     if (
         parsed.scheme != "https"
         or parsed.netloc != ALLOWED_INSTALLER_HOST
@@ -635,7 +639,7 @@ def _validate_installer_url(value: object, version: str) -> str:
         or parsed.port is not None
         or parsed.query
         or parsed.fragment
-        or parsed.path != f"/windows/{version}/OSIA-Setup.exe"
+        or parsed.path not in allowed_paths
     ):
         raise ValueError("invalid_installer_url")
     return value
@@ -671,7 +675,6 @@ def _temporary_unsigned_stable_allowed(
         and source_url == policy.manifest_url
         and meets_release_floor
         and parsed_installer.hostname == policy.installer_host
-        and parsed_installer.path == f"/windows/{version}/OSIA-Setup.exe"
         and signed is False
         and signature_publisher is None
     )
@@ -744,7 +747,7 @@ def parse_manifest(
             {"url", "sizeBytes", "sha256", "signed", "signaturePublisher"},
             "unknown_installer_field",
         )
-        url = _validate_installer_url(installer["url"], version)
+        url = _validate_installer_url(installer["url"], version, release_sequence)
         size = _require_plain_int(installer["sizeBytes"], "invalid_size")
         if size <= 0 or size > INSTALLER_MAX_BYTES:
             raise ValueError("invalid_size")
@@ -1516,6 +1519,7 @@ def prepare_installer_plan(manifest: UpdateManifest, path: Path) -> InstallerPla
 def _pending_payload(manifest: UpdateManifest, plan: InstallerPlan) -> dict:
     return {
         "version": manifest.version,
+        "releaseSequence": manifest.release_sequence,
         "path": str(plan.executable),
         "sha256": manifest.installer.sha256,
         "sizeBytes": manifest.installer.size_bytes,
@@ -1591,7 +1595,11 @@ def reconcile_pending_update(
         state["lastError"] = "invalid_pending_state"
         store.save(state)
         return "failed"
-    if metadata.version == target:
+    target_sequence = pending.get("releaseSequence")
+    if metadata.version == target and (
+        target_sequence is None
+        or (type(target_sequence) is int and metadata.release_sequence == target_sequence)
+    ):
         state["pending"] = None
         state["lastInstalledVersion"] = target
         state["notifiedVersion"] = None
