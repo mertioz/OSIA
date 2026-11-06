@@ -374,8 +374,8 @@ def validate_special_image_input(conversation_id: str, *, has_image: bool) -> No
     if has_image and conversation_special_mode(conversation_id):
         raise SlashDirectiveError(
             "special_mode_image_disabled",
-            "Use /disablevision to restore vision before sending an image.",
-            "Utilise /disablevision pour réactiver la vision avant d’envoyer une image.",
+            "Use /vision to restore vision before sending an image.",
+            "Utilise /vision pour réactiver la vision avant d’envoyer une image.",
         )
 
 

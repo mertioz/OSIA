@@ -51,7 +51,7 @@
     },
     {
       "id": "special.toggle",
-      "canonical_alias": "disablevision",
+      "canonical_alias": "vision",
       "name": {"en": "Vision and mouse", "fr": "Vision et souris"},
       "description": {"en": "Disable vision and mouse in this conversation", "fr": "Désactiver la vision et la souris dans cette discussion"},
       "argument_hint": {"en": "", "fr": ""},

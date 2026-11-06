@@ -28,7 +28,7 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "status", "help", "disablevision", "skill", "skillcreator",
+        "web", "model", "status", "help", "vision", "skill", "skillcreator",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
@@ -143,7 +143,7 @@ def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_pa
     [
         ("/", ""),
         ("/ ", ""),
-        ("/ disablevision", "disablevision"),
+        ("/ vision", "vision"),
         ("   /web", "web"),
         ("/linear do it", "linear"),
         ("//web", None),

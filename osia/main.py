@@ -4753,8 +4753,8 @@ def wake_mode():
                 popup.show_conversation_busy_notice()
             else:
                 popup._chat.show_notice(
-                    "Impossible de modifier /disablevision dans cette discussion."
-                    if language_fr else "Could not change /disablevision in this conversation."
+                    "Impossible de modifier /vision dans cette discussion."
+                    if language_fr else "Could not change /vision in this conversation."
                 )
             return
         _notify_mobile_conversation_changed(
