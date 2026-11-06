@@ -19,21 +19,32 @@ def run_claude_messages_smoke():
     with tempfile.TemporaryDirectory(prefix="osia-claude-smoke-") as temporary:
         path = Path(temporary) / "fixture.txt"
         path.write_text("OSIA frozen provider fixture", encoding="utf-8")
+        answer = "The file contains OSIA frozen provider fixture."
+
+        def reject(message):
+            return httpx.Response(400, json={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": message},
+            })
 
         def handler(request):
             body = json.loads(request.content)
             requests.append(body)
-            if body["model"] != model or len(requests) > 2:
-                raise RuntimeError("unexpected frozen provider request")
+            if body["model"] != model or len(requests) > 3:
+                return reject("unexpected frozen provider request")
             if len(requests) == 1:
                 content = [{"type": "tool_use", "id": "frozen_read", "name": "read_file", "input": {"path": str(path)}}]
                 stop = "tool_use"
             else:
-                results = body["messages"][-1]["content"]
-                if not any(b.get("type") == "tool_result" and b.get("tool_use_id") == "frozen_read"
-                           and "OSIA frozen provider fixture" in b.get("content", "") for b in results):
-                    raise RuntimeError("canonical frozen tool receipt was not reinjected")
-                content, stop = [{"type": "text", "text": "The file contains OSIA frozen provider fixture."}], "end_turn"
+                blocks = [block for message in body["messages"] for block in message["content"]]
+                if not any(block.get("type") == "tool_result" and block.get("tool_use_id") == "frozen_read"
+                           and "OSIA frozen provider fixture" in block.get("content", "") for block in blocks):
+                    return reject("canonical frozen tool receipt was not reinjected")
+                if len(requests) == 3:
+                    texts = [block.get("text", "") for block in blocks if block.get("type") == "text"]
+                    if answer not in texts or not any("The last assistant reply was a draft" in text for text in texts):
+                        return reject("canonical frozen completion review did not retain the draft")
+                content, stop = [{"type": "text", "text": answer}], "end_turn"
             if not body.get("stream"):
                 return httpx.Response(200, json={
                     "id": "msg_frozen", "type": "message", "role": "assistant",
@@ -77,7 +88,7 @@ def run_claude_messages_smoke():
                 )
                 if (
                     "OSIA frozen provider fixture" not in result
-                    or len(requests) != 2
+                    or len(requests) != 3
                     or agent.last_execution_strategy_snapshot is not None
                 ):
                     raise RuntimeError("frozen canonical Claude tool round did not complete")
