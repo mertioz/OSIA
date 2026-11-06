@@ -56,6 +56,7 @@ INSTALLER_MAX_BYTES = 2 * 1024 * 1024 * 1024
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 PART_MAX_AGE_SECONDS = 24 * 60 * 60
 INSTALLER_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_INSTALLER_SUFFIX = "-OSIA-Setup.exe"
 
 FIRST_CHECK_SECONDS = 30.0
 NORMAL_CHECK_SECONDS = 6 * 60 * 60.0
@@ -1296,7 +1297,7 @@ def _hash_file(path: Path) -> str:
 def installer_path(version: str, updates_dir: Path | None = None) -> Path:
     _validate_version(version)
     root = Path(updates_dir) if updates_dir is not None else UPDATES_DIR
-    return root / f"{version}-OSIA-Setup.exe"
+    return root / f"{version}{_INSTALLER_SUFFIX}"
 
 
 def partial_path(version: str, updates_dir: Path | None = None) -> Path:
@@ -1309,25 +1310,35 @@ def cleanup_updates(
     updates_dir: Path | None = None,
     *,
     preserve_versions: tuple[str, ...] = (),
+    verified_version: str | None = None,
     now: float | None = None,
 ) -> None:
+    """Expire cache entries or retain the installer just verified for use."""
     root = Path(updates_dir) if updates_dir is not None else UPDATES_DIR
-    if not root.is_dir():
+    try:
+        entries = tuple(root.iterdir())
+    except OSError:
         return
     timestamp = time.time() if now is None else float(now)
     preserve = {installer_path(version, root).name for version in preserve_versions}
-    for path in root.iterdir():
-        if not path.is_file():
-            continue
+    if verified_version is not None:
+        preserve.add(installer_path(verified_version, root).name)
+    for path in entries:
         try:
+            if path.name in preserve or path.is_symlink() or not path.is_file():
+                continue
             age = timestamp - path.stat().st_mtime
-            if path.suffix == ".part" and age > PART_MAX_AGE_SECONDS:
-                path.unlink()
-            elif (
-                path.name.endswith("-OSIA-Setup.exe")
-                and path.name not in preserve
-                and age > INSTALLER_MAX_AGE_SECONDS
-            ):
+            if path.suffix == ".part":
+                remove = age > PART_MAX_AGE_SECONDS
+            elif path.name.endswith(_INSTALLER_SUFFIX):
+                try:
+                    parse_product_version(path.name.removesuffix(_INSTALLER_SUFFIX))
+                except ValueError:
+                    continue
+                remove = verified_version is not None or age > INSTALLER_MAX_AGE_SECONDS
+            else:
+                continue
+            if remove:
                 path.unlink()
         except OSError:
             continue
@@ -1401,6 +1412,7 @@ def download_installer(
                         manifest.installer.size_bytes,
                         manifest.installer.size_bytes,
                     )
+                cleanup_updates(root, verified_version=manifest.version)
                 return final
             final.unlink(missing_ok=True)
         partial.unlink(missing_ok=True)
@@ -1470,6 +1482,7 @@ def download_installer(
         if digest.hexdigest() != manifest.installer.sha256:
             raise DownloadError("sha256_mismatch")
         os.replace(partial, final)
+        cleanup_updates(root, verified_version=manifest.version)
         return final
     except DownloadCancelled:
         remove_partial()

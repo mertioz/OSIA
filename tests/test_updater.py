@@ -316,17 +316,57 @@ def test_fetch_rejects_redirect_and_oversized_manifest(tmp_path):
 def test_streamed_download_atomic_rename_and_progress(tmp_path):
     data = os.urandom(updater.DOWNLOAD_CHUNK_BYTES * 2 + 31)
     manifest = parse_manifest(data)
+    previous = updater.installer_path("1.0.1", tmp_path)
+    unrelated = tmp_path / "notes-OSIA-Setup.exe"
+    other_partial = updater.partial_path("1.0.3", tmp_path)
+    for path in (previous, unrelated, other_partial):
+        path.write_bytes(b"keep during download")
     calls = []
+
+    def progress(done, total):
+        assert previous.is_file()
+        calls.append((done, total))
+
     response = FakeResponse(200, data, {"Content-Length": str(len(data))})
     path = updater.download_installer(
         manifest, updates_dir=tmp_path,
-        progress=lambda done, total: calls.append((done, total)),
+        progress=progress,
         open_response=opener(response),
     )
     assert path.name == "1.0.2-OSIA-Setup.exe"
     assert path.read_bytes() == data
     assert not (tmp_path / "1.0.2.part").exists()
+    assert not previous.exists()
+    assert unrelated.is_file() and other_partial.is_file()
     assert len(calls) >= 3 and calls[-1] == (len(data), len(data))
+
+
+def test_verified_cached_installer_prunes_others_even_if_one_is_locked(tmp_path, monkeypatch):
+    data = b"installer"
+    manifest = parse_manifest(data)
+    keep = updater.installer_path(manifest.version, tmp_path)
+    keep.write_bytes(data)
+    previous = updater.installer_path("1.0.1", tmp_path)
+    locked = updater.installer_path("1.0.0", tmp_path)
+    for path in (previous, locked):
+        path.write_bytes(b"old installer")
+
+    unlink = Path.unlink
+
+    def unlink_unless_locked(path, *args, **kwargs):
+        if path == locked:
+            raise PermissionError("installer in use")
+        return unlink(path, *args, **kwargs)
+
+    def reject_network(*_args):
+        pytest.fail("verified installer should be reused")
+
+    monkeypatch.setattr(Path, "unlink", unlink_unless_locked)
+    assert updater.download_installer(
+        manifest, updates_dir=tmp_path, open_response=reject_network,
+    ) == keep
+    assert keep.read_bytes() == data
+    assert not previous.exists() and locked.exists()
 
 
 @pytest.mark.parametrize(
@@ -349,6 +389,8 @@ def test_download_size_failures_remove_partial(tmp_path, headers, payload, code)
 def test_interrupted_and_hash_mismatch_downloads_remove_partial(tmp_path):
     data = b"installer"
     manifest = parse_manifest(data)
+    previous = updater.installer_path("1.0.1", tmp_path)
+    previous.write_bytes(b"previous installer")
     with pytest.raises(updater.DownloadError, match="download_interrupted"):
         updater.download_installer(
             manifest, updates_dir=tmp_path,
@@ -360,6 +402,7 @@ def test_interrupted_and_hash_mismatch_downloads_remove_partial(tmp_path):
     with pytest.raises(updater.DownloadError, match="sha256_mismatch"):
         updater.download_installer(manifest, updates_dir=tmp_path, open_response=opener(bad))
     assert not (tmp_path / "1.0.2.part").exists()
+    assert previous.read_bytes() == b"previous installer"
 
 
 def test_cancelled_download_removes_partial(tmp_path):
