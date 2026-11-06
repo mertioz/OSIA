@@ -67,6 +67,7 @@ class ComputerFrame:
     capture_method: str
     capture_attempts: tuple[dict, ...] = ()
     parent_frame_id: str = ""
+    foreground_at_capture: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.frame_id or not self.loop_id or not self.turn_id:
@@ -159,6 +160,7 @@ class ComputerFrame:
             "dpi_scale": round(self.dpi_scale, 4),
             "image_sha256": self.image_sha256,
             "capture_method": self.capture_method,
+            "foreground_at_capture": self.foreground_at_capture,
             "capture_attempts": [dict(item) for item in self.capture_attempts],
             "parent_frame_id": self.parent_frame_id,
             "mapping_chain": (
@@ -569,8 +571,11 @@ def _default_window_state(hwnd: int) -> dict[str, Any] | None:
         from osia.tools import desktop_control
 
         title, pid, class_name, bounds = desktop_scene._window_metadata(hwnd)
-        if not pid or bounds is None or not bounds.valid():
+        if not pid:
             return None
+        minimized = desktop_scene._window_is_minimized(hwnd)
+        if bounds is None or not bounds.valid():
+            return {"hwnd": int(hwnd), "minimized": True} if minimized else None
         _application, process_started_at = desktop_scene._process_details(pid)
         client = desktop_scene._window_client_bounds(hwnd)
         client_origin = desktop_scene._window_client_origin(
@@ -596,6 +601,7 @@ def _default_window_state(hwnd: int) -> dict[str, Any] | None:
             "capture_protection": str(
                 desktop_scene._window_capture_protection_reason(hwnd) or ""
             ),
+            "minimized": minimized,
             "foreground_hwnd": int(
                 (desktop_control._foreground_window_win32() or (0,))[0] or 0
             ),
@@ -690,7 +696,7 @@ class _PersistentV4CaptureSource:
 
         target = int(hwnd)
         if self._session is not None and self._hwnd != target:
-            raise RuntimeError("persistent_wgc_target_switch_requires_new_loop")
+            self.close()
         if self._session is None:
             self._session = PersistentWgcWindowCapture(target)
             self._hwnd = target
@@ -711,11 +717,11 @@ class _PersistentV4CaptureSource:
 
     def close(self) -> None:
         session = self._session
-        self._session = None
-        self._hwnd = 0
         if session is not None:
             session.close()
             self._last_snapshot = dict(session.lifecycle_snapshot())
+            self._session = None
+            self._hwnd = 0
 
 
 def _window_token(state: Mapping[str, Any]) -> str:
@@ -810,7 +816,9 @@ class ComputerUseV4:
             owner.close()
             self._last_capture_lifecycle = owner.snapshot()
 
-    def _capture(self, hwnd: int) -> tuple[dict[str, Any], Any, str, dict]:
+    def _capture(
+        self, hwnd: int, *, expected_window_token: str = "",
+    ) -> tuple[dict[str, Any], Any, str, dict]:
         state = dict(self._window_state(int(hwnd)) or {})
         if not state or int(state.get("hwnd") or 0) != int(hwnd):
             raise ComputerUseV4Error("WRONG_HWND", "target_window_missing")
@@ -818,12 +826,18 @@ class ComputerUseV4:
             raise ComputerUseV4Error(
                 "CAPTURE_PROTECTED", str(state["capture_protection"]),
             )
+        if state.get("minimized"):
+            raise ComputerUseV4Error("WINDOW_MINIMIZED", "target_window_is_minimized")
+        if expected_window_token and _window_token(state) != expected_window_token:
+            raise ComputerUseV4Error("STALE_WINDOW", "capture_target_identity_changed")
         try:
             image, method, provenance = self._capture_window(int(hwnd), state)
         except ComputerUseV4Error:
             raise
         except Exception as exc:
             code = str(exc or "")
+            if code == "target_window_is_minimized":
+                raise ComputerUseV4Error("WINDOW_MINIMIZED", code) from exc
             if "capture" in code.lower() and "protect" in code.lower():
                 raise ComputerUseV4Error("CAPTURE_PROTECTED", code) from exc
             raise ComputerUseV4Error(
@@ -831,12 +845,22 @@ class ComputerUseV4:
             ) from exc
         if image is None or image.width <= 0 or image.height <= 0:
             raise ComputerUseV4Error("CAPTURE_FAILED", "empty_exact_window_frame")
+        if expected_window_token:
+            current = dict(self._window_state(int(hwnd)) or {})
+            if current.get("minimized"):
+                raise ComputerUseV4Error("WINDOW_MINIMIZED", "target_window_is_minimized")
+            if current.get("capture_protection"):
+                raise ComputerUseV4Error("CAPTURE_PROTECTED", str(current["capture_protection"]))
+            if _window_token(current) != expected_window_token:
+                raise ComputerUseV4Error("STALE_WINDOW", "capture_target_identity_changed")
         return state, image.convert("RGB"), str(method or ""), dict(provenance or {})
 
-    def screenshot(self, hwnd: int) -> ComputerFrame:
+    def screenshot(self, hwnd: int, *, expected_window_token: str = "") -> ComputerFrame:
         """Capture one exact window and make it the sole current authority."""
 
-        state, image, method, provenance = self._capture(int(hwnd))
+        state, image, method, provenance = self._capture(
+            int(hwnd), expected_window_token=expected_window_token,
+        )
         raw_capture_bounds = provenance.get("capture_screen_bounds")
         if not (
             isinstance(raw_capture_bounds, (list, tuple))
@@ -849,6 +873,7 @@ class ComputerUseV4:
         if capture_bounds[2] <= capture_bounds[0] or capture_bounds[3] <= capture_bounds[1]:
             raise ComputerUseV4Error("CAPTURE_FAILED", "invalid_capture_geometry")
         captured_at = float(provenance.get("captured_at") or self._clock())
+        foreground_hwnd = int(state.get("foreground_hwnd") or 0)
         png, image_width, image_height = _frame_png(
             image, self.maximum_image_dimension,
         )
@@ -882,6 +907,7 @@ class ComputerUseV4:
             scene_sha256=_client_scene_fingerprint(image, state, provenance),
             image_sha256=hashlib.sha256(png).hexdigest(),
             capture_method=method,
+            foreground_at_capture=foreground_hwnd == int(hwnd) if foreground_hwnd else None,
             capture_attempts=tuple(
                 dict(item) for item in provenance.get("capture_attempts", ())
                 if isinstance(item, Mapping)

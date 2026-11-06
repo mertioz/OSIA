@@ -4255,6 +4255,8 @@ class PersistentWgcWindowCapture:
             unchanged = bool(prior and sequence <= prior)
             self._last_snapshot_sequence = sequence
             invalid_frame_count = int(self._invalid_frame_count)
+        if _window_is_minimized(self.native_window_id):
+            raise RuntimeError("target_window_is_minimized")
         from PIL import Image
 
         height, width = int(pixels.shape[0]), int(pixels.shape[1])
@@ -4317,6 +4319,8 @@ class PersistentWgcWindowCapture:
 
     def close(self) -> None:
         if self._closed:
+            if self._control is not None:
+                raise RuntimeError("persistent_wgc_shutdown_incomplete")
             return
         self._closed = True
         control = self._control

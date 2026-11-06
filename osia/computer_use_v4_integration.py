@@ -18,6 +18,7 @@ from osia.computer_use_v4 import (
     ComputerFrame,
     ComputerUseV4,
     ComputerUseV4Error,
+    _window_token,
 )
 
 
@@ -102,17 +103,17 @@ def computer_use_v4_turn_scope(
     try:
         yield state
     finally:
-        if state.loop is not None:
-            state.loop.close()
-            _trace("capture_closed", {
-                "loop_id": state.loop_id,
-                "provider_id": state.provider,
-                "model_id": state.model,
-                "capture_lifecycle": (
-                    state.loop.capture_lifecycle_snapshot()
-                ),
-            })
-        _TURN_STATE.reset(token)
+        try:
+            if state.loop is not None:
+                state.loop.close()
+                _trace("capture_closed", {
+                    "loop_id": state.loop_id,
+                    "provider_id": state.provider,
+                    "model_id": state.model,
+                    "capture_lifecycle": state.loop.capture_lifecycle_snapshot(),
+                })
+        finally:
+            _TURN_STATE.reset(token)
 
 
 def current_computer_use_v4_state() -> _ComputerTurnState | None:
@@ -343,8 +344,46 @@ def _resolve_window(window: str = "") -> int:
             candidates.append(int(hwnd))
     if len(set(candidates)) == 1:
         return candidates[0]
+    if candidates:
+        raise ComputerUseV4Error("WINDOW_AMBIGUOUS", "select_an_exact_window_surface_ref")
     process_match = desktop_control.find_app_window(window)
     return int(process_match[0]) if process_match is not None else 0
+
+
+def _capture_target(window: str, surface_ref: str) -> tuple[int, str]:
+    if not surface_ref:
+        return _resolve_window(window), ""
+    if str(window or "").strip():
+        raise ComputerUseV4Error("INVALID_CAPTURE_TARGET", "choose_window_or_surface_ref")
+    if sys.platform != "win32":
+        raise ComputerUseV4Error("CAPTURE_UNSUPPORTED", "exact_window_requires_win32")
+    from osia import desktop_scene
+    from osia.desktop_surface import SurfaceKind
+
+    scene, surface, reason = desktop_scene._observe_exact_bound_visual_scene(surface_ref)
+    if scene is None or surface is None:
+        raise ComputerUseV4Error(reason or "WINDOW_NOT_FOUND")
+    if surface.surface_kind not in {SurfaceKind.WINDOW, SurfaceKind.DIALOG}:
+        raise ComputerUseV4Error("INVALID_CAPTURE_TARGET", "window_surface_ref_required")
+    native = desktop_scene.DESKTOP_SURFACE_REGISTRY.native_identity(scene.window_ref.ref_id)
+    if native is None:
+        return 0, ""
+    hwnd = int(native.native_window_id)
+    return hwnd, _window_token({
+        "hwnd": hwnd, "pid": native.pid,
+        "process_started_at": native.process_started_at,
+        "window_class": native.class_name,
+    })
+
+
+def _capture_window_frame(window: str, surface_ref: str) -> ComputerFrame:
+    hwnd, expected_token = _capture_target(window, surface_ref)
+    if hwnd <= 0:
+        raise ComputerUseV4Error("WINDOW_NOT_FOUND")
+    loop = _loop()
+    if expected_token:
+        return loop.screenshot(hwnd, expected_window_token=expected_token)
+    return loop.screenshot(hwnd)
 
 
 def _current_visual_postcondition() -> tuple[object, str, str]:
@@ -438,6 +477,7 @@ def _image_result(frame: ComputerFrame, *, reason_code: str) -> dict[str, Any]:
             "frame_id": frame.frame_id,
             "image_dimensions": [frame.image_width, frame.image_height],
             "window": frame.window_title,
+            "foreground_at_capture": frame.foreground_at_capture,
             "instruction": (
                 "Use x/y in these attached image pixels. Reuse frame_id exactly."
             ),
@@ -493,32 +533,26 @@ def _error_result(code: str, detail: str = "") -> dict[str, Any]:
     }
 
 
-def tool_computer_screenshot(window: str = "") -> dict[str, Any]:
+def tool_computer_screenshot(window: str = "", surface_ref: str = "") -> dict[str, Any]:
     if not computer_use_v4_tools_available():
         return _error_result("MODEL_IMAGE_INPUT_UNAVAILABLE")
-    hwnd = _resolve_window(window)
-    if hwnd <= 0:
-        return _error_result("WINDOW_NOT_FOUND")
     try:
         return _image_result(
-            _loop().screenshot(hwnd),
+            _capture_window_frame(window, surface_ref),
             reason_code="V4_ACTIVE_MODEL_IMAGE_PART_BUILT",
         )
     except ComputerUseV4Error as exc:
         return _error_result(exc.code, exc.detail)
 
 
-def tool_save_screenshot(window: str = "") -> dict[str, Any]:
+def tool_save_screenshot(window: str = "", surface_ref: str = "") -> dict[str, Any]:
     """Save a fresh window capture as an attachment to this Chat turn."""
     from osia.chat_screenshots import save_chat_screenshot
     from osia.image_inputs import ImageInputError
 
     try:
         state = _current_state()
-        hwnd = _resolve_window(window)
-        if hwnd <= 0:
-            return _error_result("WINDOW_NOT_FOUND")
-        frame = _loop().screenshot(hwnd)
+        frame = _capture_window_frame(window, surface_ref)
         attachment = save_chat_screenshot(
             state.conversation_id, state.turn_id, frame.to_image_artifact(),
         )

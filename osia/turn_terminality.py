@@ -50,6 +50,7 @@ _STRATEGY_ATTEMPT_EVIDENCE_STATUSES = frozenset({
 # no replan quota: this strategy id is an instruction, never a terminal.
 _REPLAN_STRATEGY_ID = "provider_replan_required"
 _REPLAN_REASON_CODE = "remaining_work_requires_continuation"
+COMPLETION_REVIEW_STRATEGY = "provider_completion_review"
 # A provider invocation that raises a retryable technical error is a local
 # operation failure.  The canonical objective stays alive and may
 # retry/reconnect/continue; no consecutive-failure count ever terminalizes it.
@@ -528,6 +529,14 @@ class TurnTerminalityController:
             return ""
         return completion_instruction(OutcomeContract.from_dict(state["outcome_contract"]))
 
+    def completion_continuation_active(self) -> bool:
+        with self._lock:
+            invocations = self._state.get("invocations") or []
+            return bool(
+                invocations and invocations[-1].get("status") == "active"
+                and invocations[-1].get("strategy_id") == COMPLETION_REVIEW_STRATEGY
+            )
+
     def receipt_reference(self, result: object, attempt_id: str = "") -> str:
         token = _fingerprint(result)
         state = self.snapshot()
@@ -549,7 +558,7 @@ class TurnTerminalityController:
             entry.get("outcome"), entry.get("recorded_at"),
         ])
 
-    def accept_completion(self, text: str) -> str:
+    def accept_completion(self, text: str, *, review_tool_candidate: bool = False) -> str:
         """Accept the model's final answer, retaining factual contradictions."""
         from osia.outcome_contract import (
             CompletionValidationError, OutcomeContract,
@@ -587,6 +596,27 @@ class TurnTerminalityController:
                     receipts, turn_id=self.turn_id,
                 )
                 self._state["outcome_contract"] = assessment.contract.to_dict()
+                if assessment.complete and review_tool_candidate and any(
+                    item.get("outcome") not in {
+                        "metadata_recorded", "not_started", "rejected_before_execution",
+                    }
+                    and (
+                        item.get("attempt_id")
+                        or item.get("reason_code") in {"tool_receipt", "provider_dynamic_completed"}
+                    )
+                    for item in self._state.get("typed_evidence") or []
+                ):
+                    self._state["completion_errors"] = ["completion_review_requested"]
+                    self._state["completion_feedback"] = (
+                        "The last assistant reply was a draft. Compare it with the original "
+                        "request and the existing tool results. If a feasible step or "
+                        "deliverable remains, take the next action in this same turn. "
+                        "Reuse current evidence for completed steps. Return a final answer "
+                        "once all requested work is established, or identify the concrete "
+                        "blocker and the work it prevents."
+                    )
+                    self._persist()
+                    return ""
                 self._state["completion_errors"] = list(assessment.errors)
                 # Optional notes never prove facts or veto a new model request.
                 # A factual contradiction is returned to the same model as
@@ -2770,6 +2800,14 @@ class TurnTerminalityController:
                         "terminal",
                         TerminalState.SUCCESS_VERIFIED.value,
                         "selected_model_completed",
+                    )
+                completion_errors = self._state.get("completion_errors") or []
+                if completion_errors and completion_errors[0] in {
+                    "completion_review_requested", "selected_model_continues",
+                }:
+                    return TerminalityDecision(
+                        "continue", reason_code=completion_errors[0],
+                        next_strategy=COMPLETION_REVIEW_STRATEGY,
                     )
                 return TerminalityDecision("continue", reason_code="awaiting_selected_model")
             strategy_snapshot = self._state.get("strategy_snapshot") or {}

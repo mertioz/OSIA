@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 import time
 
 import pytest
@@ -149,6 +150,51 @@ class _Harness:
         return ComputerAction(
             "click", frame.frame_id, x=x, y=y, **values,
         )
+
+
+def test_background_observation_leaves_focus_and_pointer_untouched(tmp_path):
+    harness = _Harness(tmp_path / "attempts")
+    harness.window["foreground_hwnd"] = 202
+    frame = harness.screenshot()
+    assert frame.hwnd == 101 and frame.foreground_at_capture is False
+    assert harness.window["foreground_hwnd"] == 202
+    assert not harness.activation_calls and not harness.dispatches
+    harness.window["process_started_at"] += 10
+    with pytest.raises(ComputerUseV4Error, match="STALE_WINDOW"):
+        harness.loop.screenshot(101, expected_window_token=frame.window_token)
+    harness.window["minimized"] = True
+    with pytest.raises(ComputerUseV4Error, match="WINDOW_MINIMIZED"):
+        harness.screenshot()
+    assert harness.capture_count == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 exact window references")
+def test_background_capture_uses_a_validated_window_reference(monkeypatch):
+    from osia import desktop_scene
+    from osia.computer_use_v4_integration import _capture_target
+    from osia.desktop_surface import SurfaceKind
+
+    ref = SimpleNamespace(ref_id="window-fresh", surface_kind=SurfaceKind.WINDOW)
+    scene = SimpleNamespace(window_ref=ref)
+    monkeypatch.setattr(
+        desktop_scene, "_observe_exact_bound_visual_scene",
+        lambda requested: (scene, ref, "") if requested == "window-current"
+        else (None, None, "SURFACE_STALE_HWND_RECYCLED"),
+    )
+    monkeypatch.setattr(
+        desktop_scene.DESKTOP_SURFACE_REGISTRY, "native_identity",
+        lambda refreshed: SimpleNamespace(
+            native_window_id=101, pid=42, process_started_at=10.25,
+            class_name="FixtureClass",
+        )
+        if refreshed == ref.ref_id else None,
+    )
+    hwnd, token = _capture_target("", "window-current")
+    assert hwnd == 101 and len(token) == 32
+    with pytest.raises(ComputerUseV4Error, match="SURFACE_STALE_HWND_RECYCLED"):
+        _capture_target("", "window-stale")
+    with pytest.raises(ComputerUseV4Error, match="INVALID_CAPTURE_TARGET"):
+        _capture_target("Different window", "window-current")
 
 
 def test_frame_creation_uses_exact_window_pixels_and_minimal_identity(tmp_path):

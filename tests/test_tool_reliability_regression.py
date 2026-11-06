@@ -268,6 +268,7 @@ def test_canonical_driver_recovers_rejection_then_emits_one_final(dispatch, monk
         '<tool_call>{"tool":"run_command","command":"PRIVATE_COMMAND_SENTINEL","timeout":999}</tool_call>',
         '<tool_call>{"tool":"get_system_info"}</tool_call>',
         "The fixture system is ready.",
+        "The fixture system is ready.",
     ])
     def create(**kwargs):
         observations.append(kwargs)
@@ -278,4 +279,4 @@ def test_canonical_driver_recovers_rejection_then_emits_one_final(dispatch, monk
     a.configure_tool_attempts(conversation_id="fixture", turn_id="fixture-driver", request_id="fixture", final_response_message_id="fixture-final")
     result = a.run_terminal_turn("Read the fixture system information.", turn_id="fixture-driver", history=[], on_sentence=finals.append)
     assert result == "The fixture system is ready."
-    assert finals == [result] and invoked == [1] and len(observations) == 3
+    assert finals == [result] and invoked == [1] and len(observations) == 4

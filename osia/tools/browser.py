@@ -33,6 +33,7 @@ import hashlib
 import inspect
 import json
 import os
+import math
 import re
 import shutil
 import socket
@@ -3350,8 +3351,17 @@ class _AsyncBrowserOwner:
         delta = -amount if direction == "up" else amount
         try:
             page = await self._ensure_browser()
-            await page.evaluate(f"window.scrollBy(0, {delta})")
-            return f"Scrolled {direction} by {abs(delta)}px"
+            movement = await page.evaluate(f"""() => {{
+                const before = window.scrollY;
+                window.scrollBy({{top: {delta}, behavior: 'instant'}});
+                return window.scrollY - before;
+            }}""")
+            if type(movement) not in {int, float} or not math.isfinite(movement):
+                return "ERROR scrolling: browser scroll position could not be verified"
+            if movement == 0:
+                return "The browser page stayed at the same scroll position."
+            actual_direction = "up" if movement < 0 else "down"
+            return f"Scrolled {actual_direction} by {abs(movement):g}px"
         except Exception as exc:
             return f"ERROR scrolling: {scrub_browser_error(exc)}"
 

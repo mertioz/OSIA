@@ -129,6 +129,8 @@ class _ScriptedCompletions:
         self.provider_getter = lambda: ""
 
     def create(self, **kwargs):
+        if not self.outputs:
+            pytest.fail("Unexpected provider invocation")
         self.calls.append(copy.deepcopy(kwargs))
         self.providers.append(self.provider_getter())
         content = self.outputs.pop(0)
@@ -140,6 +142,65 @@ def _tool_call(name, **arguments):
     return "<tool_call>" + json.dumps(
         {"tool": name, **arguments}, separators=(",", ":"),
     ) + "</tool_call>"
+
+
+def test_partial_reply_after_tools_continues_the_same_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(tool_attempts, "_DEFAULT_STORE", ToolAttemptStore(tmp_path / "attempts"))
+    monkeypatch.setattr(tool_attempts, "_DEFAULT_COORDINATOR", None)
+    monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path))
+    first = tmp_path / "alpha.txt"
+    second = tmp_path / "beta.txt"
+    answer = "Both files have been written."
+    completions = _ScriptedCompletions([
+        _tool_call("write_file", path=str(first), content="alpha"),
+        "Alpha has been written. Beta still needs to be created.",
+        _tool_call("write_file", path=str(second), content="beta"),
+        answer,
+    ])
+    agent = OSIAAgent(model="deepseek-flash", lang="en")
+    agent.provider = "deepseek"
+    agent._resolve_route = lambda _text: ("max", [])
+    agent.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    completions.provider_getter = lambda: agent.provider
+    turn_id = "turn-finish-remaining-work"
+    agent.configure_tool_attempts(
+        conversation_id="conversation-finish-remaining-work",
+        turn_id=turn_id,
+        request_id="request-finish-remaining-work",
+        final_response_message_id="message-finish-remaining-work",
+    )
+    spoken = []
+    final = agent.run_terminal_turn(
+        "Write alpha in alpha.txt and beta in beta.txt.",
+        turn_id=turn_id, history=[], on_sentence=spoken.append,
+        current_conversation_id="conversation-finish-remaining-work",
+        turn_context=fixed_turn_context("en", source="fixture", reference=turn_id),
+    )
+    assert final == answer and spoken == [answer]
+    assert first.read_text() == "alpha" and second.read_text() == "beta"
+    assert completions.providers == ["deepseek"] * 4
+    assert [request["model"] for request in completions.calls] == ["deepseek-flash"] * 4
+    review_wire = json.dumps(completions.calls[2]["messages"], ensure_ascii=False)
+    assert "The last assistant reply was a draft" in review_wire
+    assert "Beta still needs to be created" in review_wire
+    assert "Successfully wrote 5 bytes to" in review_wire
+    assert "Write alpha in alpha.txt and beta in beta.txt." in review_wire
+    assert agent.terminality_result(turn_id)["terminal_state"] == "success_verified"
+
+
+def test_model_continuation_marker_leaves_the_objective_open(tmp_path):
+    from osia.turn_terminality import TurnTerminalityController
+
+    controller = TurnTerminalityController(
+        turn_id="model-continues", objective="Finish both parts of the task.",
+        execution_required=True, storage_dir=tmp_path,
+    )
+    controller.bind_outcome_contract()
+    response = '<osia_completion>{"outcomes":[],"status":"continue"}</osia_completion>'
+    assert controller.accept_completion(response) == ""
+    assert controller.evaluate().action == "continue"
+    assert controller.snapshot()["remaining_work"] == ["original_objective_satisfied"]
+    assert not controller.final_reserved
 
 
 @pytest.mark.parametrize("learning_enabled", [True, False])

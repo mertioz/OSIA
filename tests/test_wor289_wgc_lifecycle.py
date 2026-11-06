@@ -94,7 +94,7 @@ def test_persistent_wgc_owns_pixels_starts_once_and_joins_once(monkeypatch):
     assert captures[0].closed_handler is None
 
 
-def test_v4_persistent_source_rejects_hwnd_switch_inside_one_loop(monkeypatch):
+def test_v4_persistent_source_releases_the_old_window_before_switching(monkeypatch):
     from osia import desktop_scene
     from osia.computer_use_v4 import _PersistentV4CaptureSource
 
@@ -102,6 +102,7 @@ def test_v4_persistent_source_rejects_hwnd_switch_inside_one_loop(monkeypatch):
 
     class Session:
         def __init__(self, hwnd):
+            assert all(session.closed for session in sessions)
             self.hwnd = hwnd
             self.closed = False
             sessions.append(self)
@@ -123,12 +124,27 @@ def test_v4_persistent_source_rejects_hwnd_switch_inside_one_loop(monkeypatch):
     state = {"bounds_object": "bounds"}
 
     assert source(101, state)[:2] == (101, "bounds")
-    with pytest.raises(
-        RuntimeError, match="persistent_wgc_target_switch_requires_new_loop",
-    ):
-        source(202, state)
-    assert len(sessions) == 1
-    assert sessions[0].closed is False
-    source.close()
+    assert source(202, state)[:2] == (202, "bounds")
+    assert len(sessions) == 2
     assert sessions[0].closed is True
+    assert sessions[1].closed is False
+    source.close()
+    assert sessions[1].closed is True
     assert source.snapshot()["capture_stop_count"] == 1
+
+
+def test_capture_cleanup_error_does_not_leak_the_active_turn():
+    from osia.computer_use_v4_integration import (
+        computer_use_v4_turn_scope,
+        current_computer_use_v4_state,
+    )
+
+    def fail_close():
+        raise RuntimeError("capture cleanup failed")
+
+    with pytest.raises(RuntimeError, match="capture cleanup failed"):
+        with computer_use_v4_turn_scope(
+            "openai", "gpt-5.4", conversation_id="fixture", turn_id="fixture",
+        ) as state:
+            state.loop = SimpleNamespace(close=fail_close)
+    assert current_computer_use_v4_state() is None

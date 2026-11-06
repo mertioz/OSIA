@@ -135,6 +135,7 @@ class FakePage(FakeEmitter):
         self.typed = []
         self.pressed = []
         self.content_revision = 0
+        self.scroll_position = 0
 
     @property
     def url(self):
@@ -181,6 +182,11 @@ class FakePage(FakeEmitter):
 
     async def evaluate(self, expression):
         self.control.check("page.evaluate")
+        if "return window.scrollY - before;" in expression:
+            before = self.scroll_position
+            delta = int(expression.split("top: ", 1)[1].split(",", 1)[0])
+            self.scroll_position = max(0, min(1000, before + delta))
+            return self.scroll_position - before
         if expression == browser._CONTENT_FINGERPRINT_JS:
             return f"content-revision:{self.content_revision}"
         if "innerText" in expression:
@@ -508,6 +514,8 @@ def test_navigation_click_fill_keyboard_tabs_and_state(owner_harness):
     assert browser.type_text("#field", "abc") == "Text entered; the private value was withheld."
     assert browser.press_key("Enter") == "Pressed key: Enter"
     assert browser.scroll("down", 40) == "Scrolled down by 40px"
+    assert browser.scroll("up", 600) == "Scrolled up by 40px"
+    assert browser.scroll("up", 40) == "The browser page stayed at the same scroll position."
     assert browser.scroll_down() == "Scrolled down one viewport"
     new_tab = browser.open_new_tab("new.test")
     assert new_tab["receipt"]["outcome"] == "confirmed_success"

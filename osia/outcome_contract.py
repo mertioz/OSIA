@@ -52,6 +52,7 @@ class OutcomeContract:
 @dataclass(frozen=True)
 class CompletionProposal:
     answer: str
+    continue_work: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ def parse_completion(text: str) -> CompletionProposal:
     # Older prompts may still emit an envelope. It is optional metadata, not
     # a source of evidence or a checklist the model must reproduce.
     answer = _text(text, "completion_answer").strip()
+    continue_work = False
     if answer.endswith(CLOSE_MARKER) and OPEN_MARKER in answer:
         start = answer.rfind(OPEN_MARKER)
         try:
@@ -119,7 +121,11 @@ def parse_completion(text: str) -> CompletionProposal:
             payload = None
         if isinstance(payload, dict) and isinstance(payload.get("outcomes"), list):
             answer = answer[:start].rstrip()
-    return CompletionProposal(_text(answer, "completion_answer"))
+            continue_work = payload.get("status") == "continue"
+    return CompletionProposal(
+        answer if continue_work else _text(answer, "completion_answer"),
+        continue_work=continue_work,
+    )
 
 
 def evaluate_completion(contract, proposal, receipts, *, turn_id: str) -> CompletionAssessment:
@@ -130,6 +136,12 @@ def evaluate_completion(contract, proposal, receipts, *, turn_id: str) -> Comple
     terminalizes a turn. Contradictory process or stale-target facts are fed
     back to the same selected model for the next decision.
     """
+    if proposal.continue_work:
+        return CompletionAssessment(
+            contract, False, ("selected_model_continues",),
+            "The selected model reported remaining work. Continue the same objective "
+            "using the results already obtained.",
+        )
     # Text prefixes are not technical facts. The caller decides how to handle
     # actual provider exceptions and typed ToolAttempt/ActionTruth outcomes.
     current = [r for r in receipts.values() if isinstance(r, Mapping)
@@ -156,6 +168,10 @@ def completion_instruction(contract: OutcomeContract | None = None) -> str:
         "Choose tools and their order freely. declare_outcomes is optional result metadata only; "
         "no declaration or completion envelope is needed. Decide when the requested work is complete "
         "from actual tool results and observed state, then answer normally. "
+        "Check every requested deliverable against the results before closing. "
+        "Use another tool whenever a remaining step is feasible. A progress update belongs in commentary. "
+        'If you need to continue beyond this provider response, use <osia_completion>{"outcomes":[],"status":"continue"}</osia_completion>. '
+        "A final report of unfinished work must explain the concrete blocker or missing prerequisite. "
         "Failures are feedback for repair; unknown outcomes are uncertainty, not proof of success. "
         "Do not claim success contradicted by receipts. Distinguish completed work from unverified results."
     )
