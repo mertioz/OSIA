@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 from pathlib import Path
 import re
@@ -24,7 +25,7 @@ MAX_RESULTS = 24
 MAX_RESULTS_PER_CATEGORY = 8
 MAX_TITLE_CHARS = 120
 MAX_PROJECT_CHARS = 80
-REASONING_LEVELS = frozenset({"auto", "off", "low", "medium", "high"})
+_REASONING_OPTION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _PARTIAL_ALIAS_RE = re.compile(r"^(?:[a-z][a-z0-9-]{0,31})?$")
 _CATALOG_PATH = (
@@ -233,7 +234,7 @@ class SlashTurnDirectivesV1:
         )
         reasoning = value.get("reasoning_override")
         if reasoning is not None:
-            if not isinstance(reasoning, str) or reasoning not in REASONING_LEVELS:
+            if not isinstance(reasoning, str) or not _REASONING_OPTION_RE.fullmatch(reasoning):
                 raise SlashDirectiveError(
                     "unsupported_reasoning",
                     "Unsupported reasoning level.",
@@ -278,8 +279,7 @@ class SlashTurnDirectivesV1:
             len(self.connector_hints)
             + len(self.conversation_refs)
             + int(self.capability_requirements.current_web)
-            + int(self.model_override is not None)
-            + int(self.reasoning_override is not None)
+            + int(self.model_override is not None or self.reasoning_override is not None)
             + int(bool(self.skill_name) or self.skill_creator)
         )
         if count > MAX_MODIFIERS:
@@ -374,8 +374,8 @@ def validate_special_image_input(conversation_id: str, *, has_image: bool) -> No
     if has_image and conversation_special_mode(conversation_id):
         raise SlashDirectiveError(
             "special_mode_image_disabled",
-            "Use /special to restore vision before sending an image.",
-            "Utilise /special pour réactiver la vision avant d’envoyer une image.",
+            "Use /disablevision to restore vision before sending an image.",
+            "Utilise /disablevision pour réactiver la vision avant d’envoyer une image.",
         )
 
 
@@ -419,6 +419,7 @@ class ConnectorAvailability:
         }
 
 
+@lru_cache(maxsize=1)
 def load_catalog() -> tuple[dict[str, Any], ...]:
     raw = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
     if raw.get("schema_version") != SCHEMA_VERSION or not isinstance(raw.get("entries"), list):
@@ -452,6 +453,27 @@ def slash_palette_query(text: str) -> str | None:
     if len(token) > MAX_FILTER_CHARS or not _PARTIAL_ALIAS_RE.fullmatch(token):
         return None
     return token
+
+
+@dataclass(frozen=True)
+class ConversationMention:
+    start: int
+    end: int
+    query: str
+
+
+def conversation_mention(text: str, cursor: int | None = None) -> ConversationMention | None:
+    """Find a standalone @ query ending at the caret, including within a draft."""
+    end = len(text) if cursor is None else cursor
+    if end < 1 or end > len(text):
+        return None
+    start = text.rfind("@", max(0, end - MAX_FILTER_CHARS - 1), end)
+    if start < 0 or (start > 0 and not text[start - 1].isspace()):
+        return None
+    query = text[start + 1:end]
+    if "\n" in query or "\r" in query:
+        return None
+    return ConversationMention(start, end, query.strip())
 
 
 def escaped_literal_text(text: str) -> str:
@@ -634,38 +656,20 @@ def palette_items(
     *,
     locale: str = "en",
     filter_text: str = "",
-    provider_id: str = "",
-    model_id: str = "",
-    current_conversation_id: str = "",
+    models_available: bool = False,
+    web_available: bool = False,
+    vision_disabled: bool = False,
+    connectors: Iterable[ConnectorAvailability] = (),
 ) -> tuple[dict[str, Any], ...]:
-    """Show all matching commands and a bounded set of contextual results."""
-    from osia.conversations import conversation_special_mode
-
+    """Filter a prepared snapshot without disk, provider, or connector probes."""
     language = "fr" if str(locale).lower().startswith("fr") else "en"
-    query = str(filter_text or "")[:MAX_FILTER_CHARS].strip().lower()
-    models = model_availability(refresh=False)
-    conversations = conversation_availability(
-        current_conversation_id=current_conversation_id
-    )
-    reasoning_available = any(
-        str(option.get("id") or "") in REASONING_LEVELS
-        for model in models
-        if str(model.get("providerId") or "") == str(provider_id or "")
-        and str(model.get("id") or "") == str(model_id or "")
-        for option in (
-            model.get("reasoning", {}).get("options", [])
-            if isinstance(model.get("reasoning"), Mapping) else []
-        )
-        if isinstance(option, Mapping)
-    )
+    query = str(filter_text or "")[:MAX_FILTER_CHARS].strip().casefold()
     items: list[dict[str, Any]] = []
     for raw in load_catalog():
         predicate = raw["availability_predicate"]
         available = not (
-            (predicate == "current_web_available" and not current_web_available(provider_id))
-            or (predicate == "selectable_models_present" and not models)
-            or (predicate == "other_conversations_present" and not conversations)
-            or (predicate == "reasoning_options_present" and not reasoning_available)
+            (predicate == "current_web_available" and not web_available)
+            or (predicate == "selectable_models_present" and not models_available)
         )
         if not available:
             continue
@@ -674,7 +678,7 @@ def palette_items(
         item["description"] = str(
             raw["description"].get(language) or raw["description"].get("en") or ""
         )
-        if raw["id"] == "special.toggle" and conversation_special_mode(current_conversation_id):
+        if raw["id"] == "special.toggle" and vision_disabled:
             item["description"] = (
                 "Réactiver la vision et la souris dans cette discussion"
                 if language == "fr" else
@@ -686,32 +690,21 @@ def palette_items(
         item["category"] = "commands"
         item["enabled"] = True
         items.append(item)
-    items.extend(item.palette_item(language) for item in connector_availability())
-    items.extend({
-        "id": f"conversation.{item['conversation_id']}",
-        "canonical_alias": "conversation",
-        "name": item["display_title"] or (
-            "Sans titre" if language == "fr" else "Untitled"
-        ),
-        "description": item["display_project"],
-        "argument_hint": "",
-        "kind": "selector",
-        "category": "conversations",
-        "enabled": True,
-        "icon_semantic": "conversation",
-        "chip_behavior": "removable",
-        "handler_contract": "select_conversation_reference_v1",
-        "selection_type": "conversation",
-        **item,
-    } for item in conversations)
+    items.extend(item.palette_item(language) for item in connectors)
     if query:
         items = [
             item
             for item in items
-            if query in str(item.get("canonical_alias") or "").lower()
-            or query in str(item.get("name") or "").lower()
-            or query in str(item.get("description") or "").lower()
+            if query in str(item.get("canonical_alias") or "").casefold()
+            or query in str(item.get("name") or "").casefold()
+            or query in str(item.get("description") or "").casefold()
         ]
+
+        def alias_priority(item: Mapping[str, Any]) -> int:
+            alias = str(item.get("canonical_alias") or "").casefold()
+            return 0 if alias == query else 1 if alias.startswith(query) else 2
+
+        items.sort(key=alias_priority)
     counts: dict[str, int] = {}
     bounded = []
     for item in items:
@@ -723,6 +716,29 @@ def palette_items(
         if len(bounded) >= MAX_RESULTS:
             break
     return tuple(bounded)
+
+
+def conversation_palette_items(
+    conversations: Iterable[Mapping[str, str]], query: str, locale: str = "en",
+) -> list[dict[str, Any]]:
+    """Search existing titles and project names for the @ picker."""
+    needle = query.casefold()
+    rows = []
+    for item in conversations:
+        title = item["display_title"] or ("Sans titre" if locale == "fr" else "Untitled")
+        project = item["display_project"]
+        if needle and needle not in title.casefold() and needle not in project.casefold():
+            continue
+        rows.append({
+            "selection_type": "conversation",
+            "name": title,
+            "description": project,
+            "enabled": True,
+            **item,
+        })
+        if len(rows) >= MAX_RESULTS:
+            break
+    return rows
 
 
 def validate_live(
@@ -877,19 +893,6 @@ def _safe_capability_family_id(item: Any) -> str:
     return "governed_actions"
 
 
-def _localized_capability_family(family_id: str, language: str) -> str:
-    labels = {
-        "web_search": ("Web search", "Recherche web"),
-        "local_commands": ("Local commands", "Commandes locales"),
-        "local_files": ("Local files", "Fichiers locaux"),
-        "connected_connectors": ("Connected connectors", "Connecteurs connectés"),
-        "read_only_information": ("Read-only information", "Informations en lecture seule"),
-        "governed_actions": ("Governed actions", "Actions contrôlées"),
-    }
-    english, french = labels.get(family_id, ("Capability", "Capacité"))
-    return french if language == "fr" else english
-
-
 def safe_availability_overlay(provider_id: str = "") -> dict[str, Any]:
     connectors = connector_availability()
     from osia.capability_federation import federated_capabilities
@@ -923,13 +926,14 @@ def informational_payload(
     locale: str = "en",
     surface: str = "PC",
     provider_id: str = "",
-    model_id: str = "",
     provider_label: str = "",
     model_label: str = "",
     reasoning: str = "auto",
     provider_ready: bool | None = None,
     routing_mode: str = "automatic",
     transport: str = "",
+    models_available: bool = False,
+    vision_disabled: bool = False,
 ) -> dict[str, Any]:
     """Build a bounded, display-only payload; it is never a chat turn."""
     language = "fr" if str(locale).lower().startswith("fr") else "en"
@@ -938,40 +942,24 @@ def informational_payload(
     if command_id == "help.info":
         rows = palette_items(
             locale=language,
-            provider_id=provider_id,
-            model_id=model_id,
+            models_available=models_available,
+            web_available=current_web_available(provider_id),
+            vision_disabled=vision_disabled,
+            connectors=all_connectors,
         )
+        commands = [{
+            "alias": "@",
+            "description": "Référencer une discussion" if language == "fr" else "Reference a conversation",
+            "argument_hint": "discussion" if language == "fr" else "conversation",
+        }]
+        commands.extend({
+            "alias": "/" + str(item.get("canonical_alias") or ""),
+            "description": str(item.get("description") or "")[:160],
+            "argument_hint": str(item.get("argument_hint") or "")[:80],
+        } for item in rows if item.get("enabled") is True)
         return {
             "title": "Aide" if language == "fr" else "Help",
-            "commands": [
-                {
-                    "alias": "/" + str(item.get("canonical_alias") or ""),
-                    "description": str(item.get("description") or "")[:160],
-                    "argument_hint": str(item.get("argument_hint") or "")[:80],
-                }
-                for item in rows
-                if item.get("enabled") is True
-                and item.get("category") != "conversations"
-            ][:MAX_RESULTS],
-        }
-    if command_id == "tools.info":
-        from osia.capability_federation import federated_capabilities
-
-        capabilities = federated_capabilities(provider_id)
-        families = sorted({
-            _safe_capability_family_id(item)
-            for item in capabilities if item.available
-        })[:24]
-        return {
-            "title": "Outils" if language == "fr" else "Tools",
-            "families": [
-                _localized_capability_family(item, language)
-                for item in families
-            ],
-            "connectors": [
-                item.display_name[:80]
-                for item in all_connectors if item.usable
-            ][:8],
+            "commands": commands[:MAX_RESULTS],
         }
     if command_id != "status.info":
         raise SlashDirectiveError(
@@ -979,18 +967,20 @@ def informational_payload(
             "Commande d’information inconnue.",
         )
     payload = {
-        "title": "État" if language == "fr" else "Status",
+        "title": "État d’OSIA" if language == "fr" else "OSIA status",
         "surface": "Mobile" if str(surface).lower() == "mobile" else "PC",
         "routing_mode": (
             "exact" if str(routing_mode).lower() == "exact" else "automatic"
         ),
         "provider": str(provider_label or "Automatic")[:80],
         "model": str(model_label or "Automatic")[:120],
-        "reasoning": str(reasoning or "auto")[:16],
+        "reasoning": str(reasoning or "auto")[:32],
+        "vision_disabled": vision_disabled,
         "provider_ready": (
             bool(provider_id) if provider_ready is None else bool(provider_ready)
         ),
         "connector_count": len(all_connectors),
+        "connector_ready_count": sum(item.usable for item in all_connectors),
         "connectors": [
             {
                 "name": item.display_name[:80],

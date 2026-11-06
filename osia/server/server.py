@@ -5525,6 +5525,7 @@ def _build_config_snapshot() -> dict:
         cfg["stt_local_models_available"] = []
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     cfg["chat_slash_extensions"] = 1
+    cfg["slash_reasoning_model_options"] = True
     try:
         from osia.slash_commands import safe_availability_overlay
 

@@ -106,6 +106,7 @@ from osia.slash_commands import (
     SlashDirectiveError,
     SlashTurnDirectivesV1,
     consume_palette_prefix,
+    conversation_mention,
     escaped_literal_text,
 )
 
@@ -1371,7 +1372,6 @@ class _ChatPage(QWidget):
         self._slash_palette.set_context(
             locale=i18n.get_language(),
             provider_id=str(settings.get("selected_model_provider") or ""),
-            model_id=str(settings.get("selected_model") or ""),
         )
         self._slash_palette.item_selected.connect(self._on_slash_selection)
         input_layout.addWidget(self._slash_palette)
@@ -1435,6 +1435,7 @@ class _ChatPage(QWidget):
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.clicked.connect(self._on_composer_action)
         self._input.textChanged.connect(self._on_input_changed)
+        self._input.cursorPositionChanged.connect(self._update_composer_palette)
         self._sync_send_state()
 
         row.addWidget(self._file_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -1475,7 +1476,6 @@ class _ChatPage(QWidget):
         self._slash_palette.set_context(
             locale=i18n.get_language(),
             provider_id=str(settings.get("selected_model_provider") or ""),
-            model_id=str(settings.get("selected_model") or ""),
             conversation_id=str(conversation_id or ""),
         )
         self._load_current_draft()
@@ -1549,7 +1549,6 @@ class _ChatPage(QWidget):
             self._slash_palette.set_context(
                 locale=i18n.get_language(),
                 provider_id=self._directives.model_override.provider_id,
-                model_id=self._directives.model_override.model_id,
                 conversation_id=str(self._draft_context or ""),
             )
         self._rebuild_attachment_chips()
@@ -1570,24 +1569,40 @@ class _ChatPage(QWidget):
         self._input.setFocus()
         return True
 
-    def _on_input_changed(self) -> None:
+    def _composer_mention(self):
+        cursor = self._input.textCursor()
+        line = cursor.block().text()
+        if cursor.hasSelection() or "@" not in line:
+            return None, 0
+        prefix = line.encode("utf-16-le")[:cursor.positionInBlock() * 2].decode(
+            "utf-16-le", errors="ignore",
+        )
+        mention = conversation_mention(prefix)
+        size = len(prefix[mention.start:].encode("utf-16-le")) // 2 if mention else 0
+        return mention, size
+
+    def _update_composer_palette(self) -> None:
+        mention, _size = self._composer_mention()
         self._slash_palette.update_from_text(
             self._input.toPlainText(), enabled=not self._busy,
+            mention_query=mention.query if mention else None,
         )
+
+    def _on_input_changed(self) -> None:
+        self._update_composer_palette()
         self._sync_send_state()
 
     def _on_slash_selection(self, row: dict) -> None:
         handler = str(row.get("handler_contract") or "")
         selection_type = str(row.get("selection_type") or "")
-        alias = str(row.get("canonical_alias") or "")
         next_directives = self._directives
+        mention_size = 0
         if handler == "toggle_conversation_special_v1":
             self._input.setPlainText(consume_palette_prefix(self._input.text()))
             self.special_requested.emit()
             self._input.setFocus()
             return
         if handler in {
-            "show_safe_tools_v1",
             "show_safe_status_v1",
             "show_available_help_v1",
         }:
@@ -1615,14 +1630,14 @@ class _ChatPage(QWidget):
                 connector_hints=(ConnectorHint(str(row["connector_id"])),),
             )
         elif selection_type == "model":
-            alias = "model"
             if row.get("remove_override") is True:
-                next_directives = replace(next_directives, model_override=None)
+                next_directives = replace(
+                    next_directives, model_override=None, reasoning_override=None,
+                )
                 settings = load_settings() or {}
                 self._slash_palette.set_context(
                     locale=i18n.get_language(),
                     provider_id=str(settings.get("selected_model_provider") or ""),
-                    model_id=str(settings.get("selected_model") or ""),
                     conversation_id=str(self._draft_context or ""),
                 )
             else:
@@ -1631,15 +1646,17 @@ class _ChatPage(QWidget):
                     model_override=ModelOverride(
                         str(row["provider_id"]), str(row["model_id"]),
                     ),
+                    reasoning_override=str(row["reasoning_level"]),
                 )
                 self._slash_palette.set_context(
                     locale=i18n.get_language(),
                     provider_id=str(row["provider_id"]),
-                    model_id=str(row["model_id"]),
                     conversation_id=str(self._draft_context or ""),
                 )
         elif selection_type == "conversation":
-            alias = "conversation"
+            mention, mention_size = self._composer_mention()
+            if mention is None:
+                return
             next_directives = replace(
                 next_directives,
                 conversation_refs=(ConversationRef(
@@ -1647,12 +1664,6 @@ class _ChatPage(QWidget):
                     str(row.get("display_title") or "")[:120],
                     str(row.get("display_project") or "")[:80],
                 ),),
-            )
-        elif selection_type == "reasoning":
-            alias = "reasoning"
-            next_directives = replace(
-                next_directives,
-                reasoning_override=str(row["reasoning_level"]),
             )
         elif selection_type == "skill":
             next_directives = replace(
@@ -1670,7 +1681,14 @@ class _ChatPage(QWidget):
             self.show_notice(error.message(i18n.get_language()))
             return
         self._directives = next_directives
-        self._input.setPlainText(consume_palette_prefix(self._input.text()))
+        if mention_size:
+            cursor = self._input.textCursor()
+            cursor.setPosition(cursor.position() - mention_size, QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            self._input.setTextCursor(cursor)
+        else:
+            self._input.setPlainText(consume_palette_prefix(self._input.text()))
+            self._input.moveCursor(QTextCursor.MoveOperation.End)
         self._rebuild_directive_chips()
         self._sync_send_state()
         self._input.setFocus()
@@ -1691,9 +1709,12 @@ class _ChatPage(QWidget):
             ref = self._directives.conversation_refs[0]
             rows.append(("conversation", ref.display_title or "/conversation"))
         if self._directives.model_override is not None:
-            rows.append(("model", self._directives.model_override.model_id))
-        if self._directives.reasoning_override is not None:
-            rows.append(("reasoning", self._directives.reasoning_override))
+            label = self._directives.model_override.model_id
+            if (level := self._directives.reasoning_override) is not None:
+                key = "reasoning.default" if level == "auto" else f"reasoning.{level}"
+                translated = i18n.t(key)
+                label += f" · {level.title() if translated == key else translated}"
+            rows.append(("model", label))
         if self._directives.skill_name is not None:
             rows.append(("skill", self._directives.skill_name[:-3]))
         if self._directives.skill_creator:
@@ -1717,8 +1738,7 @@ class _ChatPage(QWidget):
             "connector": {"connector_hints": ()},
             "web": {"capability_requirements": CapabilityRequirements()},
             "conversation": {"conversation_refs": ()},
-            "model": {"model_override": None},
-            "reasoning": {"reasoning_override": None},
+            "model": {"model_override": None, "reasoning_override": None},
             "skill": {"skill_name": None},
             "skillcreator": {"skill_creator": False},
         }.get(identity)
@@ -1730,7 +1750,6 @@ class _ChatPage(QWidget):
             self._slash_palette.set_context(
                 locale=i18n.get_language(),
                 provider_id=str(settings.get("selected_model_provider") or ""),
-                model_id=str(settings.get("selected_model") or ""),
                 conversation_id=str(self._draft_context or ""),
             )
         self._rebuild_directive_chips()
@@ -11527,6 +11546,8 @@ class MainPopup(QWidget):
         self._settings.local_models_refresh_requested.connect(
             self._request_local_models_refresh
         )
+        self._chat._slash_palette.inventory_requested.connect(self._settings._probe_chatgpt_account)
+        self._chat._slash_palette.inventory_requested.connect(self._request_local_models_refresh)
         self._local_models_ready.connect(self._apply_local_models)
         self._remote_catalogue_ready.connect(self.set_remote_models)
         self._remote_catalogue_timer = QTimer(self)
@@ -11852,57 +11873,86 @@ class MainPopup(QWidget):
         return self._chat.accept_directive_submission(attachment_ids)
 
     def show_slash_information(self, payload: dict) -> None:
-        """Show safe informational data without appending a chat turn."""
         title = str(payload.get("title") or "OSIA")
         french = i18n.get_language() == "fr"
-        labels = {
-            "commands": "Commandes" if french else "Commands",
-            "families": "Familles" if french else "Families",
-            "connectors": "Connecteurs" if french else "Connectors",
-            "surface": "Surface",
-            "routing_mode": "Routage" if french else "Routing",
-            "provider": "Fournisseur" if french else "Provider",
-            "model": "Mod\u00e8le" if french else "Model",
-            "reasoning": "Raisonnement" if french else "Reasoning",
-            "provider_ready": (
-                "Fournisseur pr\u00eat" if french else "Provider ready"
-            ),
-            "connector_count": (
-                "Nombre de connecteurs" if french else "Connector count"
-            ),
-            "transport": "Transport",
-        }
-        lines = []
-        for key, value in payload.items():
-            if key == "title":
-                continue
-            label = labels.get(key, key.replace("_", " ").title())
-            if isinstance(value, list):
-                rendered = []
-                for item in value:
-                    if isinstance(item, dict):
-                        if key == "commands":
-                            hint = str(item.get("argument_hint") or "")
-                            alias = str(item.get("alias") or "")
-                            rendered.append(
-                                f"{alias}{f' <{hint}>' if hint else ''} \u2014 "
-                                f"{str(item.get('description') or '')}"
-                            )
-                        else:
-                            rendered.append(
-                                " · ".join(str(v) for v in item.values())
-                            )
-                    else:
-                        rendered.append(str(item))
-                value = "\n".join(rendered)
-            elif isinstance(value, bool):
-                value = (
-                    "oui" if value and french else
-                    "non" if french else
-                    "yes" if value else "no"
-                )
-            lines.append(f"{label}: {value}")
-        QMessageBox.information(self, title, "\n\n".join(lines))
+        if "commands" in payload:
+            lines = []
+            for item in payload["commands"]:
+                hint = item.get("argument_hint")
+                usage = f"{item['alias']} {hint}" if hint else item["alias"]
+                lines.append(f"{usage}  ·  {item['description']}")
+            message = QMessageBox(self)
+            message.setWindowTitle(title)
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setText("\n\n".join(lines))
+            message.exec()
+            return
+
+        dialog = QDialog(self)
+        dialog.setObjectName("slashStatusDialog")
+        dialog.setWindowTitle(title)
+        dialog.resize(388, 420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.addWidget(QLabel(title, objectName="slashStatusHeading"))
+        scroll = QScrollArea()
+        scroll.setObjectName("slashStatusScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("slashStatusContent")
+        cards = QVBoxLayout(content)
+        cards.setContentsMargins(0, 0, 4, 0)
+        cards.setSpacing(8)
+
+        def add_card(label: str, rows: list[tuple[str, str]]) -> None:
+            card = QFrame(objectName="slashStatusCard")
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(12, 9, 12, 9)
+            inner.addWidget(QLabel(label, objectName="slashPaletteTitle"))
+            for key, value in rows:
+                row = QHBoxLayout()
+                label_widget = QLabel(key, objectName="slashStatusLabel")
+                label_widget.setTextFormat(Qt.TextFormat.PlainText)
+                label_widget.setWordWrap(True)
+                value_widget = QLabel(value)
+                value_widget.setTextFormat(Qt.TextFormat.PlainText)
+                value_widget.setWordWrap(True)
+                value_widget.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                row.addWidget(label_widget, 1)
+                row.addWidget(value_widget, 1)
+                inner.addLayout(row)
+            cards.addWidget(card)
+
+        level = str(payload["reasoning"])
+        key = "reasoning.default" if level == "auto" else f"reasoning.{level}"
+        translated = i18n.t(key)
+        add_card("Modèle" if french else "Model", [
+            (str(payload["provider"]), str(payload["model"])),
+            ("Raisonnement" if french else "Reasoning", level.title() if translated == key else translated),
+            ("Disponibilité" if french else "Availability",
+             ("Prêt" if french else "Ready") if payload["provider_ready"]
+             else ("Indisponible" if french else "Unavailable")),
+        ])
+        add_card("Discussion" if french else "Chat", [
+            ("Routage" if french else "Routing",
+             ("Automatique" if french else "Automatic") if payload["routing_mode"] == "automatic"
+             else ("Modèle sélectionné" if french else "Selected model")),
+            ("Vision et souris" if french else "Vision and mouse",
+             ("Désactivées" if french else "Disabled") if payload["vision_disabled"]
+             else ("Actives" if french else "Enabled")),
+        ])
+        connector_label = "Connecteurs" if french else "Connectors"
+        add_card(f"{connector_label} · {payload['connector_ready_count']}/{payload['connector_count']}", [
+            (item["name"], item["state"]) for item in payload["connectors"]
+        ] or [("Aucun connecteur" if french else "No connectors", "")])
+        cards.addStretch()
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+        close = QPushButton("Fermer" if french else "Close", objectName="slashStatusClose")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
 
     def show_attachment_error(self, error: DesktopAttachmentError) -> None:
         self._chat.show_attachment_error(error)
@@ -12306,6 +12356,12 @@ class MainPopup(QWidget):
         provider: str | None = None,
     ) -> None:
         self._models.set_current(model_id, provider)
+        if self._chat._directives.model_override is None:
+            self._chat._slash_palette.set_context(
+                locale=i18n.get_language(),
+                provider_id=provider or "",
+                conversation_id=self._chat._draft_context or "",
+            )
 
     def set_remote_models(self, remote: list) -> None:
         self._model_remote_models = [
@@ -12345,6 +12401,7 @@ class MainPopup(QWidget):
             self._model_account_status,
         )
         self._models.set_inventory(self._model_inventory)
+        self._chat._slash_palette.set_model_inventory(self._model_inventory)
 
     def _request_local_models_refresh(self) -> None:
         refresh_local_models_async(self._publish_local_models)
@@ -12792,6 +12849,67 @@ class MainPopup(QWidget):
                 color: rgba(232, 230, 240, 0.72);
                 font-size: 11px;
                 padding: 0 2px 2px 2px;
+            }
+            QFrame#slashPalette, QFrame#slashStatusCard {
+                background: #13111a;
+                border-radius: 12px;
+            }
+            QDialog#slashStatusDialog {
+                background: #0f0d16;
+            }
+            QScrollArea#slashStatusScroll, QWidget#slashStatusContent {
+                background: transparent;
+                border: none;
+            }
+            QLabel#slashStatusHeading {
+                font-size: 18px;
+                font-weight: 600;
+            }
+            QLabel#slashStatusLabel {
+                color: rgba(232, 230, 240, 0.68);
+            }
+            QPushButton#slashStatusClose {
+                background: rgba(196, 181, 245, 0.14);
+                border: none;
+                border-radius: 8px;
+                padding: 7px 14px;
+            }
+            QPushButton#slashStatusClose:hover {
+                background: rgba(196, 181, 245, 0.25);
+            }
+            QLabel#slashPaletteTitle {
+                background: transparent;
+                color: #c4b5f5;
+                font-weight: 600;
+                padding: 2px 5px;
+            }
+            QLineEdit#slashPaletteSearch {
+                background: #0f0d16;
+                border: 1px solid transparent;
+                border-radius: 8px;
+                padding: 6px 8px;
+            }
+            QLineEdit#slashPaletteSearch:focus {
+                border-color: rgba(196, 181, 245, 0.50);
+            }
+            QListWidget#slashPaletteList {
+                background: transparent;
+                border: none;
+                outline: none;
+            }
+            QListWidget#slashPaletteList::item {
+                padding: 4px 8px;
+                border-radius: 7px;
+            }
+            QListWidget#slashPaletteList::item:hover {
+                background: rgba(196, 181, 245, 0.10);
+            }
+            QListWidget#slashPaletteList::item:selected {
+                background: rgba(196, 181, 245, 0.18);
+                color: #e8e6f0;
+            }
+            QListWidget#slashPaletteList::item:disabled {
+                color: rgba(232, 230, 240, 0.58);
             }
             QScrollArea#attachmentScroll, QWidget#attachmentHost {
                 background: transparent;

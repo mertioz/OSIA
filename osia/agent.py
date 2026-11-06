@@ -463,7 +463,7 @@ def get_system_prompt(
 
     if special_mode:
         body += (
-            "\n\n[Conversation setting: /special is active.] "
+            "\n\n[Conversation setting: vision and mouse disabled.] "
             "The user disabled vision and mouse input for this conversation. "
             "Use structured capabilities or keyboard input. Keep screen capture, "
             "image analysis and desktop pointer actions out of the turn, including through other tools."
@@ -10382,7 +10382,7 @@ class OSIAAgent:
                 ]
                 if len(parts) != len(content):
                     if all(isinstance(part, dict) and part.get("type") == "text" for part in parts):
-                        frame["content"] = text_content(parts) or "[Image withheld while /special is active.]"
+                        frame["content"] = text_content(parts) or "[Image withheld while vision is disabled.]"
                     else:
                         frame["content"] = parts
         else:

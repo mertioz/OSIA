@@ -12,6 +12,7 @@ from osia.slash_commands import (
     SlashTurnDirectivesV1,
     consume_selected_alias,
     consume_palette_prefix,
+    conversation_mention,
     escaped_literal_text,
     connector_availability,
     load_catalog,
@@ -27,8 +28,7 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "reasoning", "conversation", "tools", "status", "help",
-        "special", "skill", "skillcreator",
+        "web", "model", "status", "help", "disablevision", "skill", "skillcreator",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
@@ -143,7 +143,7 @@ def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_pa
     [
         ("/", ""),
         ("/ ", ""),
-        ("/ special", "special"),
+        ("/ disablevision", "disablevision"),
         ("   /web", "web"),
         ("/linear do it", "linear"),
         ("//web", None),
@@ -171,41 +171,37 @@ def test_literal_escape_and_selected_alias_preserve_body():
     assert consume_palette_prefix("/ skillcreator a new brief") == "a new brief"
 
 
-def test_connector_and_conversation_title_collision_remain_distinct(monkeypatch):
+def test_connector_and_conversation_title_collision_remain_distinct():
     import osia.slash_commands as slash
 
-    monkeypatch.setattr(slash, "model_availability", lambda **_kwargs: ())
-    monkeypatch.setattr(slash, "current_web_available", lambda *_args: False)
-    monkeypatch.setattr(
-        slash,
-        "connector_availability",
-        lambda: (
-            slash.ConnectorAvailability(
-                "linear", "linear", "Linear", "Connector",
-                "connected", True, True,
-            ),
+    rows = slash.palette_items(filter_text="linear", connectors=(
+        slash.ConnectorAvailability(
+            "linear", "linear", "Linear", "Connector", "connected", True, True,
         ),
-    )
-    monkeypatch.setattr(
-        slash,
-        "conversation_availability",
-        lambda **_kwargs: ({
+    ))
+    assert [row["id"] for row in rows] == ["connector.linear"]
+    references = slash.conversation_palette_items(
+        [{
             "conversation_id": "conv-linear",
             "display_title": "Linear",
             "display_project": "Delivery",
-        },),
+        }], "del",
     )
-    rows = slash.palette_items(filter_text="linear")
-    assert {(row["category"], row["id"]) for row in rows} == {
-        ("connectors", "connector.linear"),
-        ("conversations", "conversation.conv-linear"),
-    }
+    assert references[0]["conversation_id"] == "conv-linear"
+    assert conversation_mention("email@example.com") is None
+    assert conversation_mention("@@literal") is None
+    assert conversation_mention("First line @query\nSecond line") is None
+    draft = "Résume @projet en trois points"
+    match = conversation_mention(draft, len("Résume @projet"))
+    assert match.query == "projet"
+    assert draft[:match.start] + draft[match.end:] == "Résume  en trois points"
 
 
 def test_help_is_registry_derived_and_includes_argument_hints(monkeypatch):
     import osia.slash_commands as slash
 
     monkeypatch.setattr(slash, "connector_availability", lambda: ())
+    monkeypatch.setattr(slash, "current_web_available", lambda *_args: False)
     monkeypatch.setattr(
         slash,
         "palette_items",
@@ -218,7 +214,8 @@ def test_help_is_registry_derived_and_includes_argument_hints(monkeypatch):
         },),
     )
     payload = informational_payload("help.info")
-    assert payload["commands"] == [{
+    assert payload["commands"][0]["alias"] == "@"
+    assert payload["commands"][1:] == [{
         "alias": "/model",
         "description": "Choose one exact model for this turn",
         "argument_hint": "model",
@@ -243,6 +240,7 @@ def test_safe_overlay_and_status_bound_connector_rows(monkeypatch):
     status = informational_payload("status.info")
     assert len(overlay["connectors"]) == 24
     assert status["connector_count"] == 30
+    assert status["connector_ready_count"] == 30
     assert len(status["connectors"]) == 8
 
 
@@ -252,6 +250,7 @@ def test_wire_contract_is_strict_canonical_and_bounded():
         capability_requirements=CapabilityRequirements(current_web=True),
         conversation_refs=(ConversationRef("conv-1", "Title", "Project"),),
         model_override=ModelOverride("openai", "gpt-5.4"),
+        reasoning_override="xhigh",
     )
     directives._validate_bounds()
     replayed = SlashTurnDirectivesV1.from_wire(directives.to_wire())
@@ -283,10 +282,52 @@ def test_duplicates_and_fifth_modifier_fail_closed():
         conversation_refs=(ConversationRef("conv-1"),),
         model_override=ModelOverride("openai", "gpt"),
         reasoning_override="high",
+        skill_creator=True,
     )
     with pytest.raises(SlashDirectiveError) as too_many:
         fifth._validate_bounds()
     assert too_many.value.code == "directive_limit_exceeded"
+
+
+def test_model_specific_efforts_keep_max_and_ultra_in_the_canonical_route(monkeypatch):
+    from osia import reasoning, slash_commands
+    from osia.task_router import resolve_chat_route_binding
+
+    def account_model(model_id, levels):
+        return {
+            "id": model_id, "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [{"id": level} for level in levels],
+        }
+
+    advertised = [
+        account_model("gpt-6.1-sol", ("low", "medium", "high", "xhigh", "max", "ultra")),
+        account_model("gpt-6-luna", ("low", "medium", "high")),
+    ]
+    monkeypatch.setattr("osia.chatgpt_account.provider.get_cached_account_models", lambda: advertised)
+    monkeypatch.setattr(slash_commands, "model_availability", lambda **_kwargs: tuple(
+        {
+            "id": item["id"], "providerId": "chatgpt_account",
+            "reasoning": {"options": reasoning.get_reasoning_options("chatgpt_account", item["id"])},
+        }
+        for item in advertised
+    ))
+    for level in ("xhigh", "max", "ultra"):
+        directives = SlashTurnDirectivesV1.from_wire({
+            "schema_version": 1, "reasoning_override": level,
+            "model_override": {"provider_id": "chatgpt_account", "model_id": "gpt-6.1-sol"},
+        })
+        validate_live(directives)
+        route = resolve_chat_route_binding({}, "", directives)
+        assert route["effective_reasoning"] == level
+        request = reasoning.build_reasoning_request(
+            route["provider_id"], route["model_id"], {"default": level},
+        )
+        assert request["kwargs"] == {"effort": level}
+    with pytest.raises(SlashDirectiveError, match="does not support"):
+        validate_live(SlashTurnDirectivesV1(
+            model_override=ModelOverride("chatgpt_account", "gpt-6-luna"),
+            reasoning_override="max",
+        ))
 
 
 def test_modifier_requires_body_or_attachment_and_connector_is_structural():

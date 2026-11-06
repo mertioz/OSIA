@@ -1902,6 +1902,7 @@ def wake_mode():
         conversations_changed = pyqtSignal(str)
         # Canonical conversation deletion completes off the GUI thread.
         conversation_delete_finished = pyqtSignal(dict)
+        slash_information_ready = pyqtSignal(int, dict)
         # Reset chat (agent + GUI) from a worker thread â€” "nouveau chat" voice
         # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
         new_chat = pyqtSignal()
@@ -4752,8 +4753,8 @@ def wake_mode():
                 popup.show_conversation_busy_notice()
             else:
                 popup._chat.show_notice(
-                    "Impossible de modifier /special dans cette discussion."
-                    if language_fr else "Could not change /special in this conversation."
+                    "Impossible de modifier /disablevision dans cette discussion."
+                    if language_fr else "Could not change /disablevision in this conversation."
                 )
             return
         _notify_mobile_conversation_changed(
@@ -4774,49 +4775,47 @@ def wake_mode():
 
     def handle_slash_information(command_id: str) -> None:
         from osia.reasoning import resolve_reasoning_option_id
-        from osia.slash_commands import informational_payload, model_availability
+        from osia.slash_commands import informational_payload
 
         settings = load_settings() or {}
-        provider_id = str(
-            settings.get("selected_model_provider") or agent.provider or ""
-        )
+        provider_id = str(settings.get("selected_model_provider") or agent.provider or "")
         model_id = str(settings.get("selected_model") or agent.model or "")
-        selected = next(
-            (
-                item for item in model_availability(refresh=False)
-                if str(item.get("providerId") or "") == provider_id
-                and str(item.get("id") or "") == model_id
-            ),
-            {},
-        )
-        provider_label = str(
-            selected.get("providerDisplayName")
-            or selected.get("providerLabel")
-            or ("Indisponible" if i18n.get_language() == "fr" else "Unavailable")
-        )
-        model_label = str(
-            selected.get("label")
-            or selected.get("displayName")
-            or (
-                "SÃ©lection indisponible"
-                if i18n.get_language() == "fr" else "Unavailable selection"
-            )
-        )
-        payload = informational_payload(
-            command_id,
-            locale=i18n.get_language(),
-            surface="PC",
-            provider_id=provider_id,
-            model_id=model_id,
-            provider_label=provider_label,
-            model_label=model_label,
-            reasoning=resolve_reasoning_option_id(provider_id, model_id),
-            provider_ready=bool(selected),
-            routing_mode=(
-                "automatic" if settings.get("ai_hierarchy_enabled") else "exact"
-            ),
-        )
-        popup.show_slash_information(payload)
+        inventory = popup._model_inventory
+        selected = next((
+            item for item in inventory
+            if item["provider_id"] == provider_id and item["model_id"] == model_id
+        ), {})
+        locale = i18n.get_language()
+        conv_id = str((active_conv or {}).get("id") or "")
+        epoch = selection_epoch[0]
+
+        def load_status() -> None:
+            reasoning = "—"
+            if command_id == "status.info" and selected:
+                try:
+                    reasoning = resolve_reasoning_option_id(provider_id, model_id, settings)
+                except ValueError:
+                    pass
+            try:
+                payload = informational_payload(
+                    command_id, locale=locale, provider_id=provider_id,
+                    provider_label=selected.get("provider_display_name") or provider_id or "—",
+                    model_label=selected.get("model_display_name") or model_id or "—",
+                    reasoning=reasoning,
+                    provider_ready=bool(selected.get("available")),
+                    routing_mode="automatic" if settings.get("ai_hierarchy_enabled") else "exact",
+                    models_available=any(item["available"] for item in inventory),
+                    vision_disabled=conversations.conversation_special_mode(conv_id),
+                )
+                bridge.slash_information_ready.emit(epoch, payload)
+            except RuntimeError:
+                pass  # The popup can close while the status is loading.
+
+        threading.Thread(target=load_status, name="osia-command-status", daemon=True).start()
+
+    def handle_slash_information_ready(epoch: int, payload: dict) -> None:
+        if epoch == selection_epoch[0] and popup.isVisible():
+            popup.show_slash_information(payload)
 
     # â”€â”€ Signal wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -4846,6 +4845,7 @@ def wake_mode():
     popup.submit_draft.connect(handle_submit_draft)
     popup.submit_directive_draft.connect(handle_submit_directive_draft)
     popup.informational_requested.connect(handle_slash_information)
+    bridge.slash_information_ready.connect(handle_slash_information_ready)
     popup.special_requested.connect(handle_slash_special)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)

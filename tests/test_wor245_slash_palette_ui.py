@@ -1,9 +1,10 @@
 import os
+import threading
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtTest import QSignalSpy
+from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import QApplication
@@ -19,7 +20,7 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
     from osia import personality
     from osia.gui import slash_palette
 
-    monkeypatch.setattr(slash_palette, "model_availability", lambda **_kwargs: ())
+    monkeypatch.setattr(slash_palette, "connector_availability", lambda: ())
     monkeypatch.setattr(personality, "discover_skills", lambda: [
         SimpleNamespace(filename="brief.md", description="Make a brief", available=True),
     ])
@@ -30,10 +31,10 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
     legacy = QSignalSpy(chat.send_text)
     try:
         chat._input.setPlainText("/")
-        assert {"special", "skill", "skillcreator"} <= {
+        assert {"disablevision", "skill", "skillcreator"} <= {
             row.get("canonical_alias") for row in chat._slash_palette._rows
         }
-        chat._input.setPlainText("/special")
+        chat._input.setPlainText("/disablevision")
         chat._on_send()
         assert len(special) == 1
         assert not typed and not legacy
@@ -53,6 +54,99 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
         chat._on_send()
         assert typed[1][2]["skill_creator"] is True
         assert not legacy
+    finally:
+        chat.close()
+        chat.deleteLater()
+
+
+def test_palette_keeps_filtering_while_snapshot_worker_waits(monkeypatch):
+    from osia.gui import slash_palette
+
+    entered = threading.Event()
+    release = threading.Event()
+    loads = []
+
+    def slow_connectors():
+        loads.append(threading.get_ident())
+        entered.set()
+        release.wait(3)
+        return ()
+
+    monkeypatch.setattr(slash_palette, "connector_availability", slow_connectors)
+    monkeypatch.setattr(slash_palette, "current_web_available", lambda _provider: False)
+    chat = _ChatPage()
+    chat.show()
+    try:
+        chat._input.setPlainText("/")
+        assert entered.wait(1)
+        for text in ("/d", "/di", "/dis", "/disablevision"):
+            chat._input.setPlainText(text)
+            assert chat._slash_palette._rows[0]["canonical_alias"] == "disablevision"
+        assert loads != [threading.get_ident()]
+        assert len(loads) == 1
+    finally:
+        release.set()
+        chat.close()
+        chat.deleteLater()
+
+
+def test_model_search_reaches_later_entries_and_applies_model_and_effort_together():
+    chat = _ChatPage()
+    chat.show()
+    chat._input.setFocus()
+    palette = chat._slash_palette
+    model = {
+        "model_id": "gpt-6.1-sol", "model_display_name": "GPT-6.1 Sol",
+        "provider_id": "chatgpt_account", "provider_display_name": "ChatGPT",
+        "reasoning_options": [{"id": level} for level in ("low", "xhigh", "max", "ultra")],
+        "picker_visible": True, "available": True,
+    }
+    palette.set_model_inventory([
+        {**model, "model_id": f"model-{index}", "model_display_name": f"Model {index}"}
+        for index in range(40)
+    ] + [model])
+    try:
+        chat._input.setPlainText("/model use this text")
+        chat._on_send()
+        palette._filter.setText("6.1 sol")
+        assert [row["model_id"] for row in palette._rows] == [model["model_id"]]
+        palette.activate_current()
+        assert chat._directives.is_empty
+        assert [row["reasoning_level"] for row in palette._rows] == [
+            "auto", "low", "xhigh", "max", "ultra",
+        ]
+        palette._list.itemClicked.emit(palette._list.item(3))
+        assert chat._input.toPlainText() == "use this text"
+        assert chat._directives.model_override == ModelOverride("chatgpt_account", "gpt-6.1-sol")
+        assert chat._directives.reasoning_override == "max"
+        chat._remove_directive("model")
+        assert chat._directives.is_empty
+    finally:
+        chat.close()
+        chat.deleteLater()
+
+
+def test_at_reference_preserves_text_on_both_sides_of_the_caret(monkeypatch):
+    from osia.gui import slash_palette
+
+    monkeypatch.setattr(slash_palette, "conversation_availability", lambda **_kwargs: ({
+        "conversation_id": "conv-other", "display_title": "Projet", "display_project": "",
+    },))
+    chat = _ChatPage()
+    chat.show()
+    try:
+        prefix = "Reprends 🙂 @pro"
+        chat._input.setPlainText(prefix + " demain")
+        cursor = chat._input.textCursor()
+        cursor.setPosition(len(prefix.encode("utf-16-le")) // 2)
+        chat._input.setTextCursor(cursor)
+        for _ in range(20):
+            if chat._slash_palette._rows[0].get("conversation_id"):
+                break
+            QTest.qWait(10)
+        assert chat._slash_palette.activate_current()
+        assert chat._input.toPlainText() == "Reprends 🙂  demain"
+        assert chat._directives.conversation_refs[0].conversation_id == "conv-other"
     finally:
         chat.close()
         chat.deleteLater()
