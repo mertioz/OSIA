@@ -1,5 +1,7 @@
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,7 +30,7 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "status", "help", "vision", "skill", "skillcreator",
+        "web", "model", "status", "help", "mousecontrol", "skill", "skillcreator",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
@@ -36,16 +38,12 @@ def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     assert pc == mobile
 
 
-def test_special_is_conversation_bound_and_rejects_visual_calls(tmp_path, monkeypatch):
+def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path, monkeypatch):
     from osia import agent, conversations
     from osia.chatgpt_account.app_server_client import _canonical_native_tools
-    from osia.computer_use_v4_integration import (
-        computer_use_v4_test_scope,
-        computer_use_v4_tools_available,
-        computer_use_v4_turn_scope,
-    )
-    from osia.slash_commands import chat_command_scope, validate_special_image_input
-    from osia.tool_contracts import effective_static_tool_specs
+    from osia import computer_use_v4_integration as v4
+    from osia.slash_commands import chat_command_scope
+    from osia.tool_contracts import effective_static_tool_specs, get_tool_spec
 
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
     first = conversations.create_conversation()["id"]
@@ -53,39 +51,68 @@ def test_special_is_conversation_bound_and_rejects_visual_calls(tmp_path, monkey
     assert conversations.set_conversation_special_mode(first)["special_mode"] is True
     assert conversations.conversation_special_mode(first)
     assert not conversations.conversation_special_mode(second)
-    with pytest.raises(SlashDirectiveError, match="restore vision"):
-        validate_special_image_input(first, has_image=True)
-    validate_special_image_input(second, has_image=True)
-
     assert conversations.claim_background_execution(first, "active-turn")
     with pytest.raises(ValueError, match="conversation_busy"):
         conversations.set_conversation_special_mode(first, False)
     assert conversations.release_background_execution(first, "active-turn")
 
-    def unexpected_capture():
-        pytest.fail("Special mode dispatched a desktop capture")
+    def unexpected_pointer():
+        pytest.fail("Mouse-disabled conversation dispatched a native wheel action")
 
-    monkeypatch.setitem(agent.TOOL_MAP, "take_screenshot", unexpected_capture)
+    batches = []
+
+    def execute_batch(actions):
+        batches.append([action.kind for action in actions])
+        return {"status": "DISPATCHED_VERIFIED", "executed_count": len(actions)}
+
+    monkeypatch.setitem(agent.TOOL_MAP, "desktop_scroll", unexpected_pointer)
+    monkeypatch.setattr(v4, "_loop", lambda: SimpleNamespace(execute_batch=execute_batch))
+    keyboard = {"kind": "keypress", "frame_id": "frame", "key": "Enter"}
+    pointer = {"kind": "click", "frame_id": "frame", "x": 10, "y": 20}
+    blocked_tools = {"computer_click", "computer_double_click", "computer_scroll", "desktop_scroll"}
+
+    def action_kinds(schema):
+        return schema["properties"]["actions"]["items"]["properties"]["kind"]["enum"]
+
     with (
         chat_command_scope(first, None),
-        computer_use_v4_test_scope(vision_capable=True),
-        computer_use_v4_turn_scope("chatgpt_account", "gpt-6.1-sol", conversation_id=first, turn_id="t1"),
+        v4.computer_use_v4_test_scope(vision_capable=True),
+        v4.computer_use_v4_turn_scope("chatgpt_account", "gpt-6.1-sol", conversation_id=first, turn_id="t1"),
     ):
-        assert not computer_use_v4_tools_available()
+        assert v4.computer_use_v4_tools_available()
         tools = {spec.name for spec in effective_static_tool_specs()}
-        native_tools = {spec["name"] for spec in _canonical_native_tools()}
-        assert not any(name.startswith("computer_") for name in tools | native_tools)
-        assert not {"take_screenshot", "save_screenshot", "desktop_scroll"} & tools
-        assert {"desktop_type", "desktop_press", "inspect_desktop_surfaces", "get_browser_state"} <= tools
-        result = agent._execute_tool_with_policy("take_screenshot", {})
+        native_tools = {spec["name"]: spec["inputSchema"] for spec in _canonical_native_tools()}
+        assert not blocked_tools & (tools | native_tools.keys())
+        assert {
+            "take_screenshot", "save_screenshot", "desktop_type", "desktop_press",
+            "inspect_desktop_surfaces", "get_browser_state", "scroll",
+        } <= tools
+        if sys.platform == "win32":
+            assert {"computer_screenshot", "computer_type", "computer_keypress", "computer_actions"} <= tools
+            assert "computer_screenshot" in native_tools
+            assert action_kinds(native_tools["computer_actions"]) == ["type", "keypress"]
+        assert action_kinds(get_tool_spec("computer_actions").input_schema) == ["type", "keypress"]
+        result = agent._execute_tool_with_policy("desktop_scroll", {})
         assert not result.dispatched
         assert result.reason_code == "chat_command_capability_unavailable"
-        assert "The user disabled vision and mouse input" in agent.get_system_prompt("en")
+        result = agent._execute_tool_with_policy("computer_actions", {"actions": [keyboard, pointer]})
+        assert not result.dispatched
+        direct = v4.tool_computer_actions([keyboard, pointer])
+        assert direct["receipt"]["reason_code"] == "CONVERSATION_MOUSE_CONTROL_DISABLED"
+        assert not batches
+        assert v4.tool_computer_actions([keyboard])["receipt"]["batch_executed_count"] == 1
+        assert batches == [["keypress"]]
+        prompt = agent.get_system_prompt("en")
+        assert "Leave the physical desktop pointer untouched" in prompt
+        assert "Use targeted window captures" in prompt
+        assert "Bring the exact target window to the foreground before using the physical mouse." in prompt
 
     with chat_command_scope(second, None):
-        assert "save_screenshot" in {spec.name for spec in effective_static_tool_specs()}
+        assert "desktop_scroll" in {spec.name for spec in effective_static_tool_specs()}
+        assert "click" in action_kinds(get_tool_spec("computer_actions").input_schema)
     assert conversations.set_conversation_special_mode(first, False)["special_mode"] is False
-    validate_special_image_input(first, has_image=True)
+    with chat_command_scope(first, None):
+        assert "desktop_scroll" in {spec.name for spec in effective_static_tool_specs()}
 
 
 def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_path, monkeypatch):
@@ -143,7 +170,7 @@ def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_pa
     [
         ("/", ""),
         ("/ ", ""),
-        ("/ vision", "vision"),
+        ("/ mousecontrol", "mousecontrol"),
         ("   /web", "web"),
         ("/linear do it", "linear"),
         ("//web", None),

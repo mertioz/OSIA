@@ -1279,7 +1279,7 @@ class _ChatPage(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
-    special_requested = pyqtSignal()
+    mouse_control_requested = pyqtSignal()
     execution_cancel_requested = pyqtSignal(dict)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
@@ -1597,9 +1597,9 @@ class _ChatPage(QWidget):
         selection_type = str(row.get("selection_type") or "")
         next_directives = self._directives
         mention_size = 0
-        if handler == "toggle_conversation_special_v1":
+        if handler == "toggle_conversation_mouse_control_v1":
             self._input.setPlainText(consume_palette_prefix(self._input.text()))
-            self.special_requested.emit()
+            self.mouse_control_requested.emit()
             self._input.setFocus()
             return
         if handler in {
@@ -11351,7 +11351,7 @@ class MainPopup(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
-    special_requested = pyqtSignal()
+    mouse_control_requested = pyqtSignal()
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
@@ -11507,7 +11507,7 @@ class MainPopup(QWidget):
         self._chat.informational_requested.connect(
             self.informational_requested.emit
         )
-        self._chat.special_requested.connect(self.special_requested.emit)
+        self._chat.mouse_control_requested.connect(self.mouse_control_requested.emit)
         self._chat.execution_cancel_requested.connect(
             self._on_chat_execution_cancel_requested
         )
@@ -11938,9 +11938,9 @@ class MainPopup(QWidget):
             ("Routage" if french else "Routing",
              ("Automatique" if french else "Automatic") if payload["routing_mode"] == "automatic"
              else ("Modèle sélectionné" if french else "Selected model")),
-            ("Vision et souris" if french else "Vision and mouse",
-             ("Désactivées" if french else "Disabled") if payload["vision_disabled"]
-             else ("Actives" if french else "Enabled")),
+            ("Contrôle de la souris" if french else "Mouse control",
+             ("Désactivé" if french else "Disabled") if payload["mouse_control_disabled"]
+             else ("Actif" if french else "Enabled")),
         ])
         connector_label = "Connecteurs" if french else "Connectors"
         add_card(f"{connector_label} · {payload['connector_ready_count']}/{payload['connector_count']}", [

@@ -169,6 +169,32 @@ def test_background_observation_leaves_focus_and_pointer_untouched(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 exact window references")
+def test_named_capture_prefers_exact_titles_and_refuses_ambiguous_apps(monkeypatch):
+    from osia.computer_use_v4_integration import _resolve_window
+    from osia.tools import desktop_control
+
+    windows = [
+        (202, "Report - preview", 12, "EditorClass"),
+        (101, "Report", 11, "EditorClass"),
+    ]
+    monkeypatch.setattr(desktop_control, "_enum_app_windows_win32", lambda: windows)
+    monkeypatch.setattr(
+        desktop_control, "iter_app_windows",
+        lambda name, candidates: (item[:3] for item in candidates if name == "editor"),
+    )
+    monkeypatch.setattr(
+        desktop_control, "_foreground_window_win32",
+        lambda: pytest.fail("Explicit capture must resolve its own target"),
+    )
+    assert _resolve_window("Report") == 101
+    with pytest.raises(ComputerUseV4Error, match="WINDOW_AMBIGUOUS"):
+        _resolve_window("editor")
+    windows[0] = (202, "Report", 12, "EditorClass")
+    with pytest.raises(ComputerUseV4Error, match="WINDOW_AMBIGUOUS"):
+        _resolve_window("Report")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 exact window references")
 def test_background_capture_uses_a_validated_window_reference(monkeypatch):
     from osia import desktop_scene
     from osia.computer_use_v4_integration import _capture_target

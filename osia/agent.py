@@ -148,7 +148,8 @@ For a textual OSIA tool call, emit top-level JSON inside `<tool_call>` tags; nev
 - In the managed browser, `scroll` moves up or down. Use `scroll_infinite` with a fresh browser state when a list loads more items as you scroll. Inspect the newly available content when the task needs it.
 - When multiple available approaches are equally suitable and reliable, prefer the simplest, most direct path with the fewest unnecessary interactions; this is a contextual preference, not a fixed tool order. Direct, deterministic operations can avoid needless GUI steps, while Computer Use remains appropriate when visual observation or interaction is needed. Never trade correctness, required observation, factual verification, or safety—especially for consequential actions—for fewer steps.
 - Never claim an action or postcondition without supporting evidence. Respect cancellation, target identity, and stale-state rejection.
-- On Windows, `computer_screenshot` and `save_screenshot` can capture an open background window without focusing it. Pass its exact title in `window` or its `window_surface_ref` from `inspect_desktop_surfaces` as `surface_ref`. Omit both to capture the foreground window. A minimized or protected window may be unavailable. Coordinate actions use their own fresh frame and foreground checks.
+- To inspect a Windows window, resolve the intended window with `inspect_desktop_surfaces` and pass its `window_surface_ref` as `surface_ref` to `computer_screenshot` or `save_screenshot`. An exact unique window title also works. Capture an open background window without focusing it. Resolve any ambiguous match before capturing and omit the selector only when the task concerns the foreground window.
+- Bring the exact target window to the foreground before using the physical mouse. Use a current frame of that window and the verified foreground checks in Computer Use. If focusing the window changes the scene, capture a new frame before acting.
 - You can provide an image in your reply with `save_screenshot`. When the user asks for a screenshot, a picture of what is on screen, or visual evidence of a task result, use this tool when available to attach a fresh capture of the intended window. Check the tool result before confirming the attachment. The attachment shows the captured state. Earlier images are context and cannot establish the current screen or authorize an action.
 - A missing item in partial API, DOM, accessibility, Vision, or state evidence is UNKNOWN, not absent. Assert absence only from fresh target-bound evidence that explicitly proves it; resolve conflicts by observing further or stating uncertainty.
 - Execution history is factual; report uncertainty truthfully. An unchanged screenshot proves neither failure nor success. A distinct fresh model-requested action remains available after success, failure, or OUTCOME_UNKNOWN. Before an action whose target depends on desktop state, use a fresh frame and its exact window identity; never dispatch stale coordinates. Do not treat an unchanged observation or prior effect as a veto on a new model request.
@@ -435,7 +436,7 @@ def get_system_prompt(
     )
     from osia.slash_commands import current_chat_commands
 
-    special_mode, chat_directives = current_chat_commands()
+    mouse_control_disabled, chat_directives = current_chat_commands()
     surface = current_tool_surface()
     body = replace_static_tool_prompt_section(SYSTEM_PROMPT_CORE)
     if model and provider:
@@ -463,12 +464,11 @@ def get_system_prompt(
     except Exception:
         pass
 
-    if special_mode:
+    if mouse_control_disabled:
         body += (
-            "\n\n[Conversation setting: vision and mouse disabled.] "
-            "The user disabled vision and mouse input for this conversation. "
-            "Use structured capabilities or keyboard input. Keep screen capture, "
-            "image analysis and desktop pointer actions out of the turn, including through other tools."
+            "\n\n[Conversation setting: mouse control disabled.] "
+            "Leave the physical desktop pointer untouched. Use targeted window captures, "
+            "image analysis, keyboard input or structured tools for this conversation."
         )
     if chat_directives.skill_creator:
         body += (
@@ -3095,6 +3095,10 @@ def tool_desktop_press(key: str) -> str:
 
 def tool_desktop_scroll(direction: str = "down", amount=3) -> str:
     """Scroll the active native window up/down/left/right."""
+    from osia.tool_contracts import tool_disabled_by_chat_command
+
+    if tool_disabled_by_chat_command("desktop_scroll"):
+        return "ERROR: Mouse control is disabled for this conversation."
     from osia.tools import desktop_control as _dc
     arguments = {"direction": direction, "amount": amount}
     return _desktop_result_without_forced_observer(
@@ -5200,7 +5204,7 @@ def _execute_tool_with_policy(
     )
 
     spec, contract = _tool_spec_and_contract(tool_name, kwargs, user_request)
-    if tool_disabled_by_chat_command(tool_name):
+    if tool_disabled_by_chat_command(tool_name, kwargs):
         return ToolExecutionRecord(
             "ERROR: This tool is unavailable under the user's current chat commands.",
             True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION, 0, False, False,
@@ -10364,38 +10368,18 @@ class OSIAAgent:
             build_context,
             record_context_receipt,
         )
-        from osia.image_inputs import ImageInputError, adapt_messages_for_provider, has_image_content, text_content
-
-        from osia.slash_commands import current_chat_commands
+        from osia.image_inputs import ImageInputError, adapt_messages_for_provider, has_image_content
         from osia.visual_history import project_visual_history
 
         logical = [copy.deepcopy(message) for message in self.messages]
-        special_mode, _ = current_chat_commands()
-        if special_mode:
-            for frame in logical:
-                content = frame.get("content")
-                if not isinstance(content, list):
-                    continue
-                parts = [
-                    part for part in content
-                    if not isinstance(part, dict) or part.get("type") not in {
-                        "image_ref", "image_url", "input_image", "output_image", "image",
-                    }
-                ]
-                if len(parts) != len(content):
-                    if all(isinstance(part, dict) and part.get("type") == "text" for part in parts):
-                        frame["content"] = text_content(parts) or "[Image withheld while vision is disabled.]"
-                    else:
-                        frame["content"] = parts
-        else:
-            history_cache = getattr(self, "_visual_history_cache", None)
-            if history_cache is None:
-                history_cache = self._visual_history_cache = {}
-            logical = project_visual_history(
-                logical, provider=self.provider, model=self.model,
-                conversation_id=str(getattr(self, "_chatgpt_conversation_id", "") or ""),
-                cache=history_cache,
-            )
+        history_cache = getattr(self, "_visual_history_cache", None)
+        if history_cache is None:
+            history_cache = self._visual_history_cache = {}
+        logical = project_visual_history(
+            logical, provider=self.provider, model=self.model,
+            conversation_id=str(getattr(self, "_chatgpt_conversation_id", "") or ""),
+            cache=history_cache,
+        )
         # Responses items (especially ciphertext) belong to the exact route
         # that authored them. A later provider/model switch gets the factual
         # textual call/receipt history, never another model's opaque protocol.

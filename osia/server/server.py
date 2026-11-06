@@ -5525,6 +5525,7 @@ def _build_config_snapshot() -> dict:
         cfg["stt_local_models_available"] = []
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     cfg["chat_slash_extensions"] = 1
+    cfg["conversation_mouse_control"] = True
     cfg["slash_reasoning_model_options"] = True
     try:
         from osia.slash_commands import safe_availability_overlay
@@ -10859,7 +10860,7 @@ async def websocket_endpoint(ws: WebSocket):
                         })
                         continue
                     try:
-                        from osia.slash_commands import validate_live, validate_special_image_input
+                        from osia.slash_commands import validate_live
 
                         has_image_attachment = bool(
                             validated_attachment_batch is not None
@@ -10868,7 +10869,6 @@ async def websocket_endpoint(ws: WebSocket):
                                 for item in validated_attachment_batch.files.values()
                             )
                         )
-                        validate_special_image_input(_conv, has_image=has_image_attachment)
                         if turn_directives is not None:
                             turn_directives.require_sendable(
                                 body=user_text,

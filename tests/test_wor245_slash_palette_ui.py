@@ -26,17 +26,17 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
     ])
     chat = _ChatPage()
     chat.show()
-    special = QSignalSpy(chat.special_requested)
+    mouse = QSignalSpy(chat.mouse_control_requested)
     typed = QSignalSpy(chat.submit_directive_draft)
     legacy = QSignalSpy(chat.send_text)
     try:
         chat._input.setPlainText("/")
-        assert {"vision", "skill", "skillcreator"} <= {
+        assert {"mousecontrol", "skill", "skillcreator"} <= {
             row.get("canonical_alias") for row in chat._slash_palette._rows
         }
-        chat._input.setPlainText("/vision")
+        chat._input.setPlainText("/mousecontrol")
         chat._on_send()
-        assert len(special) == 1
+        assert len(mouse) == 1
         assert not typed and not legacy
 
         chat._input.setPlainText("/skill")
@@ -79,9 +79,9 @@ def test_palette_keeps_filtering_while_snapshot_worker_waits(monkeypatch):
     try:
         chat._input.setPlainText("/")
         assert entered.wait(1)
-        for text in ("/v", "/vi", "/vis", "/vision"):
+        for text in ("/mou", "/mous", "/mouse", "/mousecontrol"):
             chat._input.setPlainText(text)
-            assert chat._slash_palette._rows[0]["canonical_alias"] == "vision"
+            assert chat._slash_palette._rows[0]["canonical_alias"] == "mousecontrol"
         assert loads != [threading.get_ident()]
         assert len(loads) == 1
     finally:

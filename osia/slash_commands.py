@@ -351,7 +351,7 @@ _CHAT_COMMAND_CONTEXT: ContextVar[tuple[bool, SlashTurnDirectivesV1]] = ContextV
 
 @contextmanager
 def chat_command_scope(conversation_id: str, directives: SlashTurnDirectivesV1 | None):
-    """Bind the canonical conversation flag and explicit composer choices."""
+    """Bind the conversation's mouse control setting and explicit composer choices."""
     from osia.conversations import conversation_special_mode
 
     token = _CHAT_COMMAND_CONTEXT.set((
@@ -366,17 +366,6 @@ def chat_command_scope(conversation_id: str, directives: SlashTurnDirectivesV1 |
 
 def current_chat_commands() -> tuple[bool, SlashTurnDirectivesV1]:
     return _CHAT_COMMAND_CONTEXT.get()
-
-
-def validate_special_image_input(conversation_id: str, *, has_image: bool) -> None:
-    from osia.conversations import conversation_special_mode
-
-    if has_image and conversation_special_mode(conversation_id):
-        raise SlashDirectiveError(
-            "special_mode_image_disabled",
-            "Use /vision to restore vision before sending an image.",
-            "Utilise /vision pour réactiver la vision avant d’envoyer une image.",
-        )
 
 
 @dataclass(frozen=True)
@@ -658,7 +647,7 @@ def palette_items(
     filter_text: str = "",
     models_available: bool = False,
     web_available: bool = False,
-    vision_disabled: bool = False,
+    mouse_control_disabled: bool = False,
     connectors: Iterable[ConnectorAvailability] = (),
 ) -> tuple[dict[str, Any], ...]:
     """Filter a prepared snapshot without disk, provider, or connector probes."""
@@ -678,11 +667,11 @@ def palette_items(
         item["description"] = str(
             raw["description"].get(language) or raw["description"].get("en") or ""
         )
-        if raw["id"] == "special.toggle" and vision_disabled:
+        if raw["id"] == "mouse_control.toggle" and mouse_control_disabled:
             item["description"] = (
-                "Réactiver la vision et la souris dans cette discussion"
+                "Réactiver le contrôle de la souris dans cette discussion"
                 if language == "fr" else
-                "Restore vision and mouse in this conversation"
+                "Restore OSIA's mouse control in this conversation"
             )
         item["argument_hint"] = str(
             raw["argument_hint"].get(language) or raw["argument_hint"].get("en") or ""
@@ -933,7 +922,7 @@ def informational_payload(
     routing_mode: str = "automatic",
     transport: str = "",
     models_available: bool = False,
-    vision_disabled: bool = False,
+    mouse_control_disabled: bool = False,
 ) -> dict[str, Any]:
     """Build a bounded, display-only payload; it is never a chat turn."""
     language = "fr" if str(locale).lower().startswith("fr") else "en"
@@ -944,7 +933,7 @@ def informational_payload(
             locale=language,
             models_available=models_available,
             web_available=current_web_available(provider_id),
-            vision_disabled=vision_disabled,
+            mouse_control_disabled=mouse_control_disabled,
             connectors=all_connectors,
         )
         commands = [{
@@ -975,7 +964,7 @@ def informational_payload(
         "provider": str(provider_label or "Automatic")[:80],
         "model": str(model_label or "Automatic")[:120],
         "reasoning": str(reasoning or "auto")[:32],
-        "vision_disabled": vision_disabled,
+        "mouse_control_disabled": mouse_control_disabled,
         "provider_ready": (
             bool(provider_id) if provider_ready is None else bool(provider_ready)
         ),

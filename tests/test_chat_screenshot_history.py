@@ -108,12 +108,13 @@ def test_expired_history_does_not_block_new_user_input(visual_store):
     assert result[-1]["content"] == "Keep going."
 
 
-def test_special_mode_hides_pixels_and_restores_history_when_reenabled(visual_store):
+def test_disabled_mouse_control_preserves_current_and_historical_images(visual_store):
     from osia.agent import OSIAAgent
     from osia.slash_commands import chat_command_scope
 
     conv_id = conversations.create_conversation()["id"]
     reference = image_inputs.register_image_artifact(_image(), owner_id=conv_id)
+    current = image_inputs.register_image_artifact(_image(color="orange"), owner_id=conv_id)
     agent = SimpleNamespace(
         provider="openai", model="gpt-4o", lang="en", turn_context=None,
         _chatgpt_conversation_id=conv_id,
@@ -121,18 +122,14 @@ def test_special_mode_hides_pixels_and_restores_history_when_reenabled(visual_st
             {"role": "user", "_visual_history": True,
              "content": [{"type": "text", "text": "Earlier input."}, reference]},
             {"role": "assistant", "content": "Earlier reply."},
-            {"role": "user", "content": "Continue."},
+            {"role": "user", "content": [{"type": "text", "text": "Continue."}, current]},
         ],
     )
     conversations.set_conversation_special_mode(conv_id, True)
     with chat_command_scope(conv_id, None):
         wire = OSIAAgent._wire_messages(agent)
-        assert wire[0]["content"] == "Earlier input."
-        assert all(not image_inputs.has_image_content(frame.get("content")) for frame in wire)
-    conversations.set_conversation_special_mode(conv_id, False)
-    with chat_command_scope(conv_id, None):
-        wire = OSIAAgent._wire_messages(agent)
         assert image_inputs.image_parts(wire[0]["content"])[0]["type"] == "image_url"
+        assert image_inputs.image_parts(wire[-1]["content"])[0]["type"] == "image_url"
 
 
 def test_screenshot_is_persisted_and_downloadable_only_for_its_exact_message(visual_store, monkeypatch):

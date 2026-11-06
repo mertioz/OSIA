@@ -2628,6 +2628,7 @@ def delete_conversation(conv_id: str) -> bool:
 
 
 def conversation_special_mode(conv_id: str) -> bool:
+    """Read the mouse control preference from the existing conversation field."""
     if not isinstance(conv_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
         return False
     conv = get_conversation(conv_id)

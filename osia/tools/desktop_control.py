@@ -1437,32 +1437,31 @@ def _enum_app_windows_win32():
     return out
 
 
-def find_app_window(name):
-    """(hwnd, title, pid) of the best ALREADY-OPEN window whose owning PROCESS name
-    matches ``name`` (e.g. 'notepad' -> notepad.exe), or ``None`` when nothing
-    matches confidently / detection is unavailable.
-
-    Matches on the process name (titles rarely carry the app name) and requires an
-    EXACT executable-base match so the wrong app is never focused; among several
-    windows of one app the topmost (most-recently-active) is returned. Windows-only
-    — returns None on Linux/Mac (caller launches as usual). Never raises."""
+def iter_app_windows(name, windows=None):
+    """Yield open windows with an exact executable-name match in Z-order."""
     if sys.platform != "win32" or _load_win32() is None:
-        return None
+        return
     req = _norm_app_token(name)
     if not req:
-        return None
+        return
     try:
         import psutil
     except Exception:
-        return None
-    for hwnd, title, pid, _cls in _enum_app_windows_win32():   # topmost first
+        return
+    if windows is None:
+        windows = _enum_app_windows_win32()
+    for hwnd, title, pid, _cls in windows:
         try:
             pname = psutil.Process(pid).name()
         except Exception:
             continue
         if _proc_base(pname) == req:
-            return (hwnd, title, pid)
-    return None
+            yield (hwnd, title, pid)
+
+
+def find_app_window(name):
+    """Return the topmost open window with an exact executable-name match."""
+    return next(iter_app_windows(name), None)
 
 
 def _raise_window_win32(win32gui, win32process, hwnd) -> None:

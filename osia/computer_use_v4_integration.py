@@ -128,10 +128,8 @@ def _active_config() -> dict:
 
 
 def computer_use_v4_tools_available() -> bool:
-    from osia.slash_commands import current_chat_commands
-
     state = _TURN_STATE.get()
-    if state is None or current_chat_commands()[0]:
+    if state is None:
         return False
     config = _active_config()
     if isinstance(config.get("vision_capable"), bool):
@@ -149,13 +147,9 @@ def computer_use_v4_tools_available() -> bool:
 
 
 def _current_state() -> _ComputerTurnState:
-    from osia.slash_commands import current_chat_commands
-
     state = _TURN_STATE.get()
     if state is None:
         raise ComputerUseV4Error("TURN_CONTEXT_REQUIRED")
-    if current_chat_commands()[0]:
-        raise ComputerUseV4Error("CONVERSATION_VISION_DISABLED")
     return state
 
 
@@ -337,17 +331,20 @@ def _resolve_window(window: str = "") -> int:
     if not requested:
         foreground = desktop_control._foreground_window_win32()
         return int(foreground[0] or 0) if foreground else 0
-    candidates = []
-    for hwnd, title, _pid, _class_name in desktop_control._enum_app_windows_win32():
+    windows = desktop_control._enum_app_windows_win32()
+    exact, prefixed = set(), set()
+    for hwnd, title, _pid, _class_name in windows:
         normalized = _normalized_window_label(title)
-        if normalized == requested or normalized.startswith(requested + " -"):
-            candidates.append(int(hwnd))
-    if len(set(candidates)) == 1:
-        return candidates[0]
-    if candidates:
+        if normalized == requested:
+            exact.add(int(hwnd))
+        elif normalized.startswith(requested + " -"):
+            prefixed.add(int(hwnd))
+    candidates = exact or prefixed or {
+        int(hwnd) for hwnd, _title, _pid in desktop_control.iter_app_windows(window, windows)
+    }
+    if len(candidates) > 1:
         raise ComputerUseV4Error("WINDOW_AMBIGUOUS", "select_an_exact_window_surface_ref")
-    process_match = desktop_control.find_app_window(window)
-    return int(process_match[0]) if process_match is not None else 0
+    return next(iter(candidates), 0)
 
 
 def _capture_target(window: str, surface_ref: str) -> tuple[int, str]:
@@ -795,6 +792,10 @@ def _wrap_action(result: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _execute_action(tool_name: str, action: ComputerAction) -> dict[str, Any]:
+    from osia.tool_contracts import tool_disabled_by_chat_command
+
+    if tool_disabled_by_chat_command(tool_name):
+        return _error_result("CONVERSATION_MOUSE_CONTROL_DISABLED")
     _before_action(tool_name, action.safe_arguments())
     try:
         return _wrap_action(_loop().execute(action))
@@ -878,6 +879,8 @@ def tool_computer_scroll(
 
 
 def tool_computer_actions(actions: list[dict]) -> dict[str, Any]:
+    from osia.tool_contracts import tool_disabled_by_chat_command
+
     if not isinstance(actions, list):
         return _error_result("INVALID_ARGUMENTS")
     try:
@@ -886,6 +889,10 @@ def tool_computer_actions(actions: list[dict]) -> dict[str, Any]:
             else ComputerAction.from_mapping(item)
             for item in actions
         ]
+        if tool_disabled_by_chat_command("computer_actions", {
+            "actions": [{"kind": item.kind} for item in parsed_actions],
+        }):
+            return _error_result("CONVERSATION_MOUSE_CONTROL_DISABLED")
         _before_action("computer_actions", {
             "action_count": len(parsed_actions),
             "actions": [item.safe_arguments() for item in parsed_actions],

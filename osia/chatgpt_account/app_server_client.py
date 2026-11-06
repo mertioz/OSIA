@@ -242,9 +242,8 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
     import sys
 
     from osia.capability_federation import federated_capabilities
-    from osia.tool_contracts import dynamic_tool_specs, get_static_registry
+    from osia.tool_contracts import dynamic_tool_specs, get_tool_spec
 
-    registry = get_static_registry()
     available_osia = {
         item.identity
         for item in federated_capabilities("chatgpt_account")
@@ -270,7 +269,7 @@ def _canonical_native_tools(execution_strategy=None) -> list[dict]:
                 continue
         if name not in available_osia:
             continue
-        spec = registry.get(name)
+        spec = get_tool_spec(name)
         if spec is None:
             continue
         input_schema = deepcopy(spec.input_schema)

@@ -162,12 +162,12 @@ class SlashCommandPalette(QFrame):
                 rows = [{"name": message, "enabled": False}]
             self._show_rows(rows, "@ Discussions" if french else "@ Conversations")
             return
-        connectors, web_available, vision_disabled = data or ((), False, False)
+        connectors, web_available, mouse_control_disabled = data or ((), False, False)
         self._show_rows(
             list(palette_items(
                 locale=self._locale, filter_text=query,
                 models_available=bool(self._model_rows),
-                web_available=web_available, vision_disabled=vision_disabled,
+                web_available=web_available, mouse_control_disabled=mouse_control_disabled,
                 connectors=connectors,
             )),
             "Raccourcis" if french else "Shortcuts",

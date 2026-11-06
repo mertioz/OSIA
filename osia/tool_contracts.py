@@ -155,6 +155,11 @@ BROWSER_VERIFY_TOOL_NAMES = frozenset({
 DORMANT_VISUAL_V3_TOOL_NAMES = frozenset({
     "request_visual_observation", "desktop_click",
 })
+_MOUSE_CONTROL_TOOLS = frozenset({
+    "desktop_click", "desktop_scroll",
+    "computer_click", "computer_double_click", "computer_scroll",
+})
+_MOUSE_ACTION_KINDS = frozenset({"click", "double_click", "scroll"})
 
 _FILE_PERSISTENCE_TOOLS = frozenset({
     "read_file", "read_document", "read_document_artifact", "query_document",
@@ -1643,7 +1648,7 @@ def get_static_registry() -> ToolRegistry:
 def get_tool_spec(name: str) -> ToolSpec | None:
     static = get_static_registry().get(name)
     if static is not None:
-        return static
+        return _tool_spec_with_chat_options(static)
     with _dynamic_lock:
         return _dynamic_specs.get(str(name or ""))
 
@@ -2637,21 +2642,48 @@ def static_tool_inventory_specs() -> tuple[ToolSpec, ...]:
     """
 
     return tuple(
-        spec for spec in get_static_registry().values()
+        _tool_spec_with_chat_options(spec) for spec in get_static_registry().values()
         if _static_tool_runtime_available(spec)
     )
 
 
-def tool_disabled_by_chat_command(name: str) -> bool:
+def _tool_spec_with_chat_options(spec: ToolSpec) -> ToolSpec:
+    if spec.name != "computer_actions":
+        return spec
     from osia.slash_commands import current_chat_commands
 
-    special_mode, directives = current_chat_commands()
+    if not current_chat_commands()[0]:
+        return spec
+    schema = copy.deepcopy(spec.input_schema)
+    kind = schema["properties"]["actions"]["items"]["properties"]["kind"]
+    kind["enum"] = [value for value in kind["enum"] if value not in _MOUSE_ACTION_KINDS]
+    return replace(
+        spec, input_schema=schema,
+        capability="Run a bounded batch of native typing and keypress actions from a current frame",
+    )
+
+
+def tool_disabled_by_chat_command(
+    name: str, arguments: Mapping[str, Any] | None = None,
+) -> bool:
+    from osia.slash_commands import current_chat_commands
+
+    mouse_control_disabled, directives = current_chat_commands()
     if name == "create_chat_skill":
         return not directives.skill_creator
-    return special_mode and (
-        name.startswith("computer_")
-        or name in DORMANT_VISUAL_V3_TOOL_NAMES
-        or name in {"take_screenshot", "save_screenshot", "desktop_scroll"}
+    if not mouse_control_disabled:
+        return False
+    if name in _MOUSE_CONTROL_TOOLS:
+        return True
+    actions = (
+        arguments.get("actions")
+        if name == "computer_actions" and isinstance(arguments, Mapping)
+        else None
+    )
+    return isinstance(actions, list) and any(
+        isinstance(action, Mapping)
+        and str(action.get("kind") or "").strip().lower() in _MOUSE_ACTION_KINDS
+        for action in actions
     )
 
 

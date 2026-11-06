@@ -3967,7 +3967,7 @@ def wake_mode():
         language_text: str | None = None,
         turn_directives=None,
     ) -> bool:
-        from osia.slash_commands import SlashDirectiveError, validate_special_image_input
+        from osia.slash_commands import SlashDirectiveError
 
         conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
@@ -3991,7 +3991,6 @@ def wake_mode():
                 ]
             else:
                 attachment_metadata = []
-            validate_special_image_input(conv_id, has_image=bool(attachment_metadata))
             if attachment_metadata:
                 persistence_metadata["_attachments"] = [
                     dict(item) for item in attachment_metadata
@@ -4738,7 +4737,7 @@ def wake_mode():
         ):
             popup.accept_directive_submission()
 
-    def handle_slash_special() -> None:
+    def handle_slash_mouse_control() -> None:
         nonlocal active_conv
         language_fr = i18n.get_language() == "fr"
         try:
@@ -4753,8 +4752,8 @@ def wake_mode():
                 popup.show_conversation_busy_notice()
             else:
                 popup._chat.show_notice(
-                    "Impossible de modifier /vision dans cette discussion."
-                    if language_fr else "Could not change /vision in this conversation."
+                    "Impossible de modifier /mousecontrol dans cette discussion."
+                    if language_fr else "Could not change /mousecontrol in this conversation."
                 )
             return
         _notify_mobile_conversation_changed(
@@ -4763,13 +4762,13 @@ def wake_mode():
         )
         if active_conv.get("special_mode") is True:
             notice = (
-                "Vision et souris désactivées dans cette discussion."
-                if language_fr else "Vision and mouse disabled in this conversation."
+                "Contrôle de la souris désactivé dans cette discussion."
+                if language_fr else "Mouse control disabled in this conversation."
             )
         else:
             notice = (
-                "Vision et souris réactivées dans cette discussion."
-                if language_fr else "Vision and mouse restored in this conversation."
+                "Contrôle de la souris réactivé dans cette discussion."
+                if language_fr else "Mouse control restored in this conversation."
             )
         popup._chat.show_notice(notice)
 
@@ -4805,7 +4804,7 @@ def wake_mode():
                     provider_ready=bool(selected.get("available")),
                     routing_mode="automatic" if settings.get("ai_hierarchy_enabled") else "exact",
                     models_available=any(item["available"] for item in inventory),
-                    vision_disabled=conversations.conversation_special_mode(conv_id),
+                    mouse_control_disabled=conversations.conversation_special_mode(conv_id),
                 )
                 bridge.slash_information_ready.emit(epoch, payload)
             except RuntimeError:
@@ -4846,7 +4845,7 @@ def wake_mode():
     popup.submit_directive_draft.connect(handle_submit_directive_draft)
     popup.informational_requested.connect(handle_slash_information)
     bridge.slash_information_ready.connect(handle_slash_information_ready)
-    popup.special_requested.connect(handle_slash_special)
+    popup.mouse_control_requested.connect(handle_slash_mouse_control)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)

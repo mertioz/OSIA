@@ -50,16 +50,16 @@
       "handler_contract": "show_available_help_v1"
     },
     {
-      "id": "special.toggle",
-      "canonical_alias": "vision",
-      "name": {"en": "Vision and mouse", "fr": "Vision et souris"},
-      "description": {"en": "Disable vision and mouse in this conversation", "fr": "Désactiver la vision et la souris dans cette discussion"},
+      "id": "mouse_control.toggle",
+      "canonical_alias": "mousecontrol",
+      "name": {"en": "Mouse control", "fr": "Contrôle de la souris"},
+      "description": {"en": "Disable OSIA's mouse control in this conversation", "fr": "Désactiver le contrôle de la souris dans cette discussion"},
       "argument_hint": {"en": "", "fr": ""},
       "kind": "action",
-      "availability_predicate": "chat_slash_extensions",
-      "icon_semantic": "vision_off",
+      "availability_predicate": "conversation_mouse_control",
+      "icon_semantic": "mouse",
       "chip_behavior": "none",
-      "handler_contract": "toggle_conversation_special_v1"
+      "handler_contract": "toggle_conversation_mouse_control_v1"
     },
     {
       "id": "skill.select",
