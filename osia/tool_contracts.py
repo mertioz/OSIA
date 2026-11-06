@@ -763,6 +763,15 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("declare_outcomes", "Optionally record high-level result notes ({id,result}); never required for tools or completion",
               _object({"outcomes": {"type": "array", "items": {"type": "object"}}}, required=("outcomes",)),
               R, I, NC, timeout=10.0, retry=RetryPolicy.NEVER_AFTER_DISPATCH),
+        _spec("create_chat_skill", "Save a new reusable OSIA skill requested through /skillcreator",
+              _object({
+                  "name": _string(maximum=64, pattern=r"^[a-z][a-z0-9-]*$"),
+                  "description": _string(maximum=300),
+                  "instructions": _string(maximum=12_000),
+                  "required_tools": _array(_string(maximum=128), maximum=24),
+              }, required=("name", "description", "instructions")), PL, N, NC,
+              preconditions=("user_selected_skillcreator",), progress=effect,
+              real=local_real, verified=True, observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
         _spec("save_memory", "Persist one validated local memory", _object({
             "type": _string(enum=("route", "preference", "fact", "workflow", "contact", "shortcut"), maximum=32),
             "category": _string(enum=("app", "site", "deep_link", "folder", "file", "game", "user", "workflow", "contact", "other"), maximum=32),
@@ -2633,6 +2642,19 @@ def static_tool_inventory_specs() -> tuple[ToolSpec, ...]:
     )
 
 
+def tool_disabled_by_chat_command(name: str) -> bool:
+    from osia.slash_commands import current_chat_commands
+
+    special_mode, directives = current_chat_commands()
+    if name == "create_chat_skill":
+        return not directives.skill_creator
+    return special_mode and (
+        name.startswith("computer_")
+        or name in DORMANT_VISUAL_V3_TOOL_NAMES
+        or name in {"take_screenshot", "save_screenshot", "desktop_scroll"}
+    )
+
+
 def _static_tool_runtime_available(spec: ToolSpec) -> bool:
     """Return only genuine runtime availability for one static capability.
 
@@ -2647,6 +2669,8 @@ def _static_tool_runtime_available(spec: ToolSpec) -> bool:
     availability or integrity checks.
     """
 
+    if tool_disabled_by_chat_command(spec.name):
+        return False
     if spec.name in DORMANT_VISUAL_V3_TOOL_NAMES:
         # Retired/dormant capability: dispatch fails with a typed error.
         return False

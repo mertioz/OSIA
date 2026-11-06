@@ -1061,7 +1061,7 @@ def resolve_conversation_reference(
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def create_conversation(title: str | None = None) -> dict:
+def create_conversation(title: str | None = None, *, special_mode: bool = False) -> dict:
     """Create and persist a new conversation. Returns the full dict."""
     with _store_lock():
         conv_id = uuid.uuid4().hex
@@ -1076,6 +1076,8 @@ def create_conversation(title: str | None = None) -> dict:
             "last_operation_id": operation_id,
             "messages": [],
         }
+        if special_mode:
+            conv["special_mode"] = True
         _write_atomic(_path_for(conv_id), conv)
         return conv
 
@@ -1083,6 +1085,8 @@ def create_conversation(title: str | None = None) -> dict:
 def resolve_request_conversation(
     request_id: str,
     title: str | None = None,
+    *,
+    special_mode: bool = False,
 ) -> tuple[dict, bool]:
     """Resolve or reserve the one durable first-chat conversation for a request."""
 
@@ -1151,6 +1155,8 @@ def resolve_request_conversation(
             "messages": [],
             "_first_request_id": stable_request_id,
         }
+        if special_mode:
+            conv["special_mode"] = True
         _write_atomic(path, conv)
         return conv, True
 
@@ -1188,6 +1194,7 @@ def _list_conversations_unlocked(state: dict) -> list[dict]:
             "revision": int(data.get("revision") or 0),
             "operation_id": str(data.get("last_operation_id") or ""),
             "folder_id": memberships.get(str(data.get("id") or "")),
+            "special_mode": data.get("special_mode") is True,
         })
     items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
     return items
@@ -2618,6 +2625,36 @@ def delete_conversation_with_receipt(
 def delete_conversation(conv_id: str) -> bool:
     """Compatibility boolean wrapper for the canonical deletion receipt."""
     return bool(delete_conversation_with_receipt(conv_id).get("success"))
+
+
+def conversation_special_mode(conv_id: str) -> bool:
+    if not isinstance(conv_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
+        return False
+    conv = get_conversation(conv_id)
+    return isinstance(conv, dict) and conv.get("special_mode") is True
+
+
+def set_conversation_special_mode(conv_id: str, enabled: bool | None = None) -> dict:
+    """Set or toggle the PC-owned flag while no accepted turn can use it."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
+        raise ValueError("conversation_not_found")
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("invalid_special_request")
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        if not isinstance(conv, dict) or conv.get("id") != conv_id:
+            raise ValueError("conversation_not_found")
+        current = conv.get("special_mode") is True
+        desired = not current if enabled is None else enabled
+        if desired == current:
+            return conv
+        if _has_active_canonical_chat_lease(conv) or _background_execution_lease_active(conv):
+            raise ValueError("conversation_busy")
+        conv["special_mode"] = desired
+        conv["revision"] = _next_revision(conv)
+        conv["last_operation_id"] = f"op_{uuid.uuid4().hex}"
+        _write_atomic(_path_for(conv_id), conv)
+        return conv
 
 
 def rename_conversation(conv_id: str, title: str) -> bool:

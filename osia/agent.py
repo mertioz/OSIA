@@ -431,6 +431,9 @@ def get_system_prompt(
         replace_static_tool_prompt_section,
         static_tool_prompt_block,
     )
+    from osia.slash_commands import current_chat_commands
+
+    special_mode, chat_directives = current_chat_commands()
     surface = current_tool_surface()
     body = replace_static_tool_prompt_section(SYSTEM_PROMPT_CORE)
     if model and provider:
@@ -447,11 +450,34 @@ def get_system_prompt(
             body = body + "\n\n" + personality.render_personality_prompt_block(
                 persona
             )
-        skills = personality.load_enabled_skills_text().strip()
+        skills = (
+            personality.load_enabled_skills_text(chat_directives.skill_name)
+            if chat_directives.skill_name else personality.load_enabled_skills_text()
+        ).strip()
         if skills:
             body = body + "\n\n" + skills
+        elif chat_directives.skill_name:
+            body += "\n\nThe user-selected skill is unavailable for this turn. Tell the user it could not be loaded."
     except Exception:
         pass
+
+    if special_mode:
+        body += (
+            "\n\n[Conversation setting: /special is active.] "
+            "The user disabled vision and mouse input for this conversation. "
+            "Use structured capabilities or keyboard input. Keep screen capture, "
+            "image analysis and desktop pointer actions out of the turn, including through other tools."
+        )
+    if chat_directives.skill_creator:
+        body += (
+            "\n\n[User selected /skillcreator for this turn.] "
+            "Turn their request into reusable instructions for future tasks. "
+            "Use create_chat_skill with a lowercase hyphenated name, a one-line description, "
+            "and actionable Markdown instructions. Use ### for instruction headings and "
+            "the listed OSIA tool names for required_tools, if needed. "
+            "Keep private values out of reusable instructions. Confirm the saved skill "
+            "after the tool reports success. The user can then select it with /skill."
+        )
 
     if surface == "":
         from osia.chat_routing import execution_prompt
@@ -3425,8 +3451,49 @@ def tool_declare_outcomes(outcomes: list) -> str:
         return "ERROR: " + str(exc)
 
 
+def tool_create_chat_skill(
+    name: str, description: str, instructions: str, required_tools: list[str] | None = None,
+) -> dict:
+    from osia.personality import create_generated_skill
+    from osia.tool_contracts import tool_disabled_by_chat_command
+
+    if tool_disabled_by_chat_command("create_chat_skill"):
+        error = "The user can start skill creation with /skillcreator."
+    else:
+        try:
+            filename = create_generated_skill(name, description, instructions, required_tools)
+        except FileExistsError:
+            error = "A skill with that name already exists. Use a distinct name."
+        except ValueError as exc:
+            error = str(exc)
+        except OSError:
+            return {
+                "text": "ERROR: Skill storage failed. Check the skill list before reporting a save.",
+                "receipt": {
+                    "schema_version": 1, "dispatch_state": "effect_unknown",
+                    "outcome": "outcome_unknown", "reason_code": "SKILL_STORAGE_FAILED",
+                },
+            }
+        else:
+            return {
+                "text": f"Saved {filename}. The user can select it with /skill.",
+                "receipt": {
+                    "schema_version": 1, "dispatch_state": "effect_confirmed",
+                    "outcome": "confirmed_success", "reason_code": "SKILL_CREATED",
+                },
+            }
+    return {
+        "text": f"ERROR: {error}",
+        "receipt": {
+            "schema_version": 1, "dispatch_state": "not_dispatched",
+            "outcome": "confirmed_failure_before_effect", "reason_code": "SKILL_NOT_CREATED",
+        },
+    }
+
+
 TOOL_MAP = {
     "declare_outcomes": tool_declare_outcomes,
+    "create_chat_skill": tool_create_chat_skill,
     # Local memory
     "save_memory": tool_save_memory,
     # Scheduled tasks
@@ -5125,11 +5192,18 @@ def _execute_tool_with_policy(
         ToolExecutionRecord,
         ToolValidationError,
         persistence_contract,
+        tool_disabled_by_chat_command,
         validate_tool_arguments,
         validation_error_text,
     )
 
     spec, contract = _tool_spec_and_contract(tool_name, kwargs, user_request)
+    if tool_disabled_by_chat_command(tool_name):
+        return ToolExecutionRecord(
+            "ERROR: This tool is unavailable under the user's current chat commands.",
+            True, ExecutionOutcome.REJECTED_BEFORE_EXECUTION, 0, False, False,
+            contract, reason_code="chat_command_capability_unavailable",
+        )
     try:
         kwargs = validate_tool_arguments(spec, kwargs)
     except ToolValidationError:
@@ -10288,19 +10362,38 @@ class OSIAAgent:
             build_context,
             record_context_receipt,
         )
-        from osia.image_inputs import ImageInputError, adapt_messages_for_provider, has_image_content
+        from osia.image_inputs import ImageInputError, adapt_messages_for_provider, has_image_content, text_content
 
+        from osia.slash_commands import current_chat_commands
         from osia.visual_history import project_visual_history
 
         logical = [copy.deepcopy(message) for message in self.messages]
-        history_cache = getattr(self, "_visual_history_cache", None)
-        if history_cache is None:
-            history_cache = self._visual_history_cache = {}
-        logical = project_visual_history(
-            logical, provider=self.provider, model=self.model,
-            conversation_id=str(getattr(self, "_chatgpt_conversation_id", "") or ""),
-            cache=history_cache,
-        )
+        special_mode, _ = current_chat_commands()
+        if special_mode:
+            for frame in logical:
+                content = frame.get("content")
+                if not isinstance(content, list):
+                    continue
+                parts = [
+                    part for part in content
+                    if not isinstance(part, dict) or part.get("type") not in {
+                        "image_ref", "image_url", "input_image", "output_image", "image",
+                    }
+                ]
+                if len(parts) != len(content):
+                    if all(isinstance(part, dict) and part.get("type") == "text" for part in parts):
+                        frame["content"] = text_content(parts) or "[Image withheld while /special is active.]"
+                    else:
+                        frame["content"] = parts
+        else:
+            history_cache = getattr(self, "_visual_history_cache", None)
+            if history_cache is None:
+                history_cache = self._visual_history_cache = {}
+            logical = project_visual_history(
+                logical, provider=self.provider, model=self.model,
+                conversation_id=str(getattr(self, "_chatgpt_conversation_id", "") or ""),
+                cache=history_cache,
+            )
         # Responses items (especially ciphertext) belong to the exact route
         # that authored them. A later provider/model switch gets the factual
         # textual call/receipt history, never another model's opaque protocol.
@@ -13036,6 +13129,7 @@ class OSIAAgent:
         never per tool call, so stickiness is never reset mid-turn.
         """
         from osia import document_artifacts as _document_artifacts
+        from osia.slash_commands import chat_command_scope
         from osia.utils.key_chain import task_scope
 
         tool_attempt_metadata = self._tool_attempt_metadata
@@ -13113,18 +13207,19 @@ class OSIAAgent:
             from osia.computer_use_v4_integration import (
                 computer_use_v4_turn_scope,
             )
+            conversation_id = str(
+                current_conversation_id
+                or (self._tool_attempt_metadata or {}).get("conversation_id")
+                or self._chatgpt_conversation_id
+                or self._document_scope_id
+            )
             try:
-                with computer_use_v4_turn_scope(
+                with chat_command_scope(
+                    conversation_id, self._slash_turn_directives,
+                ), computer_use_v4_turn_scope(
                     self.provider,
                     self.model,
-                    conversation_id=str(
-                        current_conversation_id
-                        or (self._tool_attempt_metadata or {}).get(
-                            "conversation_id"
-                        )
-                        or self._chatgpt_conversation_id
-                        or self._document_scope_id
-                    ),
+                    conversation_id=conversation_id,
                     turn_id=str(
                         (self._tool_attempt_metadata or {}).get("turn_id")
                         or getattr(self.turn_context, "turn_ref", "")

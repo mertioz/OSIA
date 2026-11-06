@@ -28,6 +28,7 @@ def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
         "web", "model", "reasoning", "conversation", "tools", "status", "help",
+        "special", "skill", "skillcreator",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
@@ -35,10 +36,114 @@ def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     assert pc == mobile
 
 
+def test_special_is_conversation_bound_and_rejects_visual_calls(tmp_path, monkeypatch):
+    from osia import agent, conversations
+    from osia.chatgpt_account.app_server_client import _canonical_native_tools
+    from osia.computer_use_v4_integration import (
+        computer_use_v4_test_scope,
+        computer_use_v4_tools_available,
+        computer_use_v4_turn_scope,
+    )
+    from osia.slash_commands import chat_command_scope, validate_special_image_input
+    from osia.tool_contracts import effective_static_tool_specs
+
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    first = conversations.create_conversation()["id"]
+    second = conversations.create_conversation()["id"]
+    assert conversations.set_conversation_special_mode(first)["special_mode"] is True
+    assert conversations.conversation_special_mode(first)
+    assert not conversations.conversation_special_mode(second)
+    with pytest.raises(SlashDirectiveError, match="restore vision"):
+        validate_special_image_input(first, has_image=True)
+    validate_special_image_input(second, has_image=True)
+
+    assert conversations.claim_background_execution(first, "active-turn")
+    with pytest.raises(ValueError, match="conversation_busy"):
+        conversations.set_conversation_special_mode(first, False)
+    assert conversations.release_background_execution(first, "active-turn")
+
+    def unexpected_capture():
+        pytest.fail("Special mode dispatched a desktop capture")
+
+    monkeypatch.setitem(agent.TOOL_MAP, "take_screenshot", unexpected_capture)
+    with (
+        chat_command_scope(first, None),
+        computer_use_v4_test_scope(vision_capable=True),
+        computer_use_v4_turn_scope("chatgpt_account", "gpt-6.1-sol", conversation_id=first, turn_id="t1"),
+    ):
+        assert not computer_use_v4_tools_available()
+        tools = {spec.name for spec in effective_static_tool_specs()}
+        native_tools = {spec["name"] for spec in _canonical_native_tools()}
+        assert not any(name.startswith("computer_") for name in tools | native_tools)
+        assert not {"take_screenshot", "save_screenshot", "desktop_scroll"} & tools
+        assert {"desktop_type", "desktop_press", "inspect_desktop_surfaces", "get_browser_state"} <= tools
+        result = agent._execute_tool_with_policy("take_screenshot", {})
+        assert not result.dispatched
+        assert result.reason_code == "chat_command_capability_unavailable"
+        assert "The user disabled vision and mouse input" in agent.get_system_prompt("en")
+
+    with chat_command_scope(second, None):
+        assert "save_screenshot" in {spec.name for spec in effective_static_tool_specs()}
+    assert conversations.set_conversation_special_mode(first, False)["special_mode"] is False
+    validate_special_image_input(first, has_image=True)
+
+
+def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_path, monkeypatch):
+    from osia import agent, conversations, personality
+    from osia.chatgpt_account.app_server_client import _canonical_native_tools
+    from osia.slash_commands import chat_command_scope
+    from osia.tool_contracts import effective_static_tool_specs
+
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
+    monkeypatch.setattr(personality, "SKILLS_DIR", str(tmp_path / "skills"))
+    enabled = {}
+    monkeypatch.setattr(personality, "set_skill_enabled_state", enabled.__setitem__)
+    monkeypatch.setattr(personality, "get_setting", lambda key, default=None: (
+        enabled if key == "skills_enabled" else default
+    ))
+    monkeypatch.setattr(personality, "notify_config_changed", lambda _key: None)
+
+    arguments = {"name": "meeting-notes", "description": "Summarize meeting notes.",
+                 "instructions": "Présente les décisions et les actions.",
+                 "required_tools": ["read_document"]}
+    assert agent.tool_create_chat_skill(**arguments)["receipt"]["dispatch_state"] == "not_dispatched"
+    conv_id = conversations.create_conversation()["id"]
+    create = SlashTurnDirectivesV1.from_wire({"schema_version": 1, "skill_creator": True})
+    assert create.to_wire()["skill_creator"] is True
+    with pytest.raises(SlashDirectiveError, match="Describe the skill"):
+        create.require_sendable(body="", has_attachment=True)
+    with chat_command_scope(conv_id, create):
+        assert "create_chat_skill" in {spec.name for spec in effective_static_tool_specs()}
+        assert "create_chat_skill" in {spec["name"] for spec in _canonical_native_tools()}
+        assert "[User selected /skillcreator for this turn.]" in agent.get_system_prompt("fr")
+        saved = agent._execute_tool_with_policy("create_chat_skill", arguments)
+        assert saved.dispatched and not saved.is_error
+        assert saved.result["receipt"]["reason_code"] == "SKILL_CREATED"
+        duplicate = agent.tool_create_chat_skill(**{**arguments, "instructions": "Overwrite it."})
+        assert duplicate["receipt"]["outcome"] == "confirmed_failure_before_effect"
+        invalid = agent.tool_create_chat_skill(**{**arguments, "name": "../outside"})
+        assert invalid["receipt"]["dispatch_state"] == "not_dispatched"
+
+    selected = SlashTurnDirectivesV1.from_wire({"schema_version": 1, "skill_name": "meeting-notes.md"})
+    validate_live(selected, current_conversation_id=conv_id)
+    assert not personality.is_skill_enabled("meeting-notes.md")
+    with chat_command_scope(conv_id, selected):
+        prompt = agent.get_system_prompt("fr")
+        assert "User-selected OSIA skill for this turn" in prompt
+        assert arguments["instructions"] in prompt
+        assert "Required OSIA tools: read_document" in prompt
+        assert "- create_chat_skill(" not in prompt
+    assert arguments["instructions"] not in agent.get_system_prompt("fr")
+    with pytest.raises(SlashDirectiveError, match="unavailable"):
+        validate_live(SlashTurnDirectivesV1(skill_name="missing.md"), current_conversation_id=conv_id)
+
+
 @pytest.mark.parametrize(
     ("text", "query"),
     [
         ("/", ""),
+        ("/ ", ""),
+        ("/ special", "special"),
         ("   /web", "web"),
         ("/linear do it", "linear"),
         ("//web", None),
@@ -63,6 +168,7 @@ def test_literal_escape_and_selected_alias_preserve_body():
     assert consume_palette_prefix("  /we /linear find it") == (
         "  /linear find it"
     )
+    assert consume_palette_prefix("/ skillcreator a new brief") == "a new brief"
 
 
 def test_connector_and_conversation_title_collision_remain_distinct(monkeypatch):
@@ -449,15 +555,25 @@ def test_explicit_conversation_context_reads_only_selected_identity(monkeypatch)
 
 def test_persisted_replay_fingerprint_rejects_changed_directives(monkeypatch):
     import asyncio
-    import hashlib
     from osia.server import server
 
-    identity = "hello\0" + SlashTurnDirectivesV1(
-        capability_requirements=CapabilityRequirements(current_web=True),
-    ).canonical_json()
+    def identity(directives):
+        return server._turn_input_identity(json.dumps({
+            "attachment_batch_id": "",
+            "text": "hello",
+            "turn_directives": directives.canonical_json(),
+        }, sort_keys=True, separators=(",", ":")), kind="text")
+
+    selected = identity(SlashTurnDirectivesV1(skill_name="brief.md"))
     found = {
-        "client_content_hash": hashlib.sha256(identity.encode()).hexdigest(),
-        "turn_id": "turn-1",
+        **selected,
+        "conversation_id": "conv-1",
+        "request_id": "req-1",
+        "turn_id": "slash-replay-turn",
+        "run_id": "slash-replay-run",
+        "provider_id": "deepseek",
+        "model_id": "deepseek-flash",
+        "effective_reasoning": "auto",
         "user_message_id": "message-user",
         "assistant_message_id": "message-assistant",
         "response_event_id": "event-response",
@@ -480,17 +596,13 @@ def test_persisted_replay_fingerprint_rejects_changed_directives(monkeypatch):
 
     channel = Channel()
     assert asyncio.run(server._send_persisted_turn_for_request(
-        channel, "conv-1", "req-1", expected_user_content=identity,
+        channel, "conv-1", "req-1", expected_identity=selected,
     ))
     assert [frame["type"] for frame in channel.frames] == [
         "response", "turn_status",
     ]
-    async def changed():
-        return await server._send_persisted_turn_for_request(
-            channel,
-            "conv-1",
-            "req-1",
-            expected_user_content="hello\0changed-directives",
-        )
     with pytest.raises(ValueError, match="different content"):
-        asyncio.run(changed())
+        asyncio.run(server._send_persisted_turn_for_request(
+            channel, "conv-1", "req-1",
+            expected_identity=identity(SlashTurnDirectivesV1(skill_creator=True)),
+        ))

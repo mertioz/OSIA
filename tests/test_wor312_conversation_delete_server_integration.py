@@ -43,6 +43,66 @@ async def _internal_conversation_changed(request):
     return JSONResponse(await server.internal_conversation_changed(request))
 
 
+def test_special_mode_round_trips_through_mobile_and_reconnects(tmp_path, monkeypatch):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    monkeypatch.setattr(server, "MOBILE_TOKEN", "test-token")
+    monkeypatch.setattr(server, "_DURABLE_TRANSPORT", _NoDurableTransport())
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+    monkeypatch.setattr(server, "_CONVERSATION_BROADCAST_LOCK", None)
+    monkeypatch.setattr(server, "_LAST_BROADCAST_REVISIONS", {})
+    first = conversations.create_conversation()["id"]
+    second = conversations.create_conversation()["id"]
+
+    def authenticate(websocket, device):
+        websocket.send_json({
+            "type": "auth", "token": "test-token",
+            "device_id": device, "event_cursors": {},
+        })
+        return _receive_type(websocket, "conversations")
+
+    def change(websocket, operation_id, conversation_id, enabled):
+        websocket.send_json({
+            "type": "set_conversation_special", "operation_id": operation_id,
+            "conversation_id": conversation_id, "enabled": enabled,
+        })
+        ack = _receive_type(websocket, "conversations")
+        assert ack["operation_id"] == operation_id
+        return ack
+
+    app = Starlette(routes=[WebSocketRoute("/ws", server.websocket_endpoint)])
+    with TestClient(app, client=("127.0.0.1", 54321)) as client:
+        with (
+            client.websocket_connect("/ws") as mobile,
+            client.websocket_connect("/ws") as peer,
+        ):
+            authenticate(mobile, "slash-mobile")
+            authenticate(peer, "slash-peer")
+            ack = change(mobile, "special_enable", first, True)
+            assert ack["special_conversation_id"] == first
+            assert ack["special_error"] == ""
+            broadcast = _receive_type(peer, "conversations")
+            assert {item["id"]: item["special_mode"] for item in broadcast["items"]} == {
+                first: True, second: False,
+            }
+
+        with client.websocket_connect("/ws") as reconnected:
+            snapshot = authenticate(reconnected, "slash-mobile")
+            assert {item["id"]: item["special_mode"] for item in snapshot["items"]} == {
+                first: True, second: False,
+            }
+            ack = change(reconnected, "special_restore", first, False)
+            assert {item["id"]: item["special_mode"] for item in ack["items"]} == {
+                first: False, second: False,
+            }
+            ack = change(reconnected, "special_new", "", True)
+            new = ack["special_conversation_id"]
+            assert new and new not in (first, second)
+            assert conversations.conversation_special_mode(new)
+            replay = change(reconnected, "special_new", "", True)
+            assert replay["special_conversation_id"] == new
+            assert len(replay["items"]) == 3
+
+
 def test_real_store_single_bulk_and_desktop_server_deletion_paths(
     tmp_path, monkeypatch,
 ):

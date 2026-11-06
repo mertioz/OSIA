@@ -127,8 +127,10 @@ def _active_config() -> dict:
 
 
 def computer_use_v4_tools_available() -> bool:
+    from osia.slash_commands import current_chat_commands
+
     state = _TURN_STATE.get()
-    if state is None:
+    if state is None or current_chat_commands()[0]:
         return False
     config = _active_config()
     if isinstance(config.get("vision_capable"), bool):
@@ -146,9 +148,13 @@ def computer_use_v4_tools_available() -> bool:
 
 
 def _current_state() -> _ComputerTurnState:
+    from osia.slash_commands import current_chat_commands
+
     state = _TURN_STATE.get()
     if state is None:
         raise ComputerUseV4Error("TURN_CONTEXT_REQUIRED")
+    if current_chat_commands()[0]:
+        raise ComputerUseV4Error("CONVERSATION_VISION_DISABLED")
     return state
 
 

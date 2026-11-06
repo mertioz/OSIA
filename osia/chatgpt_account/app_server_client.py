@@ -140,6 +140,7 @@ _SAFE_NOTIFICATIONS = frozenset(
 
 _CANONICAL_NATIVE_TOOL_NAMES = (
     "declare_outcomes",
+    "create_chat_skill",
     "read_file",
     "run_command",
     "open_application",

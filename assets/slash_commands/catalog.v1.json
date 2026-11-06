@@ -84,6 +84,42 @@
       "icon_semantic": "help",
       "chip_behavior": "none",
       "handler_contract": "show_available_help_v1"
+    },
+    {
+      "id": "special.toggle",
+      "canonical_alias": "special",
+      "name": {"en": "Vision and mouse", "fr": "Vision et souris"},
+      "description": {"en": "Disable vision and mouse in this conversation", "fr": "Désactiver la vision et la souris dans cette discussion"},
+      "argument_hint": {"en": "", "fr": ""},
+      "kind": "action",
+      "availability_predicate": "chat_slash_extensions",
+      "icon_semantic": "vision_off",
+      "chip_behavior": "none",
+      "handler_contract": "toggle_conversation_special_v1"
+    },
+    {
+      "id": "skill.select",
+      "canonical_alias": "skill",
+      "name": {"en": "Use a skill", "fr": "Utiliser un skill"},
+      "description": {"en": "Choose a saved skill for the next message", "fr": "Choisir un skill enregistré pour le prochain message"},
+      "argument_hint": {"en": "skill", "fr": "skill"},
+      "kind": "selector",
+      "availability_predicate": "chat_slash_extensions",
+      "icon_semantic": "skill",
+      "chip_behavior": "removable",
+      "handler_contract": "select_skill_v1"
+    },
+    {
+      "id": "skill.create",
+      "canonical_alias": "skillcreator",
+      "name": {"en": "Create a skill", "fr": "Créer un skill"},
+      "description": {"en": "Describe a skill for OSIA to create and save", "fr": "Décrire le skill qu’OSIA doit créer et enregistrer"},
+      "argument_hint": {"en": "describe the skill", "fr": "décrire le skill"},
+      "kind": "modifier",
+      "availability_predicate": "chat_slash_extensions",
+      "icon_semantic": "skill",
+      "chip_behavior": "removable",
+      "handler_contract": "create_skill_for_turn_v1"
     }
   ]
 }

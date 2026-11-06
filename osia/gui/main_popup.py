@@ -1278,6 +1278,7 @@ class _ChatPage(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
+    special_requested = pyqtSignal()
     execution_cancel_requested = pyqtSignal(dict)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
@@ -1467,6 +1468,7 @@ class _ChatPage(QWidget):
 
         if conversation_id == self._draft_context:
             return
+        self._slash_palette.close_palette()
         self._save_current_draft()
         self._draft_context = conversation_id
         settings = load_settings() or {}
@@ -1579,6 +1581,11 @@ class _ChatPage(QWidget):
         selection_type = str(row.get("selection_type") or "")
         alias = str(row.get("canonical_alias") or "")
         next_directives = self._directives
+        if handler == "toggle_conversation_special_v1":
+            self._input.setPlainText(consume_palette_prefix(self._input.text()))
+            self.special_requested.emit()
+            self._input.setFocus()
+            return
         if handler in {
             "show_safe_tools_v1",
             "show_safe_status_v1",
@@ -1647,6 +1654,14 @@ class _ChatPage(QWidget):
                 next_directives,
                 reasoning_override=str(row["reasoning_level"]),
             )
+        elif selection_type == "skill":
+            next_directives = replace(
+                next_directives, skill_name=str(row["skill_name"]), skill_creator=False,
+            )
+        elif handler == "create_skill_for_turn_v1":
+            next_directives = replace(
+                next_directives, skill_name=None, skill_creator=True,
+            )
         else:
             return
         try:
@@ -1659,6 +1674,11 @@ class _ChatPage(QWidget):
         self._rebuild_directive_chips()
         self._sync_send_state()
         self._input.setFocus()
+        if handler == "create_skill_for_turn_v1" and not self._input.text().strip():
+            self.show_notice(
+                "Décris le skill que tu veux créer."
+                if i18n.get_language() == "fr" else "Describe the skill you want to create."
+            )
 
     def _directive_rows(self) -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = []
@@ -1674,6 +1694,10 @@ class _ChatPage(QWidget):
             rows.append(("model", self._directives.model_override.model_id))
         if self._directives.reasoning_override is not None:
             rows.append(("reasoning", self._directives.reasoning_override))
+        if self._directives.skill_name is not None:
+            rows.append(("skill", self._directives.skill_name[:-3]))
+        if self._directives.skill_creator:
+            rows.append(("skillcreator", "/skillcreator"))
         return rows
 
     def _rebuild_directive_chips(self) -> None:
@@ -1695,6 +1719,8 @@ class _ChatPage(QWidget):
             "conversation": {"conversation_refs": ()},
             "model": {"model_override": None},
             "reasoning": {"reasoning_override": None},
+            "skill": {"skill_name": None},
+            "skillcreator": {"skill_creator": False},
         }.get(identity)
         if changes is None:
             return
@@ -2304,6 +2330,8 @@ class _ChatPage(QWidget):
         )
         if self._busy and not waiting:
             self.show_notice(self._BUSY_TEXT)
+            return
+        if not waiting and self._slash_palette.activate_current():
             return
         text = escaped_literal_text(self._input.toPlainText()).strip()
         if waiting and (not text or len(text) > 160):
@@ -11304,6 +11332,7 @@ class MainPopup(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
+    special_requested = pyqtSignal()
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
@@ -11459,6 +11488,7 @@ class MainPopup(QWidget):
         self._chat.informational_requested.connect(
             self.informational_requested.emit
         )
+        self._chat.special_requested.connect(self.special_requested.emit)
         self._chat.execution_cancel_requested.connect(
             self._on_chat_execution_cancel_requested
         )

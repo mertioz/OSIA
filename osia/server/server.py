@@ -5524,6 +5524,7 @@ def _build_config_snapshot() -> dict:
     except Exception:
         cfg["stt_local_models_available"] = []
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
+    cfg["chat_slash_extensions"] = 1
     try:
         from osia.slash_commands import safe_availability_overlay
 
@@ -8692,6 +8693,52 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json(snapshot)
                 continue
 
+            if msg_type == "set_conversation_special":
+                operation_id = msg.get("operation_id")
+                if not isinstance(operation_id, str) or not re.fullmatch(
+                    r"special_[A-Za-z0-9_-]{1,112}", operation_id,
+                ):
+                    continue
+                conv_id = msg.get("conversation_id")
+                enabled = msg.get("enabled")
+                error = ""
+                try:
+                    if not isinstance(conv_id, str) or type(enabled) is not bool:
+                        raise ValueError("invalid_special_request")
+                    unbound = not conv_id
+                    if unbound:
+                        if not enabled:
+                            raise ValueError("invalid_special_request")
+                        conv, _ = await asyncio.to_thread(
+                            conversations.resolve_request_conversation,
+                            operation_id, special_mode=True,
+                        )
+                        conv_id = conv["id"]
+                        session_history = []
+                        active_conv_id = conv_id
+                    else:
+                        conv = await asyncio.to_thread(
+                            conversations.set_conversation_special_mode, conv_id, enabled,
+                        )
+                    await _broadcast_canonical_conversation_change(
+                        conv_id, revision=conv["revision"],
+                        operation_id=conv["last_operation_id"], exclude=out,
+                    )
+                except (OSError, ValueError, RuntimeError) as exc:
+                    error = (
+                        str(exc) if str(exc) in {
+                            "conversation_not_found", "conversation_busy", "invalid_special_request",
+                        } else "special_storage_error"
+                    )
+                snapshot = conversations.conversation_snapshot()
+                snapshot.update(
+                    operation_id=operation_id,
+                    special_conversation_id="" if error else conv_id,
+                    special_error=error,
+                )
+                await out.send_json(snapshot)
+                continue
+
             if msg_type == "get_chat_screenshot":
                 await _send_chat_screenshot(out, msg)
                 continue
@@ -10810,10 +10857,18 @@ async def websocket_endpoint(ws: WebSocket):
                             "conversation_id": _conv,
                         })
                         continue
-                    if turn_directives is not None:
-                        try:
-                            from osia.slash_commands import validate_live
+                    try:
+                        from osia.slash_commands import validate_live, validate_special_image_input
 
+                        has_image_attachment = bool(
+                            validated_attachment_batch is not None
+                            and any(
+                                item.detected_category == "image"
+                                for item in validated_attachment_batch.files.values()
+                            )
+                        )
+                        validate_special_image_input(_conv, has_image=has_image_attachment)
+                        if turn_directives is not None:
                             turn_directives.require_sendable(
                                 body=user_text,
                                 has_attachment=bool(attachment_batch_id),
@@ -10822,33 +10877,23 @@ async def websocket_endpoint(ws: WebSocket):
                                 turn_directives,
                                 current_conversation_id=_conv,
                                 has_attachment=bool(attachment_batch_id),
-                                requires_image_attachment=bool(
-                                    validated_attachment_batch is not None
-                                    and any(
-                                        item.detected_category == "image"
-                                        for item in validated_attachment_batch.files.values()
-                                    )
-                                ),
+                                requires_image_attachment=has_image_attachment,
                             )
-                        except Exception as exc:
-                            error_code = getattr(
-                                exc, "code", "invalid_directives"
-                            )
-                            locale = normalize_locale(msg.get("locale")) or "en"
-                            message_fn = getattr(exc, "message", None)
-                            safe_message = (
-                                message_fn(locale)
-                                if callable(message_fn) else
-                                "Invalid slash directives."
-                            )
-                            await out.send_json({
-                                "type": "status",
-                                "content": "error",
-                                "error": error_code,
-                                "message": safe_message,
-                                "conversation_id": _conv,
-                            })
-                            continue
+                    except Exception as exc:
+                        error_code = getattr(exc, "code", "invalid_directives")
+                        locale = normalize_locale(msg.get("locale")) or "en"
+                        message_fn = getattr(exc, "message", None)
+                        safe_message = message_fn(locale) if callable(message_fn) else "Invalid slash directives."
+                        await out.send_json({
+                            "type": "status",
+                            "content": "error",
+                            "error": error_code,
+                            "message": safe_message,
+                            "conversation_id": _conv,
+                            "client_request_id": client_request_id,
+                            "request_id": client_request_id,
+                        })
+                        continue
                     if _is_conversation_busy(_conv):
                         if await _handle_waiting_tool_command(
                             out, _conv, user_text,

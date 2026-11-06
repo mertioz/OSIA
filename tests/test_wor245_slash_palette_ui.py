@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -12,6 +13,49 @@ from osia.slash_commands import CapabilityRequirements, ModelOverride
 
 
 _APP = QApplication.instance() or QApplication([])
+
+
+def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(monkeypatch):
+    from osia import personality
+    from osia.gui import slash_palette
+
+    monkeypatch.setattr(slash_palette, "model_availability", lambda **_kwargs: ())
+    monkeypatch.setattr(personality, "discover_skills", lambda: [
+        SimpleNamespace(filename="brief.md", description="Make a brief", available=True),
+    ])
+    chat = _ChatPage()
+    chat.show()
+    special = QSignalSpy(chat.special_requested)
+    typed = QSignalSpy(chat.submit_directive_draft)
+    legacy = QSignalSpy(chat.send_text)
+    try:
+        chat._input.setPlainText("/")
+        assert {"special", "skill", "skillcreator"} <= {
+            row.get("canonical_alias") for row in chat._slash_palette._rows
+        }
+        chat._input.setPlainText("/special")
+        chat._on_send()
+        assert len(special) == 1
+        assert not typed and not legacy
+
+        chat._input.setPlainText("/skill")
+        chat._on_send()
+        assert chat._slash_palette._rows[0]["skill_name"] == "brief.md"
+        chat._slash_palette._list.itemClicked.emit(chat._slash_palette._list.item(0))
+        chat._input.setPlainText("Summarize this.")
+        chat._on_send()
+        assert typed[0][2]["skill_name"] == "brief.md"
+        assert chat.accept_directive_submission()
+
+        chat._input.setPlainText("/skillcreator Write a meeting skill.")
+        chat._on_send()
+        assert chat._input.toPlainText() == "Write a meeting skill."
+        chat._on_send()
+        assert typed[1][2]["skill_creator"] is True
+        assert not legacy
+    finally:
+        chat.close()
+        chat.deleteLater()
 
 
 def test_modifier_selection_creates_chip_and_enter_emits_typed_draft_only():

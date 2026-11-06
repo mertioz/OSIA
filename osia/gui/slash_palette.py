@@ -81,8 +81,8 @@ class SlashCommandPalette(QFrame):
             "Commandes slash" if self._locale == "fr" else "Slash commands",
         )
 
-    def _show_rows(self, rows: list[dict], title: str) -> None:
-        self._rows = rows[:MAX_RESULTS]
+    def _show_rows(self, rows: list[dict], title: str, *, limit: int | None = MAX_RESULTS) -> None:
+        self._rows = rows[:limit]
         self._list.clear()
         self._title.setText(title)
         categorized = any("category" in row for row in self._rows)
@@ -148,11 +148,16 @@ class SlashCommandPalette(QFrame):
                         break
             return True
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            item = self._list.currentItem()
-            if item is not None and bool(item.flags() & Qt.ItemFlag.ItemIsEnabled):
-                self._activate_item(item)
-            return True
+            return self.activate_current()
         return False
+
+    def activate_current(self) -> bool:
+        if not self.isVisible():
+            return False
+        item = self._list.currentItem()
+        if item is not None and bool(item.flags() & Qt.ItemFlag.ItemIsEnabled):
+            self._activate_item(item)
+        return True
 
     def _activate_item(self, item: QListWidgetItem) -> None:
         row = item.data(Qt.ItemDataRole.UserRole)
@@ -163,6 +168,27 @@ class SlashCommandPalette(QFrame):
             self.close_palette()
             return
         handler = str(row.get("handler_contract") or "")
+        if handler == "select_skill_v1":
+            from osia.personality import discover_skills
+
+            rows = [
+                {
+                    "selection_type": "skill",
+                    "skill_name": skill.filename,
+                    "name": skill.filename[:-3],
+                    "description": " ".join(skill.description.split())[:160],
+                    "enabled": skill.available,
+                }
+                for skill in discover_skills()
+            ]
+            if not rows:
+                rows.append({
+                    "name": "Crée un skill avec /skillcreator."
+                    if self._locale == "fr" else "Create a skill with /skillcreator.",
+                    "enabled": False,
+                })
+            self._show_rows(rows, "Skills", limit=None)
+            return
         if handler == "select_exact_model_v1":
             models = [{
                 "selection_type": "model",

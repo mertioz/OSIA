@@ -7,6 +7,8 @@ reach attachments, routing, or a provider.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -39,6 +41,8 @@ _TOP_LEVEL_KEYS = frozenset(
         "conversation_refs",
         "model_override",
         "reasoning_override",
+        "skill_name",
+        "skill_creator",
     }
 )
 
@@ -192,6 +196,8 @@ class SlashTurnDirectivesV1:
     conversation_refs: tuple[ConversationRef, ...] = field(default_factory=tuple)
     model_override: ModelOverride | None = None
     reasoning_override: str | None = None
+    skill_name: str | None = None
+    skill_creator: bool = False
 
     @classmethod
     def from_wire(cls, raw: Any) -> "SlashTurnDirectivesV1":
@@ -233,23 +239,48 @@ class SlashTurnDirectivesV1:
                     "Unsupported reasoning level.",
                     "Niveau de raisonnement non pris en charge.",
                 )
+        skill_name = value.get("skill_name")
+        if skill_name is not None:
+            skill_name = _bounded_text(skill_name, "skill_name", 256)
+            if not skill_name.lower().endswith(".md") or any(
+                char in skill_name for char in ("/", "\\")
+            ):
+                raise SlashDirectiveError(
+                    "invalid_skill_name", "Invalid skill selection.",
+                    "Sélection de skill invalide.",
+                )
+        skill_creator = value.get("skill_creator", False)
+        if type(skill_creator) is not bool:
+            raise SlashDirectiveError(
+                "invalid_directives", "skill_creator must be a boolean.",
+                "skill_creator doit être un booléen.",
+            )
         result = cls(
             connector_hints=connectors,
             capability_requirements=requirements,
             conversation_refs=refs,
             model_override=model,
             reasoning_override=reasoning,
+            skill_name=skill_name,
+            skill_creator=skill_creator,
         )
         result._validate_bounds()
         return result
 
     def _validate_bounds(self) -> None:
+        if self.skill_name and self.skill_creator:
+            raise SlashDirectiveError(
+                "conflicting_skill_commands",
+                "Choose a skill or create one for this turn.",
+                "Choisissez un skill ou créez-en un pour ce tour.",
+            )
         count = (
             len(self.connector_hints)
             + len(self.conversation_refs)
             + int(self.capability_requirements.current_web)
             + int(self.model_override is not None)
             + int(self.reasoning_override is not None)
+            + int(bool(self.skill_name) or self.skill_creator)
         )
         if count > MAX_MODIFIERS:
             raise SlashDirectiveError(
@@ -271,6 +302,8 @@ class SlashTurnDirectivesV1:
             or self.capability_requirements.current_web
             or self.model_override
             or self.reasoning_override is not None
+            or self.skill_name
+            or self.skill_creator
         )
 
     def to_wire(self) -> dict[str, Any]:
@@ -284,6 +317,10 @@ class SlashTurnDirectivesV1:
             out["model_override"] = self.model_override.to_wire()
         if self.reasoning_override is not None:
             out["reasoning_override"] = self.reasoning_override
+        if self.skill_name is not None:
+            out["skill_name"] = self.skill_name
+        if self.skill_creator:
+            out["skill_creator"] = True
         return out
 
     def canonical_json(self) -> str:
@@ -292,6 +329,11 @@ class SlashTurnDirectivesV1:
         )
 
     def require_sendable(self, *, body: str, has_attachment: bool) -> None:
+        if self.skill_creator and not str(body or "").strip():
+            raise SlashDirectiveError(
+                "skill_description_required", "Describe the skill you want to create.",
+                "Décris le skill que tu veux créer.",
+            )
         if not self.is_empty and not str(body or "").strip() and not has_attachment:
             raise SlashDirectiveError(
                 "directive_body_required",
@@ -301,6 +343,40 @@ class SlashTurnDirectivesV1:
 
 
 EMPTY_DIRECTIVES = SlashTurnDirectivesV1()
+
+_CHAT_COMMAND_CONTEXT: ContextVar[tuple[bool, SlashTurnDirectivesV1]] = ContextVar(
+    "osia_chat_command_context", default=(False, EMPTY_DIRECTIVES),
+)
+
+
+@contextmanager
+def chat_command_scope(conversation_id: str, directives: SlashTurnDirectivesV1 | None):
+    """Bind the canonical conversation flag and explicit composer choices."""
+    from osia.conversations import conversation_special_mode
+
+    token = _CHAT_COMMAND_CONTEXT.set((
+        conversation_special_mode(conversation_id),
+        directives or EMPTY_DIRECTIVES,
+    ))
+    try:
+        yield
+    finally:
+        _CHAT_COMMAND_CONTEXT.reset(token)
+
+
+def current_chat_commands() -> tuple[bool, SlashTurnDirectivesV1]:
+    return _CHAT_COMMAND_CONTEXT.get()
+
+
+def validate_special_image_input(conversation_id: str, *, has_image: bool) -> None:
+    from osia.conversations import conversation_special_mode
+
+    if has_image and conversation_special_mode(conversation_id):
+        raise SlashDirectiveError(
+            "special_mode_image_disabled",
+            "Use /special to restore vision before sending an image.",
+            "Utilise /special pour réactiver la vision avant d’envoyer une image.",
+        )
 
 
 @dataclass(frozen=True)
@@ -357,7 +433,7 @@ def load_catalog() -> tuple[dict[str, Any], ...]:
         alias = str(item.get("canonical_alias") or "")
         if not identity or identity in seen_ids or not ALIAS_RE.fullmatch(alias) or alias in seen_aliases:
             raise RuntimeError("Invalid slash command identity")
-        if item.get("kind") not in {"modifier", "selector", "informational"}:
+        if item.get("kind") not in {"modifier", "selector", "informational", "action"}:
             raise RuntimeError("Invalid slash command kind")
         seen_ids.add(identity)
         seen_aliases.add(alias)
@@ -371,7 +447,7 @@ def slash_palette_query(text: str) -> str | None:
     stripped = source.lstrip()
     if not stripped.startswith("/") or stripped.startswith("//"):
         return None
-    remainder = stripped[1:]
+    remainder = stripped[1:].lstrip()
     token = remainder.split(maxsplit=1)[0] if remainder else ""
     if len(token) > MAX_FILTER_CHARS or not _PARTIAL_ALIAS_RE.fullmatch(token):
         return None
@@ -387,34 +463,21 @@ def escaped_literal_text(text: str) -> str:
 
 
 def consume_selected_alias(text: str, alias: str) -> str:
-    if not ALIAS_RE.fullmatch(str(alias or "")):
-        return str(text or "")
     source = str(text or "")
-    leading = len(source) - len(source.lstrip())
-    tail = source[leading:]
-    if not tail.startswith("/") or tail.startswith("//"):
+    if not ALIAS_RE.fullmatch(str(alias or "")) or slash_palette_query(source) != alias:
         return source
-    token_end = len(tail)
-    for index, char in enumerate(tail):
-        if char.isspace():
-            token_end = index
-            break
-    if tail[1:token_end] != alias:
-        return source
-    remainder = tail[token_end:].lstrip()
-    return source[:leading] + remainder
+    return consume_palette_prefix(source)
 
 
 def consume_palette_prefix(text: str) -> str:
     """Consume the currently filtered initial slash token after a selection."""
     source = str(text or "")
     leading = len(source) - len(source.lstrip())
-    tail = source[leading:]
     query = slash_palette_query(source)
     if query is None:
         return source
-    token_end = 1 + len(query)
-    return source[:leading] + tail[token_end:].lstrip()
+    remainder = source[leading + 1:].lstrip()
+    return source[:leading] + remainder[len(query):].lstrip()
 
 
 def _legacy_gmail(entry: Mapping[str, Any]) -> bool:
@@ -575,7 +638,9 @@ def palette_items(
     model_id: str = "",
     current_conversation_id: str = "",
 ) -> tuple[dict[str, Any], ...]:
-    """Build at most 24 safe palette rows, capped at eight per category."""
+    """Show all matching commands and a bounded set of contextual results."""
+    from osia.conversations import conversation_special_mode
+
     language = "fr" if str(locale).lower().startswith("fr") else "en"
     query = str(filter_text or "")[:MAX_FILTER_CHARS].strip().lower()
     models = model_availability(refresh=False)
@@ -609,6 +674,12 @@ def palette_items(
         item["description"] = str(
             raw["description"].get(language) or raw["description"].get("en") or ""
         )
+        if raw["id"] == "special.toggle" and conversation_special_mode(current_conversation_id):
+            item["description"] = (
+                "Réactiver la vision et la souris dans cette discussion"
+                if language == "fr" else
+                "Restore vision and mouse in this conversation"
+            )
         item["argument_hint"] = str(
             raw["argument_hint"].get(language) or raw["argument_hint"].get("en") or ""
         )
@@ -645,7 +716,7 @@ def palette_items(
     bounded = []
     for item in items:
         category = str(item.get("category") or "commands")
-        if counts.get(category, 0) >= MAX_RESULTS_PER_CATEGORY:
+        if category != "commands" and counts.get(category, 0) >= MAX_RESULTS_PER_CATEGORY:
             continue
         counts[category] = counts.get(category, 0) + 1
         bounded.append(item)
@@ -664,6 +735,15 @@ def validate_live(
 ) -> SlashTurnDirectivesV1:
     """Validate every identity against current canonical state, without mutation."""
     directives._validate_bounds()
+    if directives.skill_name is not None:
+        from osia.personality import get_skill_definition
+
+        skill = get_skill_definition(directives.skill_name)
+        if skill is None or not skill.available:
+            raise SlashDirectiveError(
+                "skill_unavailable", "The selected skill is unavailable.",
+                "Le skill sélectionné est indisponible.",
+            )
     connectors = {item.connector_id: item for item in connector_availability()}
     for hint in directives.connector_hints:
         connector = connectors.get(hint.connector_id)

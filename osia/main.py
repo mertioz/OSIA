@@ -3966,7 +3966,7 @@ def wake_mode():
         language_text: str | None = None,
         turn_directives=None,
     ) -> bool:
-        from osia.slash_commands import SlashDirectiveError
+        from osia.slash_commands import SlashDirectiveError, validate_special_image_input
 
         conv = _ensure_active_conversation(display_text)
         conv_id = conv["id"]
@@ -3990,6 +3990,7 @@ def wake_mode():
                 ]
             else:
                 attachment_metadata = []
+            validate_special_image_input(conv_id, has_image=bool(attachment_metadata))
             if attachment_metadata:
                 persistence_metadata["_attachments"] = [
                     dict(item) for item in attachment_metadata
@@ -4736,6 +4737,41 @@ def wake_mode():
         ):
             popup.accept_directive_submission()
 
+    def handle_slash_special() -> None:
+        nonlocal active_conv
+        language_fr = i18n.get_language() == "fr"
+        try:
+            if active_conv is None:
+                active_conv = conversations.create_conversation(special_mode=True)
+                popup.refresh_conversations(active_conv["id"])
+                popup.bind_unbound_draft(active_conv["id"])
+            else:
+                active_conv = conversations.set_conversation_special_mode(active_conv["id"])
+        except (OSError, ValueError) as error:
+            if str(error) == "conversation_busy":
+                popup.show_conversation_busy_notice()
+            else:
+                popup._chat.show_notice(
+                    "Impossible de modifier /special dans cette discussion."
+                    if language_fr else "Could not change /special in this conversation."
+                )
+            return
+        _notify_mobile_conversation_changed(
+            active_conv["id"], revision=active_conv["revision"],
+            operation_id=active_conv["last_operation_id"],
+        )
+        if active_conv.get("special_mode") is True:
+            notice = (
+                "Vision et souris désactivées dans cette discussion."
+                if language_fr else "Vision and mouse disabled in this conversation."
+            )
+        else:
+            notice = (
+                "Vision et souris réactivées dans cette discussion."
+                if language_fr else "Vision and mouse restored in this conversation."
+            )
+        popup._chat.show_notice(notice)
+
     def handle_slash_information(command_id: str) -> None:
         from osia.reasoning import resolve_reasoning_option_id
         from osia.slash_commands import informational_payload, model_availability
@@ -4810,6 +4846,7 @@ def wake_mode():
     popup.submit_draft.connect(handle_submit_draft)
     popup.submit_directive_draft.connect(handle_submit_directive_draft)
     popup.informational_requested.connect(handle_slash_information)
+    popup.special_requested.connect(handle_slash_special)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)

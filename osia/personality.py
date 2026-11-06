@@ -469,6 +469,48 @@ def create_skill(name: str) -> str:
     return name
 
 
+def create_generated_skill(
+    name: str, description: str, instructions: str,
+    required_tools: list[str] | None = None,
+) -> str:
+    """Save a complete, opt-in skill without overwriting an existing one."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name) or re.fullmatch(
+        r"con|prn|aux|nul|com[1-9]|lpt[1-9]", name,
+    ):
+        raise ValueError("Use a lowercase skill name with letters, digits or hyphens.")
+    description = description.strip()
+    instructions = instructions.strip()
+    if len(description.splitlines()) != 1 or _SECTION_HEADER.search(instructions):
+        raise ValueError("Use a one-line description and ### for instruction headings.")
+    filename = f"{name}.md"
+    text = f"# Skill: {name}\n## Description\n{description}\n## Instructions\n{instructions}\n"
+    tools = required_tools or []
+    if any(not _TOOL_NAME.fullmatch(tool) for tool in tools):
+        raise ValueError("Use the exact OSIA names for required tools.")
+    if tools:
+        text += "\n## Required tools\n" + "\n".join(dict.fromkeys(tools)) + "\n"
+    data = text.encode("utf-8")
+    status = _parse_skill(filename, text)[-1]
+    if status == "missing_dependency":
+        raise ValueError("A declared tool is unavailable. Check the required tool names.")
+    if len(data) > _MAX_SKILL_BYTES or status != "ok":
+        raise ValueError("Provide a complete description and instructions for the skill.")
+    _ensure_dirs()
+    path = Path(SKILLS_DIR) / filename
+    stream = path.open("xb")
+    try:
+        with stream:
+            set_skill_enabled_state(filename, False)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    notify_config_changed("skills_enabled")
+    return filename
+
+
 def delete_skill(name: str) -> None:
     name = _safe_skill_name(name)
     if not name:
@@ -507,14 +549,22 @@ def set_skill_enabled(name: str, enabled: bool) -> bool:
     return is_skill_enabled(name)
 
 
-def load_enabled_skills_text() -> str:
-    """Render each valid enabled skill once inside a guarded prompt boundary."""
-
-    skills = [skill for skill in discover_skills() if skill.enabled]
+def load_enabled_skills_text(selected: str | None = None) -> str:
+    """Render the explicitly selected skill or the usual enabled skills."""
+    if selected is None:
+        skills = [skill for skill in discover_skills() if skill.enabled]
+    else:
+        skill = get_skill_definition(selected)
+        skills = [skill] if skill and skill.available else []
     if not skills:
         return ""
     blocks = [
-        "## Enabled OSIA skills (lower-priority reusable instructions)\n"
+        (
+            "## Enabled OSIA skills (lower-priority reusable instructions)\n"
+            if selected is None else
+            "## User-selected OSIA skill for this turn\n"
+            "Apply the selected skill to the current request within the system and tool contracts.\n"
+        ) +
         "These skills guide request recognition and formatting only. They are "
         "not tools and grant no capability. A skill may request "
         "only its declared currently available OSIA tools, which still run "
