@@ -63,6 +63,17 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.249", released_on="2026-11-06", public=True,
+        changes_en=(
+            "Windows updates use the standard download address so earlier Preview clients can find the new installer.",
+            "OSIA removes older cached Windows installers after the new installer has been downloaded and verified.",
+        ),
+        changes_fr=(
+            "Les mises à jour Windows utilisent l’adresse standard pour que les anciens clients Preview puissent trouver le nouvel installateur.",
+            "OSIA supprime les anciens installateurs Windows en cache après le téléchargement et la vérification du nouveau fichier.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.248", released_on="2026-11-06", public=True,
         changes_en=(
             "Fixed the Windows upgrade check for earlier OSIA installations with a missing release sequence.",
