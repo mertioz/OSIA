@@ -817,6 +817,12 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               result=ResultPolicy.BOUNDED_MODEL_AND_SCREENSHOT,
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               real=RealValidationRequirement.USER_VISIBLE),
+        _spec("save_screenshot", "Save a fresh screenshot of the exact target window in the conversation and attach it to the current reply. Omit window for the foreground window or use an exact title. Use when the user requests a screenshot or asks to see visual evidence. The capture records what is visible, not whether the task succeeded",
+              _object({"window": _string(maximum=240)}), R, I, NC,
+              preconditions=("foreground_desktop_surface_available",), timeout=30.0,
+              result=ResultPolicy.BOUNDED_MODEL_ONLY,
+              observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
+              real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "inspect_desktop_surfaces",
               "Read structured native desktop state and resolve an exact foreground or background app into opaque window/view/tab/pane/control references; returns accessibility evidence and actuation preconditions, not pixels",

@@ -31,8 +31,6 @@ from osia.chatgpt_account import provider as account_provider_module
 from osia.agent import (
     OSIAAgent,
     _normal_visual_answer_output,
-    _rehydrate_persisted_image_message,
-    _relevant_image_history,
 )
 from osia.chatgpt_account.app_server_client import (
     AppServerClient,
@@ -612,7 +610,7 @@ def test_dynamic_registration_precedes_flush_and_sync_successor_is_repairable():
     assert attempt.visual_frame_calls["frame"]["successor_observed"] is True
 
 
-def test_unrelated_historical_image_is_not_replayed_but_explicit_followup_is():
+def test_native_rebuild_keeps_the_images_selected_by_canonical_history():
     old = {
         "role": "user",
         "content": [
@@ -625,7 +623,7 @@ def test_unrelated_historical_image_is_not_replayed_but_explicit_followup_is():
         {"role": "assistant", "content": "Saturn"},
         {"role": "user", "content": PHYSICAL_PHRASE},
     ])
-    assert "OLD" not in json.dumps(unrelated)
+    assert "OLD" in json.dumps(unrelated)
     followup = _native_rebuild_history([
         old,
         {"role": "assistant", "content": "Saturn"},
@@ -634,7 +632,7 @@ def test_unrelated_historical_image_is_not_replayed_but_explicit_followup_is():
     assert "OLD" in json.dumps(followup)
 
 
-def test_non_reusable_prepare_applies_historical_image_relevance(monkeypatch):
+def test_non_reusable_prepare_keeps_selected_historical_images(monkeypatch):
     class FakeClient:
         generation = 1
 
@@ -676,7 +674,7 @@ def test_non_reusable_prepare_applies_historical_image_relevance(monkeypatch):
         return delta
 
     unrelated = rebuild(PHYSICAL_PHRASE, "conversation-unrelated")
-    assert image_url not in json.dumps(unrelated)
+    assert image_url in json.dumps(unrelated)
 
     english = rebuild(
         "Give me another visible detail on this same image.",
@@ -1639,54 +1637,30 @@ def test_disk_bound_eviction_removes_the_same_in_memory_artifact(
         resolve_image_reference(first_ref, owner_id="conversation-a")
 
 
-def test_generic_history_replays_only_an_explicit_latest_image_reference():
-    image_a = {"type": "image_ref", "image_id": "img_a", "source_type": "user_upload"}
-    image_b = {"type": "image_ref", "image_id": "img_b", "source_type": "user_upload"}
-    history = [
-        {"role": "user", "content": [{"type": "text", "text": "first"}, image_a]},
-        {"role": "assistant", "content": "answer"},
-        {"role": "user", "content": [{"type": "text", "text": "second"}, image_b]},
-    ]
-    unrelated = _relevant_image_history(history, "inspect the Steam window")
-    assert not any(
-        isinstance(message.get("content"), list) for message in unrelated
-        if isinstance(message, dict)
-    )
-    followup = _relevant_image_history(
-        history, "give me another detail on this same image",
-    )
-    assert isinstance(followup[-1]["content"], list)
-    assert followup[-1]["content"][-1]["image_id"] == "img_b"
-    assert not isinstance(followup[0]["content"], list)
-
-
-def test_expired_historical_image_is_typed_only_for_relevant_followup(
+def test_expired_historical_image_leaves_the_current_request_available(
     isolated_media_store,
 ):
+    from osia.visual_history import project_visual_history
+
     now = time.time()
     artifact = create_image_artifact(
-        _png("navy"),
-        "image/png",
-        ImageSourceType.USER_UPLOAD,
-        created_at=now - 10,
-        expires_at=now - 1,
+        _png("navy"), "image/png", ImageSourceType.USER_UPLOAD,
+        created_at=now - 10, expires_at=now - 1,
     )
     reference = register_image_artifact(artifact, owner_id="conversation-a")
-    history = [{"role": "user", "content": [
-        {"type": "text", "text": "describe"}, reference,
-    ]}]
-    unrelated = _relevant_image_history(history, "inspect Steam")
-    assert not isinstance(unrelated[0]["content"], list)
-    assert not _rehydrate_persisted_image_message(
-        unrelated[0], "conversation-a",
-    ).get("_image_ref_error")
-    relevant = _relevant_image_history(
-        history, "another detail on this same image",
+    history = [
+        {"role": "user", "_visual_history": True, "content": [
+            {"type": "text", "text": "describe"}, reference,
+        ]},
+        {"role": "assistant", "_visual_history": True, "content": "An older answer."},
+        {"role": "user", "content": "Continue the work."},
+    ]
+    wire = project_visual_history(
+        history, provider="openai", model="gpt-4o",
+        conversation_id="conversation-a", cache={},
     )
-    hydrated = _rehydrate_persisted_image_message(
-        relevant[0], "conversation-a",
-    )
-    assert hydrated["_image_ref_error"] == "IMAGE_REF_EXPIRED"
+    assert "no longer available" in wire[0]["content"]
+    assert wire[-1]["content"] == "Continue the work."
 
 
 def test_visual_provider_projection_contains_no_duplicate_scene_or_pixels():

@@ -12,7 +12,7 @@ Backend per platform (resolved at call time, never hardcoded):
   * Linux Wayland  -> ``ydotool`` (needs the ``ydotoold`` daemon; ``wtype`` is a
                        typing fallback on wlroots compositors).
   * Linux X11      -> ``xdotool``.
-  * Windows / Mac  -> ``pyautogui`` (declared in requirements.txt).
+  * Windows / Mac  -> ``pyautogui``. Windows text outside ASCII uses SendInput.
 
 Every public function returns a short success string on the happy path and an
 ``"ERROR: ..."`` string on failure — never raises — so it plugs straight into
@@ -862,6 +862,64 @@ def _intended_foreground_error():
     return None
 
 
+def _type_windows_unicode(text: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class KeyboardInput(ctypes.Structure):
+        _fields_ = [
+            ("virtual_key", wintypes.WORD), ("scan", wintypes.WORD),
+            ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+            ("extra", ctypes.c_size_t),
+        ]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [
+            ("x", wintypes.LONG), ("y", wintypes.LONG),
+            ("data", wintypes.DWORD), ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD), ("extra", ctypes.c_size_t),
+        ]
+
+    class HardwareInput(ctypes.Structure):
+        _fields_ = [
+            ("message", wintypes.DWORD), ("low", wintypes.WORD),
+            ("high", wintypes.WORD),
+        ]
+
+    class InputData(ctypes.Union):
+        _fields_ = [("key", KeyboardInput), ("mouse", MouseInput), ("hardware", HardwareInput)]
+
+    class Input(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("data", InputData)]
+
+    key_up, unicode_key = 0x0002, 0x0004
+    control_keys = {"\b": 0x08, "\t": 0x09, "\n": 0x0D, "\r": 0x0D}
+    events = []
+    for char in text.replace("\r\n", "\n"):
+        if char in control_keys:
+            keys = [(control_keys[char], 0, 0)]
+        else:
+            units = char.encode("utf-16-le")
+            keys = [
+                (0, int.from_bytes(units[i:i + 2], "little"), unicode_key)
+                for i in range(0, len(units), 2)
+            ]
+        for virtual_key, scan, flags in keys:
+            for event_flags in (flags, flags | key_up):
+                events.append(Input(1, InputData(key=KeyboardInput(
+                    virtual_key, scan, event_flags, 0, 0,
+                ))))
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    send_input = user32.SendInput
+    send_input.argtypes = (wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int)
+    send_input.restype = wintypes.UINT
+    inputs = (Input * len(events))(*events)
+    sent = send_input(len(inputs), inputs, ctypes.sizeof(Input))
+    if sent != len(inputs):
+        raise OSError(f"Windows accepted {sent} of {len(inputs)} keyboard events")
+
+
 def type_text(text):
     """Type ``text`` into the currently focused element."""
     if text is None:
@@ -873,6 +931,12 @@ def type_text(text):
     if foreground_error:
         return foreground_error
     ok = f"typed {len(text)} characters"
+    if sys.platform == "win32" and not text.isascii():
+        try:
+            _type_windows_unicode(text)
+            return ok
+        except Exception as e:
+            return f"ERROR: type_text via SendInput: {e}"
     backend = _backend()
 
     if backend == "pyautogui":

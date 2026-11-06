@@ -197,53 +197,8 @@ def _same_messages(left: list[dict], right: list[dict]) -> bool:
 
 
 def _native_rebuild_history(messages: list[dict]) -> list[dict]:
-    """Replay only images relevant to the current turn on thread rebuild."""
-
-    non_system = [
-        dict(message) for message in messages
-        if message.get("role") != "system"
-    ]
-    latest_user_index = next((
-        index for index in range(len(non_system) - 1, -1, -1)
-        if non_system[index].get("role") == "user"
-    ), -1)
-    if latest_user_index < 0:
-        return non_system
-    latest_text = _text_content(non_system[latest_user_index].get("content"))
-    from osia.image_inputs import historical_image_reference_requested
-
-    replay_prior = historical_image_reference_requested(latest_text)
-    prior_image_index = next((
-        index for index in range(latest_user_index - 1, -1, -1)
-        if isinstance(non_system[index].get("content"), list)
-        and any(
-            isinstance(item, dict) and item.get("type") == "image_url"
-            for item in non_system[index]["content"]
-        )
-    ), -1)
-    selected = []
-    for index, message in enumerate(non_system):
-        content = message.get("content")
-        if not isinstance(content, list):
-            selected.append(message)
-            continue
-        keep_images = bool(
-            index == latest_user_index
-            or (replay_prior and index == prior_image_index)
-        )
-        parts = [
-            dict(item)
-            for item in content
-            if isinstance(item, dict)
-            and (
-                item.get("type") == "text"
-                or (keep_images and item.get("type") == "image_url")
-            )
-        ]
-        copied = dict(message)
-        copied["content"] = parts if parts else _text_content(content)
-        selected.append(copied)
-    return selected
+    """Replay the already bounded visual context selected by the Chat runtime."""
+    return [dict(message) for message in messages if message.get("role") != "system"]
 
 
 def _turn_input(messages: list[dict]) -> str | list[dict]:

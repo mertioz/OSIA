@@ -4082,6 +4082,13 @@ def wake_mode():
         _set_chat_island_state(binding, "idle", terminal=True)
         conv_id = str((binding or {}).get("conversation_id") or "")
         if active_conv and active_conv.get("id") == conv_id:
+            from osia.chat_screenshots import message_screenshots
+
+            screenshots = message_screenshots(
+                conversations.get_conversation(conv_id), str(binding.get("turn_id") or ""),
+            )
+            if screenshots:
+                binding = {**binding, "screenshots": screenshots}
             popup.finalize_assistant_stream(text, binding)
 
     def handle_assistant_stream_error(binding: dict, text: str):
@@ -4402,6 +4409,8 @@ def wake_mode():
             {
                 "role": m["role"],
                 "content": m.get("content", ""),
+                **{key: m[key] for key in ("_conversation_id", "_turn_id", "_screenshots", "_observed_image")
+                   if key in m},
                 **(
                     {"_attachments": list(m["_attachments"])}
                     if isinstance(m.get("_attachments"), list) else {}

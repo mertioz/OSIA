@@ -31,17 +31,6 @@ from typing import Iterable
 from osia.config import CONFIG_DIR
 
 
-_HISTORICAL_IMAGE_REFERENCE = re.compile(
-    r"\b(?:(?:this|that)\s+(?:same\s+)?|the\s+same\s+|"
-    r"(?:previous|earlier|prior)\s+)(?:image|photo|picture|screenshot)\b|"
-    r"\b(?:image|photo|capture)\s+(?:precedente|précédente|d avant|d'avant)\b|"
-    r"\b(?:cette|la)\s+(?:m[eê]me\s+)?(?:image|photo|capture)\b|"
-    r"^(?:and|et|what about)\b.{0,120}\b(?:it|this|that|image|photo|picture|"
-    r"screenshot|button|bottom|top|left|right|dessus|dessous|haut|bas)\b",
-    re.IGNORECASE,
-)
-
-
 _ALL_OSIA_IMAGE_MIMES = frozenset({
     "image/gif",
     "image/jpeg",
@@ -600,12 +589,6 @@ def text_content(content) -> str:
         if isinstance(part, dict) and part.get("type") == "text"
         and part.get("text")
     )
-
-
-def historical_image_reference_requested(text: object) -> bool:
-    """Return whether the current turn refers to the latest prior image."""
-
-    return bool(_HISTORICAL_IMAGE_REFERENCE.search(str(text or "").strip()))
 
 
 def _validated_image_geometry(data: bytes, declared_mime: str) -> tuple[int, int]:

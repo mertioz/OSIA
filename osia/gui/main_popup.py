@@ -35,11 +35,12 @@ import qrcode
 from PyQt6.QtCore import (
     Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
-    QParallelAnimationGroup,
+    QParallelAnimationGroup, QUrl,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
     QTextCursor, QTextDocument, QTextOption, QImage, QBrush, QLinearGradient,
+    QDesktopServices,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -54,6 +55,7 @@ from osia import conversations
 from osia import personality
 from osia import legal
 from osia.agent import strip_tool_artifacts
+from osia.chat_screenshots import normalize_screenshots, screenshot_path, screenshot_preview
 from osia.memory import MemoryStore
 from osia.models import (
     LOCAL_PROVIDERS, PROVIDERS, get_all_models_cached as get_all_models,
@@ -445,6 +447,31 @@ class _Bubble(QFrame):
 
         self.setMaximumWidth(_BUBBLE_MAX_WIDTH)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self._layout_text()
+
+    def add_screenshots(self, conversation_id: str, turn_id: str, records: list[dict]) -> None:
+        label = "Ouvrir la capture d’écran" if i18n.get_language() == "fr" else "Open screenshot"
+        for record in normalize_screenshots(records):
+            try:
+                path = screenshot_path(conversation_id, turn_id, record)
+                preview = screenshot_preview(conversation_id, turn_id, record)
+            except (OSError, ValueError):
+                continue
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(preview):
+                continue
+            pixmap = pixmap.scaledToWidth(min(185, pixmap.width()), Qt.TransformationMode.SmoothTransformation)
+            button = QPushButton()
+            button.setObjectName("chatScreenshot")
+            button.setAccessibleName(label)
+            button.setToolTip(label)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setIcon(QIcon(pixmap))
+            button.setIconSize(pixmap.size())
+            button.clicked.connect(lambda _checked=False, image=path: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(image)),
+            ))
+            self.layout().addWidget(button, alignment=Qt.AlignmentFlag.AlignLeft)
         self._layout_text()
 
     def set_available_width(self, width: int) -> None:
@@ -1285,6 +1312,7 @@ class _ChatPage(QWidget):
         self._stream.text_changed.connect(self._on_stream_text_changed)
         self._stream.completed.connect(self._on_stream_completed)
         self._stream_bubble: _Bubble | None = None
+        self._stream_screenshots: tuple[str, str, list[dict]] | None = None
         self._stream_wrap: QWidget | None = None
         self._stream_key: tuple[str, str, str, str] | None = None
         self._stream_binding: dict[str, str] = {}
@@ -1726,6 +1754,7 @@ class _ChatPage(QWidget):
         )
 
     def clear_messages(self) -> None:
+        self._stream_screenshots = None
         self._stream.clear()
         self._stream_bubble = None
         self._stream_wrap = None
@@ -1780,7 +1809,12 @@ class _ChatPage(QWidget):
                         "assistant_message_id", message.get("_message_id"),
                     )
                     self.set_thinking_trace(historical, historical=True)
-                self._append_bubble(role, text, appearance_ms=0)
+                created = self._append_bubble(role, text, appearance_ms=0)
+                if created and role == "assistant" and message.get("_screenshots"):
+                    created[1].add_screenshots(
+                        str(message.get("_conversation_id") or ""),
+                        str(message.get("_turn_id") or ""), message["_screenshots"],
+                    )
             self._scroll_timer.start(0)
         except RuntimeError:
             pass
@@ -1978,6 +2012,11 @@ class _ChatPage(QWidget):
             return True
         if not self._stream.active and self._stream_bubble is None:
             self._stream.begin()
+        screenshots = normalize_screenshots((binding or {}).get("screenshots"))
+        if screenshots:
+            self._stream_screenshots = (
+                str(binding["conversation_id"]), str(binding["turn_id"]), screenshots,
+            )
         self._stream.finalize(final)
         return True
 
@@ -2231,6 +2270,7 @@ class _ChatPage(QWidget):
 
     def _discard_stream_bubble(self) -> None:
         wrap = self._stream_wrap
+        self._stream_screenshots = None
         self._stream_bubble = None
         self._stream_wrap = None
         if wrap is not None:
@@ -2241,8 +2281,11 @@ class _ChatPage(QWidget):
 
     def _mark_stream_finished(self, *, error: bool = False) -> None:
         bubble = self._stream_bubble
+        screenshots, self._stream_screenshots = self._stream_screenshots, None
         if bubble is not None:
             bubble.finish_streaming()
+            if screenshots is not None and not error:
+                bubble.add_screenshots(*screenshots)
             bubble.setProperty("streaming", False)
             bubble.setProperty("error", error)
             bubble.style().unpolish(bubble)

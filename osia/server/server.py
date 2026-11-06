@@ -101,6 +101,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Requ
 
 from osia import chat_routing, conversations, document_sources, i18n
 from osia.attachments import (
+    ATTACHMENT_CHUNK_BYTES,
     ATTACHMENT_EVENT_TYPES,
     MAX_ATTACHMENT_BYTES,
     AttachmentBatchManager,
@@ -108,6 +109,7 @@ from osia.attachments import (
     build_agent_input,
     cleanup_orphan_batches,
 )
+from osia.chat_screenshots import message_screenshots, normalize_screenshots, screenshot_preview
 from osia.config import CONFIG_DIR as _CONFIG_DIR, regenerate_mobile_token
 from osia.document_progress import document_progress_scope
 from osia.runtime import (
@@ -1103,6 +1105,40 @@ def _conversation_history_frame(conv: dict) -> dict:
         "operation_id": str(conv.get("last_operation_id") or ""),
         "messages": _displayable_history(list(conv.get("messages") or [])),
     }
+
+
+async def _send_chat_screenshot(out: "_OutboundChannel", msg: dict) -> None:
+    keys = ("request_id", "conversation_id", "turn_id", "message_id", "screenshot_id")
+    identifiers = {key: msg.get(key) for key in keys}
+    if any(not isinstance(value, str) or not 0 < len(value) <= 256
+           for value in identifiers.values()):
+        return
+    records = message_screenshots(
+        conversations.get_conversation(identifiers["conversation_id"]),
+        identifiers["turn_id"], identifiers["message_id"],
+    )
+    record = next((item for item in records if item["id"] == identifiers["screenshot_id"]), None)
+    try:
+        if record is None:
+            raise ValueError("screenshot_unavailable")
+        data = await asyncio.to_thread(
+            screenshot_preview, identifiers["conversation_id"],
+            identifiers["turn_id"], record,
+        )
+    except (OSError, ValueError):
+        await out.send_json({"type": "chat_screenshot_chunk", **identifiers,
+                             "error": "screenshot_unavailable"})
+        return
+    count = (len(data) + ATTACHMENT_CHUNK_BYTES - 1) // ATTACHMENT_CHUNK_BYTES
+    for index in range(count):
+        offset = index * ATTACHMENT_CHUNK_BYTES
+        await out.send_json({
+            "type": "chat_screenshot_chunk", **identifiers,
+            "index": index, "count": count,
+            "data": base64.b64encode(data[offset:offset + ATTACHMENT_CHUNK_BYTES]).decode("ascii"),
+        })
+    return
+
 
 
 async def _send_conversation_frame(
@@ -4392,6 +4428,10 @@ async def _send_persisted_turn_for_request(
             "sequence": response_sequence,
             "terminal": False,
             "content": assistant_content,
+            **({"screenshots": screenshots} if (screenshots := message_screenshots(
+                conversations.get_conversation(conv_id),
+                str(common.get("turn_id") or ""), assistant_message_id,
+            )) else {}),
             "replayed": True,
         })
         await channel.send_json({
@@ -4800,6 +4840,9 @@ def _persist_completed_assistant_message(
         )
     ):
         return False
+    screenshots = normalize_screenshots(persisted.get("_screenshots"))
+    if screenshots:
+        response_frame["screenshots"] = screenshots
     command_id = str(turn_meta.get("_durable_command_id") or "")
     command_epoch = str(turn_meta.get("_durable_command_epoch") or "")
     if not command_id:
@@ -8649,6 +8692,10 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json(snapshot)
                 continue
 
+            if msg_type == "get_chat_screenshot":
+                await _send_chat_screenshot(out, msg)
+                continue
+
             if msg_type == "new_conversation_in_project":
                 result = conversations.apply_folder_mutation(msg)
                 await out.send_json({
@@ -11598,6 +11645,9 @@ def _displayable_history(history: list) -> list[dict]:
         if role == "assistant":
             from osia.execution_trace import validate_persisted_trace
 
+            screenshots = normalize_screenshots(msg.get("_screenshots"))
+            if screenshots:
+                display["screenshots"] = screenshots
             safe_trace = validate_persisted_trace(
                 msg.get("_execution_trace_v1")
             )

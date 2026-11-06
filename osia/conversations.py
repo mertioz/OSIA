@@ -1930,6 +1930,19 @@ def delete_confirmed_ungrouped_conversations(
     )
 
 
+def _attach_completed_turn_images(entry: dict, conversation_id: str, turn_id: str) -> None:
+    if entry.get("role") != "assistant" or not turn_id:
+        return
+    from osia.chat_screenshots import retain_chat_observation, screenshots_for_turn
+
+    screenshots = screenshots_for_turn(conversation_id, turn_id)
+    if screenshots:
+        entry["_screenshots"] = screenshots
+    observation = retain_chat_observation(conversation_id, turn_id)
+    if observation is not None:
+        entry["_observed_image"] = observation
+
+
 def commit_message(
     conv_id: str,
     role: str,
@@ -2179,6 +2192,7 @@ def commit_message(
             "content": content,
         }
         entry.update(correlation)
+        _attach_completed_turn_images(entry, conv_id, turn_id)
         revision = _next_revision(conv)
         entry["_sequence"] = revision
         conv.setdefault("messages", []).append(entry)
@@ -2328,6 +2342,8 @@ def commit_durable_assistant_message(
             raise ValueError("assistant operation id must differ from user operation id")
         entry = {"role": "assistant", "content": content}
         entry.update(correlation)
+        if not _has_exact_user_cancelled_terminal(accepted_user):
+            _attach_completed_turn_images(entry, conv_id, turn_id)
         revision = _next_revision(conv)
         entry["_sequence"] = revision
         messages.append(entry)

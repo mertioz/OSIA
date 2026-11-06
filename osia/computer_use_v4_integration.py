@@ -375,6 +375,7 @@ def _current_visual_postcondition() -> tuple[object, str, str]:
 
 def _image_result(frame: ComputerFrame, *, reason_code: str) -> dict[str, Any]:
     state = _current_state()
+    from osia.chat_screenshots import remember_chat_observation
     from osia.image_inputs import register_image_artifact, turn_scoped_media_owner
 
     artifact = frame.to_image_artifact()
@@ -382,6 +383,7 @@ def _image_result(frame: ComputerFrame, *, reason_code: str) -> dict[str, Any]:
         state.conversation_id, state.turn_id,
     )
     image_ref = register_image_artifact(artifact, owner_id=owner_id)
+    remember_chat_observation(state.conversation_id, state.turn_id, image_ref)
     observation_verifier = _active_config().get(
         "observation_verifier"
     )
@@ -498,6 +500,34 @@ def tool_computer_screenshot(window: str = "") -> dict[str, Any]:
         )
     except ComputerUseV4Error as exc:
         return _error_result(exc.code, exc.detail)
+
+
+def tool_save_screenshot(window: str = "") -> dict[str, Any]:
+    """Save a fresh window capture as an attachment to this Chat turn."""
+    from osia.chat_screenshots import save_chat_screenshot
+    from osia.image_inputs import ImageInputError
+
+    try:
+        state = _current_state()
+        hwnd = _resolve_window(window)
+        if hwnd <= 0:
+            return _error_result("WINDOW_NOT_FOUND")
+        frame = _loop().screenshot(hwnd)
+        attachment = save_chat_screenshot(
+            state.conversation_id, state.turn_id, frame.to_image_artifact(),
+        )
+    except ComputerUseV4Error as exc:
+        return _error_result(exc.code, exc.detail)
+    except (OSError, ValueError, ImageInputError):
+        return _error_result("SCREENSHOT_SAVE_FAILED")
+    return {
+        "text": "Saved a fresh screenshot of the selected window for this chat reply.",
+        "receipt": {
+            "schema_version": 1, "dispatch_state": "read_only",
+            "outcome": "success_verified", "reason_code": "CHAT_SCREENSHOT_SAVED",
+            "screenshot_id": attachment["id"], "captured_at": frame.captured_at,
+        },
+    }
 
 
 def tool_computer_zoom(
