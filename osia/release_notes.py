@@ -63,6 +63,23 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.255", released_on="2026-11-06", public=True,
+        changes_en=(
+            "OSIA reviews progress before ending a task that used tools and can continue unfinished work in the same turn.",
+            "On Windows, OSIA can capture the requested window in the background and brings it forward before using the mouse.",
+            "Use /mousecontrol to toggle mouse control for the current conversation while keeping vision and keyboard input available.",
+            "The chat menu adds skills, model and reasoning selection, and conversation mentions with @.",
+            "OSIA can attach screenshots to replies and carry images forward in the conversation. Typing accented characters on Windows is fixed.",
+        ),
+        changes_fr=(
+            "OSIA vérifie l’avancement avant de terminer une tâche qui utilise des outils et peut reprendre le travail dans le même tour.",
+            "Sous Windows, OSIA peut capturer la fenêtre demandée en arrière-plan et la place au premier plan avant d’utiliser la souris.",
+            "La commande /mousecontrol active ou désactive la souris pour la discussion en cours. La vision et le clavier restent disponibles.",
+            "Le menu du chat permet de choisir un skill, un modèle et son niveau de raisonnement, ou de citer une discussion avec @.",
+            "OSIA peut joindre des captures à ses réponses et réutiliser les images de la discussion. La saisie des accents sous Windows est corrigée.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.249", released_on="2026-11-06", public=True,
         changes_en=(
             "Windows updates use the standard download address so earlier Preview clients can find the new installer.",

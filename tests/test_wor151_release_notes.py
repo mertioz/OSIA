@@ -83,7 +83,7 @@ def _controller(monkeypatch, tmp_path, *, cached=False):
 
 def test_embedded_notes_load_offline_and_are_newest_first():
     assert [entry.version for entry in RELEASE_HISTORY] == [
-        "0.9.249", "0.9.248", "0.9.1", "0.9.0", "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
+        "0.9.255", "0.9.249", "0.9.248", "0.9.1", "0.9.0", "1.1.8", "1.1.7", "1.1.6", "1.1.5", "1.1.4", "1.1.3", "1.1.2", "1.1.1", "1.1.0", "1.0.6", "1.0.5", "1.0.4", "1.0.3",
     ]
     current = release_for_version("1.1.6")
     assert release_for_version("1.1.8").public is False
