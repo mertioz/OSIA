@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.258", released_on="2026-11-08", public=True,
+        changes_en=(
+            "ChatGPT Account receives the result of a slow browser action in the same turn. Recent browser results remain available after context compaction.",
+            "Browser page text is read in consecutive chunks. OSIA can verify what was saved using the current page after a wait expires.",
+            "OSIA favors existing tabs when verifying web changes and identifies an already open matching tab when a separate tab is requested.",
+        ),
+        changes_fr=(
+            "ChatGPT Account reçoit le résultat d’une action navigateur lente dans le même tour. Les derniers résultats restent accessibles après la compaction du contexte.",
+            "OSIA lit le texte des pages par blocs consécutifs. Après un délai dépassé, il peut vérifier l’enregistrement à partir de la page actuelle.",
+            "OSIA privilégie les onglets existants pour vérifier une modification et signale un onglet correspondant si un nouvel onglet est demandé.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.257", released_on="2026-11-07", public=True,
         changes_en=(
             "Each OSIA conversation keeps its ChatGPT Account thread across turns. The managed browser reuses an existing tab when the requested address is already open.",
