@@ -65,6 +65,17 @@ def _form_html(cross_port: int) -> bytes:
   <input name="readonly_field" aria-label="Readonly field" readonly>
   <input name="disabled_field" aria-label="Disabled field" disabled>
   <input name="hidden_field" type="hidden" value="{PRIVATE_MARKER}">
+  <fieldset disabled>
+    <legend>Exception <input name="legend_field"></legend>
+    <input name="fieldset_disabled">
+  </fieldset>
+  <div aria-disabled="true">
+    <input name="aria_disabled">
+    <input name="aria_enabled" aria-disabled="false">
+    <input name="aria_hidden" type="hidden">
+  </div>
+  <div style="content-visibility:hidden"><input name="collapsed_field"></div>
+  <div id="shadow-host"></div>
   <input name="password" type="password" value="{PRIVATE_MARKER}">
   <input name="private_label" aria-label="{PRIVATE_MARKER}">
   <input name="private_placeholder" placeholder="{PRIVATE_MARKER}">
@@ -82,6 +93,8 @@ def _form_html(cross_port: int) -> bytes:
 <iframe src="http://127.0.0.1:{cross_port}/cross"></iframe>
 <script>
 window.submitCount = 0;
+document.querySelector('#shadow-host').attachShadow({{mode: 'open'}})
+  .innerHTML = '<input name="shadow_field" aria-label="Shadow field">';
 document.querySelector('#react').addEventListener('input', event => {{
   const clone = event.target.cloneNode(true);
   clone.value = event.target.value;
@@ -266,10 +279,12 @@ def test_bounded_semantic_snapshot_frames_duplicates_and_no_values(controlled_br
         "full_name", "aria_field", "labelled_field", "placeholder_field",
         "duplicate_a", "duplicate_b", "notes", "country", "agree", "choice",
         "combo", "required_field", "readonly_field", "password", "iframe_field",
+        "legend_field", "aria_enabled", "shadow_field",
     } <= names
-    assert "disabled_field" not in names
-    assert "hidden_field" not in names
-    assert "cross_origin_field" not in names
+    assert names.isdisjoint({
+        "disabled_field", "hidden_field", "cross_origin_field",
+        "fieldset_disabled", "aria_disabled", "collapsed_field",
+    })
     assert _by_name(snapshot, "full_name")["accessible_label"] == "Full name"
     assert _by_name(snapshot, "aria_field")["label_source"] == "aria-label"
     assert _by_name(snapshot, "labelled_field")["label_source"] == "aria-labelledby"
@@ -302,11 +317,18 @@ def test_bounded_semantic_snapshot_frames_duplicates_and_no_values(controlled_br
     inclusive_names = {item.get("html_name") for item in inclusive["fields"]}
     assert {"disabled_field", "hidden_field"} <= inclusive_names
     assert _by_name(inclusive, "disabled_field")["enabled"] is False
+    assert _by_name(inclusive, "fieldset_disabled")["enabled"] is False
+    assert _by_name(inclusive, "aria_disabled")["enabled"] is False
+    assert _by_name(inclusive, "aria_hidden")["enabled"] is True
     assert _by_name(inclusive, "hidden_field")["visible"] is False
+    assert _by_name(inclusive, "collapsed_field")["visible"] is False
 
     _, limited = _snapshot(max_fields=3)
     assert limited["field_count"] == 3
     assert limited["truncated"]["fields"] is True
+
+    _, hidden = _snapshot(include_hidden=True, max_fields=100)
+    assert _by_name(hidden, "aria_hidden")["visible"] is False
 
 
 def test_verified_fill_control_types_rerenders_and_safe_failures(controlled_browser, capsys):
@@ -345,6 +367,7 @@ def test_verified_fill_control_types_rerenders_and_safe_failures(controlled_brow
         ("agree", True, "check"),
         ("choice", True, "check"),
         ("combo", "editable", "fill"),
+        ("shadow_field", "inside shadow root", "fill"),
     ]
     for name, value, operation in cases:
         result = json.loads(browser.fill_form_field(refs[name], value))
@@ -441,6 +464,44 @@ def test_navigation_page_replacement_and_popup_close_invalidate_references(
     ) == "stale_reference"
 
 
+def test_batched_refs_follow_exact_nodes_and_reject_reloaded_frames(controlled_browser):
+    _navigate(controlled_browser)
+    _, snapshot = _snapshot(max_fields=100)
+    field_ref = _by_name(snapshot, "full_name")["field_ref"]
+    frame_ref = _by_name(snapshot, "iframe_field")["field_ref"]
+    owner = controlled_browser.owner
+
+    async def change_form():
+        page = owner._active_page
+        await page.evaluate("""() => {
+          const original = document.querySelector('#full');
+          const copy = original.cloneNode(true);
+          copy.removeAttribute('id');
+          copy.setAttribute('aria-label', 'Full name');
+          copy.value = '';
+          original.before(copy);
+        }""")
+        frame = next(frame for frame in page.frames if frame.url.endswith("/frame"))
+        await frame.goto(frame.url)
+
+    owner._op_test_change_form = change_form
+    owner.call("test_change_form")
+    assert json.loads(browser.fill_form_field(field_ref, "Only original"))["verified"]
+    assert _error_category(browser.fill_form_field(frame_ref, "Wrong document")) == (
+        "stale_reference"
+    )
+
+    async def values():
+        return await owner._active_page.locator("[name=full_name]").evaluate_all(
+            "(fields) => fields.map(field => field.value)"
+        )
+
+    owner._op_test_form_values = values
+    assert owner.call("test_form_values") == ["", "Only original"]
+    _, refreshed = _snapshot(max_fields=100)
+    assert _by_name(refreshed, "iframe_field")["has_value"] is False
+
+
 def test_reference_ttl_and_ambiguous_reresolution_are_fail_closed():
     now = [10.0]
     session = SemanticFormSession(clock=lambda: now[0])
@@ -464,11 +525,14 @@ def test_reference_ttl_and_ambiguous_reresolution_are_fail_closed():
     }
 
     class Candidate:
-        async def evaluate(self, _expression):
+        async def evaluate(self, _expression, _original):
             return dict(metadata)
 
         async def element_handle(self):
-            return object()
+            return self
+
+        async def dispose(self):
+            pass
 
     class Locator:
         async def count(self):
@@ -484,6 +548,7 @@ def test_reference_ttl_and_ambiguous_reresolution_are_fail_closed():
     session._token = lambda *_args, **_kwargs: "same-structure"
     entry = {
         "frame": Frame(),
+        "handle": object(),
         "signature": (
             "input", "textbox", "Duplicate", "duplicate", "text", "",
         ),

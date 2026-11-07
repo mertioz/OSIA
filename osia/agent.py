@@ -4540,6 +4540,25 @@ def _completed_mcp_execution_record(raw_result, result, contract):
     )
 
 
+def _completed_form_inspection_record(raw_result, result, contract):
+    """Keep a settled read timeout separate from a missing owner receipt."""
+    from osia.tool_contracts import ExecutionOutcome, SideEffectClass, ToolExecutionRecord
+
+    if (
+        contract.spec.name != "inspect_form_fields"
+        or contract.side_effect is not SideEffectClass.READ_ONLY
+    ):
+        return None
+    from osia.tools.browser_forms import FormInspectionTimeout
+
+    if not isinstance(raw_result, FormInspectionTimeout):
+        return None
+    return ToolExecutionRecord(
+        result, True, ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+        1, True, True, contract, reason_code="inspection_timeout",
+    )
+
+
 def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang: str):
     """Classify a worker that completed after its caller released the turn."""
     from osia.tool_contracts import (
@@ -4600,6 +4619,9 @@ def _late_completion_record(tool_name: str, kwargs: dict, future, contract, lang
     mcp_record = _completed_mcp_execution_record(raw_result, result, contract)
     if mcp_record is not None:
         return mcp_record
+    form_record = _completed_form_inspection_record(raw_result, result, contract)
+    if form_record is not None:
+        return form_record
     typed = _typed_browser_receipt_outcome(
         result, allow_json_string=tool_name == "fill_form_field",
     )
@@ -4787,6 +4809,13 @@ def _persist_tool_attempt_terminal(
         record.outcome,
         "effect_confirmed" if record.dispatched else "not_dispatched",
     )
+    if (
+        status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+        and record.contract.spec.name == "inspect_form_fields"
+        and record.reason_code == "inspection_timeout"
+        and record.dispatched and record.timed_out and not record.worker_may_be_active
+    ):
+        dispatch_state = "dispatch_returned"
     known_process = bool(record.process_facts and record.dispatched
         and not record.timed_out and not record.worker_may_be_active
         and record.outcome in {ExecutionOutcome.SUCCESS_VERIFIED, ExecutionOutcome.SUCCESS_UNVERIFIED,
@@ -5100,6 +5129,9 @@ def _execute_tool_once_record(
     mcp_record = _completed_mcp_execution_record(raw_result, result, contract)
     if mcp_record is not None:
         return mcp_record
+    form_record = _completed_form_inspection_record(raw_result, result, contract)
+    if form_record is not None:
+        return form_record
     is_error = _is_tool_error(result)
     typed_browser_outcome = _typed_browser_receipt_outcome(
         result, allow_json_string=tool_name == "fill_form_field",
@@ -5567,6 +5599,10 @@ def _execute_tool_with_policy(
         and contract.retry == RetryPolicy.READ_ONCE_AFTER_CONFIRMED_FAILURE
         and record.outcome == ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT
         and record.reason_code not in _PROMPT_TERMINAL_TOOL_REASONS
+        and not (
+            tool_name == "inspect_form_fields"
+            and record.reason_code == "inspection_timeout"
+        )
     )
     if not retry_allowed:
         if attempt_id:

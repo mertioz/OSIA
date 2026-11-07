@@ -2435,7 +2435,12 @@ def persistence_contract(
         "browser" in str(item) for item in spec.preconditions
     ):
         family = ToolPersistenceFamily.BROWSER
-        release_after = min(owner_timeout, 3.0)
+        # The bounded form read can return its timeout to the original native
+        # call, which would otherwise be closed with a generic pending result.
+        release_after = (
+            owner_timeout if name == "inspect_form_fields"
+            else min(owner_timeout, 3.0)
+        )
         inactivity = max(owner_timeout + 5.0, wait_timeout + 10.0)
         hard = max(inactivity + 15.0, owner_timeout * 1.5)
         delays = (1.0, 2.0, 3.0, 5.0, 8.0, 13.0)

@@ -16,6 +16,7 @@ import re
 import secrets
 import time
 from collections import Counter
+from contextlib import suppress
 from urllib.parse import urlsplit
 
 
@@ -184,6 +185,76 @@ _FIELD_METADATA_JS = r"""
 }
 """
 
+_FRAME_FIELDS_JS = (
+    """(elements, options) => {
+      const {nodes, url, maxCandidates, limit, includeHidden, includeDisabled} = options;
+      if (location.href !== url) return null;
+      const metadataFor = """
+    + _FIELD_METADATA_JS
+    + r""";
+      const hasBox = (node) => {
+        const box = node.getBoundingClientRect();
+        return box.width > 0 && box.height > 0;
+      };
+      const isVisible = (el) => {
+        const style = getComputedStyle(el);
+        if (style.display === 'contents') {
+          return Array.from(el.childNodes).some((child) => {
+            if (child.nodeType === 1) return isVisible(child);
+            if (child.nodeType !== 3) return false;
+            const range = document.createRange();
+            range.selectNode(child);
+            return hasBox(range);
+          });
+        }
+        if (style.visibility !== 'visible') return false;
+        if (typeof el.checkVisibility === 'function') {
+          if (!el.checkVisibility()) return false;
+        } else {
+          const details = el.closest('details,summary');
+          if (details?.tagName === 'DETAILS' && !details.open) return false;
+        }
+        return hasBox(el);
+      };
+      const hasDisabledAria = (el) => {
+        for (let node = el; node; node = node.parentElement || node.getRootNode().host) {
+          const value = (node.getAttribute('aria-disabled') || '').toLowerCase();
+          if (value === 'true') return true;
+          if (value === 'false') return false;
+        }
+        return false;
+      };
+      const fields = [];
+      let detached = 0;
+      let included = 0;
+      for (const el of elements.slice(0, maxCandidates)) {
+        try {
+          if (!el.isConnected) { detached += 1; continue; }
+          const visible = isVisible(el);
+          if (!visible && !includeHidden) continue;
+          const metadata = metadataFor(el);
+          const disabled = metadata.disabled || el.matches(':disabled');
+          if (disabled && !includeDisabled) continue;
+          // Playwright interprets inherited aria-disabled using the control's role.
+          const checkEnabled = !disabled && hasDisabledAria(el);
+          nodes[fields.length] = el;
+          fields.push({...metadata, visible, disabled, checkEnabled});
+          if (includeDisabled || !checkEnabled) included += 1;
+          if (included >= limit) break;
+        } catch {
+          detached += 1;
+        }
+      }
+      return {fields, candidateCount: elements.length, detached};
+    }
+    """
+)
+
+_REPLACEMENT_METADATA_JS = (
+    "(el, original) => !original.isConnected && el.ownerDocument === original.ownerDocument "
+    "? (" + _FIELD_METADATA_JS + ")(el) : null"
+)
+
 _SELECT_MATCH_JS = r"""
 (el, wanted) => {
   const target = String(wanted).trim();
@@ -209,6 +280,20 @@ def _error(category: str, field_ref: str | None = None) -> str:
     if field_ref and _FIELD_REF_RE.fullmatch(field_ref):
         payload["field_ref"] = field_ref
     return _json_result(payload, error=True)
+
+
+class FormInspectionTimeout(str):
+    """A terminal receipt from the bounded form read."""
+
+    def __new__(cls):
+        return super().__new__(cls, _json_result({
+            "ok": False,
+            "category": "inspection_timeout",
+            "message": (
+                "Form inspection timed out before returning a snapshot. "
+                "Inspect the form again in the same tab."
+            ),
+        }, error=True))
 
 
 def form_fill_error_receipt(
@@ -370,6 +455,26 @@ def _expected_checked(value) -> bool | None:
     return None
 
 
+async def _read_frame_fields(frame, *, url, include_hidden, include_disabled, limit):
+    # Let Playwright select in its usual DOM order, including open shadow roots.
+    # Keep the exact nodes with their metadata without leaving state on the page.
+    nodes = await frame.evaluate_handle("() => ({__proto__: null})")
+    try:
+        summary = await frame.locator(_FIELD_SELECTOR).evaluate_all(_FRAME_FIELDS_JS, {
+            "nodes": nodes,
+            "url": url,
+            "maxCandidates": FORM_MAX_DOM_CANDIDATES,
+            "limit": limit,
+            "includeHidden": include_hidden,
+            "includeDisabled": include_disabled,
+        })
+        handles = await nodes.get_properties() if summary and summary["fields"] else {}
+        return summary, handles
+    finally:
+        with suppress(Exception):
+            await nodes.dispose()
+
+
 class SemanticFormSession:
     """Private lifecycle and resolver for one browser owner."""
 
@@ -453,7 +558,7 @@ class SemanticFormSession:
                 timeout=FORM_INSPECTION_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            return _error("inspection_timeout")
+            return FormInspectionTimeout()
         except Exception:
             return _error("inspection_failed")
 
@@ -507,46 +612,48 @@ class SemanticFormSession:
             frame_ref = "frm_" + secrets.token_urlsafe(12)
             frame_records.append((frame, frame_ref, depth))
             try:
-                locator = frame.locator(_FIELD_SELECTOR)
-                candidate_count = await locator.count()
-                if candidate_count > FORM_MAX_DOM_CANDIDATES:
-                    warnings["frame_field_candidates_truncated"] += 1
-                    fields_truncated = True
-                count = min(candidate_count, FORM_MAX_DOM_CANDIDATES)
+                summary, handles = await _read_frame_fields(
+                    frame,
+                    url=frame.url,
+                    include_hidden=include_hidden,
+                    include_disabled=include_disabled,
+                    limit=limit - len(raw_fields),
+                )
             except Exception:
+                summary = None
+            if summary is None:
                 warnings["frame_inspection_failed"] += 1
                 continue
-            for index in range(count):
-                candidate = locator.nth(index)
+            if summary["candidateCount"] > FORM_MAX_DOM_CANDIDATES:
+                warnings["frame_field_candidates_truncated"] += 1
+                fields_truncated = True
+            if summary["detached"]:
+                warnings["detached_field_ignored"] += summary["detached"]
+            for index, metadata in enumerate(summary["fields"]):
+                node = handles.get(str(index))
+                handle = node.as_element() if node is not None else None
+                if handle is None:
+                    warnings["detached_field_ignored"] += 1
+                    continue
                 try:
-                    visible = bool(await candidate.is_visible())
-                    enabled = bool(await candidate.is_enabled())
-                    metadata = await candidate.evaluate(_FIELD_METADATA_JS)
-                    handle = await candidate.element_handle()
+                    if len(raw_fields) < limit:
+                        if metadata.pop("checkEnabled"):
+                            metadata["disabled"] = not await handle.is_enabled()
+                        if include_disabled or not metadata["disabled"]:
+                            raw_fields.append({
+                                "frame": frame,
+                                "frame_ref": frame_ref,
+                                "frame_depth": depth,
+                                "handle": handle,
+                                "metadata": metadata,
+                            })
+                            continue
                 except Exception:
                     warnings["detached_field_ignored"] += 1
-                    continue
-                if not isinstance(metadata, dict) or handle is None:
-                    warnings["detached_field_ignored"] += 1
-                    continue
-                disabled = bool(metadata.get("disabled")) or not enabled
-                if not visible and not include_hidden:
-                    continue
-                if disabled and not include_disabled:
-                    continue
-                metadata["visible"] = visible
-                metadata["disabled"] = disabled
-                raw_fields.append({
-                    "frame": frame,
-                    "frame_ref": frame_ref,
-                    "frame_depth": depth,
-                    "handle": handle,
-                    "metadata": metadata,
-                })
-                if len(raw_fields) >= limit:
-                    fields_truncated = True
-                    break
+                with suppress(Exception):
+                    await handle.dispose()
             if len(raw_fields) >= limit:
+                fields_truncated = True
                 break
 
         duplicate_counts = Counter(
@@ -749,9 +856,12 @@ class SemanticFormSession:
             return None, "stale_reference"
         matches = []
         for index in range(count):
-            candidate = locator.nth(index)
+            handle = None
             try:
-                metadata = await candidate.evaluate(_FIELD_METADATA_JS)
+                handle = await locator.nth(index).element_handle()
+                metadata = await handle.evaluate(
+                    _REPLACEMENT_METADATA_JS, entry["handle"],
+                )
                 if not isinstance(metadata, dict) or not self._matches_entry(entry, metadata):
                     continue
                 structural_hash = self._token(
@@ -759,19 +869,31 @@ class SemanticFormSession:
                 )
                 if structural_hash != entry["structural_hash"]:
                     continue
-                handle = await candidate.element_handle()
+                matches.append((handle, metadata))
+                handle = None
             except Exception:
                 continue
-            if handle is not None:
-                matches.append((handle, metadata))
+            finally:
+                if handle is not None:
+                    with suppress(Exception):
+                        await handle.dispose()
+            if len(matches) > 1:
+                break
         if len(matches) == 1:
             return matches[0], None
+        for handle, _metadata in matches:
+            with suppress(Exception):
+                await handle.dispose()
         return None, "ambiguous_reference" if len(matches) > 1 else "stale_reference"
 
     async def _resolve(self, entry: dict):
         metadata = await self._metadata_for_handle(entry.get("handle"))
-        if metadata is not None and self._matches_entry(entry, metadata):
+        if metadata is None:
+            return None, False, "stale_reference"
+        if self._matches_entry(entry, metadata):
             return (entry["handle"], metadata), False, None
+        if metadata.get("connected"):
+            return None, False, "stale_reference"
         replacement, error = await self._reresolve(entry)
         return replacement, True, error
 

@@ -3553,8 +3553,29 @@ class ToolAttemptStore:
                     "reason_code": reported_reason_code,
                 }),
             }
+            settled_read_failure = (
+                reported_status is ToolAttemptStatus.FAILED_BEFORE_EFFECT
+                and reported_dispatch_state == "dispatch_returned"
+                and truth.get("effect_class") == "read_only"
+            )
+            if settled_read_failure:
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.DISPATCH_RETURNED,
+                    reason_code=reported_reason_code,
+                    occurred_at=now,
+                )
+                truth = transition_action_truth(
+                    truth,
+                    state=ActionState.NOT_APPLIED_VERIFIED,
+                    reason_code=reported_reason_code,
+                    evidence=action_evidence,
+                    reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
+                    exact=True,
+                    occurred_at=now,
+                )
             if status is ToolAttemptStatus.CANCELLED_PROVEN:
-                if cancellation_authoritative:
+                if cancellation_authoritative and not settled_read_failure:
                     if reported_status is ToolAttemptStatus.SUCCEEDED:
                         verified = reported_terminal_outcome in {
                             "success_verified", "confirmed_success",

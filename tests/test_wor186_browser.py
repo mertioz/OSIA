@@ -874,13 +874,14 @@ def test_tab_listing_pairs_navigation_state_with_the_observed_url():
     assert owner._state_tracker.validate(tab["state"]) is page
 
 
+@pytest.mark.parametrize("deadline", ["inspection", "owner"])
 def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
-    controlled_browser, monkeypatch, tmp_path,
+    controlled_browser, monkeypatch, tmp_path, deadline,
 ):
     from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
     from osia.slash_commands import chat_command_scope
     from osia.tool_attempts import ToolAttemptStore
-    from osia.tools import desktop_control
+    from osia.tools import browser_forms, desktop_control
 
     # Run the same isolated browser fixture without creating a desktop window.
     popen = browser.subprocess.Popen
@@ -907,7 +908,7 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
     )
     client._attempts[attempt.thread_id] = attempt
 
-    def call(tool, arguments):
+    def call(tool, arguments, *, expect_success=True):
         call_id = f"fixture-{tool}-{len(sent) + 1}"
         client._handle_server_request({
             "id": len(sent) + 1,
@@ -922,8 +923,10 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
         client._resolve_dynamic_tool_call(attempt, payload)
         assert not attempt.interrupt_sent and attempt.native_tool_call is None
         reply = sent[-1]["result"]
-        assert reply["success"], reply
+        assert reply["success"] is expect_success, reply
         envelope = json.loads(reply["contentItems"][0]["text"])
+        if not expect_success:
+            return envelope
         result = envelope["result"]
         return json.loads(result) if isinstance(result, str) else result
 
@@ -936,6 +939,43 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
         fill = call("fill_form_field", {"field_ref": name_ref, "value": "Projet test"})
         assert fill["verified"]
         state = call("get_browser_state", {})["current_page_ref"]
+
+        async def slow_read(*_args, **_kwargs):
+            await asyncio.sleep(20)
+
+        owner_call = controlled_browser.owner.call
+
+        def short_owner_deadline(operation, *args, timeout=None, **kwargs):
+            if operation == "inspect_form_fields":
+                timeout = 0.2
+            return owner_call(operation, *args, timeout=timeout, **kwargs)
+
+        with monkeypatch.context() as slow:
+            slow.setattr(browser_forms, "_read_frame_fields", slow_read)
+            if deadline == "inspection":
+                # Outlast the ordinary browser-family release at three seconds.
+                slow.setattr(browser_forms, "FORM_INSPECTION_TIMEOUT_SECONDS", 3.2)
+            else:
+                slow.setattr(controlled_browser.owner, "call", short_owner_deadline)
+            timeout = call("inspect_form_fields", {}, expect_success=False)
+        assert timeout["status"] == "confirmed_failure_before_effect"
+        assert timeout["reason_code"] == "inspection_timeout"
+        assert "same tab" in timeout["result"]
+        attempt_id = attempt.capability_events[-1].tool_attempt_id
+        saved = store.get_attempt(attempt_id)
+        assert saved["provider_references"]["native_thread_id"] == attempt.thread_id
+        assert saved["provider_references"]["native_turn_id"] == attempt.turn_id
+        assert saved["status"] == "failed_before_effect"
+        assert saved["dispatch_state"] == "dispatch_returned"
+        assert saved["action_truth"]["effect_truth"] == "not_applied"
+        assert saved["action_truth"]["reconciliation_status"] == "not_required"
+
+        refreshed = call("inspect_form_fields", {})["fields"]
+        filled_field = next(field for field in refreshed if field.get("html_name") == "name")
+        assert filled_field["has_value"] is True
+        after_read = call("get_browser_state", {})["current_page_ref"]
+        assert after_read["page_id"] == state["page_id"]
+        assert after_read["navigation_id"] == state["navigation_id"]
         page = call("inspect_browser_page", {"state_ref": state})["operation_data"]
         submit_ref = page["buttons"][0]["element_ref"]
         result = call("activate_browser_element", {

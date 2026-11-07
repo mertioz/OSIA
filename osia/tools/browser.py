@@ -51,6 +51,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_p
 
 from osia.tools.browser_forms import (
     FORM_MAX_FIELDS_DEFAULT,
+    FormInspectionTimeout,
     SemanticFormSession,
     form_fill_error_receipt,
 )
@@ -1100,7 +1101,13 @@ class _AsyncBrowserOwner:
             return result
         except concurrent.futures.TimeoutError as exc:
             future.cancel()
-            acknowledgement.wait(_OWNER_CANCEL_TIMEOUT_S)
+            settled = acknowledgement.wait(_OWNER_CANCEL_TIMEOUT_S)
+            if operation == "inspect_form_fields" and settled:
+                # An acknowledged read cancellation leaves the tab usable.
+                publish_tool_attempt_event(
+                    "browser_owner_terminal_receipt", "inspection_timeout",
+                )
+                return FormInspectionTimeout()
             self.close()
             if tool_attempt_id:
                 publish_tool_attempt_event(
