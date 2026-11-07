@@ -49,8 +49,8 @@ def test_bad_sequence_does_not_bypass_manifest_validation(value):
 
 
 def test_history_is_display_only_and_official_source_leads_history():
-    assert PRODUCT_VERSION == '0.9.255'
-    assert display_version(PRODUCT_VERSION) == '0.9.255'
+    assert PRODUCT_VERSION == '0.9.256'
+    assert display_version(PRODUCT_VERSION) == '0.9.256'
     assert display_version('0.9.248') == '0.9.0248'
     assert display_version('0.9.1') == '0.9.01'
     with pytest.raises(ValueError, match='invalid_product_version'):
@@ -72,7 +72,7 @@ def test_unsigned_stable_successor_uses_the_validated_release_epoch():
         release_sequence=2026110501,
     )
     source_url = updater.CHANNEL_URLS['stable']
-    for version, sequence in ((PRODUCT_VERSION, RELEASE_SEQUENCE), ('0.9.256', RELEASE_SEQUENCE + 1)):
+    for version, sequence in ((PRODUCT_VERSION, RELEASE_SEQUENCE), ('0.9.257', RELEASE_SEQUENCE + 1)):
         raw = new_manifest(sequence, version)
         raw['channel'] = 'stable'
         parsed = updater.parse_manifest(json.dumps(raw), installed, source_url=source_url)

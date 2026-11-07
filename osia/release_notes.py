@@ -63,6 +63,23 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.256", released_on="2026-11-07", public=True,
+        changes_en=(
+            "ChatGPT Account can use buttons and forms in the managed browser in the background, including when mouse control is disabled.",
+            "OSIA can scroll panels and read selected tables and lists. Web actions check the current target and verify new downloads.",
+            "MCP discovers tools across all catalog pages. OSIA validates tool arguments before dispatch and reads their actual execution status.",
+            "Scheduled tasks can continue after an uncertain result. Short model contexts keep the active turn while summarizing older exchanges.",
+            "Improved local model discovery, voice playback and the conversation list. Windows updates pick the installer for the selected release.",
+        ),
+        changes_fr=(
+            "ChatGPT Account peut utiliser les boutons et formulaires du navigateur géré en arrière-plan, même si la souris est désactivée.",
+            "OSIA peut faire défiler les panneaux et lire les tableaux et listes ciblés. Il vérifie la cible des actions web et les nouveaux téléchargements.",
+            "MCP détecte les outils sur toutes les pages du catalogue. OSIA valide les arguments avant exécution et lit le statut réel des outils.",
+            "Les tâches planifiées peuvent continuer après un résultat incertain. Les modèles à contexte court gardent le tour actif et résument les anciens échanges.",
+            "La détection des modèles locaux, la lecture vocale et la liste des discussions sont améliorées. Windows utilise l’installateur de la version choisie.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.255", released_on="2026-11-06", public=True,
         changes_en=(
             "OSIA reviews progress before ending a task that used tools and can continue unfinished work in the same turn.",
