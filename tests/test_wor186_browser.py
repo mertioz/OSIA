@@ -877,7 +877,6 @@ def test_tab_listing_pairs_navigation_state_with_the_observed_url():
 def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
     controlled_browser, monkeypatch, tmp_path,
 ):
-    from osia.agent import OSIAAgent, _execute_tool_with_policy
     from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
     from osia.slash_commands import chat_command_scope
     from osia.tool_attempts import ToolAttemptStore
@@ -901,21 +900,15 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
     sent = []
     client._send = sent.append
     client._send_request_no_wait = lambda *_: None
-    agent = OSIAAgent(model="fixture", lang="en")
-    agent.provider = "chatgpt_account"
-    agent.configure_tool_attempts(
-        conversation_id="browser-fixture", turn_id="fixture-chat-turn",
-        request_id="fixture-request", final_response_message_id="fixture-final",
+    attempt = _TurnAttempt(
+        thread_id="fixture-thread", turn_id="native-turn",
+        osia_turn_id="fixture-chat-turn", conversation_id="browser-fixture",
+        client_request_id="fixture-request", model_id="fixture",
     )
+    client._attempts[attempt.thread_id] = attempt
 
     def call(tool, arguments):
-        call_id = f"fixture-{tool}"
-        attempt = _TurnAttempt(
-            thread_id="fixture-thread", turn_id=call_id,
-            osia_turn_id="fixture-chat-turn", conversation_id="browser-fixture",
-            client_request_id="fixture-request", model_id="fixture",
-        )
-        client._attempts[attempt.thread_id] = attempt
+        call_id = f"fixture-{tool}-{len(sent) + 1}"
         client._handle_server_request({
             "id": len(sent) + 1,
             "method": "item/tool/call",
@@ -925,24 +918,14 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
             },
         })
         event, payload = attempt.events.get_nowait()
-        if tool in tool_contracts.BROWSER_VERIFY_TOOL_NAMES:
-            assert event == "dynamic_tool_call"
-            client._resolve_dynamic_tool_call(attempt, payload)
-            assert not attempt.interrupt_sent
-            reply = sent[-1]["result"]
-            assert reply["success"], reply
-            envelope = json.loads(reply["contentItems"][0]["text"])
-            return json.loads(envelope["result"])
-
-        assert event == "unsafe"
-        assert attempt.native_tool_call == {"tool": tool, "arguments": arguments, "call_id": call_id}
-        context = agent._new_tool_attempt_context(
-            tool_name=tool, arguments=arguments, provider_native_call_id=call_id,
-        )
-        context.update(store=store, terminal_callback=None)
-        result = _execute_tool_with_policy(tool, arguments, attempt_context=context)
-        assert not result.is_error, result.result
-        return result.result
+        assert event == "dynamic_tool_call"
+        client._resolve_dynamic_tool_call(attempt, payload)
+        assert not attempt.interrupt_sent and attempt.native_tool_call is None
+        reply = sent[-1]["result"]
+        assert reply["success"], reply
+        envelope = json.loads(reply["contentItems"][0]["text"])
+        result = envelope["result"]
+        return json.loads(result) if isinstance(result, str) else result
 
     with chat_command_scope("browser-fixture", None):
         _navigate(controlled_browser.web.base + "/form")
@@ -951,7 +934,7 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
             field["field_ref"] for field in fields if field.get("html_name") == "name"
         )
         fill = call("fill_form_field", {"field_ref": name_ref, "value": "Projet test"})
-        assert json.loads(fill)["verified"]
+        assert fill["verified"]
         state = call("get_browser_state", {})["current_page_ref"]
         page = call("inspect_browser_page", {"state_ref": state})["operation_data"]
         submit_ref = page["buttons"][0]["element_ref"]
@@ -959,8 +942,13 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
             "state_ref": state, "element_ref": submit_ref,
             "wait_spec": {"condition_type": "navigation_commit", "timeout_seconds": 4},
         })
-        _success(result)
-        assert result["receipt"]["after_state"]["navigation_id"] != state["navigation_id"]
+        assert result["ok"]
+        assert result["current_page_ref"]["navigation_id"] != state["navigation_id"]
+        destination = controlled_browser.web.base + "/form"
+        first = call("open_new_browser_tab", {"url": destination})
+        again = call("open_new_browser_tab", {"url": destination})
+        assert again["current_page_ref"]["page_id"] == first["current_page_ref"]["page_id"]
+        assert again["operation_data"]["tab_reused"] is True
 
 
 def test_real_extraction_menu_consent_confirm_and_prompt(controlled_browser):

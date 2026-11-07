@@ -184,6 +184,19 @@ _DIRECT_READ_ONLY_NATIVE_TOOLS = frozenset({
     "computer_observation",
 })
 
+# Managed browser effects use the same correlated canonical executor as reads.
+# Returning their receipts in place keeps the provider's observations alive.
+_INLINE_BROWSER_TOOLS = BROWSER_FAMILY_TOOL_NAMES | {"navigate", "open_browser", "scroll"}
+_INLINE_NATIVE_TOOLS = _DIRECT_READ_ONLY_NATIVE_TOOLS | _INLINE_BROWSER_TOOLS
+
+_COMPACT_PROMPT = (
+    "Summarize this OSIA conversation so the same task can continue. Keep the "
+    "user's current request and constraints, completed work and how it was "
+    "verified, uncertain effects, the most recent tool results and targets, "
+    "and the next unfinished step. Give more detail to recent work in progress. "
+    "Use fresh browser or window references before acting again."
+)
+
 _DIRECT_IMAGE_NATIVE_TOOLS = frozenset({
     "request_visual_observation", "computer_screenshot", "computer_zoom",
 })
@@ -463,6 +476,14 @@ class _PendingRequest:
 
 
 @dataclass
+class _CompactionRequest:
+    event: threading.Event = field(default_factory=threading.Event)
+    turn_id: str = ""
+    compacted: bool = False
+    succeeded: bool = False
+
+
+@dataclass
 class _TurnAttempt:
     thread_id: str
     conversation_id: str = ""
@@ -731,6 +752,9 @@ class AppServerClient:
         self._next_id = 1
         self._pending: dict[str, _PendingRequest] = {}
         self._attempts: dict[str, _TurnAttempt] = {}
+        self._context_usage: dict[str, tuple[int, int]] = {}
+        self._compacting_threads: set[str] = set()
+        self._compaction_requests: dict[str, _CompactionRequest] = {}
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._wait_thread: threading.Thread | None = None
@@ -1294,6 +1318,17 @@ class AppServerClient:
                 code = error.get("code")
                 if not isinstance(code, int) or isinstance(code, bool):
                     code = None
+                if (
+                    method == "thread/resume" and code == -32600
+                    and isinstance(params, dict) and params.get("threadId")
+                    and str(error.get("message") or "").strip()
+                    == f"no rollout found for thread id {params['threadId']}"
+                ):
+                    raise AppServerError(
+                        "ERROR: the saved ChatGPT thread is missing.",
+                        allow_fallback=False, category="thread_missing",
+                        method=method, server_code=code,
+                    )
                 from osia import i18n
 
                 raise AppServerError(
@@ -1389,6 +1424,9 @@ class AppServerClient:
         with self._state_lock:
             pending = list(self._pending.values())
             attempts = list(self._attempts.values())
+            for request in self._compaction_requests.values():
+                request.event.set()
+            self._compacting_threads.clear()
         for item in pending:
             try:
                 item.response.put_nowait(error)
@@ -2678,7 +2716,7 @@ class AppServerClient:
             )
             return
 
-        if tool_name not in _DIRECT_READ_ONLY_NATIVE_TOOLS:
+        if tool_name not in _INLINE_NATIVE_TOOLS:
             from osia.tool_contracts import tool_is_runtime_available
 
             self._close_dynamic_failure(
@@ -2690,7 +2728,7 @@ class AppServerClient:
                     "available": False,
                     "requested_capability": tool_name,
                     "available_capabilities": sorted(
-                        name for name in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                        name for name in _INLINE_NATIVE_TOOLS
                         if tool_is_runtime_available(name)
                     ),
                     "retryable_in_same_model_turn": True,
@@ -2724,10 +2762,11 @@ class AppServerClient:
             spec = get_tool_spec(tool_name)
             if (
                 spec is None
-                or spec.side_effect is not SideEffectClass.READ_ONLY
+                or (tool_name not in _INLINE_BROWSER_TOOLS
+                    and spec.side_effect is not SideEffectClass.READ_ONLY)
                 or not callable(spec.dispatcher)
             ):
-                raise LookupError("canonical_read_only_dispatcher_unavailable")
+                raise LookupError("canonical_inline_dispatcher_unavailable")
             clean_arguments = validate_tool_arguments(spec, arguments)
         except ToolValidationError as exc:
             from osia.tool_contracts import validation_error_details
@@ -2768,7 +2807,7 @@ class AppServerClient:
             ) if attempt.execution_strategy is not None else None
         except Exception:
             preflight_error = (
-                "ERROR: read-only capability preflight failed safely"
+                "ERROR: capability preflight failed safely"
             )
             preflight_reason_code = "CAPABILITY_PREFLIGHT_UNAVAILABLE"
         if decision is not None and not decision.allowed:
@@ -2835,7 +2874,9 @@ class AppServerClient:
         def _status_callback(status, tool_attempt_id):
             if status == "action_starting":
                 _record_capability_event(
-                    "accepted", "read_only", tool_attempt_id,
+                    "accepted",
+                    "read_only" if spec.side_effect is SideEffectClass.READ_ONLY else "accepted",
+                    tool_attempt_id,
                 )
             elif status == "action_in_progress":
                 _record_capability_event(
@@ -2918,7 +2959,7 @@ class AppServerClient:
         if is_pending:
             reason_code = "TOOL_RESULT_PENDING"
             model_result = {
-                "text": "PENDING: the read-only observation is still running.",
+                "text": "PENDING: the tool is still running.",
                 "receipt": {
                     "schema_version": 1,
                     "dispatch_state": "worker_may_be_active",
@@ -3108,14 +3149,24 @@ class AppServerClient:
                 and bool(image_data_url or prior_visual_call is not None)
             ) else model_result
         )
-        if tool_name in BROWSER_VERIFY_TOOL_NAMES and not is_pending:
+        if (
+            tool_name in _INLINE_BROWSER_TOOLS
+            and isinstance(model_result, dict)
+            and isinstance(model_result.get("receipt"), dict)
+            and model_result["receipt"].get("schema_version") == 1
+            and not is_pending
+        ):
             provider_model_result = _model_result_text(model_result, tool_name)
+            if provider_model_result.startswith("{"):
+                provider_model_result = json.loads(provider_model_result)
         try:
             result = self._dynamic_result_envelope(
                 call,
                 success=success,
                 reason_code=reason_code,
-                status="pending" if is_pending else "",
+                status=execution_outcome if tool_name in _INLINE_BROWSER_TOOLS else (
+                    "pending" if is_pending else ""
+                ),
                 result=provider_model_result,
                 image_data_url=image_data_url,
             )
@@ -3639,7 +3690,7 @@ class AppServerClient:
                     )
                     return
             if (
-                dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                dynamic_call["tool"] in _INLINE_NATIVE_TOOLS
                 or not _is_canonical_native_handoff(dynamic_call["tool"])
             ):
                 attempt.events.put(("dynamic_tool_call", {
@@ -3705,6 +3756,7 @@ class AppServerClient:
                 self._account_generation += 1
                 self._rate_limits_cache = None
                 self._rate_limits_pending_update = {}
+                self._context_usage.clear()
             return
         if method == "account/login/completed":
             login_id = params.get("loginId")
@@ -3776,6 +3828,8 @@ class AppServerClient:
                     return
 
         attempt = self._turn_attempt_for(params)
+        if thread_id:
+            self._record_context_notification(thread_id, method, params, attempt)
         if method == "model/rerouted":
             if attempt is not None:
                 attempt.model_rerouted = True
@@ -4029,7 +4083,7 @@ class AppServerClient:
                     if method == "item/started":
                         attempt.dynamic_items[call_id] = deepcopy(dynamic_call)
                     if (
-                        dynamic_call["tool"] in _DIRECT_READ_ONLY_NATIVE_TOOLS
+                        dynamic_call["tool"] in _INLINE_NATIVE_TOOLS
                         or not _is_canonical_native_handoff(dynamic_call["tool"])
                     ):
                         return
@@ -4339,6 +4393,77 @@ class AppServerClient:
                 self._rate_limits_pending_update = {}
                 return deepcopy(safe)
 
+    def _record_context_notification(self, thread_id, method, params, attempt) -> None:
+        turn = params.get("turn") or {}
+        turn_id = str(params.get("turnId") or (turn.get("id") if isinstance(turn, dict) else "") or "")
+        if not turn_id:
+            return
+        with self._state_lock:
+            request = self._compaction_requests.get(thread_id)
+            if request is not None and method == "turn/started" and not request.turn_id:
+                request.turn_id = turn_id
+            manual = request is not None and request.turn_id == turn_id
+            if not manual and attempt is None:
+                return
+            if method == "thread/tokenUsage/updated":
+                usage = params.get("tokenUsage")
+                if isinstance(usage, dict):
+                    last = usage.get("last")
+                    used = last.get("totalTokens") if isinstance(last, dict) else None
+                    maximum = usage.get("modelContextWindow")
+                    if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+                        self._context_usage[thread_id] = (used, maximum)
+                return
+            item = params.get("item")
+            if isinstance(item, dict) and item.get("type") == "contextCompaction":
+                if method == "item/started":
+                    self._compacting_threads.add(thread_id)
+                elif method == "item/completed":
+                    self._compacting_threads.discard(thread_id)
+                    self._context_usage.pop(thread_id, None)
+                    if manual:
+                        request.compacted = True
+            if method == "turn/completed":
+                self._compacting_threads.discard(thread_id)
+                if manual:
+                    request.succeeded = request.compacted and isinstance(turn, dict) and turn.get("status") == "completed"
+                    request.event.set()
+
+    def thread_context_usage(self, thread_id: str) -> dict | None:
+        with self._state_lock:
+            usage = self._context_usage.get(thread_id)
+            if usage is None:
+                return None
+            return {
+                "used": usage[0], "maximum": usage[1], "estimated": False,
+                "compacting": thread_id in self._compacting_threads,
+            }
+
+    def compact_thread(self, thread_id: str) -> None:
+        """Compact an idle thread and wait for its correlated completion."""
+        request = _CompactionRequest()
+        with self._state_lock:
+            if thread_id in self._attempts or thread_id in self._compaction_requests:
+                raise AppServerError("ERROR: the ChatGPT conversation is busy.", category="turn_busy")
+            self._compaction_requests[thread_id] = request
+        try:
+            self._request("thread/compact/start", {"threadId": thread_id})
+            if not request.event.wait(timeout=120.0) or not request.succeeded:
+                raise AppServerError(
+                    "ERROR: ChatGPT context compaction was not confirmed.",
+                    allow_fallback=False, category="compaction_unconfirmed",
+                )
+        finally:
+            with self._state_lock:
+                self._compaction_requests.pop(thread_id, None)
+                self._compacting_threads.discard(thread_id)
+
+    def delete_thread(self, thread_id: str) -> None:
+        self._request("thread/delete", {"threadId": thread_id})
+        with self._state_lock:
+            self._context_usage.pop(thread_id, None)
+            self._compacting_threads.discard(thread_id)
+
     def start_or_resume_conversation(
         self,
         *,
@@ -4347,30 +4472,30 @@ class AppServerClient:
         base_instructions: str,
         developer_instructions: str,
         dynamic_tools=None,
+        persistent: bool = False,
     ) -> str:
         if thread_id:
-            try:
-                result = self._request(
-                    "thread/resume",
-                    {
-                        "threadId": thread_id,
-                        "model": model,
-                        "cwd": str(self.workspace_dir),
-                        "approvalPolicy": "on-request",
-                        "sandbox": "read-only",
-                    },
+            result = self._request("thread/resume", {
+                "threadId": thread_id,
+                "model": model,
+                "cwd": str(self.workspace_dir),
+                "approvalPolicy": "on-request",
+                "sandbox": "read-only",
+                "excludeTurns": True,
+                **({"config": {"compact_prompt": _COMPACT_PROMPT}} if persistent else {}),
+            })
+            thread = result.get("thread") or {}
+            if result.get("instructionSources"):
+                raise AppServerError(
+                    "ERROR: Codex inherited external instruction files.",
+                    category="isolation_failed",
                 )
-                thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
-                resumed = str(thread.get("id") or "")
-                if resumed:
-                    if result.get("instructionSources"):
-                        raise AppServerError(
-                            "ERROR: Codex inherited external instruction files.",
-                            category="isolation_failed",
-                        )
-                    return resumed
-            except AppServerError:
-                pass
+            if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                raise AppServerError(
+                    "ERROR: Codex did not resume the requested conversation.",
+                    allow_fallback=False, category="thread_failed",
+                )
+            return thread_id
 
         result = self._request(
             "thread/start",
@@ -4379,7 +4504,7 @@ class AppServerClient:
                 "cwd": str(self.workspace_dir),
                 "approvalPolicy": "on-request",
                 "sandbox": "read-only",
-                "ephemeral": True,
+                "ephemeral": not persistent,
                 "serviceName": "osia_pc",
                 "baseInstructions": base_instructions,
                 "developerInstructions": developer_instructions,
@@ -4387,6 +4512,7 @@ class AppServerClient:
                     _canonical_native_tools()
                     if dynamic_tools is None else list(dynamic_tools)
                 ),
+                **({"config": {"compact_prompt": _COMPACT_PROMPT}} if persistent else {}),
             },
         )
         if result.get("instructionSources"):
@@ -4417,6 +4543,7 @@ class AppServerClient:
         on_attempt_registered: Callable[[], None] | None = None,
         timeout: float = 300.0,
         output_schema: dict | None = None,
+        application_context: str = "",
     ) -> TurnResult:
         turn_content = content if content is not None else text
         if turn_content is None:
@@ -4443,7 +4570,7 @@ class AppServerClient:
         except Exception:
             attempt.execution_strategy = None
         with self._state_lock:
-            if thread_id in self._attempts:
+            if thread_id in self._attempts or thread_id in self._compaction_requests:
                 raise AppServerError(
                     "ERROR: a ChatGPT account turn is already active for this conversation.",
                     allow_fallback=False,
@@ -4467,6 +4594,10 @@ class AppServerClient:
             }
             if effort:
                 params["effort"] = effort
+            if application_context:
+                params["additionalContext"] = {
+                    "osia": {"kind": "application", "value": application_context},
+                }
             if on_reasoning_summary is not None:
                 params["summary"] = "concise"
             if output_schema is not None:

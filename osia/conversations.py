@@ -752,6 +752,33 @@ def _load_folder_state_unlocked() -> dict:
     return state
 
 
+def _remove_committed_chat_files(paths) -> bool:
+    """Remove committed deletions and schedule their exact private threads."""
+    bindings = []
+    removed = True
+    for path in paths:
+        try:
+            conv = {} if path.is_symlink() else json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            conv = {}
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            removed = False
+            continue
+        binding = conv.get("_chatgpt_account_thread") if isinstance(conv, dict) else None
+        if isinstance(binding, dict) and binding.get("thread_id"):
+            thread_ids = binding.get("previous_thread_ids")
+            thread_ids = list(thread_ids) if isinstance(thread_ids, list) else []
+            thread_ids.append(binding["thread_id"])
+            bindings.extend((str(conv.get("id") or ""), str(thread_id)) for thread_id in thread_ids)
+    if bindings:
+        from osia.chatgpt_account.provider import delete_saved_chatgpt_threads
+
+        delete_saved_chatgpt_threads(bindings)
+    return removed
+
+
 def _recover_bulk_transactions_unlocked(state: dict) -> None:
     """Finish or roll back interrupted Project conversation transactions."""
 
@@ -794,6 +821,7 @@ def _recover_bulk_transactions_unlocked(state: dict) -> None:
             continue
         committed = (operation_id, kind) in completed
         recovered = True
+        committed_deletions = []
         for raw_name in names:
             name = Path(str(raw_name or "")).name
             if not name or name != str(raw_name) or not name.endswith(".json"):
@@ -819,7 +847,7 @@ def _recover_bulk_transactions_unlocked(state: dict) -> None:
                 continue
             try:
                 if committed:
-                    staged.unlink()
+                    committed_deletions.append(staged)
                 else:
                     if original.exists():
                         recovered = False
@@ -827,6 +855,7 @@ def _recover_bulk_transactions_unlocked(state: dict) -> None:
                     os.replace(staged, original)
             except OSError:
                 recovered = False
+        recovered = _remove_committed_chat_files(committed_deletions) and recovered
         if not recovered:
             continue
         try:
@@ -1182,6 +1211,51 @@ def get_conversation(conv_id: str) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def store_chatgpt_thread(
+    conv_id: str, binding: dict, *, previous_thread_id: str = "",
+) -> bool:
+    """Attach private provider metadata without changing the chat revision."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
+        return False
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        if not isinstance(conv, dict) or conv.get("id") != conv_id:
+            return False
+        previous = conv.get("_chatgpt_account_thread") or {}
+        if not isinstance(previous, dict):
+            return False
+        if str(previous.get("thread_id") or "") != previous_thread_id:
+            return False
+        binding = dict(binding)
+        prior_ids = previous.get("previous_thread_ids")
+        if isinstance(prior_ids, list):
+            binding["previous_thread_ids"] = list(prior_ids)
+        if previous_thread_id and previous_thread_id != binding.get("thread_id"):
+            binding.setdefault("previous_thread_ids", []).append(previous_thread_id)
+        if previous != binding:
+            conv["_chatgpt_account_thread"] = binding
+            _write_atomic(_path_for(conv_id), conv)
+        return True
+
+
+def conversation_context_compacted(conv_id: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(conv_id or "")):
+        return False
+    return (get_conversation(conv_id) or {}).get("_context_compacted") is True
+
+
+def mark_conversation_context_compacted(conv_id: str, lease_id: str) -> bool:
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        lease = conv.get("_background_execution_lease") if isinstance(conv, dict) else None
+        if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
+            return False
+        if conv.get("_context_compacted") is not True:
+            conv["_context_compacted"] = True
+            _write_atomic(_path_for(conv_id), conv)
+        return True
 
 
 def _list_conversations_unlocked(state: dict) -> list[dict]:
@@ -1757,11 +1831,7 @@ def delete_folder_with_conversations(
                 replayed=False,
             )
 
-        for _source, staged in moved:
-            try:
-                staged.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _remove_committed_chat_files(staged for _source, staged in moved)
         try:
             (transaction / "manifest.json").unlink(missing_ok=True)
             transaction.rmdir()
@@ -1895,11 +1965,7 @@ def _delete_all_ungrouped_conversations(
                 replayed=False,
             )
 
-        for _source, target in moved:
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _remove_committed_chat_files(target for _source, target in moved)
         try:
             (trash / "manifest.json").unlink(missing_ok=True)
             trash.rmdir()
@@ -2617,10 +2683,7 @@ def delete_conversation_with_receipt(
                 },
                 replayed=False,
             )
-        try:
-            staged.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _remove_committed_chat_files((staged,))
         try:
             from osia.image_inputs import release_media_owner
 

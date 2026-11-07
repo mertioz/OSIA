@@ -1903,6 +1903,7 @@ def wake_mode():
         # Canonical conversation deletion completes off the GUI thread.
         conversation_delete_finished = pyqtSignal(dict)
         slash_information_ready = pyqtSignal(int, dict)
+        context_compaction_ready = pyqtSignal(int, str, dict)
         # Reset chat (agent + GUI) from a worker thread â€” "nouveau chat" voice
         # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
         new_chat = pyqtSignal()
@@ -4816,6 +4817,98 @@ def wake_mode():
         if epoch == selection_epoch[0] and popup.isVisible():
             popup.show_slash_information(payload)
 
+    pending_compactions: set[str] = set()
+    meter_cache: dict = {}
+
+    def refresh_context_meter() -> None:
+        if not popup.isVisible() or popup._stack.currentIndex() != popup.PAGE_CHAT:
+            return
+        from osia.conversation_context import (
+            conversation_context_usage, estimate_messages_tokens, resolve_context_limit,
+        )
+
+        conv = active_conv or {}
+        conv_id = str(conv.get("id") or "")
+        binding = _active_chat_turn_for_conversation(conv_id).get("binding") or {}
+        provider = str(binding.get("provider_id") or agent.provider or "")
+        model = str(binding.get("model_id") or agent.model or "")
+        usage = conversation_context_usage(conv_id)
+        if usage and (usage.get("provider"), usage.get("model")) != (provider, model):
+            usage = None
+        if provider == "chatgpt_account" and conv_id:
+            from osia.chatgpt_account.provider import get_account_provider
+
+            native = get_account_provider().conversation_context_usage(conv_id, model=model)
+            usage = native or usage
+        if usage is None:
+            key = (conv_id, conv.get("revision"), provider, model)
+            if meter_cache.get("key") != key:
+                meter_cache["key"] = key
+                meter_cache["usage"] = {
+                    "used": estimate_messages_tokens(conv["messages"]) if conv.get("messages") else 0,
+                    "maximum": resolve_context_limit(provider, model),
+                    "estimated": True,
+                }
+            usage = meter_cache["usage"]
+        popup._chat._context_meter.set_usage({
+            **usage, "compacting": conv_id in pending_compactions or bool(usage.get("compacting")),
+        })
+
+    def handle_context_compaction() -> None:
+        from osia.conversation_context import ContextBuildError, compact_conversation_context
+
+        conv_id = str((active_conv or {}).get("id") or "")
+        if not conv_id:
+            popup._chat.show_notice(
+                "Ouvre une discussion pour compacter son contexte."
+                if i18n.get_language() == "fr" else "Open a conversation to compact its context."
+            )
+            return
+        if conv_id in pending_compactions:
+            return
+        epoch = selection_epoch[0]
+        provider, model = str(agent.provider or ""), str(agent.model or "")
+        pending_compactions.add(conv_id)
+        refresh_context_meter()
+
+        def run() -> None:
+            try:
+                result = compact_conversation_context(conv_id, provider, model)
+            except ContextBuildError as exc:
+                result = {"error": exc.category}
+            except Exception as exc:
+                print(f"[OSIA] context compaction failed ({type(exc).__name__})")
+                result = {"error": "compaction_failed"}
+            try:
+                bridge.context_compaction_ready.emit(epoch, conv_id, result)
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=run, name="osia-context-compaction", daemon=True).start()
+
+    def handle_context_compaction_ready(epoch: int, conv_id: str, result: dict) -> None:
+        pending_compactions.discard(conv_id)
+        if epoch != selection_epoch[0]:
+            return
+        french = i18n.get_language() == "fr"
+        if result.get("error") == "conversation_busy":
+            popup.show_conversation_busy_notice()
+        elif result.get("error"):
+            popup._chat.show_notice(
+                "La compaction du contexte a échoué."
+                if french else "Context compaction failed."
+            )
+        elif result.get("changed"):
+            popup._chat.show_notice("Contexte compacté." if french else "Context compacted.")
+        else:
+            popup._chat.show_notice("Le contexte est déjà court." if french else "The context is already short.")
+        refresh_context_meter()
+
+    context_meter_timer = QTimer(popup)
+    context_meter_timer.setInterval(450)
+    context_meter_timer.timeout.connect(refresh_context_meter)
+    context_meter_timer.start()
+
     # â”€â”€ Signal wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     bridge.wake_detected.connect(handle_wake)
@@ -4846,6 +4939,8 @@ def wake_mode():
     popup.informational_requested.connect(handle_slash_information)
     bridge.slash_information_ready.connect(handle_slash_information_ready)
     popup.mouse_control_requested.connect(handle_slash_mouse_control)
+    popup.context_compaction_requested.connect(handle_context_compaction)
+    bridge.context_compaction_ready.connect(handle_context_compaction_ready)
     popup.new_conversation.connect(handle_new_conversation)
     popup.open_conversation.connect(handle_open_conversation)
     popup.rename_conversation.connect(handle_rename_conversation)

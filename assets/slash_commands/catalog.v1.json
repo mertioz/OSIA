@@ -62,6 +62,18 @@
       "handler_contract": "toggle_conversation_mouse_control_v1"
     },
     {
+      "id": "context.compact",
+      "canonical_alias": "compact",
+      "name": {"en": "Compact context", "fr": "Compacter le contexte"},
+      "description": {"en": "Free context space while keeping the conversation", "fr": "Libérer de la place dans le contexte de cette discussion"},
+      "argument_hint": {"en": "", "fr": ""},
+      "kind": "action",
+      "availability_predicate": "conversation_context_compaction",
+      "icon_semantic": "status",
+      "chip_behavior": "none",
+      "handler_contract": "compact_conversation_context_v1"
+    },
+    {
       "id": "skill.select",
       "canonical_alias": "skill",
       "name": {"en": "Use a skill", "fr": "Utiliser un skill"},

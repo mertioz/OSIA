@@ -186,8 +186,9 @@ def test_reused_account_thread_keeps_each_continuation_language_contract_last():
         ],
     )
 
-    assert len(client.starts) == 2
-    assert client.starts[1]["base_instructions"].rstrip().endswith(spanish)
+    assert len(client.starts) == 1
+    assert client.turns[2]["thread_id"] == client.turns[0]["thread_id"]
+    assert client.turns[2]["application_context"].rstrip().endswith(spanish)
     assert client.turns[2]["text"].rstrip().endswith(spanish)
 
 

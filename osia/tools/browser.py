@@ -2562,20 +2562,28 @@ class _AsyncBrowserOwner:
             tabs = []
             for page, _ref in self._state_tracker.tab_refs()[:64]:
                 try:
-                    title = await page.title()
-                except Exception:
-                    title = ""
-                safe_url = safe_url_display(await self._page_url(page))
-                try:
-                    # Navigation can commit while the title/URL is awaited.
-                    # Pair the observed tab with its latest document identity.
-                    ref = self._current_state(page)
+                    title_ref = self._current_state(page)
+                    try:
+                        title = await page.title()
+                    except Exception:
+                        title = ""
+                    for _ in range(2):
+                        before_read = self._current_state(page)
+                        safe_url = safe_url_display(await self._page_url(page))
+                        ref = self._current_state(page)
+                        if (
+                            ref.navigation_id == before_read.navigation_id
+                            and ref.document_epoch == before_read.document_epoch
+                        ):
+                            break
+                    else:
+                        continue
                 except BrowserReferenceError:
                     continue
                 tabs.append({
                     "state": ref.to_dict(),
                     "safe_url": safe_url,
-                    "title": str(title or "")[:300],
+                    "title": str(title or "")[:300] if ref.navigation_id == title_ref.navigation_id else "",
                     "active": page is self._active_page,
                     "has_opener": self._state_tracker.opener(page) is not None,
                 })
@@ -2719,11 +2727,31 @@ class _AsyncBrowserOwner:
     async def _op_go_forward_safe(self, state_ref=None):
         return await self._history_operation("forward", state_ref)
 
-    async def _op_open_new_tab_safe(self, url, state_ref=None):
+    async def _op_open_new_tab_safe(self, url, state_ref=None, reuse_existing=True):
         started = time.time()
         try:
             normalized = _normalize_url(url)
             opener, before = await self._resolve_state_page(state_ref)
+            if reuse_existing:
+                tabs = sorted(
+                    self._state_tracker.tab_refs(),
+                    key=lambda item: item[0] is not self._active_page,
+                )
+                for existing, ref in tabs:
+                    try:
+                        if await self._page_url(existing) != normalized:
+                            continue
+                        current = self._current_state(existing)
+                        if current.navigation_id != ref.navigation_id or current.document_epoch != ref.document_epoch:
+                            continue
+                    except BrowserReferenceError:
+                        continue
+                    selected = await self._op_select_tab(ref.to_dict())
+                    if selected["ok"]:
+                        selected["data"].update(
+                            tab_reused=True, safe_url=safe_url_display(normalized),
+                        )
+                    return selected
             page = await self._context.new_page()
             generation = self._register_context(self._context)
             self._register_page(
@@ -3743,7 +3771,7 @@ class _AsyncBrowserOwner:
             )
 
     async def _op_open_new_tab(self, url):
-        return await self._op_open_new_tab_safe(url)
+        return await self._op_open_new_tab_safe(url, reuse_existing=False)
         url = _normalize_url(url)
         try:
             await self._ensure_browser()
@@ -4593,8 +4621,10 @@ def browser_forward(state_ref: dict) -> dict:
     return _owner.call("go_forward_safe", state_ref, timeout=20.0)
 
 
-def open_new_browser_tab(url: str, state_ref: dict | None = None) -> dict:
-    return _owner.call("open_new_tab_safe", url, state_ref, timeout=30.0)
+def open_new_browser_tab(
+    url: str, state_ref: dict | None = None, reuse_existing: bool = True,
+) -> dict:
+    return _owner.call("open_new_tab_safe", url, state_ref, reuse_existing, timeout=30.0)
 
 
 def return_to_browser_opener(state_ref: dict) -> dict:

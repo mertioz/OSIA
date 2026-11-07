@@ -121,6 +121,34 @@ def test_small_context_compacts_past_turns_without_dropping_an_active_tool_excha
     assert estimate_messages_tokens(result.messages) <= result.receipt["input_budget"]
 
 
+def test_overflow_during_work_retains_latest_tool_exchange_and_objective():
+    messages = [
+        {"role": "system", "content": "System policy"},
+        {"role": "user", "content": "Compare and add the missing projects."},
+    ]
+    for step in range(12):
+        call_id = f"call_{step}"
+        messages.extend([
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [{
+                    "id": call_id, "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool", "tool_call_id": call_id,
+                "content": f"PROJECT_{step} " + "observed evidence " * 67,
+            },
+        ])
+    result = build_context(messages, provider="ollama", model="fixture", context_limit=8192)
+    assert result.receipt["compaction_strategy"].startswith("deterministic_")
+    assert result.messages[1] == messages[1]
+    assert result.messages[-2:] == messages[-2:]
+    assert "PROJECT_7" in result.messages[0]["content"]
+    assert estimate_messages_tokens(result.messages) <= result.receipt["input_budget"]
+
+
 def test_markdown_headings_survive_saving_and_reopening(monkeypatch, tmp_path):
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
     monkeypatch.setattr("osia.main._notify_mobile_conversation_changed", lambda *args, **kwargs: None)

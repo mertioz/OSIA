@@ -5530,6 +5530,7 @@ def _build_config_snapshot() -> dict:
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     cfg["chat_slash_extensions"] = 1
     cfg["conversation_mouse_control"] = True
+    cfg["conversation_context_compaction"] = True
     cfg["slash_reasoning_model_options"] = True
     try:
         from osia.slash_commands import safe_availability_overlay
@@ -7531,7 +7532,7 @@ async def websocket_endpoint(ws: WebSocket):
     # a successful auth, cancelled in the finally block on disconnect.
     heartbeat_task: asyncio.Task | None = None
     remote_catalogue_refresh_pending = False
-    settings_read_tasks: set[asyncio.Task] = set()
+    socket_response_tasks: set[asyncio.Task] = set()
     chatgpt_login_started_here = False
     catalogue_change_task: asyncio.Task | None = None
     account_change_task: asyncio.Task | None = None
@@ -7604,16 +7605,15 @@ async def websocket_endpoint(ws: WebSocket):
             "type": "chatgpt_account_state", "account": state
         })
 
-    def _schedule_settings_read(coroutine) -> None:
-        # Read-only provider I/O must not serialize Settings behind model/account
-        # discovery. Each request still receives its own observed PC snapshot.
+    def _schedule_socket_response(coroutine) -> None:
+        # Provider I/O must not block the receive loop for this connection.
         task = asyncio.create_task(coroutine)
-        settings_read_tasks.add(task)
+        socket_response_tasks.add(task)
 
         def finished(done: asyncio.Task) -> None:
-            settings_read_tasks.discard(done)
+            socket_response_tasks.discard(done)
             if not done.cancelled() and done.exception() is not None:
-                print("[OSIA Server] settings read failed after client closure")
+                print("[OSIA Server] response task failed after client closure")
 
         task.add_done_callback(finished)
 
@@ -8745,6 +8745,41 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json(snapshot)
                 continue
 
+            if msg_type == "compact_conversation_context":
+                operation_id, conv_id = msg.get("operation_id"), msg.get("conversation_id")
+                if (
+                    not isinstance(operation_id, str)
+                    or not re.fullmatch(r"compact_[A-Za-z0-9_-]{1,112}", operation_id)
+                    or not isinstance(conv_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id)
+                ):
+                    continue
+
+                async def respond_context_compaction(conv_id=conv_id, operation_id=operation_id):
+                    from osia.conversation_context import ContextBuildError, compact_conversation_context
+
+                    try:
+                        route = _resolve_chat_route_binding()
+                        result = await asyncio.to_thread(
+                            compact_conversation_context,
+                            conv_id, route["provider_id"], route["model_id"],
+                        )
+                    except ContextBuildError as exc:
+                        result = {"error": exc.category}
+                    except Exception as exc:
+                        print(f"[OSIA Server] context compaction failed ({type(exc).__name__})")
+                        result = {"error": "compaction_failed"}
+                    snapshot = conversations.conversation_snapshot()
+                    snapshot.update(
+                        operation_id=operation_id, compact_conversation_id=conv_id,
+                        compact_changed=result.get("changed") is True,
+                        compact_error=str(result.get("error") or ""),
+                    )
+                    await out.send_json(snapshot)
+
+                _schedule_socket_response(respond_context_compaction())
+                continue
+
             if msg_type == "get_chat_screenshot":
                 await _send_chat_screenshot(out, msg)
                 continue
@@ -9200,7 +9235,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Models ---
             if msg_type == "get_models":
-                _schedule_settings_read(_respond_models())
+                _schedule_socket_response(_respond_models())
                 continue
 
             if msg_type == "set_model":
@@ -9266,7 +9301,7 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "get_chatgpt_account":
-                _schedule_settings_read(_respond_account())
+                _schedule_socket_response(_respond_account())
                 continue
 
             if msg_type == "chatgpt_account_login":
@@ -11426,12 +11461,12 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
-        pending_settings_reads = list(settings_read_tasks)
+        pending_settings_reads = list(socket_response_tasks)
         for task in pending_settings_reads:
             task.cancel()
         if pending_settings_reads:
             await asyncio.gather(*pending_settings_reads, return_exceptions=True)
-        settings_read_tasks.clear()
+        socket_response_tasks.clear()
         for owner in command_owners:
             settlement = asyncio.create_task(_settle_websocket_command_owner(owner))
             try:

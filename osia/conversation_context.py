@@ -13,12 +13,16 @@ import json
 import logging
 import math
 import re
+import threading
 import unicodedata
-from collections import Counter
+import uuid
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 
 
 _LOG = logging.getLogger(__name__)
+_USAGE_LOCK = threading.Lock()
+_USAGE_BY_CONVERSATION: OrderedDict[str, dict] = OrderedDict()
 
 CONTEXT_RECEIPT_SCHEMA_VERSION = 1
 RECENT_MESSAGE_COUNT = 10
@@ -522,6 +526,9 @@ def _canonical_entries(messages: list, conversation_id: str) -> tuple[list[_Entr
         if (
             entries
             and entries[-1].message.get("role") == role
+            and role != "tool"
+            and not entries[-1].message.get("tool_calls")
+            and not message.get("tool_calls")
             and isinstance(entries[-1].message.get("content"), str)
             and isinstance(content, str)
         ):
@@ -632,7 +639,7 @@ def _critical_excerpt(message: dict, *, max_chars: int = 360) -> str:
             or "?" in fragment
         )
     ]
-    if not selected and message.get("role") == "user":
+    if not selected and (message.get("role") == "user" or _is_tool_result(message)):
         selected = fragments[:1]
     excerpt = " ".join(selected[:3]).strip()
     if len(excerpt) > max_chars:
@@ -640,24 +647,25 @@ def _critical_excerpt(message: dict, *, max_chars: int = 360) -> str:
     return excerpt
 
 
+_COMPACTION_HEADER = (
+    "[OSIA deterministic context compaction]\n"
+    "These excerpts come from the conversation and may be incomplete. Retain "
+    "the user's constraints, decisions, recent observations, confirmed effects, "
+    "uncertain effects and the next unfinished step. Refresh old target references."
+)
+
+
+def _compaction_line(entry: _Entry, excerpt: str) -> str:
+    source_id = _opaque_message_id(entry.source_ids[0])
+    role = str(entry.message.get("role") or "")
+    return f"- id={source_id} role={role} excerpt=" + json.dumps(excerpt, ensure_ascii=False)
+
+
 def _compaction_note(items: list[tuple[_Entry, str]]) -> dict | None:
     if not items:
         return None
-    lines = [
-        "[OSIA deterministic context compaction]",
-        "Older history was compacted locally. The entries below are selected "
-        "incomplete excerpts, not the original messages in full. Preserve explicit "
-        "user constraints, decisions, unresolved questions, confirmations and opaque "
-        "references while answering the latest user message.",
-    ]
-    for entry, excerpt in items:
-        source_id = _opaque_message_id(entry.source_ids[0])
-        role = str(entry.message.get("role") or "")
-        lines.append(
-            f"- id={source_id} role={role} excerpt="
-            + json.dumps(excerpt, ensure_ascii=False)
-        )
-    return {"role": "system", "content": "\n".join(lines)}
+    content = "\n".join([_COMPACTION_HEADER, *(_compaction_line(entry, excerpt) for entry, excerpt in items)])
+    return {"role": "system", "content": content}
 
 
 def _message_counts(messages: list[dict]) -> dict[str, int]:
@@ -811,6 +819,7 @@ def build_context(
     context_limit: int | None = None,
     metadata_messages: list | None = None,
     explicit_conversation_id: str | None = None,
+    force_compaction: bool = False,
 ) -> ContextBuildResult:
     """Return the exact bounded logical context and a sanitized receipt."""
 
@@ -868,7 +877,7 @@ def build_context(
         raise ContextBuildError("invalid_context_limit")
     budget = _input_budget(resolved_limit)
     before_tokens = estimate_messages_tokens(before)
-    if before_tokens <= budget:
+    if before_tokens <= budget and (not force_compaction or len(entries) <= RECENT_MESSAGE_COUNT + 1):
         included = set(range(len(entries)))
         receipt = _receipt(
             provider=provider,
@@ -946,6 +955,25 @@ def build_context(
         # Recent history normally stays intact. On a short context, use the
         # existing excerpt pass for past turns and preserve the active turn.
         required = essential
+    if estimate_messages_tokens([entries[index].message for index in required]) > budget:
+        # The active turn can itself fill the window. Keep its objective and the
+        # most recent complete tool exchanges. Older exchanges become excerpts.
+        required = instruction_indexes | ({latest_user} if latest_user is not None else set())
+        active = [index for index in conversational if latest_user is None or index > latest_user]
+        groups = []
+        for index in active:
+            if groups and _is_tool_result(entries[index].message):
+                groups[-1].append(index)
+            else:
+                groups.append([index])
+        remaining = budget - estimate_messages_tokens([entries[index].message for index in required])
+        reserve = min(2_048, max(0, remaining // 4))
+        for group in reversed(groups):
+            tokens = sum(estimate_message_tokens(entries[index].message) for index in group)
+            if tokens > remaining - reserve:
+                break
+            required.update(group)
+            remaining -= tokens
     required_messages = [
         copy.deepcopy(entry.message)
         for index, entry in enumerate(entries)
@@ -977,7 +1005,8 @@ def build_context(
         priority = _excerpt_priority(entry.message)
         if priority <= 0:
             continue
-        excerpt = _critical_excerpt(entry.message)
+        recent = latest_user is not None and index > latest_user
+        excerpt = _critical_excerpt(entry.message, max_chars=720 if recent else 360)
         if not excerpt:
             continue
         if priority == 20:
@@ -990,41 +1019,31 @@ def build_context(
             generic_user_samples += 1
         summary_items.append((entry, excerpt))
 
+    # Prioritize recent work when an active turn is being compacted.
+    if latest_user is not None:
+        recent_work = {id(entries[index]) for index in omitted_indexes if index > latest_user}
+    else:
+        recent_work = set()
     note = _compaction_note(summary_items)
     if note is not None:
         tentative = [note, *required_messages]
         if estimate_messages_tokens(tentative) > budget:
-            # Preserve high-value entries first, but retain chronological order
-            # among entries that fit. Critical/security/reference entries are
-            # never silently discarded: if they cannot fit even as short excerpts,
-            # fail before the provider request.
-            high_value = [
-                item for item in summary_items
-                if _excerpt_priority(item[0].message) >= 45
-            ]
-            shortened = [
-                (entry, _critical_excerpt(entry.message, max_chars=160))
-                for entry, _excerpt in high_value
-            ]
-            note = _compaction_note(shortened)
-            tentative = ([note] if note is not None else []) + required_messages
-            if estimate_messages_tokens(tentative) > budget:
-                failure = {
-                    "schema_version": CONTEXT_RECEIPT_SCHEMA_VERSION,
-                    "conversation_id": _safe_identifier(conversation, "conv"),
-                    "turn_id": _safe_identifier(turn_id, "turn"),
-                    "provider_id": str(provider or "").strip().lower(),
-                    "model_id": str(model or "").strip(),
-                    "context_limit": resolved_limit,
-                    "input_budget": budget,
-                    "estimated_tokens_before": before_tokens,
-                    "estimated_tokens_after": estimate_messages_tokens(tentative),
-                    "compaction_strategy": "failed_critical_context_too_large",
-                    "canonical_context_hash": _structure_hash(tentative),
-                }
-                record_context_receipt(failure)
-                raise ContextBuildError("critical_context_too_large", failure)
-            summary_items = shortened
+            ordered = sorted(summary_items, key=lambda item: (
+                id(item[0]) in recent_work, _excerpt_priority(item[0].message),
+                item[0].source_indexes[-1],
+            ), reverse=True)
+            room = budget - estimate_messages_tokens(required_messages) - estimate_message_tokens({
+                "role": "system", "content": _COMPACTION_HEADER,
+            })
+            retained = []
+            for entry, excerpt in ordered:
+                shortened = excerpt if id(entry) in recent_work else _critical_excerpt(entry.message, max_chars=160)
+                cost = _estimate_content_tokens("\n" + _compaction_line(entry, shortened))
+                if cost <= room:
+                    retained.append((entry, shortened))
+                    room -= cost
+            summary_items = sorted(retained, key=lambda item: item[0].source_indexes[0])
+            note = _compaction_note(summary_items)
 
     after = [
         copy.deepcopy(entry.message)
@@ -1054,6 +1073,9 @@ def build_context(
         if (
             isinstance(previous, dict)
             and previous.get("role") == message.get("role")
+            and message.get("role") != "tool"
+            and not previous.get("tool_calls")
+            and not message.get("tool_calls")
             and isinstance(previous.get("content"), str)
             and isinstance(message.get("content"), str)
         ):
@@ -1065,6 +1087,14 @@ def build_context(
     after = coalesced
     if estimate_messages_tokens(after) > budget:
         raise ContextBuildError("context_budget_invariant_failed")
+    strategy = "deterministic_critical_excerpts_recent_verbatim_v1"
+    if force_compaction and before_tokens <= budget and estimate_messages_tokens(after) >= before_tokens:
+        # A short transcript can cost less than its annotated summary.
+        after = before
+        required = set(range(len(entries)))
+        omitted_indexes = []
+        summary_items = []
+        strategy = "full_history"
 
     summarized_ids = [
         message_id
@@ -1089,7 +1119,7 @@ def build_context(
         included_entry_indexes=required,
         compacted_source_ids=compacted_ids,
         summarized_source_ids=summarized_ids,
-        strategy="deterministic_critical_excerpts_recent_verbatim_v1",
+        strategy=strategy,
         duplicates_removed=duplicates_removed,
         metadata_messages=metadata_messages if metadata_messages is not None else messages,
     )
@@ -1120,8 +1150,69 @@ def record_context_receipt(receipt: dict) -> dict:
     """Log only the already-sanitized metadata receipt."""
 
     safe = copy.deepcopy(receipt) if isinstance(receipt, dict) else {}
+    conversation = str(safe.get("conversation_id") or "")
+    used, maximum = safe.get("estimated_tokens_after"), safe.get("context_limit")
+    if conversation and type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+        with _USAGE_LOCK:
+            _USAGE_BY_CONVERSATION[conversation] = {
+                "used": used, "maximum": maximum, "estimated": True,
+                "provider": safe.get("provider_id"), "model": safe.get("model_id"),
+            }
+            _USAGE_BY_CONVERSATION.move_to_end(conversation)
+            if len(_USAGE_BY_CONVERSATION) > 128:
+                _USAGE_BY_CONVERSATION.popitem(last=False)
     _LOG.info("conversation_context_receipt %s", json.dumps(safe, sort_keys=True))
     return safe
+
+
+def conversation_context_usage(conversation_id: str) -> dict | None:
+    if not conversation_id:
+        return None
+    with _USAGE_LOCK:
+        usage = _USAGE_BY_CONVERSATION.get(_safe_identifier(conversation_id, "conv"))
+        return dict(usage) if usage else None
+
+
+def compact_conversation_context(conversation_id: str, provider: str, model: str) -> dict:
+    """Compact a provider view while keeping the canonical transcript intact."""
+    from osia import conversations
+    from osia.agent import _sanitize_persisted_history_message, get_system_prompt
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(conversation_id or "")):
+        raise ContextBuildError("conversation_not_found")
+    lease = "context_compaction_" + uuid.uuid4().hex
+    if not conversations.claim_background_execution(conversation_id, lease):
+        raise ContextBuildError("conversation_busy")
+    try:
+        conv = conversations.get_conversation(conversation_id) or {}
+        history = [
+            clean for message in conv.get("messages") or []
+            if (clean := _sanitize_persisted_history_message(message)) is not None
+        ]
+        messages = [
+            {"role": "system", "content": get_system_prompt(model=model, provider=provider)},
+            *history,
+        ]
+        compacted = build_context(
+            messages, provider=provider, model=model,
+            conversation_id=conversation_id, force_compaction=True,
+        )
+        native = False
+        if provider == "chatgpt_account" and conv.get("_chatgpt_account_thread"):
+            from osia.chatgpt_account.provider import get_account_provider
+
+            native = get_account_provider().compact_conversation(conversation_id, model)
+        receipt = compacted.receipt
+        changed = native or receipt["estimated_tokens_after"] < receipt["estimated_tokens_before"]
+        record_context_receipt(receipt)
+        if changed and not conversations.mark_conversation_context_compacted(conversation_id, lease):
+            raise ContextBuildError("conversation_not_found")
+        return {
+            "changed": changed,
+            "usage": conversation_context_usage(conversation_id),
+        }
+    finally:
+        conversations.release_background_execution(conversation_id, lease)
 
 
 __all__ = [

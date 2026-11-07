@@ -59,6 +59,26 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
         chat.deleteLater()
 
 
+def test_context_meter_and_compact_command_keep_the_composer_local():
+    chat = _ChatPage()
+    requested = QSignalSpy(chat.context_compaction_requested)
+    sent = QSignalSpy(chat.send_text)
+    try:
+        chat._context_meter.set_usage({"used": 4, "maximum": 8, "estimated": False})
+        assert chat._context_meter._fraction == 0.5
+        assert "4 / 8" in chat._context_meter.toolTip()
+        chat._input.setPlainText("/compact")
+        chat._on_send()
+        assert len(requested) == 1 and not sent
+        assert not chat._input.toPlainText()
+        chat._input.setPlainText("//compact")
+        chat._on_send()
+        assert sent[0][0] == "/compact"
+    finally:
+        chat.close()
+        chat.deleteLater()
+
+
 def test_palette_keeps_filtering_while_snapshot_worker_waits(monkeypatch):
     from osia.gui import slash_palette
 

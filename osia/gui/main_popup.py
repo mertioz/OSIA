@@ -628,6 +628,54 @@ class _ComposerButton(_PointerStyledButton):
         painter.end()
 
 
+class _ContextMeter(QWidget):
+    """Small gray ring for the selected conversation's model context."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(18, 18)
+        self._usage = {}
+        self._fraction = 0.0
+        self.set_usage({})
+
+    def set_usage(self, usage: dict) -> None:
+        used, maximum = usage.get("used"), usage.get("maximum")
+        french = i18n.get_language() == "fr"
+        label = "Contexte" if french else "Context"
+        if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+            self._fraction = min(1.0, used / maximum)
+            counts = f"{used:,} / {maximum:,}"
+            if french:
+                counts = counts.replace(",", " ")
+            label += f" · {counts} " + ("jetons" if french else "tokens")
+            if usage.get("estimated"):
+                label += " (estimation)" if french else " (estimated)"
+        else:
+            self._fraction = 0.0
+            label += " · " + ("usage inconnu" if french else "usage unavailable")
+        if usage.get("compacting"):
+            label += "\n" + ("Compaction en cours" if french else "Compacting")
+        self.setAccessibleName(label)
+        self.setToolTip(label)
+        if usage != self._usage:
+            self._usage = dict(usage)
+            self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = get_theme_manager().palette
+        ring = QRectF(2.5, 2.5, 13, 13)
+        painter.setPen(QPen(palette.color("text", 60), 1.5))
+        painter.drawEllipse(ring)
+        if self._fraction:
+            pen = QPen(palette.color("text", 175), 1.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(ring, 90 * 16, -round(360 * 16 * self._fraction))
+        painter.end()
+
+
 class _ComposerInput(QTextEdit):
     """Compact multiline editor: Enter submits, Shift+Enter inserts a newline."""
 
@@ -1280,6 +1328,7 @@ class _ChatPage(QWidget):
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
     mouse_control_requested = pyqtSignal()
+    context_compaction_requested = pyqtSignal()
     execution_cancel_requested = pyqtSignal(dict)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
     pick_file = pyqtSignal(str, str)
@@ -1434,12 +1483,14 @@ class _ChatPage(QWidget):
         self._send_btn.setObjectName("sendBtn")
         self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._send_btn.clicked.connect(self._on_composer_action)
+        self._context_meter = _ContextMeter()
         self._input.textChanged.connect(self._on_input_changed)
         self._input.cursorPositionChanged.connect(self._update_composer_palette)
         self._sync_send_state()
 
         row.addWidget(self._file_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(self._input, 1)
+        row.addWidget(self._context_meter, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(self._send_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         input_layout.addLayout(row)
         outer.addWidget(input_wrap)
@@ -1453,6 +1504,7 @@ class _ChatPage(QWidget):
         self._file_btn.setAccessibleName(i18n.t("chat.attach_file"))
         self._apply_composer_state()
         self._input.setAccessibleName(i18n.t("chat.input_placeholder"))
+        self._context_meter.set_usage(self._context_meter._usage)
         self._sync_send_state()
         self._rebuild_attachment_chips()
         self._rebuild_directive_chips()
@@ -1472,6 +1524,7 @@ class _ChatPage(QWidget):
         self._slash_palette.close_palette()
         self._save_current_draft()
         self._draft_context = conversation_id
+        self._context_meter.set_usage({})
         settings = load_settings() or {}
         self._slash_palette.set_context(
             locale=i18n.get_language(),
@@ -1597,6 +1650,9 @@ class _ChatPage(QWidget):
         selection_type = str(row.get("selection_type") or "")
         next_directives = self._directives
         mention_size = 0
+        if handler == "compact_conversation_context_v1":
+            self._request_context_compaction(consume_palette_prefix(self._input.text()))
+            return
         if handler == "toggle_conversation_mouse_control_v1":
             self._input.setPlainText(consume_palette_prefix(self._input.text()))
             self.mouse_control_requested.emit()
@@ -2343,7 +2399,28 @@ class _ChatPage(QWidget):
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def _request_context_compaction(self, remaining: str = "") -> None:
+        french = i18n.get_language() == "fr"
+        if self._busy:
+            self.show_notice(
+                "Un tour est déjà en cours dans cette discussion."
+                if french else self._BUSY_TEXT
+            )
+            return
+        if remaining.strip() or self._pending_attachments or not self._directives.is_empty:
+            self.show_notice(
+                "Utilise /compact seul, sans texte ni pièce jointe."
+                if french else "Use /compact on its own, without text or attachments."
+            )
+            self._slash_palette.close_palette()
+            return
+        self._input.clear()
+        self.context_compaction_requested.emit()
+
     def _on_send(self) -> None:
+        if self._input.toPlainText().strip().casefold() == "/compact":
+            self._request_context_compaction()
+            return
         waiting = bool(
             self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
         )
@@ -11352,6 +11429,7 @@ class MainPopup(QWidget):
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
     mouse_control_requested = pyqtSignal()
+    context_compaction_requested = pyqtSignal()
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
     open_conversation = pyqtSignal(str)
@@ -11508,6 +11586,7 @@ class MainPopup(QWidget):
             self.informational_requested.emit
         )
         self._chat.mouse_control_requested.connect(self.mouse_control_requested.emit)
+        self._chat.context_compaction_requested.connect(self.context_compaction_requested.emit)
         self._chat.execution_cancel_requested.connect(
             self._on_chat_execution_cancel_requested
         )

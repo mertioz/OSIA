@@ -42,7 +42,8 @@ Do not infer local paths unless needed.]
 
 _DEVELOPER_INSTRUCTIONS = (
     "Act as OSIA's provider. Use any applicable hosted or OSIA capability and "
-    "report only observed outcomes."
+    "report only observed outcomes. Apply the current OSIA application context "
+    "when present for this turn's instructions and settings."
 )
 
 _PLANNING_BASE_INSTRUCTIONS = (
@@ -123,6 +124,10 @@ class _ConversationState:
     native_tool_names: tuple[str, ...] = ()
     strategy_revision: int = 0
     world_revision: int = 0
+    account_scope: str = ""
+    history_cursor: tuple[str, ...] = ()
+    last_turn_id: str = ""
+    application_context: str = ""
 
 
 def _with_native_frontier_receipt(
@@ -194,6 +199,37 @@ def _same_messages(left: list[dict], right: list[dict]) -> bool:
     if len(left) > len(right):
         return False
     return all(_public_message(a) == _public_message(b) for a, b in zip(left, right))
+
+
+def _message_digest(message: dict) -> str:
+    payload = _public_message(message)
+    if isinstance(payload["content"], str):
+        payload["content"] = payload["content"].partition(_LANGUAGE_MARKER)[0].rstrip()
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _thread_delta(state: _ConversationState, messages: list[dict], turn_id: str) -> list[dict]:
+    """Append unseen input to the same thread after local history compaction."""
+    from osia.conversation_context import _is_tool_result
+
+    if state.expected_messages and _same_messages(state.expected_messages, messages):
+        return messages[len(state.expected_messages):]
+    latest_user = next((
+        i for i in range(len(messages) - 1, -1, -1)
+        if messages[i].get("role") == "user" and not _is_tool_result(messages[i])
+    ), None)
+    same_turn = bool(turn_id and state.last_turn_id == turn_id)
+    if state.history_cursor:
+        digests = [_message_digest(message) for message in messages]
+        limit = len(messages) if same_turn or latest_user is None else latest_user
+        for count in range(min(len(state.history_cursor), limit), 0, -1):
+            anchor = state.history_cursor[-count:]
+            for end in range(limit, count - 1, -1):
+                if tuple(digests[end-count:end]) == anchor:
+                    return messages[end:]
+    if latest_user is not None:
+        return messages[latest_user + int(same_turn):]
+    return messages[-1:]
 
 
 def _native_rebuild_history(messages: list[dict]) -> list[dict]:
@@ -356,6 +392,7 @@ class ChatGPTAccountProvider:
         self._models_account_generation = getattr(self.client, "account_generation", 0)
         self._threads: dict[str, _ConversationState] = {}
         self._conversation_locks: dict[str, threading.RLock] = {}
+        self._account_scope_cache: tuple[int, int, str] | None = None
 
     def _conversation_lock(self, conversation_id: str) -> threading.RLock:
         identity = str(conversation_id or "")
@@ -443,8 +480,6 @@ class ChatGPTAccountProvider:
         if model_id not in valid:
             raise AppServerError("ERROR: that ChatGPT account model is unavailable.", category="model_unavailable")
         set_setting("chatgpt_account_model", model_id)
-        with self._lock:
-            self._threads.clear()
 
     def begin_login(self) -> dict:
         return self.client.begin_login()
@@ -475,6 +510,7 @@ class ChatGPTAccountProvider:
             self.client.reset_login()
             with self._lock:
                 self._threads.clear()
+                self._account_scope_cache = None
 
     def logout(self) -> None:
         with self._lifecycle_lock:
@@ -488,6 +524,7 @@ class ChatGPTAccountProvider:
             with self._lock:
                 self._models.clear()
                 self._threads.clear()
+                self._account_scope_cache = None
         _notify_account_changed()
 
     def rate_limits(self) -> dict:
@@ -496,9 +533,39 @@ class ChatGPTAccountProvider:
     def chat_client(self, conversation_id: str | None = None):
         return _AccountChatClient(self, conversation_id=conversation_id)
 
+    def _account_scope(self, client) -> str:
+        key = (client.generation, getattr(client, "account_generation", 0))
+        cached = self._account_scope_cache
+        if cached and cached[:2] == key:
+            return cached[2]
+        read_account = getattr(client, "get_account_status", None)
+        account = (read_account().get("account") or {}) if callable(read_account) else {}
+        email = str(account.get("email") or "").strip().casefold()
+        scope = hashlib.sha256(email.encode()).hexdigest() if email else ""
+        self._account_scope_cache = (*key, scope)
+        return scope
+
+    @staticmethod
+    def _store_thread_state(conversation_id: str, state: _ConversationState, previous_thread_id: str) -> bool:
+        from osia.conversations import store_chatgpt_thread
+
+        return store_chatgpt_thread(conversation_id, {
+            "thread_id": state.thread_id,
+            "account_scope": state.account_scope,
+            "history_cursor": list(state.history_cursor),
+            "last_turn_id": state.last_turn_id,
+            "system_fingerprint": state.system_fingerprint,
+            "tool_schema_fingerprint": state.tool_schema_fingerprint,
+            "native_tool_names": list(state.native_tool_names),
+        }, previous_thread_id=previous_thread_id)
+
+    @staticmethod
+    def _thread_key(conversation_id: str, planning_only: bool) -> str:
+        return "planning:" + conversation_id if planning_only else conversation_id
+
     def _prepare(
         self, conversation_id: str, model: str, messages: list[dict],
-        *, planning_only: bool = False,
+        *, planning_only: bool = False, osia_turn_id: str = "",
     ) -> tuple[_ConversationState, list[dict]]:
         public = [_public_message(message) for message in messages]
         system = next((m["content"] for m in public if m["role"] == "system"), "")
@@ -534,6 +601,15 @@ class ChatGPTAccountProvider:
         runtime_client = (
             self._direct_visual_client if direct_visual_turn else self.client
         )
+        from osia.conversations import get_conversation
+
+        conv = (
+            get_conversation(conversation_id)
+            if not planning_only and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id)
+            else None
+        )
+        if conv is not None:
+            runtime_client = self.client
         # Establish process ownership before deciding whether an existing
         # thread is still loaded. run_turn() may otherwise restart the child
         # only after we have chosen a stale thread from the previous process.
@@ -541,6 +617,12 @@ class ChatGPTAccountProvider:
         if callable(start_runtime):
             start_runtime()
         account_generation = getattr(runtime_client, "account_generation", 0)
+        scope = self._account_scope(runtime_client) if conv is not None else ""
+        stored = (conv or {}).get("_chatgpt_account_thread") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored_id = str(stored.get("thread_id") or "")
+        saved = bool(scope and stored_id and stored.get("account_scope") == scope)
         frontier_names = [
             str(item.get("name") or "")
             for item in dynamic_tools
@@ -586,49 +668,87 @@ class ChatGPTAccountProvider:
         system_fingerprint = hashlib.sha256(
             fingerprint_input.encode("utf-8"),
         ).hexdigest()
-        public_non_system = [m for m in public if m["role"] != "system"]
         non_system = [message for message in messages if message.get("role") != "system"]
+        key = self._thread_key(conversation_id, planning_only)
         with self._lock:
-            state = self._threads.get(conversation_id)
+            state = self._threads.get(key)
             reusable = bool(
                 state
                 and state.runtime_client is runtime_client
                 and state.generation == runtime_client.generation
                 and state.account_generation == account_generation
-                and state.model == model
-                and state.system_fingerprint == system_fingerprint
-                and state.tool_schema_fingerprint == tool_schema_fingerprint
-                and state.planning_only is planning_only
-                and _same_messages(state.expected_messages, public_non_system)
+                and state.account_scope == scope
+                and (not scope or (saved and state.thread_id == stored_id))
+                and (not saved or state.history_cursor == tuple(stored.get("history_cursor") or ()))
             )
-            delta = (
-                non_system[len(state.expected_messages):]
-                if reusable and state else _native_rebuild_history(non_system)
-            )
+            if planning_only and reusable:
+                reusable = state.system_fingerprint == system_fingerprint and state.model == model
         if not reusable:
-            thread_id = runtime_client.start_or_resume_conversation(
-                thread_id=None,
-                model=model,
-                base_instructions=base_instructions,
-                developer_instructions=developer_instructions,
-                dynamic_tools=dynamic_tools,
-            )
+            parameters = {
+                "model": model, "base_instructions": base_instructions,
+                "developer_instructions": developer_instructions,
+                "dynamic_tools": dynamic_tools,
+                **({"persistent": True} if scope else {}),
+            }
+            try:
+                thread_id = runtime_client.start_or_resume_conversation(
+                    thread_id=stored_id if saved else None, **parameters,
+                )
+            except AppServerError as exc:
+                if not saved or exc.category != "thread_missing":
+                    raise
+                # An empty or deleted rollout has nothing to resume. Rebuild
+                # from OSIA's canonical history only after that exact diagnosis.
+                saved = False
+                thread_id = runtime_client.start_or_resume_conversation(thread_id=None, **parameters)
             state = _ConversationState(
                 thread_id=thread_id,
                 generation=runtime_client.generation,
                 account_generation=account_generation,
                 model=model,
-                system_fingerprint=system_fingerprint,
-                tool_schema_fingerprint=tool_schema_fingerprint,
+                system_fingerprint=str(stored.get("system_fingerprint") or "") if saved else system_fingerprint,
+                tool_schema_fingerprint=str(stored.get("tool_schema_fingerprint") or "") if saved else tool_schema_fingerprint,
                 runtime_client=runtime_client,
                 expected_messages=[],
                 planning_only=planning_only,
-                native_tool_names=tuple(frontier_names),
+                native_tool_names=tuple(stored.get("native_tool_names") or ()) if saved else tuple(frontier_names),
                 strategy_revision=strategy_revision,
                 world_revision=world_revision,
+                account_scope=scope,
+                history_cursor=tuple(stored.get("history_cursor") or ()) if saved else (),
+                last_turn_id=str(stored.get("last_turn_id") or "") if saved else "",
             )
+            if scope and not saved and not self._store_thread_state(conversation_id, state, stored_id):
+                raise AppServerError(
+                    "ERROR: OSIA could not bind the ChatGPT thread to this conversation.",
+                    allow_fallback=False, category="thread_binding_failed",
+                )
             with self._lock:
-                self._threads[conversation_id] = state
+                self._threads[key] = state
+        state.model = model
+        state.strategy_revision = strategy_revision
+        state.world_revision = world_revision
+        state.application_context = (
+            _insert_before_turn_language(
+                base_instructions,
+                "Use native calls only for tools declared on this thread. "
+                "Use OSIA's textual format for other available tools.",
+            )
+            if state.system_fingerprint != system_fingerprint and not planning_only else ""
+        )
+        delta = (
+            _thread_delta(state, non_system, osia_turn_id)
+            if reusable or (saved and state.history_cursor) else
+            _native_rebuild_history(non_system)
+        )
+        if not delta and osia_turn_id and state.last_turn_id == osia_turn_id:
+            delta = [{
+                "role": "user",
+                "content": (
+                    "Continue the current OSIA task using the observations already in this thread. "
+                    "Keep the completed steps and continue with the next unfinished step."
+                ),
+            }]
         if not delta:
             raise AppServerError("ERROR: no new OSIA message was available for ChatGPT.", category="empty_input")
         return state, delta
@@ -683,6 +803,7 @@ class ChatGPTAccountProvider:
     ) -> TurnResult:
         state = None
         lifecycle_gate_held = False
+        key = self._thread_key(conversation_id, planning_only)
 
         def release_lifecycle_gate() -> None:
             nonlocal lifecycle_gate_held
@@ -690,12 +811,41 @@ class ChatGPTAccountProvider:
                 self._lifecycle_lock.release()
                 lifecycle_gate_held = False
 
+        def remember_input(assistant_text: str | None = None) -> None:
+            if state is None:
+                return
+            public = [
+                _public_message(message) for message in messages
+                if message.get("role") != "system"
+            ]
+            if assistant_text is not None:
+                public.append({"role": "assistant", "content": assistant_text})
+            with self._lock:
+                if self._threads.get(key) is not state:
+                    return
+                state.expected_messages = public
+                state.history_cursor = tuple(_message_digest(item) for item in public[-24:])
+                state.last_turn_id = str(osia_turn_id or "")
+            if state.account_scope:
+                try:
+                    self._store_thread_state(conversation_id, state, state.thread_id)
+                except OSError:
+                    # The already accepted provider turn remains authoritative.
+                    pass
+
+        def registered() -> None:
+            try:
+                remember_input()
+            finally:
+                release_lifecycle_gate()
+
         try:
             self._lifecycle_lock.acquire()
             lifecycle_gate_held = True
             state, delta_messages = self._prepare(
                 conversation_id, model, messages,
                 planning_only=planning_only,
+                osia_turn_id=str(osia_turn_id or ""),
             )
             turn_input = _turn_input(delta_messages)
             run_kwargs = dict(
@@ -710,8 +860,10 @@ class ChatGPTAccountProvider:
                 on_reasoning_summary=on_reasoning_summary,
                 timeout=_bounded_turn_timeout(timeout),
                 output_schema=output_schema,
-                on_attempt_registered=release_lifecycle_gate,
+                on_attempt_registered=registered,
             )
+            if state.application_context:
+                run_kwargs["application_context"] = state.application_context
             if isinstance(turn_input, list):
                 run_kwargs["content"] = turn_input
             else:
@@ -721,14 +873,7 @@ class ChatGPTAccountProvider:
                 result = _with_native_frontier_receipt(result, state)
             finally:
                 release_lifecycle_gate()
-            with self._lock:
-                current = self._threads.get(conversation_id)
-                if current is state:
-                    current.expected_messages = [
-                        _public_message(message)
-                        for message in messages
-                        if message.get("role") != "system"
-                    ] + [{"role": "assistant", "content": result.text}]
+            remember_input(result.text)
             return result
         except AppServerError as exc:
             native_tool_text = _canonical_native_tool_text(exc)
@@ -760,28 +905,10 @@ class ChatGPTAccountProvider:
                 )
                 if on_reasoning_summary is not None and result.public_reasoning_summary:
                     on_reasoning_summary(result.public_reasoning_summary)
-                with self._lock:
-                    current = self._threads.get(conversation_id)
-                    if current is state:
-                        current.expected_messages = [
-                            _public_message(message)
-                            for message in messages
-                            if message.get("role") != "system"
-                        ] + [{"role": "assistant", "content": result.text}]
+                remember_input(result.text)
                 return result
             if exc.native_action and state is not None:
-                with self._lock:
-                    current = self._threads.get(conversation_id)
-                    if current is state:
-                        current.expected_messages = [
-                            _public_message(message)
-                            for message in messages
-                            if message.get("role") != "system"
-                        ]
-            if exc.category in {"thread_failed", "request_rejected", "process_crash"}:
-                with self._lock:
-                    if self._threads.get(conversation_id) is state:
-                        self._threads.pop(conversation_id, None)
+                remember_input()
             raise AccountProviderError(
                 exc,
                 selected_model=model,
@@ -795,6 +922,45 @@ class ChatGPTAccountProvider:
             state = self._threads.get(conversation_id)
         if state:
             state.runtime_client.cancel_turn(thread_id=state.thread_id)
+
+    def conversation_context_usage(self, conversation_id: str, *, model: str = "") -> dict | None:
+        with self._lock:
+            state = self._threads.get(conversation_id)
+        if (
+            state is None or (model and state.model != model)
+            or state.account_generation != getattr(state.runtime_client, "account_generation", 0)
+        ):
+            return None
+        return state.runtime_client.thread_context_usage(state.thread_id)
+
+    def compact_conversation(self, conversation_id: str, model: str) -> bool:
+        """Compact the same saved ChatGPT thread without adding a chat message."""
+        from osia.conversations import get_conversation
+
+        with self._conversation_lock(conversation_id), self._lifecycle_lock:
+            conv = get_conversation(conversation_id) or {}
+            binding = conv.get("_chatgpt_account_thread") or {}
+            thread_id = str(binding.get("thread_id") or "")
+            if not thread_id:
+                return False
+            client = self.client
+            client.start()
+            if not binding.get("account_scope") or binding["account_scope"] != self._account_scope(client):
+                return False
+            with self._lock:
+                state = self._threads.get(conversation_id)
+            if state is None or state.thread_id != thread_id or state.generation != client.generation:
+                try:
+                    client.start_or_resume_conversation(
+                        thread_id=thread_id, model=model, base_instructions="",
+                        developer_instructions="", persistent=True,
+                    )
+                except AppServerError as exc:
+                    if exc.category == "thread_missing":
+                        return False
+                    raise
+            client.compact_thread(thread_id)
+            return True
 
     def release_ephemeral_conversation(self, conversation_id: str) -> None:
         """Forget local state for a completed one-shot observation turn."""
@@ -1134,3 +1300,29 @@ def get_account_provider() -> ChatGPTAccountProvider:
 
 def get_cached_account_models() -> list[dict]:
     return get_account_provider().cached_models()
+
+
+def delete_saved_chatgpt_threads(bindings: list[tuple[str, str]]) -> None:
+    """Clean up only the native threads of canonical, committed deletions."""
+    exact = {
+        (conv_id, thread_id) for conv_id, thread_id in bindings
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id)
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", thread_id)
+    }
+    if not exact:
+        return
+
+    def delete() -> None:
+        provider = get_account_provider()
+        for conv_id, thread_id in exact:
+            with provider._conversation_lock(conv_id):
+                with provider._lock:
+                    state = provider._threads.get(conv_id)
+                    if state is not None and state.thread_id == thread_id:
+                        provider._threads.pop(conv_id, None)
+                try:
+                    provider.client.delete_thread(thread_id)
+                except (OSError, AppServerError):
+                    print("[OSIA] saved ChatGPT thread cleanup could not be confirmed")
+
+    threading.Thread(target=delete, name="osia-delete-chatgpt-threads", daemon=True).start()

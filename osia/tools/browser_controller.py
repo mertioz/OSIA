@@ -120,7 +120,8 @@ def close_browser_tab(state_ref: dict): return _invoke("close_browser_tab", stat
 def reload_browser_page(state_ref: dict): return _invoke("reload_browser_page", state_ref=state_ref)
 def browser_back(state_ref: dict): return _invoke("browser_back", state_ref=state_ref)
 def browser_forward(state_ref: dict): return _invoke("browser_forward", state_ref=state_ref)
-def open_new_browser_tab(url: str, state_ref=None): return _invoke("open_new_browser_tab", url=url, state_ref=state_ref)
+def open_new_browser_tab(url: str, state_ref=None, reuse_existing=True):
+    return _invoke("open_new_browser_tab", url=url, state_ref=state_ref, reuse_existing=reuse_existing)
 def return_to_browser_opener(state_ref: dict): return _invoke("return_to_browser_opener", state_ref=state_ref)
 def search_web(query: str, state_ref=None): return _invoke("search_web", query=query, state_ref=state_ref)
 def open_search_result(state_ref: dict, result_ref: str): return _invoke("open_search_result", state_ref=state_ref, result_ref=result_ref)

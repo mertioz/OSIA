@@ -105,6 +105,40 @@ def test_special_mode_round_trips_through_mobile_and_reconnects(tmp_path, monkey
             assert len(replay["items"]) == 3
 
 
+def test_mobile_context_compaction_targets_the_canonical_chat(tmp_path, monkeypatch):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
+    monkeypatch.setattr(server, "MOBILE_TOKEN", "test-token")
+    monkeypatch.setattr(server, "_DURABLE_TRANSPORT", _NoDurableTransport())
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+    monkeypatch.setattr(server, "_CONVERSATION_BROADCAST_LOCK", None)
+    monkeypatch.setattr(server, "_LAST_BROADCAST_REVISIONS", {})
+    monkeypatch.setattr(server, "_resolve_chat_route_binding", lambda: {
+        "provider_id": "openai", "model_id": "fixture-model",
+    })
+    target = conversations.create_conversation()["id"]
+    other = conversations.create_conversation()["id"]
+    for index in range(16):
+        role = "user" if index % 2 == 0 else "assistant"
+        conversations.add_message(target, role, f"Message {index}. " + "Older context. " * 70)
+    transcript = conversations.get_conversation(target)["messages"]
+
+    app = Starlette(routes=[WebSocketRoute("/ws", server.websocket_endpoint)])
+    with TestClient(app, client=("127.0.0.1", 54321)) as client, client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "token": "test-token", "device_id": "compact-mobile"})
+        _receive_type(ws, "conversations")
+        ws.send_json({
+            "type": "compact_conversation_context", "operation_id": "compact_fixture",
+            "conversation_id": target,
+        })
+        ack = _receive_type(ws, "conversations")
+        assert ack["operation_id"] == "compact_fixture"
+        assert ack["compact_conversation_id"] == target
+        assert ack["compact_changed"] and not ack["compact_error"]
+    assert conversations.conversation_context_compacted(target)
+    assert not conversations.conversation_context_compacted(other)
+    assert conversations.get_conversation(target)["messages"] == transcript
+
+
 def test_real_store_single_bulk_and_desktop_server_deletion_paths(
     tmp_path, monkeypatch,
 ):
