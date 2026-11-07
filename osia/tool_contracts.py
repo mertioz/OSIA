@@ -1413,7 +1413,9 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE,
               permission_category="browser_account", postcondition_required=True,
               redaction_policy="browser_private_bounded"),
-        _spec("open_new_browser_tab", "Select an existing tab at the exact URL or open it. Set reuse_existing=false for a separate tab",
+        _spec("open_new_browser_tab",
+              "Reuse exact matching tabs by default. Set reuse_existing=false only for an intentionally separate tab. "
+              "For verification, select a known tab with list_browser_tabs and select_browser_tab, or refresh it with reload_browser_page",
               _object({"url": URL, "state_ref": _nullable(BROWSER_STATE_REF),
                        "reuse_existing": _boolean()},
                       required=("url",)), RL, N, NC,

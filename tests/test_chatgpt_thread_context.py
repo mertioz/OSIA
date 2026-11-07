@@ -1,5 +1,9 @@
 import json
+import threading
+from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
 
 from osia import conversations
 from osia.chatgpt_account.app_server_client import AppServerClient, AppServerError, TurnResult, _TurnAttempt
@@ -150,6 +154,65 @@ def test_manual_native_compaction_requires_same_thread_and_turn(monkeypatch, tmp
     assert not client._compaction_requests
 
 
+def test_compaction_reinforces_browser_receipts_only_for_the_exact_native_turn(monkeypatch, tmp_path):
+    client = AppServerClient(base_dir=tmp_path)
+    attempt = _TurnAttempt("thread", osia_turn_id="chat-turn", turn_id="native-turn")
+    client._attempts["thread"] = attempt
+    sent = []
+    monkeypatch.setattr(client, "_send", sent.append)
+    call = {"tool": "activate_browser_element", "call_id": "write"}
+    result = client._dynamic_result_envelope(
+        call, success=False, status="outcome_unknown", reason_code="postcondition_not_observed",
+    )
+    fact = {"expected_text": "Fixture record", "outcome": "outcome_unknown"}
+    client._commit_dynamic_response(
+        attempt, request_id=1, call_id="write", signature="write",
+        result=result, browser_fact=fact, inline_browser=True,
+    )
+    for number, turn_id in enumerate(("stale-turn", "native-turn"), start=2):
+        client._dispatch_notification("item/completed", {
+            "threadId": "thread", "turnId": turn_id,
+            "item": {"type": "contextCompaction", "id": f"compact-{number}"},
+        })
+        client._commit_dynamic_response(
+            attempt, request_id=number, call_id=str(number), signature=str(number),
+            result=result, inline_browser=True,
+        )
+        contents = sent[-1]["result"]["contentItems"]
+        assert (len(contents) == 2) is (turn_id == "native-turn")
+    assert "Fixture record" in contents[1]["text"]
+    assert "outcome_unknown" in contents[1]["text"]
+    client._commit_dynamic_response(
+        attempt, request_id=4, call_id="4", signature="4", result=result, inline_browser=True,
+    )
+    assert len(sent[-1]["result"]["contentItems"]) == 1
+
+
+def test_browser_receipts_survive_native_segments_but_not_new_osia_turns(monkeypatch, tmp_path):
+    client = AppServerClient(base_dir=tmp_path)
+    requests = []
+
+    def capture(method, params):
+        assert method == "turn/start"
+        requests.append(params)
+        if len(requests) == 1:
+            client._attempts["thread"].browser_work.append({
+                "expected_text": "Fixture record", "outcome": "outcome_unknown",
+            })
+        raise AppServerError("Fixture interrupts this native segment")
+
+    monkeypatch.setattr(client, "_request", capture)
+    for osia_turn in ("same-turn", "same-turn", "new-turn"):
+        with pytest.raises(AppServerError):
+            client.run_turn(
+                thread_id="thread", conversation_id="conversation",
+                osia_turn_id=osia_turn, model="fixture-model", text="Continue",
+            )
+    carried = requests[1]["additionalContext"]["osia_browser_receipts"]
+    assert carried["kind"] == "untrusted" and "Fixture record" in carried["value"]
+    assert "additionalContext" not in requests[2]
+
+
 def test_uncertain_browser_action_returns_typed_result_in_the_same_native_turn(monkeypatch, tmp_path):
     client = AppServerClient(base_dir=tmp_path)
     attempt = _TurnAttempt(
@@ -193,6 +256,102 @@ def test_uncertain_browser_action_returns_typed_result_in_the_same_native_turn(m
     assert not attempt.interrupt_sent and attempt.native_tool_call is None
     result = json.loads(sent[-1]["result"]["contentItems"][0]["text"])
     assert result["status"] == result["result"]["typed_outcome"] == "outcome_unknown"
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_native_browser_waits_for_correlated_receipt_or_stop(monkeypatch, tmp_path, stop):
+    from osia import agent, tool_contracts
+    from osia.tool_attempts import ToolAttemptStore
+
+    store = ToolAttemptStore(tmp_path / "attempts")
+    client = AppServerClient(base_dir=tmp_path, tool_attempt_store=store)
+    attempt = _TurnAttempt(
+        "native", conversation_id="conversation", osia_turn_id="chat-turn",
+        turn_id="native-turn", model_id="fixture-model",
+    )
+    client._attempts["native"] = attempt
+    sent = []
+    calls = []
+    waiting = threading.Event()
+    release_worker = threading.Event()
+    monkeypatch.setattr(client, "_send", sent.append)
+    monkeypatch.setattr(client, "_request", lambda *_args, **_kwargs: {})
+    original_contract = tool_contracts.persistence_contract
+
+    def short_release(*args, **kwargs):
+        return replace(original_contract(*args, **kwargs), release_after_seconds=0.05)
+
+    monkeypatch.setattr(tool_contracts, "persistence_contract", short_release)
+
+    def open_tab(**arguments):
+        calls.append(arguments)
+        assert release_worker.wait(5)
+        return {
+            "ok": True, "text": "Verified browser result",
+            "receipt": {
+                "schema_version": 1, "outcome": "confirmed_success",
+                "dispatch_state": "effect_confirmed",
+            },
+        }
+
+    monkeypatch.setitem(agent.TOOL_MAP, "open_new_browser_tab", open_tab)
+    original_dispatch = agent._execute_tool_with_policy
+
+    def observe_release(*args, **kwargs):
+        record = original_dispatch(*args, **kwargs)
+        if record.outcome is ExecutionOutcome.PENDING:
+            waiting.set()
+        return record
+
+    monkeypatch.setattr(agent, "_execute_tool_with_policy", observe_release)
+    request = {
+        "id": 7, "method": "item/tool/call",
+        "params": {
+            "threadId": "native", "turnId": "native-turn", "callId": "open",
+            "tool": "open_new_browser_tab", "arguments": {"url": "https://example.invalid/"},
+        },
+    }
+    client._handle_server_request(request)
+    event, payload = attempt.events.get_nowait()
+    assert event == "dynamic_tool_call"
+    resolver = threading.Thread(
+        target=client._resolve_dynamic_tool_call, args=(attempt, payload),
+        daemon=True,
+    )
+    resolver.start()
+    try:
+        assert waiting.wait(3)
+        assert sent == []
+        client.cancel_turn(thread_id="native", turn_id="older-native-turn")
+        assert not attempt.dynamic_replies_closed.is_set()
+        if stop:
+            client.cancel_turn(thread_id="native", turn_id="native-turn")
+        else:
+            release_worker.set()
+        resolver.join(3)
+        assert not resolver.is_alive()
+        assert len(calls) == 1
+        if stop:
+            assert sent == []
+            assert not attempt.dynamic_tool_responses
+        else:
+            assert len(sent) == 1
+            result = json.loads(sent[0]["result"]["contentItems"][0]["text"])
+            assert result["status"] == "success_verified"
+            assert result["result"]["typed_outcome"] == "confirmed_success"
+            client._resolve_dynamic_tool_call(attempt, payload)
+            assert len(calls) == 1 and sent[0] == sent[1]
+            client._handle_server_request({
+                **request, "id": 8,
+                "params": {**request["params"], "callId": "fresh"},
+            })
+            event, next_payload = attempt.events.get_nowait()
+            assert event == "dynamic_tool_call"
+            client._resolve_dynamic_tool_call(attempt, next_payload)
+            assert len(calls) == 2 and sent[-1]["id"] == 8
+    finally:
+        release_worker.set()
+        resolver.join(3)
 
 
 def test_deleted_conversation_releases_only_its_saved_native_thread(monkeypatch, tmp_path):

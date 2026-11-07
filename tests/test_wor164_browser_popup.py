@@ -533,6 +533,37 @@ def test_navigation_click_fill_keyboard_tabs_and_state(owner_harness):
     }
 
 
+def test_exact_tab_reuse_and_intentionally_separate_tab(owner_harness):
+    url = "https://projects.test/details?section=work#latest"
+    original = browser.navigate_browser(url)["data"]["state"]
+
+    reused = browser.open_new_browser_tab(url)
+    assert reused["ok"] is True
+    assert reused["data"]["tab_reused"] is True
+    assert reused["data"]["state"] == original
+    assert len(browser.list_browser_tabs()["data"]["tabs"]) == 1
+
+    separate = browser.open_new_browser_tab(url, reuse_existing=False)
+    assert separate["ok"] is True
+    assert separate["data"]["tab_reused"] is False
+    assert separate["data"]["matching_tab"] == {
+        "state": original,
+        "safe_url": "https://projects.test/details",
+    }
+    opened = separate["data"]["state"]
+    assert opened["page_id"] != original["page_id"]
+
+    # A refresh of the destination in the new tab keeps its page identity
+    # and leaves the previously open tab available for direct selection.
+    navigated = browser.navigate_browser(url, opened)["data"]["state"]
+    assert navigated["page_id"] == opened["page_id"]
+    tabs = browser.list_browser_tabs()["data"]["tabs"]
+    assert {tab["state"]["page_id"] for tab in tabs} == {
+        original["page_id"], opened["page_id"],
+    }
+    assert browser.select_browser_tab(original)["data"]["state"] == original
+
+
 def test_firefox_bidi_reuses_one_persistent_context(owner_harness, monkeypatch):
     control, owner = owner_harness
     monkeypatch.setattr(browser, "resolve_browser_name", lambda _name: "fake-firefox")

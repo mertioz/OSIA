@@ -677,6 +677,60 @@ def test_windows_browser_smoke_requires_private_download_verification(monkeypatc
     assert calls == [({"page_id": "page_safe_ref"}, "el_safe_download_ref")]
 
 
+def test_browser_text_cursor_delivers_every_character_to_the_model(controlled_browser):
+    from osia.agent import _model_result_text
+    from osia.tools.browser_state import BROWSER_PAGE_TEXT_CHUNK_CHARS
+
+    state = _navigate(controlled_browser.web.base + "/static")
+    owner = controlled_browser.owner
+    source = (
+        "x" * 5_000 + "Visible project record" +
+        "y" * (BROWSER_PAGE_TEXT_CHUNK_CHARS - 5_000 - len("Visible project record") - 1) +
+        "\U0001f680" + "z" * 9_000
+    )
+
+    async def set_text():
+        await owner._active_page.evaluate(
+            "text => { document.body.innerHTML = '<pre></pre>'; document.body.firstChild.textContent = text; }",
+            source,
+        )
+
+    owner._op_set_cursor_fixture = set_text
+    owner.call("set_cursor_fixture")
+    cursor = None
+    chunks = []
+    for index in range(3):
+        receipt = browser.inspect_browser_page(
+            state, mode="main_content" if index == 0 else "page_text_chunk", cursor=cursor,
+        )
+        _success(receipt)
+        payload = json.loads(_model_result_text(receipt, "inspect_browser_page"))["operation_data"]
+        chunks.append(payload["page_text"])
+        cursor = payload.get("next_cursor")
+    assert cursor is None
+    assert "Visible project record" in chunks[0]
+    assert chunks[1].startswith("\U0001f680")
+    assert "".join(chunks) == source
+
+
+def test_browser_action_timeout_exposes_observed_current_document(controlled_browser):
+    from osia.agent import _model_result_text
+
+    state = _navigate(controlled_browser.web.base + "/static")
+    link = _success(browser.inspect_browser_page(state))["links"][0]
+    receipt = browser.activate_browser_element(state, link["element_ref"], {
+        "condition_type": "text_appearance",
+        "expected": "Synthetic missing postcondition",
+        "timeout_seconds": 0.5,
+    })
+    projected = json.loads(_model_result_text(receipt, "activate_browser_element"))
+    assert projected["typed_outcome"] == "outcome_unknown"
+    assert projected["current_page_ref"]["document_epoch"] != state["document_epoch"]
+    assert any(item.get("click_returned") is True for item in projected["safe_evidence"])
+    assert any(item.get("postcondition_observed") is False for item in projected["safe_evidence"])
+    assert projected["verification_guidance"]
+
+
 def test_real_structured_inspection_frames_waits_and_stale_state(controlled_browser):
     web = controlled_browser.web
     state = _navigate(web.base + "/extract?token=QUERY_SENTINEL#fragment")
@@ -989,6 +1043,45 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
         again = call("open_new_browser_tab", {"url": destination})
         assert again["current_page_ref"]["page_id"] == first["current_page_ref"]["page_id"]
         assert again["operation_data"]["tab_reused"] is True
+
+        if deadline == "inspection":
+            from dataclasses import replace
+
+            async def delay_save():
+                await controlled_browser.owner._active_page.evaluate("""() => {
+                  document.querySelector('form').addEventListener('submit', event => {
+                    event.preventDefault();
+                    setTimeout(() => {
+                      const item = document.createElement('p');
+                      item.textContent = 'Fixture project saved';
+                      document.body.appendChild(item);
+                    }, 350);
+                  });
+                }""")
+
+            controlled_browser.owner._op_delay_fixture_save = delay_save
+            controlled_browser.owner.call("delay_fixture_save")
+            current = again["current_page_ref"]
+            snapshot = call("inspect_browser_page", {"state_ref": current})["operation_data"]
+            persistence_contract = tool_contracts.persistence_contract
+
+            def early_release(*args, **kwargs):
+                return replace(persistence_contract(*args, **kwargs), release_after_seconds=0.05)
+
+            with monkeypatch.context() as short:
+                short.setattr(tool_contracts, "persistence_contract", early_release)
+                submitted = call("activate_browser_element", {
+                    "state_ref": current, "element_ref": snapshot["buttons"][0]["element_ref"],
+                    "wait_spec": {
+                        "condition_type": "text_appearance", "expected": "Fixture project saved",
+                        "timeout_seconds": 2,
+                    },
+                })
+            assert any(evidence.get("text_state_matched") for evidence in submitted["safe_evidence"])
+            final = call("inspect_browser_page", {
+                "state_ref": submitted["current_page_ref"], "mode": "page_text_chunk",
+            })["operation_data"]
+            assert final["page_text"].count("Fixture project saved") == 1
 
 
 def test_real_extraction_menu_consent_confirm_and_prompt(controlled_browser):

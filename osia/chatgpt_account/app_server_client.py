@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections import deque
 from copy import deepcopy
 import hashlib
 import json
@@ -194,8 +195,45 @@ _COMPACT_PROMPT = (
     "user's current request and constraints, completed work and how it was "
     "verified, uncertain effects, the most recent tool results and targets, "
     "and the next unfinished step. Give more detail to recent work in progress. "
+    "For a batch of changes, retain exact item names and separate verified, "
+    "submitted but unverified, and remaining items. Preserve what each browser "
+    "receipt actually verified. A click or URL change alone does not verify a save. "
     "Use fresh browser or window references before acting again."
 )
+
+
+def _browser_activation_fact(call: Mapping[str, Any], result: Any) -> dict | None:
+    """Keep bounded observation facts already shown to the selected model."""
+    if (
+        call.get("tool") != "activate_browser_element"
+        or not isinstance(result, dict)
+        or result.get("operation") != "activate_browser_element"
+        or result.get("dispatch_state") not in {"dispatched", "effect_confirmed", "effect_unknown"}
+    ):
+        return None
+    fact = {
+        "outcome": result.get("typed_outcome"),
+        "dispatch_state": result["dispatch_state"],
+        "observed": result.get("safe_evidence", []),
+    }
+    wait = (call.get("arguments") or {}).get("wait_spec")
+    if isinstance(wait, dict):
+        condition = str(wait.get("condition_type") or "")
+        fact["wait_condition"] = condition
+        expected = wait.get("expected")
+        if condition in {"text_appearance", "text_disappearance"} and isinstance(expected, str):
+            fact["expected_text"] = expected[:200]
+    return fact
+
+
+def _browser_work_context(facts) -> str:
+    return (
+        "Earlier browser activation receipts from this same OSIA turn, in order. "
+        "The expected text came from the tool request. A URL change or returned "
+        "click only verifies that observation, and a missing postcondition leaves "
+        "the write uncertain. Reobserve the item in its existing tab if needed.\n"
+        + json.dumps(list(facts), ensure_ascii=True, separators=(",", ":"))
+    )
 
 _DIRECT_IMAGE_NATIVE_TOOLS = frozenset({
     "request_visual_observation", "computer_screenshot", "computer_zoom",
@@ -513,8 +551,15 @@ class _TurnAttempt:
     public_reasoning_summary_emitted: str = ""
     dynamic_items: dict[str, dict] = field(default_factory=dict)
     dynamic_tool_responses: dict[str, dict] = field(default_factory=dict)
+    browser_work: deque = field(default_factory=lambda: deque(maxlen=12), repr=False)
+    browser_compaction_count: int = 0
+    browser_work_reported_at: int = 0
     dynamic_response_lock: Any = field(
         default_factory=threading.RLock,
+        repr=False,
+    )
+    dynamic_replies_closed: threading.Event = field(
+        default_factory=threading.Event,
         repr=False,
     )
     dynamic_response_sent: bool = False
@@ -752,6 +797,7 @@ class AppServerClient:
         self._next_id = 1
         self._pending: dict[str, _PendingRequest] = {}
         self._attempts: dict[str, _TurnAttempt] = {}
+        self._browser_work_by_thread: dict[str, tuple[str, str, deque]] = {}
         self._context_usage: dict[str, tuple[int, int]] = {}
         self._compacting_threads: set[str] = set()
         self._compaction_requests: dict[str, _CompactionRequest] = {}
@@ -1433,6 +1479,7 @@ class AppServerClient:
             except queue.Full:
                 pass
         for attempt in attempts:
+            attempt.dynamic_replies_closed.set()
             attempt.events.put(("error", error))
         # Login is also an in-flight RPC lifecycle. Wake its owner now instead
         # of leaving the UI connecting until its unrelated login deadline.
@@ -2508,9 +2555,20 @@ class AppServerClient:
         call_id: str,
         signature: str,
         result: Mapping[str, Any],
+        browser_fact: dict | None = None,
+        inline_browser: bool = False,
     ) -> None:
         pending_successors: list[str] = []
         with attempt.dynamic_response_lock:
+            if inline_browser and attempt.dynamic_replies_closed.is_set():
+                return
+            result = dict(result)
+            compaction = attempt.browser_compaction_count
+            if inline_browser and attempt.browser_work and compaction != attempt.browser_work_reported_at:
+                result["contentItems"] = [
+                    *result["contentItems"],
+                    {"type": "inputText", "text": _browser_work_context(attempt.browser_work)},
+                ]
             visual_entry = next((
                 entry for entry in attempt.visual_frame_calls.values()
                 if str(entry.get("call_id") or "") == str(call_id or "")
@@ -2539,6 +2597,10 @@ class AppServerClient:
                 "signature": signature,
                 "result": deepcopy(dict(result)),
             }
+            if browser_fact is not None:
+                attempt.browser_work.append(browser_fact)
+            if inline_browser:
+                attempt.browser_work_reported_at = compaction
             attempt.dynamic_response_sent = True
         for successor_item_id in pending_successors:
             correlated = self._mark_visual_input_consumed(
@@ -2623,7 +2685,10 @@ class AppServerClient:
         attempt: _TurnAttempt,
         payload: Mapping[str, Any],
     ) -> None:
-        """Close one read-only App Server call on its original model turn."""
+        """Deliver a canonical tool result to its original model turn."""
+
+        if attempt.dynamic_replies_closed.is_set():
+            return
 
         request_id = payload.get("request_id")
         params = payload.get("params")
@@ -2822,11 +2887,17 @@ class AppServerClient:
             preflight_error = "ERROR: image delivery state is unresolved"
             preflight_reason_code = "IMAGE_DELIVERY_COMMIT_UNKNOWN"
 
-        from osia.agent import _execute_tool_with_policy, _model_result_text
+        from osia.agent import (
+            _configured_tool_timeout_seconds,
+            _execute_tool_with_policy,
+            _model_result_text,
+        )
         from osia.tool_contracts import ExecutionOutcome
 
         durable_turn_id = str(attempt.osia_turn_id or attempt.turn_id or "")
         provider_request_id = str(request_id or "")
+        inline_browser = tool_name in _INLINE_BROWSER_TOOLS
+        browser_terminal = queue.Queue() if inline_browser else None
 
         def _capability_outcome(record) -> str:
             value = str(
@@ -2890,6 +2961,8 @@ class AppServerClient:
                     "completed", outcome, tool_attempt_id,
                     str(getattr(record, "reason_code", "") or ""),
                 )
+                if browser_terminal is not None:
+                    browser_terminal.put_nowait((tool_attempt_id, record))
 
         attempt_context = {
             "enabled": True,
@@ -2911,6 +2984,11 @@ class AppServerClient:
             "status_callback": _status_callback,
             "terminal_callback": _terminal_callback,
         }
+        browser_deadline = (
+            time.monotonic()
+            + _configured_tool_timeout_seconds(spec, tool_name, clean_arguments)
+            if inline_browser else 0.0
+        )
         execution_record = _execute_tool_with_policy(
             tool_name,
             clean_arguments,
@@ -2926,6 +3004,32 @@ class AppServerClient:
             or ""
         )
         execution_outcome = _capability_outcome(execution_record)
+        received_browser_terminal = False
+        if (
+            browser_terminal is not None
+            and durable_attempt_id
+            and execution_outcome == "pending"
+        ):
+            # A native dynamic call accepts one response. The local early-release
+            # state is useful to durable Chat, but returning it here discards
+            # the later receipt for this exact browser request.
+            while not attempt.dynamic_replies_closed.is_set():
+                remaining = browser_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    receipt_id, terminal = browser_terminal.get(
+                        timeout=min(remaining, 0.1),
+                    )
+                except queue.Empty:
+                    continue
+                if receipt_id == durable_attempt_id:
+                    execution_record = terminal
+                    execution_outcome = _capability_outcome(terminal)
+                    received_browser_terminal = True
+                    break
+        if inline_browser and attempt.dynamic_replies_closed.is_set():
+            return
         model_result = getattr(execution_record, "result", None)
         text_result = (
             str(model_result.get("text") or "")
@@ -2952,14 +3056,20 @@ class AppServerClient:
             getattr(execution_record, "reason_code", "")
             or receipt.get("reason_code")
             or (
+                "CAPABILITY_EXECUTION_FAILED" if is_error else
                 "READ_ONLY_OBSERVATION_COMPLETED"
-                if not is_error else "CAPABILITY_EXECUTION_FAILED"
+                if spec.side_effect is SideEffectClass.READ_ONLY else
+                "CAPABILITY_EXECUTION_COMPLETED"
             )
         )[:160]
         if is_pending:
             reason_code = "TOOL_RESULT_PENDING"
             model_result = {
-                "text": "PENDING: the tool is still running.",
+                "text": (
+                    "The browser operation has no terminal receipt yet. "
+                    "Observe the current target state before deciding on another action."
+                    if inline_browser else "PENDING: the tool is still running."
+                ),
                 "receipt": {
                     "schema_version": 1,
                     "dispatch_state": "worker_may_be_active",
@@ -3420,7 +3530,7 @@ class AppServerClient:
             semantic_postcondition = str(
                 getattr(node, "observable_success_postcondition", "") or ""
             )[:512]
-        if execution_outcome != "pending":
+        if execution_outcome != "pending" and not received_browser_terminal:
             _record_capability_event(
                 "completed",
                 execution_outcome,
@@ -3428,6 +3538,8 @@ class AppServerClient:
                 str(getattr(execution_record, "reason_code", "") or ""),
                 semantic_postcondition,
             )
+        if inline_browser and attempt.dynamic_replies_closed.is_set():
+            return
         try:
             self._commit_dynamic_response(
                 attempt,
@@ -3435,6 +3547,8 @@ class AppServerClient:
                 call_id=call_id,
                 signature=signature,
                 result=result,
+                browser_fact=_browser_activation_fact(call, provider_model_result),
+                inline_browser=inline_browser,
             )
         except AppServerError:
             if media_delivery is not None:
@@ -3880,6 +3994,8 @@ class AppServerClient:
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
             item_type = str(item.get("type") or "")
             item_id = str(item.get("id") or "")
+            if attempt is not None and method == "item/completed" and item_type == "contextCompaction":
+                attempt.browser_compaction_count += 1
             if (
                 attempt is not None
                 and item_type
@@ -4114,6 +4230,7 @@ class AppServerClient:
 
         if method == "turn/completed":
             if attempt is not None:
+                attempt.dynamic_replies_closed.set()
                 turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                 completion = {
                     "status": str(turn.get("status") or "failed"),
@@ -4463,6 +4580,7 @@ class AppServerClient:
         with self._state_lock:
             self._context_usage.pop(thread_id, None)
             self._compacting_threads.discard(thread_id)
+            self._browser_work_by_thread.pop(thread_id, None)
 
     def start_or_resume_conversation(
         self,
@@ -4577,6 +4695,14 @@ class AppServerClient:
                     category="turn_busy",
                 )
             self._attempts[thread_id] = attempt
+            previous_work = self._browser_work_by_thread.pop(thread_id, None)
+            if attempt.osia_turn_id:
+                identity = (attempt.conversation_id, attempt.osia_turn_id)
+                if previous_work is not None and previous_work[:2] == identity:
+                    attempt.browser_work = previous_work[2]
+                self._browser_work_by_thread[thread_id] = (*identity, attempt.browser_work)
+                if len(self._browser_work_by_thread) > 32:
+                    del self._browser_work_by_thread[next(iter(self._browser_work_by_thread))]
         try:
             app_input, staged_images, staged_deliveries = self._stage_turn_input(
                 turn_content,
@@ -4597,6 +4723,11 @@ class AppServerClient:
             if application_context:
                 params["additionalContext"] = {
                     "osia": {"kind": "application", "value": application_context},
+                }
+            if attempt.browser_work:
+                params.setdefault("additionalContext", {})["osia_browser_receipts"] = {
+                    "kind": "untrusted",
+                    "value": _browser_work_context(attempt.browser_work),
                 }
             if on_reasoning_summary is not None:
                 params["summary"] = "concise"
@@ -5158,10 +5289,12 @@ class AppServerClient:
             raise
 
     def cancel_turn(self, *, thread_id: str, turn_id: str | None = None) -> None:
-        if not turn_id:
-            with self._state_lock:
-                attempt = self._attempts.get(thread_id)
+        with self._state_lock:
+            attempt = self._attempts.get(thread_id)
+            if not turn_id:
                 turn_id = attempt.turn_id if attempt else None
+            if attempt is not None and turn_id and attempt.turn_id == turn_id:
+                attempt.dynamic_replies_closed.set()
         if not turn_id:
             return
         params = {"threadId": thread_id, "turnId": turn_id}

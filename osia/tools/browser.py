@@ -66,6 +66,7 @@ from osia.tools.browser_artifacts import (
     validate_upload_path,
 )
 from osia.tools.browser_state import (
+    BROWSER_PAGE_TEXT_CHUNK_CHARS,
     BoundReferenceStore,
     BrowserReferenceError,
     BrowserStateRef,
@@ -174,6 +175,26 @@ _STRUCTURED_INSPECTION_JS = (
     headings: [], sections: [], links: [], buttons: [], controls: [],
     forms: [], tables: [], lists: [], scroll_regions: [], metadata: {},
   };
+  const bodyText = document.body ? String(document.body.innerText || '') : '';
+  let textEnd = Math.min(bodyText.length, textOffset + textLimit);
+  // A cursor is measured in UTF-16 units. Do not split a surrogate pair.
+  if (textEnd < bodyText.length &&
+      bodyText.charCodeAt(textEnd - 1) >= 0xd800 && bodyText.charCodeAt(textEnd - 1) <= 0xdbff &&
+      bodyText.charCodeAt(textEnd) >= 0xdc00 && bodyText.charCodeAt(textEnd) <= 0xdfff) textEnd--;
+  result.page_text = bodyText.slice(textOffset, textEnd);
+  result.page_text_length = bodyText.length;
+  result.page_text_next_offset = textEnd;
+  result.content_truncated = textEnd < bodyText.length;
+  const hasCaptcha = Boolean(document.querySelector(
+    'iframe[src*="captcha" i],iframe[src*="recaptcha" i],[class*="captcha" i],[id*="captcha" i]'
+  ));
+  const hasOtp = Boolean(document.querySelector(
+    'input[autocomplete="one-time-code"],input[name*="otp" i],input[name*="verification" i]'
+  ));
+  const hasPassword = Boolean(document.querySelector('input[type="password"]'));
+  result.manual_intervention = hasCaptcha ? 'captcha_required' :
+    hasOtp ? 'two_factor_required' : hasPassword ? 'manual_login_required' : '';
+  if (mode === 'page_text_chunk') return result;
   const headings = all('h1,h2,h3,h4,h5,h6');
   result.headings = bounded(headings).map((el, index) => ({
     level: Number(el.tagName.slice(1)), text: clean(el.innerText), index,
@@ -240,21 +261,8 @@ _STRUCTURED_INSPECTION_JS = (
     canonical: canonical ? canonical.href : '',
     description: description ? clean(description.content, 600) : '',
   };
-  const hasCaptcha = Boolean(document.querySelector(
-    'iframe[src*="captcha" i],iframe[src*="recaptcha" i],[class*="captcha" i],[id*="captcha" i]'
-  ));
-  const hasOtp = Boolean(document.querySelector(
-    'input[autocomplete="one-time-code"],input[name*="otp" i],input[name*="verification" i]'
-  ));
-  const hasPassword = Boolean(document.querySelector('input[type="password"]'));
-  result.manual_intervention = hasCaptcha ? 'captcha_required' :
-    hasOtp ? 'two_factor_required' : hasPassword ? 'manual_login_required' : '';
-  const bodyText = document.body ? String(document.body.innerText || '') : '';
-  result.page_text = bodyText.slice(textOffset, textOffset + textLimit);
-  result.page_text_length = bodyText.length;
-  result.page_text_next_offset = Math.min(bodyText.length, textOffset + textLimit);
   result.content_truncated = [headings, sections, links, buttons, safeControls, forms, tables, lists, scrollRegions]
-    .some(items => items.length > maxItems) || result.page_text_next_offset < bodyText.length ||
+    .some(items => items.length > maxItems) || result.content_truncated ||
     result.tables.some(item => item.truncated) || result.lists.some(item => item.truncated);
   if (mode === 'article') result.sections = result.sections.filter(s => s.kind === 'article');
   if (mode === 'main_content') result.sections = result.sections.filter(s => s.kind === 'main' || s.kind === 'article');
@@ -2240,7 +2248,7 @@ class _AsyncBrowserOwner:
                 ))
             payload = await self._structured_frame_data(
                 frame, state, mode=mode, max_items=max_items,
-                text_offset=text_offset, text_limit=8_000,
+                text_offset=text_offset, text_limit=BROWSER_PAGE_TEXT_CHUNK_CHARS,
                 expected_frame_url=expected_frame_url,
             )
             payload["browser_state"] = state.to_dict()
@@ -2251,6 +2259,7 @@ class _AsyncBrowserOwner:
                 payload["frames"] = []
             next_offset = payload.pop("page_text_next_offset")
             length = payload.get("page_text_length", 0)
+            payload["page_text_offset"] = text_offset
             payload["next_cursor"] = (
                 self._bound_refs.issue("cursor", state, next_offset)
                 if next_offset < length else None
@@ -2481,7 +2490,7 @@ class _AsyncBrowserOwner:
             return self._receipt_failure(before=before, started_at=started, code=exc.code)
         except Exception as exc:
             click_error = exc
-        evidence = [{"single_dispatch": True}]
+        evidence = [{"single_dispatch": True, "click_returned": click_error is None}]
         # A JavaScript dialog deliberately blocks the page's event loop.  With
         # a dialog listener installed, Playwright can therefore time out the
         # click even though the one permitted dispatch demonstrably created
@@ -2553,9 +2562,9 @@ class _AsyncBrowserOwner:
             after = before
         if not ok:
             return self._receipt_failure(
-                before=before, started_at=started,
+                before=before, after=after, started_at=started,
                 code="postcondition_not_observed", dispatched=True, unknown=True,
-                evidence=evidence,
+                evidence=[*evidence, {"postcondition_observed": False}],
             )
         return self._receipt_success(
             before=before, after=after, started_at=started, evidence=evidence,
@@ -2739,7 +2748,10 @@ class _AsyncBrowserOwner:
         try:
             normalized = _normalize_url(url)
             opener, before = await self._resolve_state_page(state_ref)
-            if reuse_existing:
+            matching_tab = None
+            # BiDi needs a remote URL read. Do not add that wait when a
+            # caller explicitly asks for a separate tab.
+            if reuse_existing or self._active_browser_type != "bidi":
                 tabs = sorted(
                     self._state_tracker.tab_refs(),
                     key=lambda item: item[0] is not self._active_page,
@@ -2748,17 +2760,21 @@ class _AsyncBrowserOwner:
                     try:
                         if await self._page_url(existing) != normalized:
                             continue
-                        current = self._current_state(existing)
-                        if current.navigation_id != ref.navigation_id or current.document_epoch != ref.document_epoch:
+                        if self._current_state(existing) != ref:
                             continue
-                    except BrowserReferenceError:
+                    except Exception as exc:
+                        if reuse_existing and not isinstance(exc, BrowserReferenceError):
+                            raise
                         continue
-                    selected = await self._op_select_tab(ref.to_dict())
-                    if selected["ok"]:
-                        selected["data"].update(
-                            tab_reused=True, safe_url=safe_url_display(normalized),
-                        )
-                    return selected
+                    matching_tab = ref
+                    break
+            if reuse_existing and matching_tab is not None:
+                selected = await self._op_select_tab(matching_tab.to_dict())
+                if selected["ok"]:
+                    selected["data"].update(
+                        tab_reused=True, safe_url=safe_url_display(normalized),
+                    )
+                return selected
             page = await self._context.new_page()
             generation = self._register_context(self._context)
             self._register_page(
@@ -2788,13 +2804,25 @@ class _AsyncBrowserOwner:
             pass
         self._active_page = page
         self._publish()
+        data = {
+            "state": after.to_dict(),
+            "safe_url": safe_url_display(await self._page_url(page)),
+            "tab_reused": False,
+        }
+        if matching_tab is not None:
+            try:
+                self._state_tracker.validate(matching_tab)
+            except BrowserReferenceError:
+                pass
+            else:
+                data["matching_tab"] = {
+                    "state": matching_tab.to_dict(),
+                    "safe_url": safe_url_display(normalized),
+                }
         return self._receipt_success(
             before=before, after=after, started_at=started,
             evidence=[{"tab_created": True, "navigation_commit": True}],
-            data={
-                "state": after.to_dict(),
-                "safe_url": safe_url_display(await self._page_url(page)),
-            },
+            data=data,
         )
 
     async def _op_search_web(self, query, state_ref=None):
