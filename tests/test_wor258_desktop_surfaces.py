@@ -8,6 +8,7 @@ import json
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -52,6 +53,54 @@ from osia.vision_runtime import (
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+
+
+def test_chat_window_focus_records_the_primitive_without_a_strategy(monkeypatch, tmp_path):
+    from osia import desktop_scene
+    from osia.agent import _execute_tool_with_policy
+    from osia.tool_attempts import ToolAttemptStore
+    from osia.tools import desktop_control
+
+    registry = DesktopSurfaceRegistry()
+    foreground = _registered_visual_scene(registry)
+    background = replace(foreground, foreground=False)
+    scenes = iter((background, foreground))
+
+    def select(application):
+        return desktop_scene.TargetSurfaceSelection(application, "exact_target", None, next(scenes))
+
+    focus_calls = []
+
+    def focus(window):
+        focus_calls.append(window)
+        return "ready", "fixture focus"
+
+    monkeypatch.setattr(desktop_scene.sys, "platform", "win32")
+    monkeypatch.setattr(desktop_scene, "DESKTOP_SURFACE_REGISTRY", registry)
+    monkeypatch.setattr(desktop_scene, "_select_desktop_target", select)
+    monkeypatch.setattr(desktop_control, "focus_app_window", focus)
+    agent = OSIAAgent(model="fixture", lang="en")
+    agent.configure_tool_attempts(
+        conversation_id="fixture-conversation", turn_id="fixture-turn",
+        request_id="fixture-request", final_response_message_id="fixture-final",
+    )
+    arguments = {
+        "surface_ref": background.window_ref.ref_id,
+        "objective": background.window_ref.accessible_label,
+        "action_pattern": "Window",
+    }
+    context = agent._new_tool_attempt_context(tool_name="activate_desktop_surface", arguments=arguments)
+    store = ToolAttemptStore(tmp_path / "attempts")
+    context.update(store=store, terminal_callback=None)
+    result = _execute_tool_with_policy("activate_desktop_surface", arguments, attempt_context=context)
+
+    assert result.result["receipt"]["reason_code"] == "desktop_target_focus_verified"
+    assert focus_calls == [(7100, "Messenger", 7200)]
+    attempt = store.get_attempt(result.tool_attempt_id)
+    primitive, = attempt["primitive_journal"]
+    assert primitive["effect_role"] == "preparatory"
+    assert primitive["native_window_id"] == "7100"
+    assert primitive["dispatch_started_at"] > 0
 
 
 def _public(

@@ -747,6 +747,95 @@ def test_real_chat_agent_bridge_uses_typed_browser_results(controlled_browser):
     assert "screenshot" not in json.dumps((navigated, inspected)).lower()
 
 
+def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
+    controlled_browser, monkeypatch, tmp_path,
+):
+    from osia.agent import OSIAAgent, _execute_tool_with_policy
+    from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
+    from osia.slash_commands import chat_command_scope
+    from osia.tool_attempts import ToolAttemptStore
+    from osia.tools import desktop_control
+
+    # Run the same isolated browser fixture without creating a desktop window.
+    popen = browser.subprocess.Popen
+
+    def launch(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and f"--user-data-dir={controlled_browser.profile}" in cmd:
+            cmd = [*cmd, "--headless=new"]
+        return popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(browser.subprocess, "Popen", launch)
+    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
+    monkeypatch.setattr(
+        desktop_control, "focus_app_window", lambda *_: pytest.fail("desktop focus used"),
+    )
+    store = ToolAttemptStore(tmp_path / "attempts")
+    client = AppServerClient(base_dir=tmp_path / "codex", tool_attempt_store=store)
+    sent = []
+    client._send = sent.append
+    client._send_request_no_wait = lambda *_: None
+    agent = OSIAAgent(model="fixture", lang="en")
+    agent.provider = "chatgpt_account"
+    agent.configure_tool_attempts(
+        conversation_id="browser-fixture", turn_id="fixture-chat-turn",
+        request_id="fixture-request", final_response_message_id="fixture-final",
+    )
+
+    def call(tool, arguments):
+        call_id = f"fixture-{tool}"
+        attempt = _TurnAttempt(
+            thread_id="fixture-thread", turn_id=call_id,
+            osia_turn_id="fixture-chat-turn", conversation_id="browser-fixture",
+            client_request_id="fixture-request", model_id="fixture",
+        )
+        client._attempts[attempt.thread_id] = attempt
+        client._handle_server_request({
+            "id": len(sent) + 1,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": attempt.thread_id, "turnId": attempt.turn_id,
+                "callId": call_id, "tool": tool, "arguments": arguments,
+            },
+        })
+        event, payload = attempt.events.get_nowait()
+        if tool in tool_contracts.BROWSER_VERIFY_TOOL_NAMES:
+            assert event == "dynamic_tool_call"
+            client._resolve_dynamic_tool_call(attempt, payload)
+            assert not attempt.interrupt_sent
+            reply = sent[-1]["result"]
+            assert reply["success"], reply
+            envelope = json.loads(reply["contentItems"][0]["text"])
+            return json.loads(envelope["result"])
+
+        assert event == "unsafe"
+        assert attempt.native_tool_call == {"tool": tool, "arguments": arguments, "call_id": call_id}
+        context = agent._new_tool_attempt_context(
+            tool_name=tool, arguments=arguments, provider_native_call_id=call_id,
+        )
+        context.update(store=store, terminal_callback=None)
+        result = _execute_tool_with_policy(tool, arguments, attempt_context=context)
+        assert not result.is_error, result.result
+        return result.result
+
+    with chat_command_scope("browser-fixture", None):
+        _navigate(controlled_browser.web.base + "/form")
+        fields = call("inspect_form_fields", {})["fields"]
+        name_ref = next(
+            field["field_ref"] for field in fields if field.get("html_name") == "name"
+        )
+        fill = call("fill_form_field", {"field_ref": name_ref, "value": "Projet test"})
+        assert json.loads(fill)["verified"]
+        state = call("get_browser_state", {})["current_page_ref"]
+        page = call("inspect_browser_page", {"state_ref": state})["operation_data"]
+        submit_ref = page["buttons"][0]["element_ref"]
+        result = call("activate_browser_element", {
+            "state_ref": state, "element_ref": submit_ref,
+            "wait_spec": {"condition_type": "navigation_commit", "timeout_seconds": 4},
+        })
+        _success(result)
+        assert result["receipt"]["after_state"]["navigation_id"] != state["navigation_id"]
+
+
 def test_real_extraction_menu_consent_confirm_and_prompt(controlled_browser):
     web = controlled_browser.web
     state = _navigate(web.base + "/extract")

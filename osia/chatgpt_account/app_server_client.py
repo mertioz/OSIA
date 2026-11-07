@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from osia.runtime import resource_path, is_frozen
+from osia.tool_contracts import BROWSER_FAMILY_TOOL_NAMES, BROWSER_VERIFY_TOOL_NAMES
 from osia.version import PRODUCT_VERSION
 from osia.utils.subprocess_policy import (
     ProcessMode,
@@ -154,11 +155,8 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
     "write_file",
     "navigate",
     "open_browser",
-    "navigate_browser",
-    "get_browser_state",
-    "inspect_browser_page",
     "scroll",
-    "scroll_infinite",
+    *sorted(BROWSER_FAMILY_TOOL_NAMES),
     "read_document",
     "query_document",
     "inspect_desktop_surfaces",
@@ -175,6 +173,7 @@ _CANONICAL_NATIVE_TOOL_NAMES = (
 )
 
 _DIRECT_READ_ONLY_NATIVE_TOOLS = frozenset({
+    *BROWSER_VERIFY_TOOL_NAMES,
     "steam_game_state",
     "search_public_web",
     "read_public_web_page",
@@ -2784,7 +2783,7 @@ class AppServerClient:
             preflight_error = "ERROR: image delivery state is unresolved"
             preflight_reason_code = "IMAGE_DELIVERY_COMMIT_UNKNOWN"
 
-        from osia.agent import _execute_tool_with_policy
+        from osia.agent import _execute_tool_with_policy, _model_result_text
         from osia.tool_contracts import ExecutionOutcome
 
         durable_turn_id = str(attempt.osia_turn_id or attempt.turn_id or "")
@@ -3109,6 +3108,8 @@ class AppServerClient:
                 and bool(image_data_url or prior_visual_call is not None)
             ) else model_result
         )
+        if tool_name in BROWSER_VERIFY_TOOL_NAMES and not is_pending:
+            provider_model_result = _model_result_text(model_result, tool_name)
         try:
             result = self._dynamic_result_envelope(
                 call,

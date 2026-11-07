@@ -147,6 +147,8 @@ def test_exact_file_browser_and_document_intents_map_to_canonical_tools(
 
 
 def test_advertised_native_surface_uses_authoritative_exact_schemas_only():
+    from osia.tool_contracts import BROWSER_FAMILY_TOOL_NAMES
+
     tools = _canonical_native_tools()
     # WOR-300: the native frontier follows runtime availability only; the
     # desktop V4 entries are absent here because no V4 turn is bound.
@@ -159,10 +161,14 @@ def test_advertised_native_surface_uses_authoritative_exact_schemas_only():
         "is_installed",
         "is_running",
         "has_window",
+        "steam_game_state",
+        "search_public_web",
+        "read_public_web_page",
         "write_file",
         "navigate",
         "open_browser",
-        "navigate_browser",
+        "scroll",
+        *sorted(BROWSER_FAMILY_TOOL_NAMES),
         "read_document",
         "query_document",
         "inspect_desktop_surfaces",

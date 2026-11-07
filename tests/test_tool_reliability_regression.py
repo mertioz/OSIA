@@ -9,7 +9,7 @@ from osia import agent as runtime
 from osia.capability_federation import federated_capabilities
 from osia.chatgpt_account.app_server_client import _canonical_native_tools
 from osia.tool_contracts import (
-    ALL_TEXT_PROVIDERS, ToolValidationError, effective_static_tool_specs,
+    ALL_TEXT_PROVIDERS, BROWSER_FAMILY_TOOL_NAMES, ToolValidationError, effective_static_tool_specs,
     get_static_registry, static_tool_prompt_block, validate_tool_arguments,
     validation_error_details,
 )
@@ -109,6 +109,17 @@ def test_account_app_tools_have_exact_native_contracts():
     tools = {t["name"]: t for t in _canonical_native_tools()}
     for name in ("open_application", "open_uri", "is_installed", "is_running", "has_window", "steam_game_state"):
         assert tools[name]["inputSchema"] == get_static_registry().get(name).input_schema
+
+
+def test_account_managed_browser_tools_stay_available_with_mouse_disabled(monkeypatch):
+    from osia.slash_commands import chat_command_scope
+
+    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
+    with chat_command_scope("browser-fixture", None):
+        tools = {tool["name"]: tool for tool in _canonical_native_tools()}
+        assert BROWSER_FAMILY_TOOL_NAMES <= tools.keys()
+        for name in BROWSER_FAMILY_TOOL_NAMES:
+            assert tools[name]["inputSchema"] == get_static_registry().get(name).input_schema
 
 
 @pytest.mark.parametrize(("downloaded", "progress"), [
