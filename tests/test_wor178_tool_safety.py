@@ -55,6 +55,26 @@ def test_shell_classifier_is_narrow_and_ambiguous_syntax_is_high_risk():
     assert risky.side_effect == SideEffectClass.UNKNOWN_HIGH_RISK
 
 
+@pytest.mark.parametrize("platform", ["win32", "darwin", "linux"])
+def test_open_in_editor_never_uses_file_association(platform, monkeypatch, tmp_path):
+    target = tmp_path / "script.cmd"
+    target.write_text("echo fixture", encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(agent_module.sys, "platform", platform)
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setattr(agent_module.shutil, "which", lambda name: "/usr/bin/gedit" if name == "gedit" else None)
+    monkeypatch.setattr(agent_module.os, "startfile", lambda *_: pytest.fail("file association used"), raising=False)
+    monkeypatch.setattr(agent_module.subprocess, "Popen", lambda command, **kwargs: launched.append(command))
+
+    assert not agent_module.tool_open_in_editor(str(target)).startswith("ERROR:")
+    expected = {
+        "win32": [str(tmp_path / "System32" / "notepad.exe")],
+        "darwin": ["/usr/bin/open", "-t"],
+        "linux": ["/usr/bin/gedit"],
+    }[platform]
+    assert launched == [[*expected, str(target)]]
+
+
 def test_confirmation_ledger_is_exact_expiring_and_single_use():
     now = [100.0]
     ledger = ConfirmationLedger(ttl_seconds=5.0, clock=lambda: now[0])

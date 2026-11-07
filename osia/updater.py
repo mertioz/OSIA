@@ -1328,16 +1328,17 @@ def cleanup_updates(
             if path.name in preserve or path.is_symlink() or not path.is_file():
                 continue
             age = timestamp - path.stat().st_mtime
-            if path.suffix == ".part":
-                remove = age > PART_MAX_AGE_SECONDS
-            elif path.name.endswith(_INSTALLER_SUFFIX):
-                try:
-                    parse_product_version(path.name.removesuffix(_INSTALLER_SUFFIX))
-                except ValueError:
-                    continue
-                remove = verified_version is not None or age > INSTALLER_MAX_AGE_SECONDS
-            else:
+            suffix = ".part" if path.suffix == ".part" else _INSTALLER_SUFFIX
+            if not path.name.endswith(suffix):
                 continue
+            try:
+                parse_product_version(path.name.removesuffix(suffix))
+            except ValueError:
+                continue
+            remove = (
+                age > PART_MAX_AGE_SECONDS if suffix == ".part"
+                else verified_version is not None or age > INSTALLER_MAX_AGE_SECONDS
+            )
             if remove:
                 path.unlink()
         except OSError:

@@ -49,6 +49,7 @@ def _manifest(
     payload: bytes = PAYLOAD,
     *,
     sha256: str | None = None,
+    version: str = "1.0.2",
 ) -> updater.UpdateManifest:
     raw = {
         "schemaVersion": 1,
@@ -56,10 +57,10 @@ def _manifest(
         "platform": "windows",
         "architecture": "x86_64",
         "channel": "internal-preview",
-        "version": "1.0.2",
+        "version": version,
         "publishedAt": "2026-08-06T12:00:00Z",
         "installer": {
-            "url": "https://download.osia.space/windows/1.0.2/OSIA-Setup.exe",
+            "url": f"https://download.osia.space/windows/{version}/OSIA-Setup.exe",
             "sizeBytes": len(payload),
             "sha256": sha256 or hashlib.sha256(payload).hexdigest(),
             "signed": False,
@@ -213,6 +214,33 @@ def _controller(monkeypatch, tmp_path, manifest, opener, process_factory=None):
         error=None,
     )
     return controller
+
+
+def test_new_manifest_downloads_its_own_installer_after_cancel(app, monkeypatch, tmp_path):
+    previous = _manifest(b"old")
+    route = _Route(payload=b"new")
+    current = _manifest(route.payload, version="1.0.3")
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Cancel,
+    )
+    with _http_fixture(route) as (opener, _):
+        controller = _controller(monkeypatch, tmp_path, previous, opener)
+        cache = updater.installer_path(previous.version, tmp_path / "updates")
+        cache.parent.mkdir()
+        cache.write_bytes(b"old")
+        controller.installer = cache
+        assert controller.scheduler.begin()
+        assert controller.install() is False
+        controller._on_check_finished(
+            updater.ManifestFetchResult("available", current), True, None, controller.preview_opt_in,
+        )
+        controller._timer.stop()
+        assert controller.installer is None
+        assert controller.install()
+        assert _wait_until(app, lambda: controller.operation.snapshot.phase == "idle")
+        assert route.requests == 1
+        assert controller.installer.read_bytes() == route.payload
+        assert controller.installer.name == "1.0.3-OSIA-Setup.exe"
 
 
 def test_snapshots_are_immutable_and_french_progress_is_concise(app):

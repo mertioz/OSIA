@@ -605,13 +605,15 @@ def _track_inventory(container, family: str) -> tuple[list[dict], list[Any]]:
     return tracks, streams
 
 
-def _silence_regions(path: Path, stream_index: int) -> list[dict]:
-    """Find bounded >=0.4 s silence runs without retaining decoded audio."""
+def _silence_regions(path: Path, stream_index: int) -> tuple[list[dict], bool]:
+    """Find silence runs and report whether all decoded samples are zero."""
 
     import av
     import numpy as np
 
     regions = []
+    has_samples = False
+    all_zero = True
     active_start = None
     current_end = 0.0
     with av.open(str(path), mode="r") as container:
@@ -626,12 +628,14 @@ def _silence_regions(path: Path, stream_index: int) -> list[dict]:
             raw = frame.to_ndarray()
             if raw.size == 0:
                 continue
+            has_samples = True
             if np.issubdtype(raw.dtype, np.integer):
                 scale = float(max(abs(np.iinfo(raw.dtype).min), np.iinfo(raw.dtype).max))
                 array = raw.astype("float32") / max(1.0, scale)
             else:
                 array = raw.astype("float32", copy=False)
             peak = float(np.max(np.abs(array)))
+            all_zero = all_zero and peak == 0.0
             start = _safe_float(frame.pts) * _safe_float(frame.time_base)
             duration = _safe_float(frame.samples) / max(1, int(frame.sample_rate or 1))
             current_end = start + duration
@@ -650,7 +654,7 @@ def _silence_regions(path: Path, stream_index: int) -> list[dict]:
                 "start_seconds": round(active_start, 3),
                 "end_seconds": round(current_end, 3),
             })
-    return regions
+    return regions, has_samples and all_zero
 
 
 def _transcribe(path: Path, language: str, track_id: str) -> tuple[list[dict], dict]:
@@ -827,10 +831,12 @@ def _extract_audio(path: Path, request: dict) -> dict:
         if len(list(raw_chapters or [])) > MAX_CHAPTERS:
             raise MediaReadError("resource_limit_exceeded", limit_kind="chapter_count")
     selected_track, _selected_stream = audio_pairs[0]
-    silence = _silence_regions(path, int(selected_track["stream_index"]))
-    transcript, speech = _transcribe(
-        path, str(request.get("language") or ""), selected_track["track_id"],
-    )
+    silence, digital_silence = _silence_regions(path, int(selected_track["stream_index"]))
+    transcript, speech = [], {}
+    if not digital_silence:
+        transcript, speech = _transcribe(
+            path, str(request.get("language") or ""), selected_track["track_id"],
+        )
     document = _base_document(
         str(request["format_label"]), "audio", list(request.get("warnings") or []),
     )

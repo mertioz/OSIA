@@ -323,6 +323,8 @@ def test_safe_url_display_never_exposes_query_fragment_userinfo_or_file_path():
     assert safe_url_display(raw) == "https://example.test/private/path"
     assert safe_url_display("file:///C:/private/secret.txt") == "file:///[private]"
     assert safe_url_display("about:blank?token=QUERY#fragment") == "about:blank"
+    assert safe_url_display("https://[2001:db8::1]:8443/path?q=ignored") == "https://[2001:db8::1]:8443/path"
+    assert safe_url_display("https://example.test:invalid/path") == "invalid-url"
 
 
 @pytest.mark.parametrize(
@@ -745,6 +747,131 @@ def test_real_chat_agent_bridge_uses_typed_browser_results(controlled_browser):
     data = _success(inspected)
     assert data["headings"][0]["text"] == "Fixture heading"
     assert "screenshot" not in json.dumps((navigated, inspected)).lower()
+
+
+def test_exact_browser_extraction_and_nested_scroll_with_mouse_disabled(
+    controlled_browser, monkeypatch,
+):
+    from osia.agent import _execute_tool_with_policy
+    from osia.slash_commands import chat_command_scope
+    from osia.tools import desktop_control
+
+    state = _navigate(controlled_browser.web.base + "/audit-browser")
+    snapshot = _success(browser.inspect_browser_page(state))
+    table_ref = snapshot["tables"][1]["element_ref"]
+    table = _success(browser.inspect_browser_page(
+        state, mode="table", target_ref=table_ref, max_items=1,
+    ))
+    assert table["status"] == "truncated"
+    assert table["tables"] == [{
+        "caption": "Exact metrics", "headers": [], "rows": [["Second table"]],
+        "element_ref": table_ref,
+    }]
+    assert not table["lists"]
+    list_ref = snapshot["lists"][0]["element_ref"]
+    listing = _success(browser.inspect_browser_page(state, mode="list", target_ref=list_ref))
+    assert listing["lists"][0]["items"] == ["Exact list"]
+    mismatch = browser.inspect_browser_page(state, mode="list", target_ref=table_ref)
+    assert mismatch["error"]["code"] == "target_does_not_match_extraction_mode"
+
+    panel = next(region for region in snapshot["scroll_regions"] if region["label"] == "Nested panel")
+    assert panel["scroll_top"] == 0
+    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
+    monkeypatch.setattr(
+        desktop_control, "focus_app_window", lambda *_: pytest.fail("desktop focus used"),
+    )
+    with chat_command_scope("browser-scroll-fixture", None):
+        result = _execute_tool_with_policy(
+            "scroll", {"direction": "down", "amount": 120, "state_ref": state,
+                       "element_ref": panel["element_ref"]},
+            allow_retry=False,
+        )
+    assert _success(result.result) == {"movement": 120, "nested": True, "status": "moved"}
+    updated = _success(browser.inspect_browser_page(state))
+    assert next(
+        region["scroll_top"] for region in updated["scroll_regions"] if region["label"] == "Nested panel"
+    ) == 120
+
+
+def test_browser_rejects_replaced_dom_node_before_acting(controlled_browser):
+    state = _navigate(controlled_browser.web.base + "/audit-browser")
+    before = _success(browser.inspect_browser_page(state))
+    old_ref = next(
+        item["element_ref"] for item in before["buttons"] if item["text"] == "Run action"
+    )
+    _success(browser.click("#replace"))
+    expected = {
+        "condition_type": "text_appearance", "expected": "Replacement clicked",
+        "timeout_seconds": 1.0,
+    }
+    rejected = browser.activate_browser_element(state, old_ref, expected)
+    assert rejected["error"]["code"] == "stale_element_reference"
+    assert rejected["receipt"]["dispatch_state"] == "not_dispatched"
+    updated = _success(browser.inspect_browser_page(state))
+    assert "Replacement ready" in updated["page_text"]
+    new_ref = next(
+        item["element_ref"] for item in updated["buttons"] if item["text"] == "Run action"
+    )
+    assert old_ref != new_ref
+    _success(browser.activate_browser_element(state, new_ref, expected))
+
+
+def test_old_frame_reference_cannot_read_cross_origin_navigation(controlled_browser):
+    state = _navigate(controlled_browser.web.base + "/frame-transition")
+    snapshot = _success(browser.inspect_browser_page(state))
+    old_ref = snapshot["frames"][0]["frame_ref"]
+    _success(browser.click("#switch-frame"))
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        snapshot = _success(browser.inspect_browser_page(state))
+        if snapshot["frames"][0].get("status") == "cross_origin_inaccessible":
+            break
+        time.sleep(0.05)
+    assert snapshot["frames"][0]["status"] == "cross_origin_inaccessible"
+    rejected = browser.inspect_browser_page(state, mode="headings", frame_ref=old_ref)
+    assert rejected["error"]["code"] == "stale_element_reference"
+
+
+def test_download_wait_requires_a_new_event_on_the_bound_page(controlled_browser):
+    state = _navigate(controlled_browser.web.base + "/download-page")
+    page = _success(browser.inspect_browser_page(state))
+    download_ref = page["links"][0]["element_ref"]
+    _success(browser.download_browser_file(state, download_ref))
+    missed = browser.activate_browser_element(
+        state, page["buttons"][0]["element_ref"],
+        {"condition_type": "download_completion", "timeout_seconds": 0.25},
+    )
+    assert missed["error"]["code"] == "postcondition_not_observed"
+    assert missed["receipt"]["outcome"] == "outcome_unknown"
+    _success(browser.activate_browser_element(
+        state, download_ref,
+        {"condition_type": "download_completion", "timeout_seconds": 2},
+    ))
+
+
+def test_tab_listing_pairs_navigation_state_with_the_observed_url():
+    owner = browser._AsyncBrowserOwner()
+    owner._state_tracker.start_context(object())
+
+    class RedirectedTab:
+        url = "https://example.test/initial"
+
+        async def title(self):
+            self.url = "https://example.test/redirected"
+            owner._state_tracker.note_navigation(self)
+            return "Redirected tab"
+
+    page = RedirectedTab()
+    before = owner._state_tracker.register_page(page)
+
+    async def resolve(_state_ref):
+        return page, before
+
+    owner._resolve_state_page = resolve
+    tab = _success(asyncio.run(owner._op_list_tabs()))["tabs"][0]
+    assert tab["safe_url"] == "https://example.test/redirected"
+    assert tab["state"]["document_epoch"] == before.document_epoch + 1
+    assert owner._state_tracker.validate(tab["state"]) is page
 
 
 def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(

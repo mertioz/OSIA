@@ -59,12 +59,12 @@ def safe_url_display(value: Any) -> str:
     try:
         port = parsed.port
     except ValueError:
-        port = None
-    netloc = host
+        return "invalid-url"
+    netloc = f"[{host}]" if ":" in host else host
     if port is not None and not (
         (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     ):
-        netloc = f"{host}:{port}"
+        netloc = f"{netloc}:{port}"
     path = parsed.path
     if len(path) > 512:
         path = path[:509] + "..."
@@ -164,7 +164,7 @@ class WaitSpec:
         try:
             condition = WaitConditionType(str(value.get("condition_type") or ""))
             timeout = float(value["timeout_seconds"])
-            quiet = float(value.get("quiet_period_seconds", 0.5))
+            quiet = float(value.get("quiet_period_seconds", min(0.5, timeout)))
             failure = WaitFailurePolicy(str(
                 value.get("failure_policy")
                 or WaitFailurePolicy.OUTCOME_UNKNOWN_IF_DISPATCHED.value

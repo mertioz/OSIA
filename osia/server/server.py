@@ -1164,6 +1164,18 @@ async def _broadcast_conversation_history(conv_id: str | None) -> None:
     await _send_conversation_frame(_conversation_history_frame(conv))
 
 
+async def _cancel_deleted_chat_turn(conv_id: str) -> None:
+    turn_meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
+    if isinstance(turn_meta, dict) and (
+        conversations.was_cancelled_for_conversation_delete(turn_meta)
+    ):
+        await _commit_canonical_chat_cancellation(
+            turn_meta,
+            reason_code="conversation_delete",
+            send_busy_false=True,
+        )
+
+
 async def _broadcast_canonical_conversation_change(
     conv_id: str | None,
     *,
@@ -1195,15 +1207,7 @@ async def _broadcast_canonical_conversation_change(
                     flush=True,
                 )
                 return False
-            turn_meta = _ACTIVE_TURN_META_BY_CONV.get(conv_id)
-            if isinstance(turn_meta, dict) and (
-                conversations.was_cancelled_for_conversation_delete(turn_meta)
-            ):
-                await _commit_canonical_chat_cancellation(
-                    turn_meta,
-                    reason_code="conversation_delete",
-                    send_busy_false=True,
-                )
+            await _cancel_deleted_chat_turn(conv_id)
             _LAST_BROADCAST_REVISIONS.pop(conv_id, None)
             await _send_conversation_frame(
                 {
@@ -8935,37 +8939,14 @@ async def websocket_endpoint(ws: WebSocket):
                     f"started_at_unix_ns={time.time_ns()}",
                     flush=True,
                 )
-                if (
-                    conv_id in streaming_tasks
-                    or _is_conversation_busy(conv_id)
-                ):
-                    snapshot = conversations.conversation_snapshot()
-                    snapshot_revision = int(
-                        snapshot.get("snapshot_revision") or 0
-                    )
-                    print(
-                        "[OSIA DeleteTrace] origin=Mobile phase=canonical_result "
-                        f"conversation_id={conv_id!r} operation_id={operation_id!r} "
-                        "success=false error=conversation_busy "
-                        f"snapshot_revision={snapshot_revision} "
-                        f"persistence_location={str(conversations.CONVERSATIONS_DIR)!r} "
-                        f"completed_at_unix_ns={time.time_ns()}",
-                        flush=True,
-                    )
-                    await out.send_json({
-                        "type": "conversation_deleted",
-                        "id": conv_id,
-                        "success": False,
-                        "error": "conversation_busy",
-                        "operation_id": operation_id,
-                        "snapshot_revision": snapshot_revision,
-                    })
-                    await out.send_json(snapshot)
-                    await _send_recovered_turn_state(out, conv_id)
-                    continue
+                active_task = _ACTIVE_TURNS_BY_CONV.get(conv_id)
                 receipt = conversations.delete_conversation_with_receipt(
                     conv_id,
                     operation_id=operation_id,
+                    cancel_active_turn=(
+                        active_task is not None and not active_task.done()
+                    ),
+                    cancel_active_binding=_ACTIVE_TURN_META_BY_CONV.get(conv_id) or {},
                 )
                 ok = bool(receipt.get("success"))
                 snapshot = conversations.conversation_snapshot()
@@ -8994,9 +8975,9 @@ async def websocket_endpoint(ws: WebSocket):
                     flush=True,
                 )
                 if ok:
-                    # The atomic store lease has now proved that no canonical
-                    # turn owns this conversation. Clear only local projections
-                    # for the file that was actually removed.
+                    # Propagate the exact cancellation before worker cleanup
+                    # can remove its live turn metadata.
+                    await _cancel_deleted_chat_turn(conv_id)
                     doomed = streaming_tasks.pop(conv_id, None)
                     if doomed is None:
                         doomed = _ACTIVE_TURNS_BY_CONV.get(conv_id)
@@ -9044,6 +9025,8 @@ async def websocket_endpoint(ws: WebSocket):
                         action="delete",
                         exclude=out,
                     )
+                elif receipt.get("error") == "conversation_busy":
+                    await _send_recovered_turn_state(out, conv_id)
                 continue
 
             if msg_type == "rename_conversation":

@@ -417,14 +417,16 @@ def test_cancelled_download_removes_partial(tmp_path):
 
 
 def test_cleanup_age_rules(tmp_path):
-    old_part = tmp_path / "old.part"
+    old_part = tmp_path / "1.0.0.part"
+    unrelated = tmp_path / "notes.part"
     old_installer = tmp_path / "1.0.0-OSIA-Setup.exe"
     keep = tmp_path / "1.0.2-OSIA-Setup.exe"
-    for path in (old_part, old_installer, keep):
+    for path in (old_part, old_installer, keep, unrelated):
         path.write_bytes(b"x")
         os.utime(path, (1, 1))
     updater.cleanup_updates(tmp_path, preserve_versions=("1.0.2",), now=10**9)
     assert not old_part.exists() and not old_installer.exists() and keep.exists()
+    assert unrelated.read_bytes() == b"x"
 
 
 def test_scheduler_single_flight_and_retry_sequence():

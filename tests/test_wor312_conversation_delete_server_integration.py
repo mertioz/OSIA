@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 
 from fastapi.testclient import TestClient
@@ -7,7 +8,8 @@ from starlette.responses import JSONResponse
 from starlette.applications import Starlette
 from starlette.routing import Route, WebSocketRoute
 
-from osia import conversations
+from osia import conversations, turn_terminality
+from osia.durable_transport import DurableTransportStore
 from osia.server import server
 
 
@@ -155,12 +157,8 @@ def test_real_store_single_bulk_and_desktop_server_deletion_paths(
                 item["id"] for item in initial["items"]
             }
 
-            real_busy_check = server._is_conversation_busy
-            monkeypatch.setattr(
-                server,
-                "_is_conversation_busy",
-                lambda conv_id: conv_id == mobile_busy["id"]
-                or real_busy_check(conv_id),
+            assert conversations.claim_background_execution(
+                mobile_busy["id"], "protected-background-lease",
             )
             websocket.send_json({
                 "type": "delete_conversation",
@@ -175,7 +173,9 @@ def test_real_store_single_bulk_and_desktop_server_deletion_paths(
                 item["id"] for item in busy_snapshot["items"]
             }
             assert conversations.get_conversation(mobile_busy["id"]) is not None
-            monkeypatch.setattr(server, "_is_conversation_busy", real_busy_check)
+            assert conversations.release_background_execution(
+                mobile_busy["id"], "protected-background-lease",
+            )
 
             websocket.send_json({
                 "type": "delete_conversation",
@@ -330,3 +330,101 @@ def test_real_store_single_bulk_and_desktop_server_deletion_paths(
     assert foldered["id"] in final_ids
     for conv_id in deleted_ids:
         assert reloaded_store.get_conversation(conv_id) is None
+
+
+def test_mobile_single_delete_stops_exact_canonical_chat_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
+    monkeypatch.setattr(turn_terminality, "CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setattr(server, "MOBILE_TOKEN", "test-token")
+    monkeypatch.setattr(
+        server, "_DURABLE_TRANSPORT", DurableTransportStore(tmp_path / "transport"),
+    )
+    for name in ("_ACTIVE_TURNS_BY_CONV", "_ACTIVE_TURN_META_BY_CONV",
+                 "_ACTIVE_CONV_BY_REQUEST", "_LAST_BROADCAST_REVISIONS"):
+        monkeypatch.setattr(server, name, {})
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+    monkeypatch.setattr(server, "_CONVERSATION_BROADCAST_LOCK", None)
+
+    conv_id = conversations.create_conversation("Active chat")["id"]
+    keep_id = conversations.create_conversation("Another chat")["id"]
+    desktop_id = conversations.create_conversation("Active desktop chat")["id"]
+    stopped = []
+    binding = {
+        "conversation_id": conv_id,
+        "request_id": "request-to-delete",
+        "turn_id": "turn-to-delete",
+        "run_id": "run-to-delete",
+        "provider_id": "deepseek",
+        "model_id": "deepseek-flash",
+        "effective_reasoning": "off",
+    }
+    meta = {
+        **binding,
+        "client_request_id": binding["request_id"],
+        "user_message_id": "user-to-delete",
+        "assistant_message_id": "assistant-to-delete",
+        "_terminality_objective": "an unfinished task",
+        "_execution_generation_cancel": stopped.append,
+    }
+    desktop_meta = {
+        **meta,
+        "conversation_id": desktop_id,
+        "request_id": "desktop-request",
+        "client_request_id": "desktop-request",
+        "turn_id": "desktop-turn",
+        "run_id": "desktop-run",
+        "user_message_id": "desktop-user",
+        "assistant_message_id": "desktop-assistant",
+        "_execution_owner": "desktop",
+    }
+    assert server._persist_accepted_user_message(
+        desktop_id, "Desktop-owned task", desktop_meta,
+    )
+
+    async def claim_turns():
+        assert server._persist_accepted_user_message(conv_id, "an unfinished task", meta)
+        active = asyncio.create_task(asyncio.Event().wait())
+        other = asyncio.create_task(asyncio.Event().wait())
+        assert server._claim_conversation_turn(conv_id, active, meta)
+        assert server._claim_conversation_turn(keep_id, other)
+        return active, other
+
+    app = Starlette(routes=[WebSocketRoute("/ws", server.websocket_endpoint)])
+    with TestClient(app, client=("127.0.0.1", 54321)) as client:
+        with client.websocket_connect("/ws") as mobile:
+            mobile.send_json({"type": "auth", "token": "test-token"})
+            initial = _receive_type(mobile, "conversations")
+            active, other = client.portal.call(claim_turns)
+            try:
+                mobile.send_json({
+                    "type": "delete_conversation", "id": desktop_id,
+                    "operation_id": "mobile_delete_desktop_active",
+                })
+                protected = _receive_type(mobile, "conversation_deleted")
+                assert protected["success"] is False
+                assert protected["error"] == "conversation_busy"
+                protected_snapshot = _receive_type(mobile, "conversations")
+                assert desktop_id in {item["id"] for item in protected_snapshot["items"]}
+                assert not conversations.was_cancelled_for_conversation_delete(desktop_meta)
+
+                mobile.send_json({
+                    "type": "delete_conversation", "id": conv_id,
+                    "operation_id": "mobile_delete_active",
+                })
+                status = _receive_type(mobile, "turn_status")
+                assert status["status"] == "cancelled"
+                assert {key: status[key] for key in binding} == binding
+                ack = _receive_type(mobile, "conversation_deleted")
+                assert ack["id"] == conv_id
+                assert ack["success"] is True
+                assert ack["operation_id"] == "mobile_delete_active"
+                assert ack["snapshot_revision"] > initial["snapshot_revision"]
+                snapshot = _receive_type(mobile, "conversations")
+                assert {item["id"] for item in snapshot["items"]} == {keep_id, desktop_id}
+                assert conversations.was_cancelled_for_conversation_delete(binding)
+                assert active.cancelling()
+                assert not other.done()
+                assert stopped == [binding["turn_id"]]
+            finally:
+                client.portal.call(active.cancel)
+                client.portal.call(other.cancel)

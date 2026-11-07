@@ -216,6 +216,7 @@ def test_audio_wav_worker_mp3_ogg_metadata_and_segments(tmp_path, monkeypatch):
     assert worker["metadata"]["duration_seconds"] == 1.0
     assert worker["tracks"][0]["codec"] == "pcm_s16le"
     assert worker["metadata"]["silence_regions"]
+    assert worker["transcript"] == []
 
     transcript = [{
         "segment_id": "segment_000001", "track_id": "track_000001",
@@ -225,7 +226,7 @@ def test_audio_wav_worker_mp3_ogg_metadata_and_segments(tmp_path, monkeypatch):
     monkeypatch.setattr(media_reader, "_transcribe", lambda *_args: (
         transcript, {"speech_language": "fr", "language_confidence": 0.95},
     ))
-    monkeypatch.setattr(media_reader, "_silence_regions", lambda *_args: [])
+    monkeypatch.setattr(media_reader, "_silence_regions", lambda *_args: ([], False))
     for name, fmt, codec, expected in [
         ("speech.mp3", "mp3", "mp3", "mp3"),
         ("speech.ogg", "ogg", "libopus", "opus"),

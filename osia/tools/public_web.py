@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 from dataclasses import dataclass
+from email.message import Message
 from functools import cache
 from html.parser import HTMLParser
 import http.client
@@ -186,12 +187,50 @@ def _get(url: str, accept: tuple[str, ...], limit: int, deadline: float) -> tupl
     raise _PublicWebError("public_web_redirect_failed", "The public page did not resolve to a readable destination.")
 
 
-def _decode(data: bytes, charset: str | None) -> str:
-    try:
-        encoding = codecs.lookup(charset or "utf-8").name
-        return data.decode(encoding, errors="replace")
-    except (LookupError, UnicodeError):
-        return data.decode("utf-8", errors="replace")
+class _HTMLCharset(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.charset = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "meta" or self.charset:
+            return
+        attributes = dict(attrs)
+        self.charset = attributes.get("charset")
+        if not self.charset and (attributes.get("http-equiv") or "").casefold() == "content-type":
+            header = Message()
+            header["Content-Type"] = attributes.get("content") or ""
+            self.charset = header.get_content_charset()
+
+
+def _decode(data: bytes, charset: str | None, *, html: bool = False) -> str:
+    for marker, encoding in (
+        (codecs.BOM_UTF8, "utf-8-sig"),
+        (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+    ):
+        if data.startswith(marker):
+            return data.decode(encoding, errors="replace")
+    declared = [charset] if charset else []
+    if html and not charset:
+        parser = _HTMLCharset()
+        try:
+            parser.feed(data[:4096].decode("latin-1"))
+        except AssertionError:
+            # HTMLParser rejects some malformed marked declarations.
+            pass
+        if parser.charset:
+            declared.append(parser.charset)
+    for label in declared:
+        try:
+            encoding = codecs.lookup(label.strip()).name
+            # HTML's legacy Latin-1 and ASCII labels decode as Windows-1252.
+            if html and encoding in {"iso8859-1", "ascii"}:
+                encoding = "cp1252"
+            return data.decode(encoding, errors="replace")
+        except (LookupError, UnicodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 class _SearchResults(HTMLParser):
@@ -321,11 +360,11 @@ def search_public_web(query: str) -> dict:
                 rows = _bing_results(response.body)
             else:
                 parser = _SearchResults()
-                parser.feed(_decode(response.body, response.charset))
+                parser.feed(_decode(response.body, response.charset, html=True))
                 rows = parser.results
             had_response = True
             results = _format_results(rows)
-        except (_PublicWebError, ET.ParseError, ValueError):
+        except (_PublicWebError, ET.ParseError, ValueError, AssertionError):
             continue
         if results:
             entries = [
@@ -349,11 +388,17 @@ def read_public_web_page(url: str, offset: int = 0) -> dict:
         )
     except _PublicWebError as error:
         return _failure(error)
-    content = _decode(response.body, response.charset)
+    is_html = response.content_type in {"text/html", "application/xhtml+xml"}
+    content = _decode(response.body, response.charset, html=is_html)
     title = ""
-    if response.content_type in {"text/html", "application/xhtml+xml"}:
+    if is_html:
         parser = _PageText()
-        parser.feed(content)
+        try:
+            parser.feed(content)
+        except AssertionError:
+            return _failure(_PublicWebError(
+                "public_page_invalid_html", "The public response could not be parsed as HTML.",
+            ))
         content = "".join(parser.parts)
         title = " ".join(parser.title.split())[:240]
     text = "\n".join(line for raw in content.splitlines() if (line := " ".join(raw.split())))

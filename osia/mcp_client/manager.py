@@ -2,10 +2,8 @@
 """OSIA MCP client core — WOR-44 Phase 1.
 
 Standalone, self-contained MCP CLIENT. Lets OSIA connect to MCP servers,
-discover their tools, and call a tool — returning the result as a plain string
-or an ``ERROR: ...`` string, mirroring the native-tool contract in
-``osia.agent`` (a tool result is treated as a failure when its first non-blank
-token begins with ``ERROR``/``ERREUR``; see ``osia.agent._is_tool_error``).
+discover their tools, and call a tool. Results remain strings for display,
+with the protocol outcome carried separately from connector-provided text.
 
 NO agent or server wiring lives here. This module imports neither
 ``osia.agent`` nor ``osia.server`` and owns its OWN asyncio event loop in a
@@ -97,6 +95,15 @@ KNOWN_TRANSPORTS = ("stdio", "streamable_http", "sse")
 # convention (``osia.agent._is_tool_error`` does NOT treat ``(no output)`` as an
 # error) so Phase 2 won't misread an empty success as a failure.
 _EMPTY_OK = "(no output)"
+
+
+class MCPToolResult(str):
+    """Display text with dispatch and outcome facts from the MCP client."""
+
+    def __new__(cls, text: str, *, status: str):
+        value = super().__new__(cls, text)
+        value.status = status
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +198,15 @@ def _sanitize_error(text: str, cfg: Optional[dict]) -> str:
         headers = cfg.get("headers")
         if isinstance(headers, dict):
             values += [str(v) for v in headers.values() if v]
+            for key, value in headers.items():
+                if str(key).lower() == "authorization":
+                    scheme, _, credential = str(value).partition(" ")
+                    if scheme.lower() in {"bearer", "basic"} and credential.strip():
+                        values.append(credential.strip())
         tok = cfg.get("token")
         if tok:
             values.append(str(tok))
-        for v in values:
+        for v in sorted(set(values), key=len, reverse=True):
             if v and v in text:
                 text = text.replace(v, "***")
     except Exception:
@@ -350,6 +362,31 @@ def _tool_annotations(t: Any) -> dict:
     return out
 
 
+async def _list_session_tools(session: Any) -> list[dict]:
+    from mcp.types import PaginatedRequestParams
+
+    tools = []
+    seen_cursors = set()
+    page = await session.list_tools()
+    while True:
+        tools.extend(
+            {
+                "name": getattr(tool, "name", ""),
+                "description": getattr(tool, "description", "") or "",
+                "inputSchema": getattr(tool, "inputSchema", None) or {},
+                "annotations": _tool_annotations(tool),
+            }
+            for tool in getattr(page, "tools", []) or []
+        )
+        cursor = getattr(page, "nextCursor", None)
+        if cursor is None:
+            return tools
+        if cursor in seen_cursors:
+            raise RuntimeError("MCP tools/list returned a repeated pagination cursor")
+        seen_cursors.add(cursor)
+        page = await session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+
+
 # ---------------------------------------------------------------------------
 # Credential validation — connect-time auth probe + demote-on-auth-error
 # ---------------------------------------------------------------------------
@@ -389,46 +426,35 @@ _IDENTITY_PROBE_CANDIDATES = (
 # CONNECTED and let the demote-on-auth-error fallback catch a bad token on use.
 PROBE_CALL_TIMEOUT = 15.0
 
-# Clear authentication/authorization failure phrases. DELIBERATELY conservative:
-# only unambiguous auth verdicts, so a 404 / bad-arg / generic tool error never
-# trips it. Rate-limiting frequently rides a 403 but is NOT an auth failure (the
-# credential is valid, just throttled) and is excluded below. The 401/403 status
-# codes are matched separately with word boundaries (``_AUTH_CODE_RE``) so a digit
-# embedded in unrelated data can't false-positive.
+# A resource-specific 403 or rate limit says nothing about the connector's
+# credential. Only look for authentication evidence in a typed error response.
 _AUTH_FAIL_KEYWORDS = (
-    "unauthorized", "forbidden", "bad credentials", "invalid credentials",
+    "bad credentials", "invalid credentials",
     "invalid token", "invalid access token", "invalid authentication",
     "authentication failed", "authentication required", "requires authentication",
-    "not authenticated", "permission denied", "access denied",
+    "not authenticated",
     "invalid api key", "invalid_grant", "invalid_token", "token expired",
     "expired token",
 )
 _RATE_LIMIT_HINTS = ("rate limit", "rate-limit", "ratelimit", "too many requests")
-_AUTH_CODE_RE = re.compile(r"\b40[13]\b")
-
-
-def _looks_like_error(text: str) -> bool:
-    """True iff a tool-result string carries the native ``ERROR``/``ERREUR``
-    failure marker (same convention as ``osia.agent._is_tool_error``), checked
-    locally so this module stays standalone (no agent import)."""
-    s = (text or "").lstrip()
-    up = s[:6].upper()
-    return up.startswith("ERROR") or up.startswith("ERREUR")
+_AUTH_CODE_RE = re.compile(r"\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*401\b")
 
 
 def _auth_failure_signal(text: str) -> bool:
-    """Conservatively decide whether an error string means the CREDENTIAL was
-    rejected (401/403/unauthorized/bad-credentials/…). Returns False for
-    rate-limiting (a throttled but valid credential) and for any non-auth error,
-    so a healthy connector is never demoted by a 404 / bad-arg / transient fault."""
+    """Recognize credential rejection in an MCP tool's reported error."""
     if not text:
         return False
     low = text.lower()
     if any(h in low for h in _RATE_LIMIT_HINTS):
         return False  # throttled, not an auth failure — never demote
-    if _AUTH_CODE_RE.search(low):
+    if low.strip() in {"unauthorized", "401", "401 unauthorized"} or _AUTH_CODE_RE.search(low):
         return True
     return any(kw in low for kw in _AUTH_FAIL_KEYWORDS)
+
+
+def _is_auth_transport_error(error: BaseException) -> bool:
+    leaf, _ = _leaf_exception(error)
+    return getattr(getattr(leaf, "response", None), "status_code", None) == 401
 
 
 def _strip_mcp_prefix(text: str, server_id: str, tool_name: str) -> str:
@@ -674,12 +700,11 @@ class MCPManager:
         except Exception:
             pass
 
-    def _signal_stop(self, server_id: str) -> None:
+    def _signal_stop(self, conn: _ServerConn) -> None:
         """Ask a server's ``_serve`` coroutine to wind down gracefully by setting
         its stop event ON the loop thread (asyncio.Event is not thread-safe)."""
-        conn = self._get(server_id)
         loop = self._loop
-        if conn is None or loop is None:
+        if loop is None:
             return
         ev = conn.stop_event
         if ev is None or not loop.is_running():
@@ -732,38 +757,33 @@ class MCPManager:
             res = await asyncio.wait_for(
                 session.call_tool(probe, probe_args), timeout=PROBE_CALL_TIMEOUT
             )
-            text = _calltoolresult_to_text(res, server_id, probe)
+            if getattr(res, "isError", False) and _auth_failure_signal(
+                _strip_mcp_prefix(_calltoolresult_to_text(res, server_id, probe), server_id, probe)
+            ):
+                return "token rejected"
         except asyncio.TimeoutError:
             return ""  # network slowness — don't hard-fail; demote-on-call covers it
         except asyncio.CancelledError:
             raise  # disconnect/shutdown teardown — propagate to the serve handler
-        except Exception as e:  # noqa: BLE001 - a transport error here is data
-            text = f"ERROR: {type(e).__name__}: {e}"
-        # Scan ONLY the tool's error TEXT, not the ``ERROR: mcp/<server>/<tool>:``
-        # namespace wrapper — the user-chosen server/tool id could itself contain
-        # '401'/'403'/an auth word and cause a false "token rejected".
-        if _looks_like_error(text) and _auth_failure_signal(
-            _strip_mcp_prefix(text, server_id, probe)
-        ):
-            return "token rejected"
+        except Exception as exc:  # noqa: BLE001 - a transport error here is data
+            if _is_auth_transport_error(exc):
+                return "token rejected"
         return ""
 
-    def _demote_auth_failed(self, server_id: str) -> None:
+    def _demote_auth_failed(self, conn: _ServerConn) -> None:
         """The moment a real tool call proves a connector's credential invalid
-        (401/403/auth), flip it from the optimistic CONNECTED to FAILED, drop its
+        (authentication rejection), flip it from CONNECTED to FAILED, drop its
         tools, wind the now-dead session down, and notify the status listener so
         the PC + mobile pills self-correct. Only demotes a currently-CONNECTED
         server; idempotent; never raises."""
+        server_id = conn.server_id
         with self._lock:
-            conn = self._servers.get(server_id)
-            if conn is None or conn.status != STATUS_CONNECTED:
+            if self._servers.get(server_id) is not conn or conn.status != STATUS_CONNECTED:
                 return
             conn.status = STATUS_FAILED
             conn.error = "token rejected (auth failed)"
-        # Outside the lock: unadvertise the tools, ask the serve coroutine to wind
-        # the session/subprocess down gracefully, and emit the new status.
-        self._unregister_tools(server_id)
-        self._signal_stop(server_id)
+            self._unregister_tools(server_id)
+        self._signal_stop(conn)
         _emit_status_change(server_id, STATUS_FAILED)
 
     # ── The long-lived per-server coroutine ──────────────────────────────────
@@ -906,16 +926,7 @@ class MCPManager:
                     async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
-                            listed = await session.list_tools()
-                            tools = [
-                                {
-                                    "name": getattr(t, "name", ""),
-                                    "description": getattr(t, "description", "") or "",
-                                    "inputSchema": getattr(t, "inputSchema", None) or {},
-                                    "annotations": _tool_annotations(t),
-                                }
-                                for t in getattr(listed, "tools", []) or []
-                            ]
+                            tools = await _list_session_tools(session)
                             with self._lock:
                                 conn.session = session
                                 conn.tools = tools
@@ -1022,16 +1033,7 @@ class MCPManager:
                         async with streamablehttp_client(url, auth=provider) as (read, write, _sid):
                             async with ClientSession(read, write) as session:
                                 await session.initialize()
-                                listed = await session.list_tools()
-                                tools = [
-                                    {
-                                        "name": getattr(t, "name", ""),
-                                        "description": getattr(t, "description", "") or "",
-                                        "inputSchema": getattr(t, "inputSchema", None) or {},
-                                        "annotations": _tool_annotations(t),
-                                    }
-                                    for t in getattr(listed, "tools", []) or []
-                                ]
+                                tools = await _list_session_tools(session)
                                 with self._lock:
                                     conn.session = session
                                     conn.tools = tools
@@ -1046,16 +1048,7 @@ class MCPManager:
                     async with streamablehttp_client(url, headers=headers) as (read, write, _sid):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
-                            listed = await session.list_tools()
-                            tools = [
-                                {
-                                    "name": getattr(t, "name", ""),
-                                    "description": getattr(t, "description", "") or "",
-                                    "inputSchema": getattr(t, "inputSchema", None) or {},
-                                    "annotations": _tool_annotations(t),
-                                }
-                                for t in getattr(listed, "tools", []) or []
-                            ]
+                            tools = await _list_session_tools(session)
                             # FIX 1(a/b): EXERCISE the credential before declaring
                             # CONNECTED. A remote server may serve initialize/
                             # list_tools unauthenticated (the existing 401-at-
@@ -1104,16 +1097,7 @@ class MCPManager:
                 async with stdio_client(params) as (read, write):
                     async with ClientSession(read, write) as session:
                         await session.initialize()
-                        listed = await session.list_tools()
-                        tools = [
-                            {
-                                "name": getattr(t, "name", ""),
-                                "description": getattr(t, "description", "") or "",
-                                "inputSchema": getattr(t, "inputSchema", None) or {},
-                                "annotations": _tool_annotations(t),
-                            }
-                            for t in getattr(listed, "tools", []) or []
-                        ]
+                        tools = await _list_session_tools(session)
                         # FIX 1(a/b): EXERCISE the credential before declaring
                         # CONNECTED. initialize()/list_tools() are local protocol
                         # only (the stdio subprocess never hit the auth boundary),
@@ -1207,10 +1191,8 @@ class MCPManager:
                 if conn.status == STATUS_CONNECTED:
                     # Normal stop_event path (no exception): mark disconnected.
                     conn.status = STATUS_DISCONNECTED
-            # WOR-44 Phase 2: the server is going away by ANY path (graceful
-            # stop, cancel, or error after connect) — drop its tools from the
-            # agent maps so the model can no longer call a dead server.
-            self._unregister_tools(server_id)
+                if self._servers.get(server_id) is conn:
+                    self._unregister_tools(server_id)
             self._safe_set_future(ready, conn.status)
             conn.done_event.set()
 
@@ -1419,7 +1401,7 @@ class MCPManager:
                     conn.status = STATUS_DISCONNECTED
             return conn.status
 
-        self._signal_stop(server_id)
+        self._signal_stop(conn)
         finished = conn.done_event.wait(timeout=timeout)
         if not finished:
             sf = conn.serve_future
@@ -1520,19 +1502,17 @@ class MCPManager:
         arguments: Optional[dict] = None,
         timeout: float = DEFAULT_CALL_TIMEOUT,
     ) -> str:
-        """Call a tool on a connected server and return its result as a string.
-
-        ALWAYS returns a string — every failure path (server not registered /
-        not connected / loop down / scheduling error / timeout / transport
-        exception / ``isError`` / conversion error) returns an
-        ``ERROR: mcp/<server>/<tool>: ...`` string. It NEVER raises.
-        """
+        """Call a connected tool, preserving typed facts alongside display text."""
         arguments = arguments or {}
         prefix = f"ERROR: mcp/{server_id}/{tool_name}:"
 
         conn = self._get(server_id)
+
+        def failure(detail: str, status: str = "not_dispatched") -> MCPToolResult:
+            return MCPToolResult(f"{prefix} {detail}", status=status)
+
         if conn is None:
-            return f"{prefix} server not registered"
+            return failure("server not registered")
 
         with self._lock:
             status = conn.status
@@ -1540,20 +1520,23 @@ class MCPManager:
             err = conn.error
         if status != STATUS_CONNECTED or session is None:
             detail = f" ({err})" if err else ""
-            return f"{prefix} not connected (status={status}){detail}"
+            return failure(f"not connected (status={status}){detail}")
 
         loop = self._loop
         if loop is None or not loop.is_running():
-            return f"{prefix} MCP loop not running"
+            return failure("MCP loop not running")
 
         try:
+            request = session.call_tool(tool_name, arguments)
+        except Exception:
+            return failure("could not prepare tool call")
+        try:
             fut = asyncio.run_coroutine_threadsafe(
-                session.call_tool(tool_name, arguments), loop
+                request, loop
             )
-        except RuntimeError as e:
-            return f"{prefix} could not schedule call ({e})"
-        except Exception as e:  # noqa: BLE001
-            return f"{prefix} {type(e).__name__}: {e}"
+        except Exception:
+            request.close()
+            return failure("could not schedule tool call")
 
         try:
             res = fut.result(timeout=timeout)
@@ -1562,32 +1545,24 @@ class MCPManager:
                 fut.cancel()
             except Exception:
                 pass
-            return f"{prefix} timed out after {timeout:.0f}s"
-        except Exception as e:  # noqa: BLE001
-            detail = f"{type(e).__name__}: {e}"
-            msg = f"{prefix} {detail}"
-            # FIX 1(c): a transport-level auth rejection (e.g. a streamable_http
-            # 401 raised by the SDK) demotes the connector so it stops showing a
-            # false CONNECTED. Scan only ``detail`` (not the server/tool-id prefix).
-            if _auth_failure_signal(detail):
-                self._demote_auth_failed(server_id)
-            return msg
+            return failure(f"timed out after {timeout:.0f}s", "timeout")
+        except Exception as exc:  # noqa: BLE001
+            if _is_auth_transport_error(exc):
+                self._demote_auth_failed(conn)
+                return failure("connector authentication failed", "transport_error")
+            # SDK errors may contain request URLs, auth headers or private data.
+            return failure(f"connector call failed ({type(exc).__name__})", "transport_error")
 
         try:
             out = _calltoolresult_to_text(res, server_id, tool_name)
-        except Exception as e:  # noqa: BLE001 - conversion backstop
-            return f"{prefix} result conversion failed: {type(e).__name__}: {e}"
-        # FIX 1(c): demote-on-auth-error. If the credential was rejected at CALL
-        # time (the handshake could not catch it — e.g. an unknown connector with
-        # no safe probe), flip the connector to FAILED so the PC + mobile pills
-        # self-correct. Conservative: only an ERROR-shaped result carrying a clear
-        # auth signal — never a 404 / bad-arg / rate-limit / generic tool error,
-        # and scanning only the post-prefix detail so the server/tool id can't trip.
-        if _looks_like_error(out) and _auth_failure_signal(
-            _strip_mcp_prefix(out, server_id, tool_name)
-        ):
-            self._demote_auth_failed(server_id)
-        return out
+        except Exception:  # noqa: BLE001 - conversion backstop
+            return failure("connector result could not be decoded", "transport_error")
+        if not getattr(res, "isError", False):
+            return MCPToolResult(out, status="success")
+        detail = _strip_mcp_prefix(out, server_id, tool_name).strip()
+        if _auth_failure_signal(detail):
+            self._demote_auth_failed(conn)
+        return failure(_sanitize_error(detail, conn.cfg), "tool_error")
 
     def list_tools(self, server_id: str) -> list:
         """Return the cached discovered tools for a connected server (a list of

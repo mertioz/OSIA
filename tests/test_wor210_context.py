@@ -97,6 +97,30 @@ def test_a_short_history_is_complete_ordered_and_origin_independent():
     ]
 
 
+def test_small_context_compacts_past_turns_without_dropping_an_active_tool_exchange():
+    messages = _alternating_history(10, size=80)
+    messages[0]["content"] = "System policy. " * 420
+    call = {
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": "call_active", "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }],
+    }
+    active = [
+        {"role": "user", "content": "Current question"},
+        call,
+        {"role": "tool", "tool_call_id": "call_active", "content": "Current result"},
+    ]
+    result = build_context(
+        messages + active, provider="ollama", model="test-model",
+        conversation_id="conv-long", context_limit=8_192,
+    )
+    assert result.receipt["compaction_strategy"].startswith("deterministic_")
+    assert result.messages[-3:] == active
+    assert estimate_messages_tokens(result.messages) <= result.receipt["input_budget"]
+
+
 def test_markdown_headings_survive_saving_and_reopening(monkeypatch, tmp_path):
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
     monkeypatch.setattr("osia.main._notify_mobile_conversation_changed", lambda *args, **kwargs: None)

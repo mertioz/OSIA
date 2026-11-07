@@ -179,6 +179,31 @@ def test_hostname_with_mixed_public_and_private_dns_answers_never_connects(monke
     assert not result["ok"] and result["error"]["code"] == "public_address_required"
 
 
+@pytest.mark.parametrize("declaration", [
+    '<meta charset="windows-1252">',
+    '<meta http-equiv="content-type" content="text/html; charset=iso-8859-1">',
+])
+def test_read_public_page_honors_html_charset_without_http_charset(monkeypatch, declaration):
+    body = (
+        '<head><!-- <meta charset="utf-8"> -->' + declaration
+        + '<title>Référence</title></head><main>Le coût est de 30 €.</main>'
+    ).encode("cp1252")
+    monkeypatch.setattr(public_web, "_request_once", lambda *_: public_web._Response(
+        "text/html", body=body,
+    ))
+    result = public_web.read_public_web_page(_RESULT_URL)
+    assert result["title"] == "Référence"
+    assert "Le coût est de 30 €." in result["text"]
+
+
+def test_malformed_public_html_returns_an_actionable_error(monkeypatch):
+    monkeypatch.setattr(public_web, "_request_once", lambda *_: public_web._Response(
+        "text/html", body=b"<![bogus]><main>Page</main>",
+    ))
+    result = public_web.read_public_web_page(_RESULT_URL)
+    assert result["error"]["code"] == "public_page_invalid_html"
+
+
 def test_page_reader_connects_to_checked_ip_with_original_tls_and_host(monkeypatch):
     observed = []
     raw_socket = object()

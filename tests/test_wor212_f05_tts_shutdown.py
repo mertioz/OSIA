@@ -174,6 +174,44 @@ def test_streaming_stale_segment_is_rejected_and_current_fifo_is_preserved(
     assert spoken == ["first", "second"]
 
 
+def test_stopping_old_speech_cannot_drain_a_new_sessions_queue(monkeypatch):
+    draining = threading.Event()
+    release = threading.Event()
+    queued = threading.Event()
+    get_nowait = tts._stream_queue.get_nowait
+    session_ids = []
+
+    def pause_old_drain():
+        if threading.current_thread() is stopping:
+            draining.set()
+            assert release.wait(timeout=2)
+        return get_nowait()
+
+    def enqueue_new_session():
+        session = tts.start_tts_session()
+        session_ids.append(session)
+        tts.speak_streaming("New speech", session_id=session)
+        queued.set()
+
+    stopping = threading.Thread(target=tts.stop, daemon=True)
+    starting = threading.Thread(target=enqueue_new_session, daemon=True)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(tts._stream_queue, "get_nowait", pause_old_drain)
+        patcher.setattr(tts, "_stream_thread", SimpleNamespace(is_alive=lambda: True))
+        stopping.start()
+        try:
+            assert draining.wait(timeout=1)
+            starting.start()
+            assert not queued.wait(timeout=0.1)
+        finally:
+            release.set()
+            stopping.join(timeout=2)
+            if starting.ident is not None:
+                starting.join(timeout=2)
+        assert queued.is_set()
+        assert get_nowait() == (session_ids[0], "New speech", None)
+
+
 def test_stop_during_active_playback_releases_waiter_and_counters(
     _isolated_tts_state,
 ) -> None:

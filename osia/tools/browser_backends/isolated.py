@@ -8,7 +8,7 @@ from osia.tools.browser_backend import BrowserBackend
 
 
 _OPERATIONS = frozenset({
-    "navigate", "click", "fill", "read_page", "get_current_url", "scroll",
+    "navigate", "click", "fill", "read_page", "get_current_url", "scroll", "scroll_bound",
     "go_back", "go_forward", "open_new_tab", "find_and_click", "dom_click",
     "wait_for_load", "get_page_text", "scroll_down", "type_text", "press_key",
     "open_browser", "inspect_form_fields", "fill_form_field", "get_web_state",

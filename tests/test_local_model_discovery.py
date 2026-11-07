@@ -124,6 +124,23 @@ def test_lmstudio_projects_chat_models_and_exact_loaded_aliases(monkeypatch):
     assert not phone["vendor/unloaded"]["selectable"]
 
 
+def test_lmstudio_compatible_inventory_survives_native_read_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("LMSTUDIO_HOME", str(tmp_path))
+    base = "http://127.0.0.1:1234/v1"
+    calls = []
+
+    def get(session, url, **kwargs):
+        calls.append(url)
+        if url.endswith("/api/v1/models"):
+            raise discovery.requests.ReadTimeout()
+        return SimpleNamespace(status_code=200, json=lambda: {"data": [{"id": "local-chat"}]})
+
+    monkeypatch.setattr(discovery.requests.Session, "get", get)
+    found = discovery.query_lmstudio_models(base)
+    assert calls == ["http://127.0.0.1:1234/api/v1/models", base + "/models"]
+    assert [(model["id"], model["available"]) for model in found] == [("local-chat", True)]
+
+
 def test_lmstudio_offline_index_checks_files_and_merges_legacy_api_alias(monkeypatch, tmp_path):
     monkeypatch.setenv("LMSTUDIO_HOME", str(tmp_path))
     index = tmp_path / ".internal" / "model-index-cache.json"

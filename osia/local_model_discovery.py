@@ -192,11 +192,18 @@ def query_lmstudio_models(base_url: str, headers=None) -> list[dict]:
     native = compatible = None
     with requests.Session() as session:
         session.trust_env = not _is_loopback(root)
+        reachable = True
         try:
             native = _json_list(session, root + "/api/v1/models", "models", headers=headers)
-            compatible = _json_list(session, base_url.rstrip("/") + "/models", "data", headers=headers)
-        except (requests.ConnectionError, requests.Timeout):
+        except requests.ConnectionError:
+            reachable = False
+        except requests.Timeout:
             pass
+        if reachable:
+            try:
+                compatible = _json_list(session, base_url.rstrip("/") + "/models", "data", headers=headers)
+            except (requests.ConnectionError, requests.Timeout):
+                pass
 
     inventory, disk_aliases = _lmstudio_disk_models() if native is None and _is_loopback(root) else ({}, {})
     instance_metadata, excluded = {}, set()

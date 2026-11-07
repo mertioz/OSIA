@@ -157,6 +157,22 @@ def test_edit_bumps_revisions_and_stale_occurrence_is_rejected(scheduled_runtime
     scheduled_tasks.execution_context_for_scheduled_occurrence(fresh)
 
 
+def test_finishing_an_old_occurrence_cannot_disable_or_overwrite_an_edit(scheduled_runtime):
+    created = _create_sensitive()
+    old = _execution(_current(created["id"]), "occurrence:old")
+    assert scheduled_tasks.mark_scheduled_task_running(old)
+    result = scheduled_tasks.update_scheduled_task(
+        task_id=created["id"], instruction="Set volume to 35",
+    )
+    assert result["ok"]
+    scheduled_tasks.update_scheduled_occurrence_status(old, last_status="old-status")
+    scheduled_tasks.mark_scheduled_task_finished(old)
+    assert scheduled_tasks.disable_scheduled_task(created["id"], execution=old)["ok"] is False
+    updated = _current(created["id"])
+    assert updated["task"] == "Set volume to 35"
+    assert updated["enabled"] and updated["last_status"] != "old-status"
+
+
 def test_disable_stops_the_scheduler_without_consuming_the_schedule(
     scheduled_runtime,
 ):
@@ -213,7 +229,7 @@ def test_legacy_migration_and_unknown_schema_fail_closed(scheduled_runtime):
     assert jobs["cron_corrupt_schema"]["schema_version"] == "bad"
 
 
-def test_outcome_unknown_is_durable_and_blocks_later_occurrence(
+def test_outcome_unknown_stays_factual_and_allows_current_and_later_occurrences(
     scheduled_runtime,
 ):
     _values = scheduled_runtime
@@ -230,15 +246,33 @@ def test_outcome_unknown_is_durable_and_blocks_later_occurrence(
     scheduled_tasks.record_scheduled_tool_execution(
         execution, "set_volume", {"level": 25}, record,
     )
-    blocked = scheduled_tasks.preflight_scheduled_task(created["id"])
-    assert blocked["ok"] is False
-    assert blocked["execution_state"] == scheduled_tasks.BLOCKED_OUTCOME_UNKNOWN
+    current = scheduled_tasks.preflight_scheduled_task(created["id"])
+    assert current["ok"] is True
+    assert current["job"]["execution_records"][-1]["outcome"] == "outcome_unknown"
     assert scheduled_tasks.scheduled_execution_block_state(
         execution,
-    ) == scheduled_tasks.BLOCKED_OUTCOME_UNKNOWN
+    ) == ""
+    scheduled_tasks.record_scheduled_occurrence(execution, outcome="failed_before_dispatch")
+    assert _current(created["id"])["occurrence_records"][-1]["outcome"] == "outcome_unknown"
     later = {**execution, "occurrence_id": "occurrence:later"}
-    with pytest.raises(scheduled_tasks.ScheduledTaskError):
-        scheduled_tasks.execution_context_for_scheduled_occurrence(later)
+    later_context = scheduled_tasks.execution_context_for_scheduled_occurrence(later)
+    assert later_context.execution_id != context.execution_id
+
+
+@pytest.mark.parametrize("desired_enabled", [True, False])
+def test_legacy_ambiguity_barrier_preserves_user_enablement(scheduled_runtime, desired_enabled):
+    _create_sensitive()
+    job = scheduled_runtime["cron_jobs"][0]
+    job.update(
+        enabled=False,
+        desired_enabled=desired_enabled,
+        ambiguity_barriers=["legacy-marker"],
+        execution_records=[{"outcome": "outcome_unknown"}],
+    )
+    restored = scheduled_tasks.scheduler_jobs_snapshot()[0]
+    assert restored["enabled"] is desired_enabled
+    assert "ambiguity_barriers" not in restored
+    assert restored["execution_records"] == [{"outcome": "outcome_unknown"}]
 
 
 def test_universal_destruction_barrier_still_blocks(scheduled_runtime, tmp_path):

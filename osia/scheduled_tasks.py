@@ -16,7 +16,6 @@ import secrets
 import threading
 import time
 import unicodedata
-from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -40,7 +39,6 @@ ERROR_DISABLED = "task_disabled"
 ERROR_STALE = "task_definition_changed"
 
 SCHEDULED_TASK_SCHEMA_VERSION = 2
-BLOCKED_OUTCOME_UNKNOWN = "blocked_outcome_unknown"
 DISABLED = "disabled"
 RUNNING = "running"
 
@@ -53,7 +51,6 @@ _MAX_EXECUTION_RECORDS = 64
 
 _TASK_ID_RE = re.compile(r"^cron_[A-Za-z0-9_-]{8,}$")
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
-_DAY_NAMES = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 _SUPPORTED_SOURCES = {"chat", "settings", "mobile_settings"}
 _CHANGE_CALLBACK: Callable[[], None] | None = None
 _CHANGE_CALLBACKS: list[Callable[[], None]] = []
@@ -63,6 +60,7 @@ _JOBS_LOCK = threading.RLock()
 _OBSOLETE_AUTHORIZATION_FIELDS = (
     "grant_refs", "authorization_status", "authorization_expires_at",
     "authorization_bounds", "authorization_request", "migration_state",
+    "ambiguity_barriers",
 )
 
 _UNSAFE_MARKUP_RE = re.compile(
@@ -608,34 +606,9 @@ def normalize_schedule(schedule: Any, *, now: datetime | None = None) -> tuple[s
         plural = unit + "s"
         return f"every {every} {plural}", timezone_name
 
-    if schedule_type == "weekly":
-        days = schedule.get("days_of_week") or []
-        if isinstance(days, str):
-            days = [days]
-        clean_days = [
-            str(day or "").strip().lower()[:3]
-            for day in days
-            if str(day or "").strip()
-        ]
-        if not clean_days or any(day not in _DAY_NAMES for day in clean_days):
-            raise ScheduledTaskError(
-                ERROR_VALIDATION,
-                "days_of_week must contain values like mon, tue, wed",
-            )
-        raise ScheduledTaskError(
-            ERROR_UNSUPPORTED,
-            "weekly schedules are not supported by the current cron runtime",
-        )
-
-    if schedule_type == "cron":
-        raise ScheduledTaskError(
-            ERROR_UNSUPPORTED,
-            "cron expressions are not supported by the current cron runtime",
-        )
-
     raise ScheduledTaskError(
         ERROR_UNSUPPORTED,
-        "schedule.type must be once, daily, interval, weekly, or cron",
+        "schedule.type must be once, daily, or interval",
     )
 
 
@@ -1066,13 +1039,8 @@ def _normalize_existing_job(
         changed = True
     else:
         clean["schema_version"] = SCHEDULED_TASK_SCHEMA_VERSION
-        blocked_by_ambiguity = bool(
-            isinstance(clean.get("ambiguity_barriers"), list)
-            and clean.get("ambiguity_barriers")
-        )
-        expected_enabled = bool(desired_enabled and not blocked_by_ambiguity)
-        if clean.get("enabled") is not expected_enabled:
-            clean["enabled"] = expected_enabled
+        if clean.get("enabled") is not desired_enabled:
+            clean["enabled"] = desired_enabled
             changed = True
     for name in _OBSOLETE_AUTHORIZATION_FIELDS:
         if name in clean:
@@ -1564,11 +1532,19 @@ def _save_current_job(job: dict[str, Any]) -> None:
 def _job_execution_state(job: dict[str, Any]) -> str:
     """Return the durable execution block state for one stored job."""
 
-    if isinstance(job.get("ambiguity_barriers"), list) and job.get("ambiguity_barriers"):
-        return BLOCKED_OUTCOME_UNKNOWN
     if not job.get("desired_enabled") or not job.get("enabled"):
         return DISABLED
     return ""
+
+
+def _matches_scheduled_revision(execution: dict[str, Any], job: dict[str, Any]) -> bool:
+    return (
+        job.get("schema_version") == SCHEDULED_TASK_SCHEMA_VERSION
+        and execution.get("task_id") == job.get("id")
+        and execution.get("task_revision") == job.get("task_revision")
+        and execution.get("definition_hash") == job.get("definition_hash")
+        and execution.get("authorization_revision") == job.get("authorization_revision")
+    )
 
 
 def _public_task(job: dict[str, Any]) -> dict[str, Any]:
@@ -1597,18 +1573,29 @@ def _public_task(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def disable_scheduled_task(task_id: str) -> dict[str, Any]:
+def disable_scheduled_task(
+    task_id: str, *, execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Disable a task as an execution-relevant edit (scheduler stop semantics)."""
 
     try:
-        job = _current_job(task_id)
-        if not job.get("desired_enabled") and not job.get("enabled"):
-            return _result_ok(changed=False, task=_public_task(job))
-        job["desired_enabled"] = False
-        job = _bump_execution_revision(job, increment_task_revision=True)
-        job["enabled"] = False
-        job["definition_hash"] = task_definition_hash(job)
-        _save_current_job(job)
+        with _JOBS_LOCK:
+            jobs = _load_normalized_jobs()
+            idx = _find_index(jobs, str(task_id or "").strip())
+            if idx < 0:
+                raise ScheduledTaskError(ERROR_NOT_FOUND, "scheduled task not found")
+            job = jobs[idx]
+            if execution is not None and not _matches_scheduled_revision(execution, job):
+                return _result_error(ERROR_STALE, "scheduled occurrence is stale")
+            if not job.get("desired_enabled") and not job.get("enabled"):
+                return _result_ok(changed=False, task=_public_task(job))
+            job["desired_enabled"] = False
+            job = _bump_execution_revision(job, increment_task_revision=True)
+            job["enabled"] = False
+            job["definition_hash"] = task_definition_hash(job)
+            jobs[idx] = job
+            _save_jobs(jobs)
+        _notify_changed()
         return _result_ok(changed=True, task=_public_task(job))
     except ScheduledTaskError as exc:
         return _result_error(exc.code, exc.message)
@@ -1636,15 +1623,6 @@ def preflight_scheduled_task(task_id: str) -> dict[str, Any]:
                 "task definition changed",
                 execution_state=ERROR_STALE,
             )
-        if (
-            isinstance(job.get("ambiguity_barriers"), list)
-            and job.get("ambiguity_barriers")
-        ):
-            return _result_error(
-                ERROR_BLOCKED,
-                "ambiguous outcome blocks replay",
-                execution_state=BLOCKED_OUTCOME_UNKNOWN,
-            )
         if not job.get("enabled") or not job.get("desired_enabled"):
             return _result_error(
                 ERROR_DISABLED,
@@ -1666,22 +1644,15 @@ def execution_context_for_scheduled_occurrence(execution: dict[str, Any]):
     """Create the non-interactive execution context for one validated occurrence."""
 
     task_id = str(execution.get("task_id") or "")
-    job = _current_job(task_id)
-    exact = (
-        int(execution.get("task_revision", -1)) == int(job.get("task_revision", 0))
-        and str(execution.get("definition_hash") or "")
-        == str(job.get("definition_hash") or "")
-        and int(execution.get("authorization_revision", -1))
-        == int(job.get("authorization_revision", 0))
-    )
-    if not exact:
-        raise ScheduledTaskError(ERROR_STALE, "scheduled context is stale")
     preflight = preflight_scheduled_task(task_id)
     if not preflight.get("ok"):
         raise ScheduledTaskError(
             ERROR_BLOCKED,
             str(preflight.get("message") or "scheduled execution blocked"),
         )
+    job = preflight["job"]
+    if not _matches_scheduled_revision(execution, job):
+        raise ScheduledTaskError(ERROR_STALE, "scheduled context is stale")
     from osia.action_policy import ExecutionType, make_execution_context
 
     occurrence_id = str(execution.get("occurrence_id") or "")
@@ -1715,32 +1686,6 @@ def _equivalent_operation_id(
     })[:48]
 
 
-def bind_request_execution_context(context, tool_name: str, call_hash: str):
-    """Bind an actual scheduled call to the current task and occurrence."""
-
-    from osia.action_policy import ExecutionType
-
-    if context.execution_type != ExecutionType.SCHEDULED:
-        return context
-    job = _current_job(context.scheduled_task_id)
-    if (
-        context.task_revision != str(job.get("task_revision") or "")
-        or context.plan_revision != _execution_binding(job)
-        or task_definition_hash(job) != str(job.get("definition_hash") or "")
-    ):
-        raise ScheduledTaskError(ERROR_STALE, "scheduled task binding changed")
-    equivalent = _equivalent_operation_id(job, tool_name, call_hash)
-    if equivalent in list(job.get("ambiguity_barriers") or []):
-        raise ScheduledTaskError(
-            ERROR_BLOCKED,
-            "equivalent operation has an unresolved outcome",
-        )
-    operation_id = "schedop:" + canonical_hash({
-        "equivalent": equivalent,
-        "occurrence": context.execution_id,
-    })[:48]
-    return replace(context, operation_id=operation_id)
-
 def scheduled_execution_block_state(execution: dict[str, Any] | None) -> str:
     """Return a durable block state for one launched occurrence, else ``""``."""
 
@@ -1750,6 +1695,8 @@ def scheduled_execution_block_state(execution: dict[str, Any] | None) -> str:
         job = _current_job(str(execution["task_id"]))
     except Exception:
         return ERROR_BLOCKED
+    if not _matches_scheduled_revision(execution, job):
+        return ERROR_STALE
     return _job_execution_state(job)
 
 
@@ -1763,18 +1710,7 @@ def mark_scheduled_task_running(execution: dict[str, Any]) -> bool:
         if idx < 0:
             return False
         job = dict(jobs[idx])
-        exact = (
-            int(execution.get("task_revision", -1))
-            == int(job.get("task_revision", 0))
-            and str(execution.get("definition_hash") or "")
-            == str(job.get("definition_hash") or "")
-            and int(execution.get("authorization_revision", -1))
-            == int(job.get("authorization_revision", 0))
-        )
-        if (
-            not exact
-            or _job_execution_state(job) != ""
-        ):
+        if not _matches_scheduled_revision(execution, job) or _job_execution_state(job):
             return False
         job["execution_state"] = RUNNING
         job["updated_at"] = _iso()
@@ -1794,15 +1730,7 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
         if idx < 0:
             return
         job = dict(jobs[idx])
-        exact = (
-            int(execution.get("task_revision", -1))
-            == int(job.get("task_revision", 0))
-            and str(execution.get("definition_hash") or "")
-            == str(job.get("definition_hash") or "")
-            and int(execution.get("authorization_revision", -1))
-            == int(job.get("authorization_revision", 0))
-        )
-        if not exact or job.get("execution_state") != RUNNING:
+        if not _matches_scheduled_revision(execution, job) or job.get("execution_state") != RUNNING:
             return
         job["execution_state"] = ""
         job["updated_at"] = _iso()
@@ -1811,13 +1739,29 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
     _notify_changed()
 
 
+def update_scheduled_occurrence_status(execution: dict[str, Any], **fields: Any) -> None:
+    """Save timing and presentation metadata only for the current revision."""
+    try:
+        with _JOBS_LOCK:
+            jobs = _load_normalized_jobs()
+            idx = _find_index(jobs, str(execution.get("task_id") or ""))
+            if idx < 0 or not _matches_scheduled_revision(execution, jobs[idx]):
+                return
+            job = jobs[idx]
+            job.update(fields)
+            job["updated_at"] = _iso()
+            _save_jobs(jobs)
+    except OSError as exc:
+        print(f"[CRON] could not update job status: {type(exc).__name__}")
+
+
 def record_scheduled_tool_execution(
     execution: dict[str, Any] | None,
     tool_name: str,
     arguments: dict[str, Any],
     execution_record,
 ) -> None:
-    """Persist only a value-free outcome and durable ambiguity barrier."""
+    """Persist a value-free observation without changing the schedule."""
 
     if not isinstance(execution, dict) or not execution.get("task_id"):
         return
@@ -1868,12 +1812,6 @@ def record_scheduled_tool_execution(
         })
         job["execution_records"] = records[-_MAX_EXECUTION_RECORDS:]
         job["last_execution_outcome"] = safe_outcome
-        if safe_outcome == "outcome_unknown":
-            barriers = list(job.get("ambiguity_barriers") or [])
-            if equivalent not in barriers:
-                barriers.append(equivalent)
-            job["ambiguity_barriers"] = barriers[-_MAX_EXECUTION_RECORDS:]
-            job["enabled"] = False
         job["updated_at"] = _iso()
         jobs[idx] = job
         _save_jobs(jobs)
@@ -1890,6 +1828,7 @@ def record_scheduled_occurrence(
     allowed = {
         "success_verified", "cancelled_proven", "failed_before_dispatch",
         "partial_effect_verified", "outcome_unknown", "blocked_execution",
+        "completed_unverified",
         # Legacy scheduler label for a blocked occurrence.
         "blocked_authorization",
     }
@@ -1904,61 +1843,27 @@ def record_scheduled_occurrence(
             if idx < 0:
                 return
             job = dict(jobs[idx])
+            occurrence_id = str(execution.get("occurrence_id") or "")
+            if safe_outcome in {"failed_before_dispatch", "completed_unverified"} and any(
+                record.get("occurrence_id") == occurrence_id
+                and record.get("outcome") == "outcome_unknown"
+                for record in job.get("execution_records") or []
+                if isinstance(record, dict)
+            ):
+                safe_outcome = "outcome_unknown"
             records = list(job.get("occurrence_records") or [])
             records.append({
-                "occurrence_id": str(execution.get("occurrence_id") or ""),
+                "occurrence_id": occurrence_id,
                 "outcome": safe_outcome,
                 "recorded_at": _iso(),
             })
             job["occurrence_records"] = records[-_MAX_EXECUTION_RECORDS:]
-            if safe_outcome in {"outcome_unknown", "partial_effect_verified"}:
-                barriers = list(job.get("ambiguity_barriers") or [])
-                if not barriers:
-                    barriers.append("schedocc:" + canonical_hash({
-                        "task_id": str(execution.get("task_id") or ""),
-                        "task_revision": int(
-                            execution.get("task_revision", 0) or 0
-                        ),
-                        "definition_hash": str(
-                            execution.get("definition_hash") or ""
-                        ),
-                        "occurrence_id": str(
-                            execution.get("occurrence_id") or ""
-                        ),
-                    })[:48])
-                    job["ambiguity_barriers"] = barriers
-                job["enabled"] = False
             job["updated_at"] = _iso()
             jobs[idx] = job
             _save_jobs(jobs)
         _notify_changed()
     except Exception:
         pass
-
-
-def reconcile_scheduled_outcome(
-    task_id: str,
-    equivalent_operation_id: str,
-    outcome: str,
-) -> dict[str, Any]:
-    """Explicit local reconciliation; the task stays disabled until re-enabled."""
-
-    if outcome not in {"success_verified", "cancelled_proven", "partial_effect_verified"}:
-        return _result_error(ERROR_VALIDATION, "invalid reconciliation outcome")
-    try:
-        job = _current_job(task_id)
-        barriers = list(job.get("ambiguity_barriers") or [])
-        target = str(equivalent_operation_id or "")
-        if target not in barriers:
-            return _result_ok(changed=False, task=_public_task(job))
-        barriers.remove(target)
-        job = _bump_execution_revision(job, increment_task_revision=False)
-        job["ambiguity_barriers"] = barriers
-        job["reconciliation_outcome"] = outcome
-        _save_current_job(job)
-        return _result_ok(changed=True, task=_public_task(job))
-    except ScheduledTaskError as exc:
-        return _result_error(exc.code, exc.message)
 
 
 def sanitized_mobile_jobs(jobs: Any = None) -> list[dict[str, Any]]:

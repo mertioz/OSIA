@@ -987,13 +987,7 @@ def _stream_worker():
 def start_tts_session(*, reopen_after_shutdown: bool = True) -> int:
     """Invalidate older speech and return one token for direct or queued TTS."""
 
-    global _tts_accepting
-    stop()
-    with _playback_condition:
-        if reopen_after_shutdown:
-            _tts_accepting = True
-        session_id = _tts_epoch
-        _playback_condition.notify_all()
+    session_id = _invalidate_playback(accepting=True if reopen_after_shutdown else None)
     _debug(f"start_tts_session(): epoch={session_id}")
     return session_id
 
@@ -1035,38 +1029,40 @@ def speak_streaming(
                 target=_stream_worker, daemon=True, name="osia-tts-stream",
             )
             _stream_thread.start()
-    if not _change_stream_pending(epoch, 1):
-        _debug("speak_streaming(): ownership changed before enqueue")
-        return
-    _stream_queue.put((epoch, text, language))
+    with _playback_condition:
+        if not _change_stream_pending(epoch, 1):
+            _debug("speak_streaming(): ownership changed before enqueue")
+            return
+        _stream_queue.put((epoch, text, language))
 
 
-def _invalidate_playback(*, disable: bool) -> None:
+def _invalidate_playback(*, accepting: bool | None = None) -> int:
     global _tts_epoch, _tts_accepting, _playback_activity, _stream_pending
+    drained = 0
     with _playback_start_lock:
         with _playback_condition:
             _tts_epoch += 1
-            if disable:
-                _tts_accepting = False
+            if accepting is not None:
+                _tts_accepting = accepting
             _playback_activity = 0
             _stream_pending = 0
             epoch = _tts_epoch
+            while True:
+                try:
+                    _stream_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
             _playback_condition.notify_all()
-        _debug(f"stop() called — epoch bumped to {epoch}, draining queue")
+        _debug(f"stop() called — epoch bumped to {epoch}")
         try:
             if _AUDIO_OK:
                 sd.stop()
         except Exception as e:
             print(f"⚠️  sd.stop() failed ({type(e).__name__})")
-    drained = 0
-    while True:
-        try:
-            item = _stream_queue.get_nowait()
-            drained += 1
-        except queue.Empty:
-            break
     if drained:
         _debug(f"stop(): drained {drained} pending sentence(s)")
+    return epoch
 
 
 def stop() -> None:
@@ -1077,14 +1073,14 @@ def stop() -> None:
     Completion counters are reconciled and all waiters are notified immediately.
     """
 
-    _invalidate_playback(disable=False)
+    _invalidate_playback()
 
 
 def shutdown(join_timeout: float = 2.0) -> None:
     """Stop playback and reap the streaming worker during application exit."""
 
     global _stream_thread
-    _invalidate_playback(disable=True)
+    _invalidate_playback(accepting=False)
     with _stream_lock:
         thread = _stream_thread
         if thread is None or not thread.is_alive():

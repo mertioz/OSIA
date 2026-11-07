@@ -90,7 +90,11 @@ def click(selector: str): return _invoke("click", selector=selector)
 def fill(selector: str, value: str): return _invoke("fill", selector=selector, value=value)
 def read_page(): return _invoke("read_page")
 def get_current_url(): return _invoke("get_current_url")
-def scroll(direction: str = "down", amount: int = 600): return _invoke("scroll", direction=direction, amount=amount)
+def scroll(direction: str = "down", amount: int = 600, *, state_ref=None, element_ref=None):
+    if state_ref is not None or element_ref is not None:
+        return _invoke("scroll_bound", direction=direction, amount=amount,
+                       state_ref=state_ref, element_ref=element_ref)
+    return _invoke("scroll", direction=direction, amount=amount)
 def go_back(): return _invoke("go_back")
 def go_forward(): return _invoke("go_forward")
 def open_new_tab(url: str): return _invoke("open_new_tab", url=url)

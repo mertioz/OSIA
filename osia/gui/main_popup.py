@@ -3279,8 +3279,8 @@ class _ConversationsPanel(QWidget):
             row.move_clicked.connect(self._emit_move)
             self._host_layout.insertWidget(insert_at, row)
             self._row_widgets[str(conv.get("id") or "")] = row
+            row.show()
             if active_changed and row.property("active"):
-                row.show()
                 self._motion.fade_in(row, MOTION.state_ms)
             insert_at += 1
 

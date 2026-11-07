@@ -937,10 +937,15 @@ def build_context(
         for index in conversational
         if _is_security_confirmation(entries[index].message)
     }
-    required = instruction_indexes | recent_indexes | active_tool_indexes | security_indexes
+    essential = instruction_indexes | active_tool_indexes | security_indexes
     if latest_user is not None:
-        required.add(latest_user)
+        essential.update(index for index in conversational if index >= latest_user)
 
+    required = essential | recent_indexes
+    if estimate_messages_tokens([entries[index].message for index in required]) > budget:
+        # Recent history normally stays intact. On a short context, use the
+        # existing excerpt pass for past turns and preserve the active turn.
+        required = essential
     required_messages = [
         copy.deepcopy(entry.message)
         for index, entry in enumerate(entries)

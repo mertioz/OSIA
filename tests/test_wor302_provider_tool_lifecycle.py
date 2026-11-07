@@ -535,6 +535,36 @@ def test_raw_dsml_never_reaches_final_or_display_projection():
 
 # ── 7, 15-16: native protocol / provider contracts ─────────────────────────
 
+@pytest.mark.parametrize("invalid_response", [
+    {"content": None, "tool_calls": [
+        {"function": {"name": "get_system_info", "arguments": "{"}},
+    ]},
+    {"content": None, "tool_calls": [
+        {"function": {"name": "get_system_info", "arguments": "[]"}},
+    ]},
+    {"content": None, "tool_calls": [
+        {"function": {"name": "get_system_info", "arguments": '{"tool":"get_clipboard"}'}},
+    ]},
+    {"content": [
+        {"type": "tool_use", "name": "get_system_info", "input": {"tool": "get_clipboard"}},
+    ]},
+    _tool_call("get_system_info", arguments={"tool": "get_clipboard"}),
+    _dsml_response(_dsml_invoke("get_system_info", tool="get_clipboard")),
+])
+def test_malformed_tool_arguments_are_repaired_without_changing_tool_identity(monkeypatch, invalid_response):
+    calls = []
+    _patch_tool(monkeypatch, "get_system_info", lambda: calls.append("system") or "fixture")
+    _patch_tool(monkeypatch, "get_clipboard", lambda: calls.append("clipboard") or "fixture")
+    agent = _agent(monkeypatch, [invalid_response, _tool_call("get_system_info"), "Termine."])
+
+    assert agent.run("Consulte la configuration du système.", history=[]) == "Termine."
+
+    assert calls == ["system"]
+    repair_request = agent.client.chat.completions.calls[1]["messages"]
+    assert "malformed_tool_arguments" in str(repair_request)
+    assert "not_dispatched" in str(repair_request)
+
+
 def test_native_structured_call_stays_structured_and_dispatches(monkeypatch):
     dispatched: list[str] = []
     _patch_tool(
@@ -613,6 +643,9 @@ def test_groq_failed_native_attempt_is_normalized_to_canonical_call():
     assert recover("groq", model, _groq_tool_use_failed(
         '{"name": "tool_call", "arguments": {"path": "C:\\\\x", '
         '"type": "directory"}}',
+    )) is None
+    assert recover("groq", model, _groq_tool_use_failed(
+        '{"name": "get_system_info", "arguments": {"tool": "get_clipboard"}}',
     )) is None
     assert recover("groq", "llama-3.3-70b-versatile", _groq_tool_use_failed(
         '{"name": "bash", "arguments": {"command": "x"}}',

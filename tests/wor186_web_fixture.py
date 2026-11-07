@@ -166,6 +166,22 @@ class Wor186WebFixture:
                     <a href="/static">Safe link</a><table><caption>Metrics</caption><tr><th>Name</th><th>Value</th></tr><tr><td>Alpha</td><td>1</td></tr></table>
                     <ol><li>First item</li><li>Second item</li></ol></main></body></html>""")
                     return
+                if path == "/audit-browser":
+                    self._send("""<!doctype html><title>Browser audit</title>
+                    <main><table><tr><td>First table</td></tr></table>
+                    <table><caption>Exact metrics</caption><tr><td>Second table</td></tr>
+                    <tr><td>Extra row</td></tr></table><ul><li>Exact list</li></ul>
+                    <div aria-label="Nested panel" style="height:100px;overflow-y:auto">
+                      <p style="height:650px">Scrollable panel content</p>
+                    </div>
+                    <button id="replace" onclick="const previous=document.querySelector('#action');
+                      const next=previous.cloneNode(true);
+                      next.onclick=()=>document.querySelector('#status').textContent='Replacement clicked';
+                      previous.replaceWith(next);
+                      document.querySelector('#status').textContent='Replacement ready'">Replace action</button>
+                    <button id="action" onclick="document.querySelector('#status').textContent='Original clicked'">Run action</button>
+                    <p id="status">Ready</p></main>""")
+                    return
                 if path == "/menu":
                     self._send("""<!doctype html><title>Menu</title><button id="menu" aria-expanded="false"
                     onclick="this.setAttribute('aria-expanded','true');document.querySelector('#items').hidden=false">Menu</button>
@@ -192,6 +208,14 @@ class Wor186WebFixture:
                 if path == "/frames":
                     self._send(f"""<!doctype html><title>Frames</title><iframe src="/frame"></iframe>
                     <iframe src="{fixture.cross_base}/frame-cross"></iframe>""")
+                    return
+                if path == "/frame-transition":
+                    self._send(f"""<!doctype html><title>Frame transition</title>
+                    <iframe src="/frame"></iframe>
+                    <button id="switch-frame"
+                      onclick="document.querySelector('iframe').src='{fixture.cross_base}/frame-cross';this.textContent='Frame changed'">
+                      Change frame
+                    </button>""")
                     return
                 if path == "/popup":
                     self._send("<main><h1>Popup content</h1></main>")
@@ -230,7 +254,8 @@ class Wor186WebFixture:
                     )
                     return
                 if path == "/download-page":
-                    self._send('<a id="download" href="/download" download>Download</a>')
+                    self._send('<a id="download" href="/download" download>Download</a>'
+                               '<button type="button">No download</button>')
                     return
                 if path == "/download-delay-page":
                     self._send('<a id="download" href="/download-delay" download>Delayed download</a>')

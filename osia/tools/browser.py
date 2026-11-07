@@ -42,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote_plus, urlsplit
@@ -112,9 +113,53 @@ def _semantic_browser_binding(kind, frame, metadata) -> str:
     ).encode("utf-8", errors="replace")
     return hashlib.sha256(material).hexdigest()
 
-_STRUCTURED_INSPECTION_JS = r"""
-({mode, maxItems, textOffset, textLimit}) => {
+_NODE_BINDINGS_JS = r"""
+  const binding = globalThis[bindingKey] || (
+    globalThis[bindingKey] = {
+      ids: new WeakMap(), next: 0,
+      documentId: crypto.getRandomValues(new Uint32Array(4)).join('-')
+    }
+  );
+  const nodeId = (el) => {
+    if (!binding.ids.has(el)) binding.ids.set(el, binding.documentId + '_' + ++binding.next);
+    return binding.ids.get(el);
+  };
+"""
+
+_STRUCTURED_COLLECTION_JS = r"""
   const clean = (v, n=600) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const bounded = (items) => items.slice(0, maxItems);
+  const readTable = (table) => {
+    const headers = Array.from(table.querySelectorAll('thead th'));
+    const fallbackHeaders = headers.length ? headers : Array.from(
+      table.rows[0] ? table.rows[0].querySelectorAll('th') : []
+    );
+    const rows = Array.from(table.rows);
+    return {
+      caption: clean(table.caption && table.caption.innerText, 300),
+      headers: bounded(fallbackHeaders).map(cell => clean(cell.innerText, 500)),
+      rows: bounded(rows).map(row =>
+        bounded(Array.from(row.cells)).map(cell => clean(cell.innerText, 500))
+      ),
+      truncated: fallbackHeaders.length > maxItems || rows.length > maxItems ||
+        bounded(rows).some(row => row.cells.length > maxItems),
+    };
+  };
+  const readList = (list) => {
+    const items = Array.from(list.children).filter(el => el.tagName === 'LI');
+    return {
+      ordered: list.tagName === 'OL',
+      items: bounded(items).map(el => clean(el.innerText, 600)),
+      truncated: items.length > maxItems,
+    };
+  };
+"""
+
+_STRUCTURED_INSPECTION_JS = (
+    """({mode, maxItems, textOffset, textLimit, bindingKey, expectedFrameUrl}) => {
+      if (expectedFrameUrl !== null && location.href !== expectedFrameUrl) return null;
+    """
+    + _NODE_BINDINGS_JS + _STRUCTURED_COLLECTION_JS + r"""
   const visible = (el) => {
     const s = getComputedStyle(el), r = el.getBoundingClientRect();
     return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
@@ -122,12 +167,11 @@ _STRUCTURED_INSPECTION_JS = r"""
   const all = (selector) => Array.from(document.querySelectorAll(selector)).filter(visible);
   const indexed = (selector) => Array.from(document.querySelectorAll(selector))
     .map((el, index) => ({el, index})).filter(item => visible(item.el));
-  const bounded = (items) => items.slice(0, maxItems);
   const result = {
     title: clean(document.title, 300),
     language: clean(document.documentElement.lang, 32),
     headings: [], sections: [], links: [], buttons: [], controls: [],
-    forms: [], tables: [], lists: [], metadata: {},
+    forms: [], tables: [], lists: [], scroll_regions: [], metadata: {},
   };
   const headings = all('h1,h2,h3,h4,h5,h6');
   result.headings = bounded(headings).map((el, index) => ({
@@ -140,13 +184,13 @@ _STRUCTURED_INSPECTION_JS = r"""
   const links = indexed('a[href]');
   result.links = bounded(links).map(({el, index}) => ({
     text: clean(el.innerText || el.getAttribute('aria-label'), 300),
-    destination: el.href, index,
+    destination: el.href, index, node_id: nodeId(el),
   }));
   const buttons = indexed('button,input[type=button],input[type=submit],[role=button]');
   result.buttons = bounded(buttons).map(({el, index}) => ({
     text: clean(el.innerText || el.value || el.getAttribute('aria-label'), 300),
     disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
-    expanded: el.getAttribute('aria-expanded'), index,
+    expanded: el.getAttribute('aria-expanded'), index, node_id: nodeId(el),
   }));
   const controls = indexed('input:not([type=hidden]),textarea,select');
   const safeControls = controls.filter(({el}) =>
@@ -156,34 +200,38 @@ _STRUCTURED_INSPECTION_JS = r"""
   result.controls = bounded(safeControls).map(({el, index}) => ({
     kind: el.tagName.toLowerCase(), type: clean(el.type, 40),
     label: clean(el.labels && el.labels[0] ? el.labels[0].innerText : el.getAttribute('aria-label'), 300),
-    disabled: Boolean(el.disabled), index,
+    disabled: Boolean(el.disabled), index, node_id: nodeId(el),
   }));
   const forms = indexed('form');
   result.forms = bounded(forms).map(({el, index}) => ({
     label: clean(el.getAttribute('aria-label') || el.getAttribute('name'), 300),
     field_count: el.querySelectorAll('input:not([type=hidden]),textarea,select').length,
-    index,
+    index, node_id: nodeId(el),
   }));
   const tables = indexed('table');
-  result.tables = bounded(tables).map(({el: table, index}) => {
-    const headers = bounded(Array.from(table.querySelectorAll('thead th')));
-    const fallbackHeaders = headers.length ? headers : bounded(Array.from(
-      (table.rows && table.rows[0] ? table.rows[0].querySelectorAll('th') : [])
-    ));
-    const rows = bounded(Array.from(table.rows || [])).map(row =>
-      bounded(Array.from(row.cells || [])).map(cell => clean(cell.innerText, 500))
-    );
-    return {
-      caption: clean(table.caption && table.caption.innerText, 300),
-      headers: fallbackHeaders.map(cell => clean(cell.innerText, 500)),
-      rows, index,
-    };
-  });
+  result.tables = bounded(tables).map(({el, index}) => ({
+    ...readTable(el), index, node_id: nodeId(el),
+  }));
   const lists = indexed('ol,ul');
-  result.lists = bounded(lists).map(({el: list, index}) => ({
-    ordered: list.tagName.toLowerCase() === 'ol',
-    items: bounded(Array.from(list.children).filter(el => el.tagName === 'LI'))
-      .map(el => clean(el.innerText, 600)), index,
+  result.lists = bounded(lists).map(({el, index}) => ({
+    ...readList(el), index, node_id: nodeId(el),
+  }));
+  const scrollRegions = [];
+  if (mode === 'snapshot') {
+    const elements = document.querySelectorAll('*');
+    for (let index = 0; index < elements.length && scrollRegions.length <= maxItems; index++) {
+      const el = elements[index];
+      if (el !== document.scrollingElement && el.clientHeight > 0 &&
+          el.scrollHeight > el.clientHeight + 1 &&
+          /^(auto|scroll|overlay)$/.test(getComputedStyle(el).overflowY) && visible(el)) {
+        scrollRegions.push({el, index});
+      }
+    }
+  }
+  result.scroll_regions = bounded(scrollRegions).map(({el, index}) => ({
+    label: clean(el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText, 160),
+    scroll_top: el.scrollTop, scroll_height: el.scrollHeight,
+    viewport_height: el.clientHeight, index, node_id: nodeId(el),
   }));
   const canonical = document.querySelector('link[rel=canonical]');
   const description = document.querySelector('meta[name=description],meta[property="og:description"]');
@@ -204,13 +252,100 @@ _STRUCTURED_INSPECTION_JS = r"""
   result.page_text = bodyText.slice(textOffset, textOffset + textLimit);
   result.page_text_length = bodyText.length;
   result.page_text_next_offset = Math.min(bodyText.length, textOffset + textLimit);
-  result.content_truncated = [headings, sections, links, buttons, controls, forms, tables, lists]
-    .some(items => items.length > maxItems) || result.page_text_next_offset < bodyText.length;
+  result.content_truncated = [headings, sections, links, buttons, safeControls, forms, tables, lists, scrollRegions]
+    .some(items => items.length > maxItems) || result.page_text_next_offset < bodyText.length ||
+    result.tables.some(item => item.truncated) || result.lists.some(item => item.truncated);
   if (mode === 'article') result.sections = result.sections.filter(s => s.kind === 'article');
   if (mode === 'main_content') result.sections = result.sections.filter(s => s.kind === 'main' || s.kind === 'article');
   return result;
 }
 """
+)
+
+_TARGETED_COLLECTION_JS = (
+    "(el, maxItems) => {" + _STRUCTURED_COLLECTION_JS + r"""
+      if (el.tagName === 'TABLE') return readTable(el);
+      if (el.tagName === 'OL' || el.tagName === 'UL') return readList(el);
+      return null;
+    }
+"""
+)
+
+_SEARCH_RESULT_JS = (
+    "(el, bindingKey) => {" + _NODE_BINDINGS_JS + r"""
+      return {
+        nodeId: nodeId(el),
+        href: el.getAttribute('href'),
+        title: el.innerText,
+        summary: el.parentElement?.innerText,
+      };
+    }
+"""
+)
+
+_SCROLL_BOUND_JS = r"""
+(el, delta) => {
+  if (!el.isConnected) return null;
+  const root = el.ownerDocument.scrollingElement;
+  let scroller = el;
+  while (scroller && scroller !== root) {
+    if (scroller.clientHeight > 0 && scroller.scrollHeight > scroller.clientHeight + 1 &&
+        /^(auto|scroll|overlay)$/.test(getComputedStyle(scroller).overflowY)) break;
+    scroller = scroller.parentElement;
+  }
+  scroller ||= root;
+  if (!scroller) return null;
+  const before = scroller.scrollTop;
+  scroller.scrollBy({top: delta, behavior: 'instant'});
+  return {movement: scroller.scrollTop - before, nested: scroller !== root};
+}
+"""
+
+
+class _SnapshotElement:
+    """Resolve the inspected node before acting, even when a selector can move."""
+
+    def __init__(self, locator, binding_key: str, node_id: str):
+        self.locator = locator
+        self.binding_key = binding_key
+        self.node_id = node_id
+
+    @asynccontextmanager
+    async def _element(self):
+        handles = await self.locator.element_handles()
+        try:
+            if len(handles) != 1 or not await handles[0].evaluate(
+                "(el, args) => el.isConnected && globalThis[args.key]?.ids.get(el) === args.id",
+                {"key": self.binding_key, "id": self.node_id},
+            ):
+                raise BrowserReferenceError("stale_element_reference")
+            yield handles[0]
+        finally:
+            for handle in handles:
+                await handle.dispose()
+
+    async def count(self) -> int:
+        try:
+            async with self._element():
+                return 1
+        except BrowserReferenceError:
+            return 0
+
+    async def is_visible(self) -> bool:
+        async with self._element() as element:
+            return await element.is_visible()
+
+    async def evaluate(self, expression, arg=None):
+        async with self._element() as element:
+            return await element.evaluate(expression, arg)
+
+    async def click(self, *, timeout):
+        async with self._element() as element:
+            await element.click(timeout=timeout)
+
+    async def set_input_files(self, files):
+        async with self._element() as element:
+            await element.set_input_files(files)
 
 _ELEMENT_STATE_JS = r"""
 (el) => ({
@@ -750,11 +885,13 @@ class _AsyncBrowserOwner:
         self._form_session = SemanticFormSession()
         self._state_tracker = BrowserStateTracker()
         self._bound_refs = BoundReferenceStore()
+        self._element_binding_key = opaque_ref("osia_browser_nodes")
         self._pending_dialogs = {}
         self._dialog_sequence = 0
         self._network_activity = {}
+        self._page_downloads = {}
+        self._download_sequence = 0
         self._download_session_bytes = 0
-        self._download_phase = ""
         self._prepared_uploads = {}
         self._browser_progress_callback = None
         self._disconnecting = False
@@ -1100,9 +1237,9 @@ class _AsyncBrowserOwner:
         self._bound_refs.clear()
         self._pending_dialogs.clear()
         self._network_activity.clear()
+        self._page_downloads.clear()
         self._prepared_uploads.clear()
         self._download_session_bytes = 0
-        self._download_phase = ""
         self._form_session.reset()
         self._active_page = None
         self._registry_context = None
@@ -1116,6 +1253,8 @@ class _AsyncBrowserOwner:
             return
         key = id(page)
         item = self._registry.pop(key, None)
+        self._page_downloads.pop(key, None)
+        self._network_activity.pop(key, None)
         self._page_tombstones.add(key)
         try:
             page_id = self._state_tracker.current(page).page_id
@@ -1179,14 +1318,32 @@ class _AsyncBrowserOwner:
         }
         self._publish()
 
-    def _handle_network_activity(self, page, generation, delta):
+    def _handle_network_activity(self, page, generation, request, *, started):
         if generation != self._registry_generation or id(page) not in self._registry:
             return
-        state = self._network_activity.setdefault(
-            id(page), {"inflight": 0, "last_change": time.monotonic()},
-        )
-        state["inflight"] = max(0, int(state["inflight"]) + int(delta))
+        state = self._network_activity[id(page)]
+        inflight = state["inflight"]
+        if started:
+            try:
+                is_web_request = urlsplit(request.url).scheme in {"http", "https"}
+                is_web_document = request.is_navigation_request() or (
+                    urlsplit(request.frame.url).scheme in {"http", "https"}
+                )
+            except Exception:
+                return
+            if not is_web_request or not is_web_document or request in inflight:
+                return
+            inflight.add(request)
+        elif request in inflight:
+            inflight.remove(request)
+        else:
+            return
         state["last_change"] = time.monotonic()
+
+    def _handle_page_download(self, page, generation, download):
+        if generation == self._registry_generation and id(page) in self._registry:
+            self._download_sequence += 1
+            self._page_downloads[id(page)] = (self._download_sequence, download)
 
     def _register_page(
         self, page, *, context, generation, opener=None, make_active=False
@@ -1224,14 +1381,17 @@ class _AsyncBrowserOwner:
                 "dialog": lambda dialog: self._handle_dialog(
                     page, generation, dialog
                 ),
-                "request": lambda *_args: self._handle_network_activity(
-                    page, generation, 1
+                "download": lambda download: self._handle_page_download(
+                    page, generation, download
                 ),
-                "requestfinished": lambda *_args: self._handle_network_activity(
-                    page, generation, -1
+                "request": lambda request: self._handle_network_activity(
+                    page, generation, request, started=True,
                 ),
-                "requestfailed": lambda *_args: self._handle_network_activity(
-                    page, generation, -1
+                "requestfinished": lambda request: self._handle_network_activity(
+                    page, generation, request, started=False,
+                ),
+                "requestfailed": lambda request: self._handle_network_activity(
+                    page, generation, request, started=False,
                 ),
             }
             item = {
@@ -1245,7 +1405,7 @@ class _AsyncBrowserOwner:
                 page, opener=item["opener"], popup=item["opener"] is not None,
             )
             self._network_activity[key] = {
-                "inflight": 0, "last_change": time.monotonic(),
+                "inflight": set(), "last_change": time.monotonic(),
             }
             if item["opener"] is None:
                 self._schedule_opener_resolution(page, context, generation)
@@ -1734,7 +1894,7 @@ class _AsyncBrowserOwner:
             elif condition == WaitConditionType.NETWORK_QUIET:
                 activity = self._network_activity.get(id(page), {})
                 quiet_for = time.monotonic() - float(activity.get("last_change", 0))
-                matched = int(activity.get("inflight", 0)) == 0 and quiet_for >= wait.quiet_period_seconds
+                matched = not activity.get("inflight") and quiet_for >= wait.quiet_period_seconds
                 evidence["network_quiet"] = matched
             elif condition == WaitConditionType.STABLE_CONTENT:
                 current = await self._page_fingerprint(page)
@@ -1762,10 +1922,20 @@ class _AsyncBrowserOwner:
                 WaitConditionType.DOWNLOAD_START,
                 WaitConditionType.DOWNLOAD_COMPLETION,
             }:
-                phase = self._download_phase
-                wanted = "downloading" if condition == WaitConditionType.DOWNLOAD_START else "complete"
-                matched = phase == wanted
-                evidence["download_phase_matched"] = matched
+                sequence, download = self._page_downloads.get(id(page), (0, None))
+                fresh = sequence > baseline.get("download_sequence", self._download_sequence)
+                evidence["fresh_download_observed"] = fresh
+                if fresh and condition == WaitConditionType.DOWNLOAD_START:
+                    matched = True
+                elif fresh:
+                    try:
+                        failure = await asyncio.wait_for(
+                            download.failure(), timeout=max(0.001, deadline - now),
+                        )
+                        matched = failure is None
+                    except asyncio.TimeoutError:
+                        matched = False
+                    evidence["download_completed"] = matched
             if matched:
                 return True, evidence
             await asyncio.sleep(min(0.05, max(0.001, deadline - now)))
@@ -1825,7 +1995,7 @@ class _AsyncBrowserOwner:
                 item["frame_ref"] = self._bound_refs.issue(
                     "frame",
                     state,
-                    frame,
+                    (frame, frame_url),
                     binding_key=_semantic_browser_binding(
                         "frame", frame, {"url": frame_url},
                     ),
@@ -1835,28 +2005,43 @@ class _AsyncBrowserOwner:
             summaries.append(item)
         return summaries
 
+    def _snapshot_element(self, locator, node_id: str):
+        if not isinstance(node_id, str) or not node_id:
+            raise BrowserReferenceError("stale_element_reference")
+        return _SnapshotElement(locator, self._element_binding_key, node_id)
+
+    def _issue_snapshot_element(self, kind, frame, state, selector, item):
+        # The snapshot uses document.querySelectorAll, which does not pierce
+        # shadow roots. Resolve with the same selector scope and index.
+        locator = frame.locator("css:light=" + selector).nth(item["index"])
+        return self._bound_refs.issue(
+            kind, state, self._snapshot_element(locator, item["node_id"]),
+            binding_key=_semantic_browser_binding(kind, frame, item),
+        )
+
     async def _structured_frame_data(
         self, frame, state, *, mode, max_items, text_offset, text_limit,
+        expected_frame_url=None,
     ):
         raw = await frame.evaluate(_STRUCTURED_INSPECTION_JS, {
             "mode": mode,
             "maxItems": max_items,
             "textOffset": text_offset,
             "textLimit": text_limit,
+            "bindingKey": self._element_binding_key,
+            "expectedFrameUrl": expected_frame_url,
         })
+        if raw is None and expected_frame_url is not None:
+            raise BrowserReferenceError("stale_element_reference")
         if not isinstance(raw, dict):
             raise RuntimeError("invalid_structured_snapshot")
         links = []
         for item in raw.get("links") or []:
             if not isinstance(item, dict) or not isinstance(item.get("index"), int):
                 continue
-            locator = frame.locator("a[href]").nth(item["index"])
             links.append({
-                "element_ref": self._bound_refs.issue(
-                    "link",
-                    state,
-                    locator,
-                    binding_key=_semantic_browser_binding("link", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "link", frame, state, "a[href]", item,
                 ),
                 "text": str(item.get("text") or "")[:300],
                 "safe_destination": safe_url_display(item.get("destination")),
@@ -1866,13 +2051,9 @@ class _AsyncBrowserOwner:
         for item in raw.get("buttons") or []:
             if not isinstance(item, dict) or not isinstance(item.get("index"), int):
                 continue
-            locator = frame.locator(button_selector).nth(item["index"])
             buttons.append({
-                "element_ref": self._bound_refs.issue(
-                    "button",
-                    state,
-                    locator,
-                    binding_key=_semantic_browser_binding("button", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "button", frame, state, button_selector, item,
                 ),
                 "text": str(item.get("text") or "")[:300],
                 "disabled": item.get("disabled") is True,
@@ -1882,13 +2063,9 @@ class _AsyncBrowserOwner:
         for item in raw.get("controls") or []:
             if not isinstance(item, dict) or not isinstance(item.get("index"), int):
                 continue
-            locator = frame.locator("input:not([type=hidden]),textarea,select").nth(item["index"])
             controls.append({
-                "element_ref": self._bound_refs.issue(
-                    "control",
-                    state,
-                    locator,
-                    binding_key=_semantic_browser_binding("control", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "control", frame, state, "input:not([type=hidden]),textarea,select", item,
                 ),
                 "kind": str(item.get("kind") or "")[:40],
                 "type": str(item.get("type") or "")[:40],
@@ -1904,11 +2081,8 @@ class _AsyncBrowserOwner:
                 if isinstance(row, list):
                     rows.append([str(cell)[:500] for cell in row[:max_items]])
             tables.append({
-                "element_ref": self._bound_refs.issue(
-                    "table",
-                    state,
-                    frame.locator("table").nth(item["index"]),
-                    binding_key=_semantic_browser_binding("table", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "table", frame, state, "table", item,
                 ),
                 "caption": str(item.get("caption") or "")[:300],
                 "headers": [
@@ -1922,11 +2096,8 @@ class _AsyncBrowserOwner:
             if not isinstance(item, dict) or not isinstance(item.get("index"), int):
                 continue
             lists.append({
-                "element_ref": self._bound_refs.issue(
-                    "list",
-                    state,
-                    frame.locator("ol,ul").nth(item["index"]),
-                    binding_key=_semantic_browser_binding("list", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "list", frame, state, "ol,ul", item,
                 ),
                 "ordered": item.get("ordered") is True,
                 "items": [str(value)[:600] for value in (item.get("items") or [])[:max_items]],
@@ -1936,16 +2107,26 @@ class _AsyncBrowserOwner:
             if not isinstance(item, dict) or not isinstance(item.get("index"), int):
                 continue
             forms.append({
-                "element_ref": self._bound_refs.issue(
-                    "form",
-                    state,
-                    frame.locator("form").nth(item["index"]),
-                    binding_key=_semantic_browser_binding("form", frame, item),
+                "element_ref": self._issue_snapshot_element(
+                    "form", frame, state, "form", item,
                 ),
                 "label": str(item.get("label") or "")[:300],
                 "field_count": max(0, min(int(item.get("field_count") or 0), 10_000)),
             })
         metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        scroll_regions = []
+        for item in raw.get("scroll_regions") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                continue
+            scroll_regions.append({
+                "element_ref": self._issue_snapshot_element(
+                    "scroll_region", frame, state, "*", item,
+                ),
+                "label": str(item.get("label") or "")[:160],
+                "scroll_top": item.get("scroll_top"),
+                "scroll_height": item.get("scroll_height"),
+                "viewport_height": item.get("viewport_height"),
+            })
         payload = {
             "title": str(raw.get("title") or "")[:300],
             "language": str(raw.get("language") or "")[:32],
@@ -1971,6 +2152,7 @@ class _AsyncBrowserOwner:
             "forms": forms,
             "tables": tables,
             "lists": lists,
+            "scroll_regions": scroll_regions,
             "metadata": {
                 "canonical": safe_url_display(metadata.get("canonical")),
                 "description": str(metadata.get("description") or "")[:600],
@@ -1987,6 +2169,30 @@ class _AsyncBrowserOwner:
             "page_text_next_offset": max(0, int(raw.get("page_text_next_offset") or 0)),
         }
         return payload
+
+    async def _inspect_collection(self, state, mode, target_ref, max_items, started):
+        locator = self._bound_refs.resolve(target_ref, state, kinds={"table", "list"})
+        collection = await locator.evaluate(_TARGETED_COLLECTION_JS, max_items)
+        if not isinstance(collection, dict):
+            raise BrowserReferenceError("stale_element_reference")
+        kind = "table" if "rows" in collection else "list"
+        if mode not in {"snapshot", kind}:
+            return self._receipt_failure(
+                before=state, started_at=started, code="target_does_not_match_extraction_mode",
+            )
+        truncated = collection.pop("truncated")
+        collection["element_ref"] = target_ref
+        return self._receipt_success(
+            before=state, after=state, started_at=started,
+            evidence=[{"targeted_extraction": True, "truncated": truncated}],
+            data={
+                "browser_state": state.to_dict(),
+                "tables": [collection] if kind == "table" else [],
+                "lists": [collection] if kind == "list" else [],
+                "content_truncated": truncated,
+                "status": "truncated" if truncated else "ok",
+            },
+        )
 
     async def _op_inspect_page(
         self, state_ref=None, mode="snapshot", target_ref=None, cursor=None,
@@ -2005,19 +2211,21 @@ class _AsyncBrowserOwner:
             max_items = max(1, min(int(max_items), 100))
             page, state = await self._resolve_state_page(state_ref)
             if target_ref:
-                # Targeted table/list extraction is deliberately not guessed:
-                # validate ownership/staleness first, then report the currently
-                # unsupported narrower operation explicitly.
-                self._bound_refs.resolve(
-                    target_ref, state, kinds={"table", "list"},
-                )
-                return self._receipt_failure(
-                    before=state, started_at=started,
-                    code="unsupported_targeted_extraction",
+                if cursor or frame_ref:
+                    return self._receipt_failure(
+                        before=state, started_at=started, code="conflicting_extraction_references",
+                    )
+                return await self._inspect_collection(
+                    state, mode, target_ref, max_items, started,
                 )
             frame = page
+            expected_frame_url = None
             if frame_ref:
-                frame = self._bound_refs.resolve(frame_ref, state, kinds={"frame"})
+                frame, expected_frame_url = self._bound_refs.resolve(
+                    frame_ref, state, kinds={"frame"},
+                )
+                if frame.url != expected_frame_url:
+                    raise BrowserReferenceError("stale_element_reference")
             text_offset = 0
             if cursor:
                 text_offset = int(self._bound_refs.resolve(
@@ -2026,6 +2234,7 @@ class _AsyncBrowserOwner:
             payload = await self._structured_frame_data(
                 frame, state, mode=mode, max_items=max_items,
                 text_offset=text_offset, text_limit=8_000,
+                expected_frame_url=expected_frame_url,
             )
             payload["browser_state"] = state.to_dict()
             payload["safe_url"] = safe_url_display(await self._page_url(page))
@@ -2096,6 +2305,7 @@ class _AsyncBrowserOwner:
                 "document_epoch": state.document_epoch,
                 "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
                 "dialog_sequence": self._dialog_sequence,
+                "download_sequence": self._download_sequence,
             }
             ok, evidence = await self._wait_condition(page, wait_spec, baseline)
             after = self._current_state(page)
@@ -2131,6 +2341,7 @@ class _AsyncBrowserOwner:
                 "document_epoch": before.document_epoch,
                 "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
                 "dialog_sequence": self._dialog_sequence,
+                "download_sequence": self._download_sequence,
             }
         except BrowserReferenceError as exc:
             return self._receipt_failure(started_at=started, code=exc.code)
@@ -2226,7 +2437,10 @@ class _AsyncBrowserOwner:
                 element_ref, before,
                 kinds={"link", "button", "control", "search_result", "pagination"},
             )
-            if await locator.count() != 1 or not await locator.is_visible():
+            if (
+                (not isinstance(locator, _SnapshotElement) and await locator.count() != 1)
+                or not await locator.is_visible()
+            ):
                 return self._receipt_failure(
                     before=before, started_at=started, code="target_not_actionable",
                 )
@@ -2245,10 +2459,8 @@ class _AsyncBrowserOwner:
                 "document_epoch": before.document_epoch,
                 "page_ids": [ref.page_id for _item, ref in self._state_tracker.tab_refs()],
                 "dialog_sequence": self._dialog_sequence,
+                "download_sequence": self._download_sequence,
             }
-            downloads = []
-            download_handler = lambda download: downloads.append(download)
-            page.on("download", download_handler)
         except BrowserReferenceError as exc:
             return self._receipt_failure(started_at=started, code=exc.code)
         except Exception as exc:
@@ -2258,6 +2470,8 @@ class _AsyncBrowserOwner:
         try:
             await locator.click(timeout=5_000)
             click_error = None
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(before=before, started_at=started, code=exc.code)
         except Exception as exc:
             click_error = exc
         evidence = [{"single_dispatch": True}]
@@ -2270,7 +2484,6 @@ class _AsyncBrowserOwner:
             evidence.append({"dialog_appeared": True})
             ok = True
         elif click_error is not None:
-            self._emitter_off(page, "download", download_handler)
             return self._receipt_failure(
                 before=before, started_at=started,
                 code=scrub_browser_error(click_error), dispatched=True, unknown=True,
@@ -2310,7 +2523,8 @@ class _AsyncBrowserOwner:
                     evidence.append({"dialog_appeared": True})
                     ok = True
                     break
-                if downloads:
+                download_sequence, _download = self._page_downloads.get(id(page), (0, None))
+                if download_sequence > baseline["download_sequence"]:
                     evidence.append({"download_created": True})
                     ok = True
                     break
@@ -2323,7 +2537,6 @@ class _AsyncBrowserOwner:
                     evidence.append({"content_fingerprint_changed": True})
                     ok = True
                     break
-        self._emitter_off(page, "download", download_handler)
         active = self._reconcile_pages(self._context) or page
         self._active_page = active
         self._publish()
@@ -2347,14 +2560,21 @@ class _AsyncBrowserOwner:
         try:
             _page, before = await self._resolve_state_page(state_ref)
             tabs = []
-            for page, ref in self._state_tracker.tab_refs()[:64]:
+            for page, _ref in self._state_tracker.tab_refs()[:64]:
                 try:
                     title = await page.title()
                 except Exception:
                     title = ""
+                safe_url = safe_url_display(await self._page_url(page))
+                try:
+                    # Navigation can commit while the title/URL is awaited.
+                    # Pair the observed tab with its latest document identity.
+                    ref = self._current_state(page)
+                except BrowserReferenceError:
+                    continue
                 tabs.append({
                     "state": ref.to_dict(),
-                    "safe_url": safe_url_display(await self._page_url(page)),
+                    "safe_url": safe_url,
                     "title": str(title or "")[:300],
                     "active": page is self._active_page,
                     "has_opener": self._state_tracker.opener(page) is not None,
@@ -2573,21 +2793,19 @@ class _AsyncBrowserOwner:
             for index in range(count):
                 item = locator.nth(index)
                 try:
-                    destination = await item.get_attribute("href") or ""
-                    display = safe_url_display(destination)
+                    metadata = await item.evaluate(_SEARCH_RESULT_JS, self._element_binding_key)
+                    bound = self._snapshot_element(item, metadata["nodeId"])
+                    display = safe_url_display(metadata["href"])
                     if not display or display in seen:
                         continue
-                    title = " ".join((await item.inner_text()).split())[:300]
-                    summary = ""
-                    parent = item.locator("xpath=..")
-                    if await parent.count():
-                        summary = " ".join((await parent.inner_text()).split())[:600]
+                    title = " ".join((metadata["title"] or "").split())[:300]
+                    summary = " ".join((metadata["summary"] or "").split())[:600]
                 except Exception:
                     continue
                 seen.add(display)
                 results.append({
                     "result_ref": self._bound_refs.issue(
-                        "search_result", state, item,
+                        "search_result", state, bound,
                     ),
                     "title": title,
                     "safe_destination": display,
@@ -3095,7 +3313,6 @@ class _AsyncBrowserOwner:
         )
 
     def _emit_browser_progress(self, phase, **safe_values):
-        self._download_phase = str(phase)[:32]
         from osia.tool_attempts import (
             current_tool_attempt_id,
             publish_tool_attempt_event,
@@ -3364,6 +3581,47 @@ class _AsyncBrowserOwner:
             return f"Scrolled {actual_direction} by {abs(movement):g}px"
         except Exception as exc:
             return f"ERROR scrolling: {scrub_browser_error(exc)}"
+
+    async def _op_scroll_bound(self, state_ref, element_ref, direction="down", amount=600):
+        started = time.time()
+        try:
+            if state_ref is None or direction not in {"up", "down"} or int(amount) < 1:
+                return self._receipt_failure(started_at=started, code="invalid_scroll_request")
+            page, state = await self._resolve_state_page(state_ref)
+            locator = (
+                self._bound_refs.resolve(element_ref, state, kinds={
+                    "link", "button", "control", "form", "table", "list", "scroll_region",
+                }) if element_ref else page.locator(":root")
+            )
+            delta = int(amount) * (-1 if direction == "up" else 1)
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(started_at=started, code=exc.code)
+        except (TypeError, ValueError):
+            return self._receipt_failure(started_at=started, code="invalid_scroll_request")
+        except Exception as exc:
+            return self._receipt_failure(started_at=started, code=scrub_browser_error(exc))
+        try:
+            result = await locator.evaluate(_SCROLL_BOUND_JS, delta)
+            if result is None:
+                raise BrowserReferenceError("stale_element_reference")
+            movement = result["movement"]
+            if type(movement) not in {int, float} or not math.isfinite(movement):
+                raise ValueError("unverified_scroll_movement")
+        except BrowserReferenceError as exc:
+            return self._receipt_failure(before=state, started_at=started, code=exc.code)
+        except Exception as exc:
+            return self._receipt_failure(
+                before=state, started_at=started, code=scrub_browser_error(exc),
+                dispatched=True, unknown=True,
+            )
+        return self._receipt_success(
+            before=state, after=self._current_state(page), started_at=started,
+            evidence=[{"scroll_movement_observed": True, "movement": movement}],
+            data={
+                "movement": movement, "nested": result["nested"] is True,
+                "status": "moved" if movement else "at_boundary",
+            },
+        )
 
     async def _op_go_back(self):
         return await self._op_go_back_safe()
@@ -4055,6 +4313,13 @@ def get_current_url() -> str:
 def scroll(direction: str = "down", amount: int = 600) -> str:
     try:
         return _owner.call("scroll", direction, amount)
+    except Exception as exc:
+        return _owner_error("scrolling", exc)
+
+
+def scroll_bound(state_ref, element_ref=None, direction="down", amount=600):
+    try:
+        return _owner.call("scroll_bound", state_ref, element_ref, direction, amount)
     except Exception as exc:
         return _owner_error("scrolling", exc)
 

@@ -606,7 +606,10 @@ class CronManager:
         # scheduler loop is single-threaded, so this completes before any later
         # tick and cannot double-fire.
         try:
-            from osia.scheduled_tasks import mark_scheduled_task_running
+            from osia.scheduled_tasks import (
+                mark_scheduled_task_running,
+                update_scheduled_occurrence_status,
+            )
 
             if not mark_scheduled_task_running(execution_context):
                 if conversation_lease_claimed:
@@ -642,8 +645,8 @@ class CronManager:
         st.pop("pending_due_date", None)
         next_run_at = self._next_run_after(schedule, now)
         st["next_run"] = _parse_job_datetime(next_run_at)
-        self._update_job_status(
-            job_index, signature, task_id,
+        update_scheduled_occurrence_status(
+            execution_context,
             last_run_at=now.astimezone().isoformat(timespec="seconds"),
             last_status="running",
             next_run_at=next_run_at,
@@ -716,10 +719,10 @@ class CronManager:
 
                     blocked = scheduled_execution_block_state(execution_context)
                     occurrence_outcome = (
-                        "outcome_unknown" if blocked == "blocked_outcome_unknown"
-                        else "blocked_authorization" if blocked
-                        else "success_verified" if job_status in {
-                            "success_verified", "completed", "completed_unlinked"
+                        "blocked_execution" if blocked
+                        else "success_verified" if job_status == "success_verified"
+                        else "completed_unverified" if job_status in {
+                            "completed", "completed_unlinked"
                         }
                         else "cancelled_proven" if job_status == "user_cancelled"
                         else "failed_before_dispatch"
@@ -731,17 +734,15 @@ class CronManager:
                     mark_scheduled_task_finished(execution_context)
                 except Exception:
                     pass
-                self._update_job_status(
-                    job_index, signature, task_id,
-                    last_status=job_status,
-                    last_error=last_error,
+                update_scheduled_occurrence_status(
+                    execution_context, last_status=job_status, last_error=last_error,
                 )
                 try:
                     spec = parse_schedule(schedule)
                     if spec and spec.get("kind") == "once" and task_id:
                         from osia.scheduled_tasks import disable_scheduled_task
 
-                        disable_scheduled_task(str(task_id))
+                        disable_scheduled_task(str(task_id), execution=execution_context)
                 except Exception as e:
                     print(f"[CRON] could not disable completed one-shot: {e}")
                 self._notify_completion(

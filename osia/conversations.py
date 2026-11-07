@@ -504,6 +504,7 @@ def _path_has_active_canonical_chat_lease(path: Path) -> bool:
 
 def _cancel_chat_turns_for_deletion(
     path: Path, *, cancel_active_turn: bool = False,
+    cancel_active_binding: dict | None = None,
 ) -> bool:
     """Install exact Stop tombstones before removing a conversation."""
     try:
@@ -530,7 +531,14 @@ def _cancel_chat_turns_for_deletion(
     for message, binding in unresolved:
         if binding["conversation_id"] != str(conversation.get("id") or ""):
             return False
-        if not cancel_active_turn:
+        can_cancel_live = cancel_active_turn and (
+            cancel_active_binding is None
+            or all(
+                cancel_active_binding.get(key) == value
+                for key, value in binding.items()
+            )
+        )
+        if not can_cancel_live:
             try:
                 owner_pid = int(message.get("_execution_owner_pid") or 0)
             except (TypeError, ValueError, OverflowError):
@@ -549,7 +557,7 @@ def _cancel_chat_turns_for_deletion(
                 return False
         turn_id = binding["turn_id"]
         objective = str(message.get("_terminality_objective") or "")
-        if not cancel_active_turn and not persisted_turn_state_exists(turn_id):
+        if not can_cancel_live and not persisted_turn_state_exists(turn_id):
             return False
         try:
             controller = TurnTerminalityController(
@@ -562,7 +570,7 @@ def _cancel_chat_turns_for_deletion(
                 return False
             durable_binding = state.get("execution_binding") or {}
             if (
-                cancel_active_turn
+                can_cancel_live
                 and not durable_binding
                 and not state.get("final_reservation")
             ):
@@ -2529,13 +2537,16 @@ def delete_conversation_with_receipt(
     *,
     operation_id: str | None = None,
     cancel_active_turn: bool = False,
+    cancel_active_binding: dict | None = None,
 ) -> dict:
     """Delete one conversation and durably advance the list revision.
 
     The versioned receipt is shared by the Desktop and WebSocket callers so a
     success acknowledgement can be tied to the file removal and metadata
-    commit that completed under the canonical store lock. Desktop single-delete
-    can also commit cancellation of an accepted Chat turn under that lock.
+    commit that completed under the canonical store lock. Single-delete can
+    also commit cancellation of an accepted Chat turn under that lock. A caller
+    with limited worker ownership can constrain that cancellation to its exact
+    live binding.
     """
     stable_id = str(conv_id or "")
     op_id = str(operation_id or "").strip()[:200]
@@ -2558,7 +2569,9 @@ def delete_conversation_with_receipt(
         if (
             _path_has_active_canonical_chat_lease(path)
             and not _cancel_chat_turns_for_deletion(
-                path, cancel_active_turn=cancel_active_turn,
+                path,
+                cancel_active_turn=cancel_active_turn,
+                cancel_active_binding=cancel_active_binding,
             )
         ):
             return _folder_receipt(

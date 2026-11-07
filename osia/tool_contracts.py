@@ -338,6 +338,10 @@ class ProcessOutput(str):
         return value
 
 
+class ReadTextOutput(str):
+    """Text from a successful read, with no status encoded in the payload."""
+
+
 @dataclass(frozen=True)
 class ToolPersistenceContract:
     """One value-free, tool-family-specific durable waiting policy.
@@ -542,14 +546,12 @@ TEXT = _string(minimum=0, maximum=16_000)
 LARGE_TEXT = _string(minimum=0, maximum=2_000_000)
 
 SCHEDULE_SCHEMA = _object({
-    "type": _string(enum=("once", "daily", "interval", "weekly", "cron"), maximum=16),
+    "type": _string(enum=("once", "daily", "interval"), maximum=16),
     "run_at": _nullable(_string(maximum=64)),
     "time": _nullable(_string(maximum=16, pattern=r"^\d{1,2}:\d{2}$")),
     "timezone": _nullable(_string(maximum=64)),
     "every": _nullable(_integer(1, 1_000_000)),
     "unit": _nullable(_string(enum=("minute", "minutes", "hour", "hours", "day", "days"), maximum=16)),
-    "days_of_week": _nullable(_array(_string(maximum=16), maximum=7)),
-    "expression": _nullable(_string(maximum=128)),
 }, required=("type",), allOf=[
     {
         "if": {"properties": {"type": {"const": "once"}}, "required": ["type"]},
@@ -568,20 +570,6 @@ SCHEDULE_SCHEMA = _object({
                 "unit": _string(enum=("minute", "minutes", "hour", "hours", "day", "days"), maximum=16),
             },
         },
-    },
-    {
-        "if": {"properties": {"type": {"const": "weekly"}}, "required": ["type"]},
-        "then": {
-            "required": ["time", "days_of_week"],
-            "properties": {
-                "time": _string(maximum=16, pattern=r"^\d{1,2}:\d{2}$"),
-                "days_of_week": _array(_string(maximum=16), maximum=7),
-            },
-        },
-    },
-    {
-        "if": {"properties": {"type": {"const": "cron"}}, "required": ["type"]},
-        "then": {"required": ["expression"], "properties": {"expression": _string(maximum=128)}},
     },
 ])
 
@@ -1058,9 +1046,11 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
         _spec("get_current_url", "Read the managed browser URL", _object(), R, I, NC,
               preconditions=("managed_browser",), progress=state, real=read_real),
-        _spec("scroll", "Scroll the managed browser up or down and report the actual movement",
+        _spec("scroll", "Scroll the managed page or a nested panel and report actual movement. For a panel use a fresh state_ref and an element_ref from scroll_regions or inside the panel",
               _object({"direction": _string(enum=("up", "down"), maximum=8),
-                       "amount": _integer(1, 100_000)}), RL, C, NC,
+                       "amount": _integer(1, 100_000),
+                       "state_ref": _nullable(BROWSER_STATE_REF),
+                       "element_ref": _nullable(ELEMENT_REF)}), RL, C, NC,
               preconditions=("managed_browser",), real=RealValidationRequirement.USER_VISIBLE),
         _spec("go_back", "Navigate backward in managed-browser history", _object(), RL, C, NC,
               preconditions=("managed_browser",), progress=state,
@@ -1352,7 +1342,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY,
               permission_category="browser_account", postcondition_required=True,
               redaction_policy="browser_private_bounded"),
-        _spec("inspect_browser_page", "Inspect bounded structured rendered page content",
+        _spec("inspect_browser_page", "Inspect structured rendered content and discover scroll regions. For a single table or list, pass its fresh element_ref as target_ref with the matching mode",
               _object({
                   "state_ref": _nullable(BROWSER_STATE_REF),
                   "mode": _string(enum=(
@@ -2628,6 +2618,8 @@ def bounded_model_result(result: Any, *, limit: int = 64_000) -> Any:
         preserved = str.__new__(ProcessOutput, display)
         preserved.process_facts = dict(result.process_facts)
         return preserved
+    if isinstance(result, ReadTextOutput):
+        return ReadTextOutput(display)
     return display
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import sys
+from types import SimpleNamespace
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -21,6 +23,35 @@ from osia.tool_contracts import (
     static_tool_prompt_block,
     validate_arguments,
 )
+
+
+@pytest.mark.parametrize("content", ["", "ERROR: rapport d’incident"])
+def test_read_file_reports_success_for_empty_and_error_looking_data(tmp_path, content):
+    path = tmp_path / "data.txt"
+    path.write_text(content, encoding="utf-8")
+
+    result = agent_module._execute_tool_with_policy("read_file", {"path": str(path)})
+
+    assert result.outcome is ExecutionOutcome.SUCCESS_VERIFIED
+    assert result.result == content
+
+
+def test_read_clipboard_reports_success_for_error_looking_data(monkeypatch):
+    content = "ERROR: rapport d’incident"
+    if sys.platform == "win32":
+        import pyperclip
+
+        monkeypatch.setattr(pyperclip, "paste", lambda: content)
+    else:
+        monkeypatch.setattr(agent_module, "_clipboard_backend", lambda: (["test-read"], []))
+        monkeypatch.setattr(agent_module.subprocess, "run", lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout=content,
+        ))
+
+    result = agent_module._execute_tool_with_policy("get_clipboard", {})
+
+    assert result.outcome is ExecutionOutcome.SUCCESS_VERIFIED
+    assert result.result == content
 
 
 def test_static_registry_is_complete_unique_and_provider_prompt_derived():

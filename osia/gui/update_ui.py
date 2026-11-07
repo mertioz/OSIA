@@ -345,6 +345,7 @@ class UpdateController(QObject):
         if error is not None:
             if code in {"equal_version", "downgrade"}:
                 self.manifest = None
+                self.installer = None
                 self.store.update(lastError=None)
                 self._publish(
                     status="no_update", availableVersion=None,
@@ -364,6 +365,7 @@ class UpdateController(QObject):
         manifest = result.manifest
         if manifest is None or manifest.rollout_state != "enabled":
             self.manifest = None
+            self.installer = None
             self._publish(
                 status="paused" if manifest is not None else "no_update",
                 availableVersion=None, availableChannel=None,
@@ -374,6 +376,11 @@ class UpdateController(QObject):
                 error=None,
             )
             return
+        previous = self.manifest
+        if previous is None or (previous.version, previous.installer) != (
+            manifest.version, manifest.installer,
+        ):
+            self.installer = None
         self.manifest = manifest
         visible = prepare_notification_state(
             self.store, manifest.version, manual=manual
@@ -432,7 +439,7 @@ class UpdateController(QObject):
         self._publish(bannerVisible=False)
 
     def install(self, parent: QWidget | None = None) -> bool:
-        if self.manifest is None:
+        if self.manifest is None or self.scheduler.in_flight:
             return False
         if self.operation.begin() is None:
             return False
