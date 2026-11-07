@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.257", released_on="2026-11-07", public=True,
+        changes_en=(
+            "Each OSIA conversation keeps its ChatGPT Account thread across turns. The managed browser reuses an existing tab when the requested address is already open.",
+            "The chat shows context usage beside Send. Use /compact to summarize earlier exchanges. Automatic compaction keeps the active request and recent work.",
+            "OSIA reads browser form fields together and checks each field reference before filling it. A timed-out read can be retried in the same tab.",
+        ),
+        changes_fr=(
+            "Chaque discussion OSIA conserve son fil ChatGPT Account d’un tour à l’autre. Le navigateur géré réutilise l’onglet quand l’adresse demandée est déjà ouverte.",
+            "Le chat affiche le contexte utilisé à côté du bouton Envoyer. La commande /compact résume les anciens échanges. La compaction automatique conserve la demande en cours et les travaux récents.",
+            "OSIA lit les champs des formulaires en groupe et vérifie chaque référence avant de saisir du texte. Une lecture expirée peut être relancée dans le même onglet.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.256", released_on="2026-11-07", public=True,
         changes_en=(
             "ChatGPT Account can use buttons and forms in the managed browser in the background, including when mouse control is disabled.",
