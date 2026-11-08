@@ -63,6 +63,13 @@ def source_tree_fingerprint(root: str | Path | None = None) -> str:
             candidate = base / name
             if candidate.is_file():
                 files.add(candidate)
+        # Linux releases ship compiled modules beside their assets. Include
+        # that payload when there is no source, without hashing dev caches.
+        if not files:
+            files.update(
+                path for path in source_dirs[0].rglob("*.pyc")
+                if "__pycache__" not in path.parts and path.is_file()
+            )
         digest = hashlib.sha256()
         for path in sorted(files, key=lambda item: item.relative_to(base).as_posix()):
             relative = path.relative_to(base).as_posix().encode("utf-8")
