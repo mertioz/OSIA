@@ -1593,6 +1593,15 @@ def ensure_service_running(name: str) -> bool:
             mutex.close()
 
 
+def _systemctl_command(name: str, *, privileged: bool = False) -> list[str]:
+    if sys.platform.startswith("linux"):
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        user_unit = config_home / "systemd" / "user" / name
+        if user_unit.is_file():
+            return ["systemctl", "--user"]
+    return ["pkexec", "systemctl"] if privileged else ["systemctl"]
+
+
 def is_service_enabled(name: str) -> bool:
     """True if the unit is enabled (will start at boot/login).
 
@@ -1607,7 +1616,7 @@ def is_service_enabled(name: str) -> bool:
             return False
         return _win_task_registered(_TASK_NAME[kind])
     try:
-        result = _run(["systemctl", "is-enabled", name])
+        result = _run([*_systemctl_command(name), "is-enabled", name])
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
     return result.stdout.strip() == "enabled"
@@ -1623,7 +1632,7 @@ def get_service_status(name: str) -> str:
             return "running" if _win_port_open(_SERVER_PORT) else "stopped"
         return "error"
     try:
-        result = _run(["systemctl", "is-active", name])
+        result = _run([*_systemctl_command(name), "is-active", name])
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return "error"
     state = result.stdout.strip()
@@ -1640,7 +1649,7 @@ def enable_service(name: str) -> bool:
         return _win_enable(name)
     try:
         result = _run(
-            ["pkexec", "systemctl", "enable", "--now", name],
+            [*_systemctl_command(name, privileged=True), "enable", "--now", name],
             timeout=60.0,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -1654,7 +1663,7 @@ def disable_service(name: str) -> bool:
         return _win_disable(name)
     try:
         result = _run(
-            ["pkexec", "systemctl", "disable", "--now", name],
+            [*_systemctl_command(name, privileged=True), "disable", "--now", name],
             timeout=60.0,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -1674,13 +1683,13 @@ def stop_service(name: str) -> bool:
         # The desktop does not own a separate system service on macOS.
         return True
     try:
-        probe = _run(["systemctl", "is-active", name])
+        probe = _run([*_systemctl_command(name), "is-active", name])
         state = (probe.stdout or "").strip()
         if state in {"inactive", "failed", "unknown", "deactivating"}:
             return True
         if probe.returncode == 4:  # systemd: unit does not exist
             return True
-        result = _run(["pkexec", "systemctl", "stop", name], timeout=60.0)
+        result = _run([*_systemctl_command(name, privileged=True), "stop", name], timeout=60.0)
     except FileNotFoundError:
         return True
     except subprocess.TimeoutExpired:
@@ -1714,7 +1723,7 @@ def restart_service(name: str) -> bool:
                 mutex.close()
     try:
         result = _run(
-            ["pkexec", "systemctl", "restart", name],
+            [*_systemctl_command(name, privileged=True), "restart", name],
             timeout=60.0,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):

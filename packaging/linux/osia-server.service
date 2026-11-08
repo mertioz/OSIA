@@ -1,0 +1,13 @@
+[Unit]
+Description=OSIA Mobile server
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart="%h/.local/bin/osia" --server
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

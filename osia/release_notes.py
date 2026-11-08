@@ -63,6 +63,15 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.259", released_on="2026-11-08", public=True,
+        changes_en=(
+            "The Linux x86-64 beta uses the shared OSIA runtime. The installer keeps data in your profile and retains installed versions for manual rollback.",
+        ),
+        changes_fr=(
+            "La bêta Linux x86‑64 utilise le moteur OSIA commun. L’installateur conserve les données dans ton profil et garde les versions installées pour un retour manuel.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.258", released_on="2026-11-08", public=True,
         changes_en=(
             "ChatGPT Account receives the result of a slow browser action in the same turn. Recent browser results remain available after context compaction.",

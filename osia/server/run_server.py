@@ -74,6 +74,10 @@ def _boot_mark(message: str) -> None:
         pass
 
 
+def _bind_host() -> str:
+    return "127.0.0.1" if os.environ.get("OSIA_SERVER_LOOPBACK_ONLY") == "1" else "0.0.0.0"
+
+
 def _port_8765_available() -> bool:
     """Return whether uvicorn can own 8765, without leaving a socket behind."""
 
@@ -85,7 +89,7 @@ def _port_8765_available() -> bool:
             # Match asyncio's POSIX bind behavior so TIME_WAIT is not mistaken
             # for a live listener. SO_REUSEADDR can hijack on Windows.
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind(("0.0.0.0", 8765))
+        probe.bind((_bind_host(), 8765))
         return True
     except OSError:
         return False
@@ -136,7 +140,7 @@ def _run_uvicorn() -> None:
     try:
         uvicorn.run(
             "osia.server.server:app",
-            host="0.0.0.0",
+            host=_bind_host(),
             port=8765,
             log_level="info",
         )
