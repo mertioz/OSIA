@@ -47,6 +47,7 @@ _SAFE_ACCOUNT_ERRORS = {
     "runtime_incompatible",
     "isolation_failed",
     "login_cancelled",
+    "login_busy",
     "login_failed",
     "login_invalid",
     "login_timeout",
@@ -60,8 +61,11 @@ _remote_refreshing = False
 _remote_callbacks: list[Callable[[], None]] = []
 
 _login_lock = threading.RLock()
+_login_operation_lock = threading.Lock()
+_login_generation = 0
 _login_connecting = False
 _login_ephemeral: dict[str, str] = {}
+_login_error = ""
 
 
 def _safe_error(value) -> str:
@@ -158,7 +162,9 @@ def _account_status_with_usage(*, refresh_models: bool) -> dict:
         }
 
 
-def account_snapshot(*, refresh_models: bool = True, include_ephemeral: bool = False) -> dict:
+def account_snapshot(
+    *, refresh_models: bool = True, login_generation: int | None = None
+) -> dict:
     status = _account_status_with_usage(refresh_models=refresh_models)
     account = status.get("account") if isinstance(status.get("account"), dict) else {}
     models = []
@@ -173,9 +179,12 @@ def account_snapshot(*, refresh_models: bool = True, include_ephemeral: bool = F
         models.append(model)
     with _login_lock:
         connecting = _login_connecting
-        ephemeral = dict(_login_ephemeral) if include_ephemeral else {}
+        ephemeral = dict(_login_ephemeral) if login_generation == _login_generation else {}
+        login_error = _login_error
     error = _safe_error(status.get("error"))
     connected = bool(status.get("connected"))
+    if not connected and not connecting and error == "disconnected" and login_error:
+        error = login_error
     available = bool(connected and status.get("available") and not error and models)
     snapshot = {
         "providerId": ACCOUNT_PROVIDER_ID,
@@ -565,76 +574,88 @@ def validate_and_set_reasoning(provider_id: str, model_id: str, option_id: str) 
     return True
 
 
-def start_device_login(callback: Callable[[dict], None]) -> dict:
-    """Start one official device-code login; never persist or log its code."""
-    global _login_connecting, _login_ephemeral
+def start_device_login(code_ready: Callable[[], None]) -> tuple[dict, int]:
+    """Keep the pending sign-in on the PC across mobile transport changes."""
+    from osia.chatgpt_account.provider import get_account_provider, notify_account_changed
+
+    global _login_generation, _login_connecting, _login_ephemeral, _login_error
     with _login_lock:
-        if _login_connecting:
-            return account_snapshot(refresh_models=False, include_ephemeral=True)
-        _login_connecting = True
-        _login_ephemeral = {}
+        start = not _login_connecting
+        if start:
+            _login_generation += 1
+            _login_connecting = True
+            _login_ephemeral = {}
+            _login_error = ""
+        generation = _login_generation
 
     def worker() -> None:
-        global _login_connecting, _login_ephemeral
+        global _login_connecting, _login_ephemeral, _login_error
+        error = ""
         try:
-            from osia.chatgpt_account.provider import get_account_provider
-
-            provider = get_account_provider()
-            login = provider.begin_device_code_login()
-            ephemeral = {
-                "verificationUrl": str(login.get("verificationUrl") or ""),
-                "userCode": str(login.get("userCode") or ""),
-            }
-            with _login_lock:
-                _login_ephemeral = ephemeral
-            callback(account_snapshot(refresh_models=False, include_ephemeral=True))
+            with _login_operation_lock:
+                with _login_lock:
+                    if generation != _login_generation:
+                        return
+                provider = get_account_provider()
+                login = provider.begin_device_code_login()
+                with _login_lock:
+                    _login_ephemeral = {
+                        "verificationUrl": str(login.get("verificationUrl") or ""),
+                        "userCode": str(login.get("userCode") or ""),
+                    }
+            code_ready()
             provider.wait_for_login(str(login.get("loginId") or ""), timeout=300.0)
         except Exception as exc:
-            category = _safe_error(getattr(exc, "category", "login_failed"))
+            error = _safe_error(getattr(exc, "category", "login_failed")) or "login_failed"
+        finally:
             with _login_lock:
-                cancelled = not _login_connecting
-            if category in {"login_cancelled", "provider_error"} and cancelled:
-                category = "disconnected"
-            with _login_lock:
-                _login_connecting = False
-                _login_ephemeral = {}
-            state = account_snapshot(refresh_models=False)
-            if not state["connected"]:
-                state["error"] = category or "login_failed"
-            callback(state)
-            return
-        with _login_lock:
-            _login_connecting = False
-            _login_ephemeral = {}
-        callback(account_snapshot(refresh_models=True))
+                current = generation == _login_generation
+                if current:
+                    _login_connecting = False
+                    _login_ephemeral = {}
+                    _login_error = error
+            if current:
+                notify_account_changed()
 
-    threading.Thread(target=worker, name="osia-mobile-chatgpt-login", daemon=True).start()
-    return account_snapshot(refresh_models=False)
+    if start:
+        threading.Thread(target=worker, name="osia-mobile-chatgpt-login", daemon=True).start()
+    return account_snapshot(refresh_models=False, login_generation=generation), generation
+
+
+def _clear_device_login() -> bool:
+    global _login_generation, _login_connecting, _login_ephemeral, _login_error
+    with _login_lock:
+        pending = _login_connecting
+        _login_generation += 1
+        _login_connecting = False
+        _login_ephemeral = {}
+        _login_error = ""
+    return pending
 
 
 def cancel_device_login() -> dict:
-    global _login_connecting, _login_ephemeral
-    try:
-        from osia.chatgpt_account.provider import get_account_provider
+    from osia.chatgpt_account.provider import get_account_provider
 
-        get_account_provider().cancel_login()
-    except Exception:
-        pass
-    with _login_lock:
-        _login_connecting = False
-        _login_ephemeral = {}
+    with _login_operation_lock:
+        if _clear_device_login():
+            try:
+                get_account_provider().cancel_login()
+            except Exception:
+                pass
     return account_snapshot(refresh_models=False)
 
 
 def logout_account() -> dict:
-    global _login_connecting, _login_ephemeral
-    try:
-        from osia.chatgpt_account.provider import get_account_provider
+    from osia.chatgpt_account.provider import get_account_provider
 
-        get_account_provider().logout()
-    except Exception:
-        pass
-    with _login_lock:
-        _login_connecting = False
-        _login_ephemeral = {}
-    return account_snapshot(refresh_models=False)
+    failed = False
+    with _login_operation_lock:
+        _clear_device_login()
+        try:
+            get_account_provider().logout()
+        except Exception:
+            failed = True
+    state = account_snapshot(refresh_models=False)
+    if failed and state["connected"]:
+        state["error"] = "provider_error"
+    return state

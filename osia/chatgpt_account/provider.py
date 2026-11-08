@@ -492,12 +492,12 @@ class ChatGPTAccountProvider:
         if status.get("connected"):
             self.reset_login()
             self.list_models(force=True)
-        _notify_account_changed()
+        notify_account_changed()
         return status
 
     def cancel_login(self) -> None:
         self.client.cancel_login()
-        _notify_account_changed()
+        notify_account_changed()
 
     def reset_login(self) -> None:
         with self._lifecycle_lock:
@@ -525,7 +525,7 @@ class ChatGPTAccountProvider:
                 self._models.clear()
                 self._threads.clear()
                 self._account_scope_cache = None
-        _notify_account_changed()
+        notify_account_changed()
 
     def rate_limits(self) -> dict:
         return self.client.get_rate_limits()
@@ -614,6 +614,9 @@ class ChatGPTAccountProvider:
         # thread is still loaded. run_turn() may otherwise restart the child
         # only after we have chosen a stale thread from the previous process.
         start_runtime = getattr(runtime_client, "start", None)
+        refresh_account_storage = getattr(runtime_client, "refresh_account_storage", None)
+        if callable(refresh_account_storage):
+            refresh_account_storage()
         if callable(start_runtime):
             start_runtime()
         account_generation = getattr(runtime_client, "account_generation", 0)
@@ -1280,7 +1283,7 @@ def add_account_change_listener(callback: Callable[[], None]) -> Callable[[], No
     return unsubscribe
 
 
-def _notify_account_changed() -> None:
+def notify_account_changed() -> None:
     with _ACCOUNT_CHANGE_LOCK:
         callbacks = tuple(_ACCOUNT_CHANGE_LISTENERS)
     for callback in callbacks:

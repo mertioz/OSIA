@@ -63,6 +63,17 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.260", released_on="2026-11-08", public=True,
+        changes_en=(
+            "ChatGPT sign-in continues when OSIA Mobile reconnects after opening the browser.",
+            "OSIA refreshes the ChatGPT account shared by the desktop and mobile clients after sign-in or sign-out.",
+        ),
+        changes_fr=(
+            "La connexion ChatGPT continue lorsque le mobile se reconnecte après avoir ouvert le navigateur.",
+            "OSIA actualise le compte ChatGPT partagé par le bureau et le mobile après la connexion ou la déconnexion.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.259", released_on="2026-11-08", public=True,
         changes_en=(
             "The Linux x86-64 beta uses the shared OSIA runtime. The installer keeps data in your profile and retains installed versions for manual rollback.",

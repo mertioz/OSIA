@@ -7533,7 +7533,8 @@ async def websocket_endpoint(ws: WebSocket):
     heartbeat_task: asyncio.Task | None = None
     remote_catalogue_refresh_pending = False
     socket_response_tasks: set[asyncio.Task] = set()
-    chatgpt_login_started_here = False
+    chatgpt_login_generation: int | None = None
+    account_state_lock = asyncio.Lock()
     catalogue_change_task: asyncio.Task | None = None
     account_change_task: asyncio.Task | None = None
     canonical_config_task: asyncio.Task | None = None
@@ -7582,28 +7583,30 @@ async def websocket_endpoint(ws: WebSocket):
                 "account": {},
             })
 
-    async def _respond_account() -> None:
-        try:
-            def read_account():
+    async def _respond_account(*, refresh_models: bool = True) -> None:
+        async with account_state_lock:
+            try:
                 from osia.mobile_model_catalogue import account_snapshot
 
-                return account_snapshot()
-
-            state = await asyncio.to_thread(read_account)
-        except Exception:
-            state = {
-                "providerId": "chatgpt_account",
-                "runtimeAvailable": False,
-                "connected": False,
-                "connecting": False,
-                "loginCancellable": False,
-                "available": False,
-                "error": "runtime_missing",
-                "models": [],
-            }
-        await out.send_json({
-            "type": "chatgpt_account_state", "account": state
-        })
+                state = await asyncio.to_thread(
+                    account_snapshot,
+                    refresh_models=refresh_models,
+                    login_generation=chatgpt_login_generation,
+                )
+            except Exception:
+                state = {
+                    "providerId": "chatgpt_account",
+                    "runtimeAvailable": False,
+                    "connected": False,
+                    "connecting": False,
+                    "loginCancellable": False,
+                    "available": False,
+                    "error": "runtime_missing",
+                    "models": [],
+                }
+            await out.send_json({
+                "type": "chatgpt_account_state", "account": state
+            })
 
     def _schedule_socket_response(coroutine) -> None:
         # Provider I/O must not block the receive loop for this connection.
@@ -7698,24 +7701,15 @@ async def websocket_endpoint(ws: WebSocket):
 
         request_remote_refresh(ready)
 
-    def _push_chatgpt_account_state(state: dict) -> None:
-        """Thread-safe, sanitized account update callback for login workers."""
-        nonlocal chatgpt_login_started_here
-        if not state.get("connecting"):
-            chatgpt_login_started_here = False
+    def _chatgpt_device_code_ready() -> None:
+        """Send the transient code only to the socket that requested it."""
+        def schedule() -> None:
+            if authenticated:
+                _schedule_socket_response(_respond_account(refresh_models=False))
+
         try:
-            asyncio.run_coroutine_threadsafe(
-                out.send_json({"type": "chatgpt_account_state", "account": state}),
-                loop,
-            )
-            if not state.get("connecting"):
-                asyncio.run_coroutine_threadsafe(
-                    _send_model_catalogue(
-                        refresh_local=False, refresh_account=False
-                    ),
-                    loop,
-                )
-        except Exception:
+            loop.call_soon_threadsafe(schedule)
+        except RuntimeError:
             pass
 
     def _api_key_changed(provider_id: str) -> None:
@@ -7765,16 +7759,9 @@ async def websocket_endpoint(ws: WebSocket):
             async def refresh() -> None:
                 nonlocal account_change_task, account_change_again
                 try:
-                    from osia.mobile_model_catalogue import account_snapshot
-
                     while True:
                         account_change_again = False
-                        state = await asyncio.to_thread(
-                            account_snapshot, refresh_models=False
-                        )
-                        await out.send_json({
-                            "type": "chatgpt_account_state", "account": state
-                        })
+                        await _respond_account(refresh_models=False)
                         await _send_model_catalogue(
                             refresh_local=False, refresh_account=False
                         )
@@ -9305,36 +9292,38 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
 
             if msg_type == "chatgpt_account_login":
-                chatgpt_login_started_here = True
-                try:
-                    from osia.mobile_model_catalogue import start_device_login
+                async with account_state_lock:
+                    try:
+                        from osia.mobile_model_catalogue import start_device_login
 
-                    state = await asyncio.to_thread(
-                        start_device_login, _push_chatgpt_account_state
-                    )
-                except Exception:
-                    state = {
-                        "providerId": "chatgpt_account",
-                        "runtimeAvailable": False,
-                        "connected": False,
-                        "connecting": False,
-                        "loginCancellable": False,
-                        "available": False,
-                        "error": "login_failed",
-                        "models": [],
-                    }
-                await out.send_json({
-                    "type": "chatgpt_account_state", "account": state
-                })
+                        state, chatgpt_login_generation = await asyncio.to_thread(
+                            start_device_login, _chatgpt_device_code_ready
+                        )
+                    except Exception:
+                        state = {
+                            "providerId": "chatgpt_account",
+                            "runtimeAvailable": False,
+                            "connected": False,
+                            "connecting": False,
+                            "loginCancellable": False,
+                            "available": False,
+                            "error": "login_failed",
+                            "models": [],
+                        }
+                    await out.send_json({
+                        "type": "chatgpt_account_state", "account": state
+                    })
                 continue
 
             if msg_type == "chatgpt_account_cancel_login":
                 from osia.mobile_model_catalogue import cancel_device_login
 
-                state = await asyncio.to_thread(cancel_device_login)
-                await out.send_json({
-                    "type": "chatgpt_account_state", "account": state
-                })
+                chatgpt_login_generation = None
+                async with account_state_lock:
+                    state = await asyncio.to_thread(cancel_device_login)
+                    await out.send_json({
+                        "type": "chatgpt_account_state", "account": state
+                    })
                 await _send_model_catalogue(
                     refresh_local=False, refresh_account=False
                 )
@@ -9343,10 +9332,12 @@ async def websocket_endpoint(ws: WebSocket):
             if msg_type == "chatgpt_account_logout":
                 from osia.mobile_model_catalogue import logout_account
 
-                state = await asyncio.to_thread(logout_account)
-                await out.send_json({
-                    "type": "chatgpt_account_state", "account": state
-                })
+                chatgpt_login_generation = None
+                async with account_state_lock:
+                    state = await asyncio.to_thread(logout_account)
+                    await out.send_json({
+                        "type": "chatgpt_account_state", "account": state
+                    })
                 await _send_model_catalogue(
                     refresh_local=False, refresh_account=False
                 )
@@ -11461,6 +11452,7 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        authenticated = False
         pending_settings_reads = list(socket_response_tasks)
         for task in pending_settings_reads:
             task.cancel()
@@ -11499,13 +11491,6 @@ async def websocket_endpoint(ws: WebSocket):
                     unsubscribe()
                 except Exception:
                     pass
-        if chatgpt_login_started_here:
-            try:
-                from osia.mobile_model_catalogue import cancel_device_login
-
-                await asyncio.to_thread(cancel_device_login)
-            except Exception:
-                pass
         if unsubscribe_scheduled_tasks is not None:
             try:
                 unsubscribe_scheduled_tasks()

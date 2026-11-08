@@ -79,6 +79,50 @@ def test_logout_cancels_pending_login_and_releases_waiter(runtime):
     assert client._active_login is None
 
 
+def test_idle_clients_reload_external_sign_in_and_sign_out(runtime):
+    client, factory = runtime
+    credentials = client.home_dir / "auth.json"
+
+    def handler(process, message):
+        method = message.get("method")
+        if method == "initialize":
+            process.signed_in = credentials.is_file()
+        if method == "account/read" and process.signed_in:
+            process.emit({
+                "id": message["id"],
+                "result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True},
+            })
+        else:
+            _base_handler(process, message)
+
+    factory.handler = handler
+    assert not client.get_account_status()["connected"]
+    credentials.write_text("{}", encoding="utf-8")
+    assert client.get_account_status()["connected"]
+    assert len(factory.processes) == 2
+    credentials.unlink()
+
+    with client._state_lock:
+        client._pending["other-request"] = _PendingRequest()
+    try:
+        client.refresh_account_storage()
+        assert len(factory.processes) == 2
+        assert client._process is factory.processes[-1]
+    finally:
+        client._pending.pop("other-request")
+
+    assert not client.get_account_status()["connected"]
+    assert len(factory.processes) == 3
+
+
+def test_device_and_desktop_sign_in_do_not_reuse_incompatible_challenges(runtime):
+    client, _ = runtime
+    client.begin_login()
+    with pytest.raises(AppServerError) as error:
+        client.begin_device_code_login()
+    assert error.value.category == "login_busy"
+
+
 @pytest.mark.parametrize("reason", ["process_crash", "protocol_invalid", "shutdown"])
 def test_runtime_failure_releases_login_with_typed_reason(runtime, reason):
     client, _ = runtime

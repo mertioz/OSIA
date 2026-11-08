@@ -807,6 +807,7 @@ class AppServerClient:
         self._intentional_processes: set[int] = set()
         self._generation = 0
         self._account_generation = 0
+        self._auth_storage_revision: tuple[int, int, int] | None = None
         self._stderr_categories: dict[str, int] = {}
         self._crash_times: list[float] = []
         self._rate_limits_refresh_lock = threading.Lock()
@@ -818,7 +819,7 @@ class AppServerClient:
         self._log_redaction_stop = threading.Event()
         self._log_redaction_thread: threading.Thread | None = None
 
-        self._login_lock = threading.Lock()
+        self._login_lock = threading.RLock()
         self._active_login: dict | None = None
         self._login_events: dict[str, tuple[threading.Event, dict]] = {}
 
@@ -1227,6 +1228,7 @@ class AppServerClient:
                 )
             executable, _version = self._resolve_runtime()
             self._ensure_layout()
+            self._auth_storage_revision = self._read_auth_storage_revision()
             env = self.isolated_environment()
             Path(env["APPDATA"]).mkdir(parents=True, exist_ok=True)
             Path(env["LOCALAPPDATA"]).mkdir(parents=True, exist_ok=True)
@@ -4278,7 +4280,45 @@ class AppServerClient:
             return str(info.get("type") or next(iter(info), "turn_failed"))
         return "turn_failed"
 
+    def _read_auth_storage_revision(self) -> tuple[int, int, int] | None:
+        try:
+            auth = (self.home_dir / "auth.json").stat()
+        except FileNotFoundError:
+            return None
+        return auth.st_ino, auth.st_mtime_ns, auth.st_size
+
+    def refresh_account_storage(self) -> None:
+        """Reload the shared Codex account at an idle App Server boundary."""
+        with self._start_lock:
+            if self._process is None or self._process.poll() is not None:
+                return
+            try:
+                revision = self._read_auth_storage_revision()
+            except OSError:
+                return
+            if revision == self._auth_storage_revision:
+                return
+            # Login start can hold the login lock while sending its RPC.
+            if not self._login_lock.acquire(blocking=False):
+                return
+            try:
+                if self._active_login is not None:
+                    return
+                with self._state_lock:
+                    if self._attempts or self._compaction_requests or self._pending:
+                        return
+                # The next request starts a child using the shared storage.
+                # account/read alone does not reload another process's auth.
+                self.shutdown()
+                with self._state_lock:
+                    self._account_generation += 1
+                    self._rate_limits_cache = None
+                    self._rate_limits_pending_update = {}
+            finally:
+                self._login_lock.release()
+
     def get_account_status(self) -> dict:
+        self.refresh_account_storage()
         result = self._request("account/read", {"refreshToken": False})
         account = result.get("account") if isinstance(result.get("account"), dict) else None
         safe_account = None
@@ -4316,6 +4356,8 @@ class AppServerClient:
         self.start()
         with self._login_lock:
             if self._active_login is not None:
+                if "authUrl" not in self._active_login:
+                    raise AppServerError("A ChatGPT sign-in is already active.", category="login_busy")
                 return dict(self._active_login)
             result = self._request(
                 "account/login/start",
@@ -4338,6 +4380,8 @@ class AppServerClient:
         self.start()
         with self._login_lock:
             if self._active_login is not None:
+                if "userCode" not in self._active_login:
+                    raise AppServerError("A ChatGPT sign-in is already active.", category="login_busy")
                 return dict(self._active_login)
             result = self._request(
                 "account/login/start", {"type": "chatgptDeviceCode"}
@@ -4439,6 +4483,7 @@ class AppServerClient:
         # Stop a pending OAuth flow before logging out, so it cannot complete
         # afterwards and reconnect the account the operator just disconnected.
         self.reset_login()
+        self.refresh_account_storage()
         self._request("account/logout", {})
         with self._state_lock:
             self._rate_limits_cache = None
