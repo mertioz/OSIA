@@ -90,7 +90,11 @@ def test_pyinstaller_environment_excludes_codex_host_native_dependencies(
         tmp_path / ".cache" / "codex-runtimes" / "primary"
         / "dependencies" / "native" / "poppler" / "Library" / "bin"
     )
-    path_entries = [project_python, host_native, system]
+    packaged_host_native = (
+        tmp_path / "WindowsApps" / "OpenAI.CodexPrimaryRuntime.v26-example"
+        / "dependencies" / "native" / "libheif" / "bin"
+    )
+    path_entries = [project_python, host_native, packaged_host_native, system]
     monkeypatch.setenv("PATH", os.pathsep.join(map(str, path_entries)))
 
     environment = build._pyinstaller_environment()

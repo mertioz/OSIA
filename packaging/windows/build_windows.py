@@ -104,16 +104,15 @@ def _pyinstaller_environment() -> dict[str, str]:
     """Keep Codex-host native runtimes out of the packaged dependency search."""
 
     environment = os.environ.copy()
-    path_entries = environment.get("PATH", "").split(os.pathsep)
-    environment["PATH"] = os.pathsep.join(
-        entry
-        for entry in path_entries
-        if not (
-            "codex-runtimes" in entry.replace("/", "\\").casefold()
-            and "\\dependencies\\native\\"
-            in entry.replace("/", "\\").casefold()
-        )
-    )
+    path_entries = []
+    for entry in environment.get("PATH", "").split(os.pathsep):
+        normalized = entry.replace("/", "\\").casefold()
+        if "\\dependencies\\native\\" in normalized and (
+            "codex-runtimes" in normalized or "openai.codexprimaryruntime." in normalized
+        ):
+            continue
+        path_entries.append(entry)
+    environment["PATH"] = os.pathsep.join(path_entries)
     return environment
 
 
@@ -123,7 +122,7 @@ def _run_package_smoke(executable: Path) -> None:
     report = Path(tempfile.gettempdir()) / (
         f"osia-package-smoke-result-{os.urandom(8).hex()}.txt"
     )
-    environment = os.environ.copy()
+    environment = _pyinstaller_environment()
     environment["OSIA_PACKAGE_SMOKE_REPORT"] = str(report)
     try:
         with tempfile.TemporaryDirectory(prefix="osia-frozen-profile-") as temporary:
