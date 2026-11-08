@@ -36,7 +36,7 @@ cp -a -- "$work/bundle/runtimes" "$payload/"
 install -m 0755 -- "$here/install.sh" "$package/install.sh"
 install -m 0755 -- "$here/launch.sh" "$payload/bin/osia"
 install -m 0644 -- "$here/doctor.py" "$payload/doctor.py"
-install -m 0644 -- "$here/osia-server.service" "$here/write_desktop_entry.py" "$payload/integration/"
+install -m 0644 -- "$here/osia-server.service" "$here/write_desktop_entry.py" "$here/link_browsers.py" "$payload/integration/"
 install -m 0644 -- "$here/README.md" "$package/README.md"
 
 "$python" -I -B "$here/lock_dependencies.py" \
@@ -65,7 +65,7 @@ PY
 name=OSIA-Linux-x86_64.tar.xz
 test ! -e "$output/$name"
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
-  -C "$stage" -cf - OSIA-Linux-x86_64 | xz -T2 -3 -c > "$output/$name.partial"
+  -C "$stage" -cf - OSIA-Linux-x86_64 | xz -T2 -1 -c > "$output/$name.partial"
 xz -t "$output/$name.partial"
 mv -T -- "$output/$name.partial" "$output/$name"
 (

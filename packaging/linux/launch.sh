@@ -7,7 +7,7 @@ export PYTHONPATH="$root/app"
 export PYTHONNOUSERSITE=1
 export PYTHONSAFEPATH=1
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$root/browsers}"
-export PATH="$root/runtimes/codex/bin:$PATH"
+export PATH="$root/browsers/bin:$root/runtimes/codex/bin:$PATH"
 
 case "${1:-}" in
   --version)

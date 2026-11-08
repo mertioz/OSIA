@@ -90,6 +90,8 @@ else
   "$runtime_python" -I -B -m pip check
   PLAYWRIGHT_BROWSERS_PATH="$stage/browsers" \
     "$runtime_python" -I -B -m playwright install chromium firefox
+  PLAYWRIGHT_BROWSERS_PATH="$stage/browsers" \
+    "$runtime_python" -I -B "$stage/integration/link_browsers.py"
   [ "$("$stage/bin/osia" --version)" = "$version" ]
   mv -T -- "$stage" "$release"
   trap - EXIT
