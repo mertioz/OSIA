@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 from osia.config import CONFIG_DIR, get_setting, set_setting
+from osia.notifications import scheduled_notification_outcome
 
 # How often the scheduler wakes to re-evaluate the job list. 20s keeps
 # "at HH:MM" jobs accurate to within one tick while staying cheap.
@@ -139,6 +140,7 @@ def _job_signature(job: dict) -> tuple:
         int(job.get("task_revision", 0) or 0),
         str(job.get("definition_hash", "")),
         int(job.get("authorization_revision", 0) or 0),
+        str(job.get("id", "")),
     )
 
 
@@ -477,6 +479,8 @@ class CronManager:
 
     @staticmethod
     def _is_due(spec: dict, st: dict, now: datetime) -> bool:
+        if spec["kind"] == "once" and st.get("once_fired"):
+            return False
         next_run = st.get("next_run")
         if next_run is not None:
             return now >= next_run
@@ -512,8 +516,6 @@ class CronManager:
         if spec["kind"] == "once":
             # Fire once when the target time is reached (or already past, e.g.
             # OSIA started after it), then never again this session.
-            if st.get("once_fired"):
-                return False
             return now >= spec["dt"]
         return False
 
@@ -573,6 +575,8 @@ class CronManager:
         if self._busy.is_set():
             print(f"[CRON] busy — deferring '{task[:60]}' to the next tick")
             return False
+        spec = parse_schedule(schedule)
+        one_shot = bool(spec and spec["kind"] == "once")
         scheduled_for = st.get("next_run") or now
         execution_context = _scheduled_execution_context(
             task_id=task_id,
@@ -600,33 +604,7 @@ class CronManager:
                     "to the next tick"
                 )
                 return False
-        self._busy.set()
-
-        # Commit the timing state only now that we are actually launching. The
-        # scheduler loop is single-threaded, so this completes before any later
-        # tick and cannot double-fire.
-        try:
-            from osia.scheduled_tasks import (
-                mark_scheduled_task_running,
-                update_scheduled_occurrence_status,
-            )
-
-            if not mark_scheduled_task_running(execution_context):
-                if conversation_lease_claimed:
-                    from osia.conversations import release_background_execution
-
-                    release_background_execution(
-                        conversation_id,
-                        execution_context["occurrence_id"],
-                    )
-                self._busy.clear()
-                self._update_job_status(
-                    job_index, signature, task_id,
-                    last_status="blocked_authorization",
-                    last_error="authorization_stale",
-                )
-                return False
-        except Exception:
+        def _release_lease() -> None:
             if conversation_lease_claimed:
                 try:
                     from osia.conversations import release_background_execution
@@ -637,109 +615,64 @@ class CronManager:
                     )
                 except Exception:
                     pass
-            self._busy.clear()
-            return False
-        st["last_run"] = now
-        st["last_date"] = now.date()
-        st["anchor_date"] = now.date()
-        st.pop("pending_due_date", None)
-        next_run_at = self._next_run_after(schedule, now)
-        st["next_run"] = _parse_job_datetime(next_run_at)
-        update_scheduled_occurrence_status(
-            execution_context,
-            last_run_at=now.astimezone().isoformat(timespec="seconds"),
-            last_status="running",
-            next_run_at=next_run_at,
-            next_run_schedule=schedule,
-            last_occurrence_id=execution_context["occurrence_id"],
-        )
-
-        print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
 
         def _worker():
-            status = "completed"
-            job_status = "completed"
-            last_error = ""
             try:
-                result = self._run_task(
-                    task,
-                    conversation_id,
-                    **_run_task_kwargs(
-                        self._run_task,
-                        model=model,
-                        scheduled_execution=execution_context,
-                    ),
-                )
-                if isinstance(result, dict):
+                try:
+                    result = self._run_task(
+                        task,
+                        conversation_id,
+                        **_run_task_kwargs(
+                            self._run_task,
+                            model=model,
+                            scheduled_execution=execution_context,
+                        ),
+                    )
+                    result = result if isinstance(result, dict) else {}
                     raw_status = str(result.get("status") or "").strip().lower()
-                    if raw_status == "success_verified":
-                        status = "completed"
-                        job_status = "success_verified"
-                    elif raw_status == "completed":
-                        status = "completed"
-                        job_status = "completed"
-                    elif raw_status == "user_cancelled":
-                        job_status = "user_cancelled"
-                    elif raw_status == "hard_safety_block":
-                        job_status = "hard_safety_block"
-                    elif raw_status == "blocked_verified":
-                        job_status = "blocked_verified"
-                    elif raw_status in {"failed", "error"}:
-                        status = "failed"
-                        job_status = "error"
-                    elif result.get("conversation_stale"):
-                        job_status = "completed_unlinked"
-                    message = str(result.get("message") or "").strip()
-                    if message:
-                        last_error = message[:240]
-            except Exception as e:
-                status = "failed"
-                job_status = "error"
-                last_error = str(e)[:240]
-                print(f"[CRON] task failed: {e}")
-            finally:
-                if conversation_lease_claimed:
-                    try:
-                        from osia.conversations import (
-                            release_background_execution,
-                        )
-
-                        release_background_execution(
-                            conversation_id,
-                            execution_context["occurrence_id"],
-                        )
-                    except Exception:
-                        pass
+                    status = scheduled_notification_outcome(raw_status)
+                    job_status = "error" if status == "failed" else status
+                    if raw_status == "completed":
+                        job_status = "completed_unlinked" if result.get("conversation_stale") else "completed"
+                    last_error = str(result.get("message") or "").strip()[:240]
+                except Exception as e:
+                    status = "failed"
+                    job_status = "error"
+                    last_error = str(e)[:240]
+                    print(f"[CRON] task failed: {e}")
+                finally:
+                    _release_lease()
                 try:
                     from osia.scheduled_tasks import (
-                        mark_scheduled_task_finished,
                         record_scheduled_occurrence,
                         scheduled_execution_block_state,
                     )
 
                     blocked = scheduled_execution_block_state(execution_context)
                     occurrence_outcome = (
-                        "blocked_execution" if blocked
-                        else "success_verified" if job_status == "success_verified"
-                        else "completed_unverified" if job_status in {
-                            "completed", "completed_unlinked"
-                        }
-                        else "cancelled_proven" if job_status == "user_cancelled"
-                        else "failed_before_dispatch"
+                        "blocked_execution" if blocked or status in {"hard_safety_block", "blocked_verified"}
+                        else "cancelled_proven" if status == "user_cancelled"
+                        else status if status in {"success_verified", "completed_unverified"}
+                        else "outcome_unknown"
                     )
                     record_scheduled_occurrence(
                         execution_context,
                         outcome=occurrence_outcome,
                     )
-                    mark_scheduled_task_finished(execution_context)
-                except Exception:
-                    pass
-                update_scheduled_occurrence_status(
-                    execution_context, last_status=job_status, last_error=last_error,
-                )
+                except Exception as e:
+                    print(f"[CRON] could not record task outcome: {type(e).__name__}")
                 try:
-                    spec = parse_schedule(schedule)
-                    if spec and spec.get("kind") == "once" and task_id:
+                    mark_scheduled_task_finished(execution_context)
+                except Exception as e:
+                    print(f"[CRON] could not settle task state: {type(e).__name__}")
+                try:
+                    update_scheduled_occurrence_status(
+                        execution_context, last_status=job_status, last_error=last_error,
+                    )
+                except Exception as e:
+                    print(f"[CRON] could not save final task status: {type(e).__name__}")
+                try:
+                    if one_shot and task_id:
                         from osia.scheduled_tasks import disable_scheduled_task
 
                         disable_scheduled_task(str(task_id), execution=execution_context)
@@ -751,26 +684,62 @@ class CronManager:
                     status=status,
                     conversation_id=conversation_id,
                 )
+            finally:
                 self._busy.clear()
 
+        self._busy.set()
+        admitted = False
+        launched = False
         try:
+            from osia.scheduled_tasks import (
+                mark_scheduled_task_finished,
+                mark_scheduled_task_running,
+                update_scheduled_occurrence_status,
+            )
+
+            admitted = mark_scheduled_task_running(execution_context)
+            if not admitted:
+                self._update_job_status(
+                    job_index, signature, task_id,
+                    last_status="blocked_authorization",
+                    last_error="authorization_stale",
+                )
+                return False
+            next_run_at = self._next_run_after(schedule, now)
+            # Keep the original due time for a one-shot until it is disabled.
+            # A failed final write must not re-arm the same occurrence in memory.
+            timing = {} if one_shot else {"next_run_at": next_run_at, "next_run_schedule": schedule}
+            if not update_scheduled_occurrence_status(
+                execution_context,
+                last_run_at=now.astimezone().isoformat(timespec="seconds"),
+                last_status="running",
+                last_occurrence_id=execution_context["occurrence_id"],
+                **timing,
+            ):
+                return False
+            print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
             threading.Thread(
                 target=_worker, name="osia-cron-task", daemon=True,
             ).start()
-        except Exception:
-            if conversation_lease_claimed:
+            launched = True
+            st.update(last_run=now, last_date=now.date(), anchor_date=now.date())
+            st.pop("pending_due_date", None)
+            if not one_shot:
+                st["next_run"] = _parse_job_datetime(next_run_at)
+            return True
+        except Exception as e:
+            print(f"[CRON] could not launch scheduled task: {type(e).__name__}")
+            return False
+        finally:
+            if not launched:
                 try:
-                    from osia.conversations import release_background_execution
-
-                    release_background_execution(
-                        conversation_id,
-                        execution_context["occurrence_id"],
-                    )
-                except Exception:
-                    pass
-            self._busy.clear()
-            raise
-        return True
+                    _release_lease()
+                    if admitted:
+                        mark_scheduled_task_finished(execution_context)
+                except Exception as e:
+                    print(f"[CRON] could not settle task admission: {type(e).__name__}")
+                finally:
+                    self._busy.clear()
 
     @staticmethod
     def _next_run_after(schedule: str, now: datetime) -> str | None:

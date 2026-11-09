@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -275,7 +276,16 @@ def test_legacy_ambiguity_barrier_preserves_user_enablement(scheduled_runtime, d
     assert restored["execution_records"] == [{"outcome": "outcome_unknown"}]
 
 
-def test_universal_destruction_barrier_still_blocks(scheduled_runtime, tmp_path):
+def test_universal_destruction_barrier_still_blocks(scheduled_runtime, tmp_path, monkeypatch):
+    from osia import system_resources
+
+    registry = system_resources.SystemResourceRegistry(
+        platform_family="windows",
+        windows=system_resources.WindowsRuntimeAdapter(
+            storage_rows=[{"DiskNumber": 0, "PartitionNumber": 1, "IsSystem": True}],
+        ),
+    )
+    monkeypatch.setattr(system_resources, "get_default_system_resource_registry", lambda: registry)
     _values = scheduled_runtime
     target = tmp_path / "synthetic-delete-target"
     target.mkdir()
@@ -346,6 +356,136 @@ def test_mobile_payload_and_notification_are_sanitized(scheduled_runtime):
     assert sentinel not in json.dumps(frame)
     assert frame["title"] == "Scheduled task"
     assert frame["safe_category"] == "safe_local_setting"
+
+
+@pytest.fixture
+def cron_workers(monkeypatch):
+    workers = []
+    real_thread = threading.Thread
+
+    def spawn(*args, **kwargs):
+        worker = real_thread(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    def join():
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=5)
+                assert not worker.is_alive()
+
+    monkeypatch.setattr(cron.threading, "Thread", spawn)
+    yield join
+    join()
+
+
+@pytest.mark.parametrize("stage", ["admission", "finalization"])
+def test_job_write_failure_does_not_strand_the_scheduler(
+    scheduled_runtime, cron_workers, monkeypatch, stage,
+):
+    first = _create_sensitive(25)
+    second = _create_sensitive(35)
+    now = datetime(2026, 7, 27, 12, 5)
+    executed = []
+
+    def run_task(task, *_args):
+        executed.append(task)
+        return {"status": "success_verified"}
+
+    manager = cron.CronManager(run_task)
+    if stage == "admission":
+        save = scheduled_tasks.config.set_setting
+
+        def fail_running_write(key, jobs):
+            if any(job["id"] == first["id"] and job.get("last_status") == "running" for job in jobs):
+                raise OSError("synthetic storage failure")
+            save(key, jobs)
+
+        target, name, failing = scheduled_tasks.config, "set_setting", fail_running_write
+    else:
+        update = scheduled_tasks.update_scheduled_occurrence_status
+
+        def fail_final_write(execution, **fields):
+            if fields.get("last_status") == "success_verified":
+                raise RuntimeError("synthetic persistence failure")
+            return update(execution, **fields)
+
+        target, name, failing = scheduled_tasks, "update_scheduled_occurrence_status", fail_final_write
+
+    due = {"next_run": now}
+    with monkeypatch.context() as failure:
+        failure.setattr(target, name, failing)
+        launched = manager._fire(first["task"], first["schedule"], due, now, task_id=first["id"])
+        assert launched is (stage == "finalization")
+        cron_workers()
+    if stage == "admission":
+        assert due["next_run"] == now and not executed
+        assert _current(first["id"])["execution_state"] != scheduled_tasks.RUNNING
+
+    assert manager._fire(second["task"], second["schedule"], {}, now, task_id=second["id"])
+    cron_workers()
+    assert executed[-1] == second["task"]
+
+
+def test_one_shot_is_not_relaunched_when_disabling_fails(
+    scheduled_runtime, cron_workers, monkeypatch,
+):
+    now = datetime(2026, 7, 27, 12, 0)
+    due = now + timedelta(minutes=5)
+    result = scheduled_tasks.create_scheduled_task(
+        title="One-shot result",
+        instruction="Return status",
+        schedule={"type": "once", "run_at": due.isoformat()},
+        enabled=True,
+        now=now,
+    )
+    assert result["ok"]
+    runs = []
+
+    def fail_disable(*_args, **_kwargs):
+        raise OSError("synthetic storage failure")
+
+    def run_task(task, *_args):
+        runs.append(task)
+        return {"status": "success_verified"}
+
+    monkeypatch.setattr(scheduled_tasks, "disable_scheduled_task", fail_disable)
+    manager = cron.CronManager(run_task)
+    manager._check_jobs(due)
+    cron_workers()
+    manager._check_jobs(due + timedelta(minutes=1))
+    cron_workers()
+    assert runs == ["Return status"]
+
+
+@pytest.mark.parametrize(("terminal", "outcome", "wire_status"), [
+    ("success_verified", "success_verified", "completed"),
+    ("blocked_verified", "blocked_verified", "failed"),
+    ("hard_safety_block", "hard_safety_block", "failed"),
+    ("user_cancelled", "user_cancelled", "failed"),
+    ("completed", "completed_unverified", "failed"),
+    (None, "outcome_unknown", "failed"),
+])
+def test_cron_notification_mirrors_the_terminal_result(
+    scheduled_runtime, cron_workers, terminal, outcome, wire_status,
+):
+    from osia.server.server import _cron_notification_frame
+
+    job = _create_sensitive()
+    notices = []
+    manager = cron.CronManager(
+        lambda *_args: {"status": terminal},
+        notify_task=lambda **payload: notices.append(_cron_notification_frame(payload)),
+    )
+    assert manager._fire(
+        job["task"], job["schedule"], {}, datetime(2026, 7, 27, 12, 5),
+        task_id=job["id"],
+    )
+    cron_workers()
+    assert len(notices) == 1
+    assert notices[0]["task_id"] == job["id"]
+    assert notices[0]["outcome"] == outcome
+    assert notices[0]["status"] == wire_status
 
 
 def test_windows_volume_success_is_verified(monkeypatch):

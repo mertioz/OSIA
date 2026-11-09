@@ -1739,20 +1739,22 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
     _notify_changed()
 
 
-def update_scheduled_occurrence_status(execution: dict[str, Any], **fields: Any) -> None:
+def update_scheduled_occurrence_status(execution: dict[str, Any], **fields: Any) -> bool:
     """Save timing and presentation metadata only for the current revision."""
     try:
         with _JOBS_LOCK:
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, str(execution.get("task_id") or ""))
             if idx < 0 or not _matches_scheduled_revision(execution, jobs[idx]):
-                return
+                return False
             job = jobs[idx]
             job.update(fields)
             job["updated_at"] = _iso()
             _save_jobs(jobs)
+            return True
     except OSError as exc:
         print(f"[CRON] could not update job status: {type(exc).__name__}")
+        return False
 
 
 def record_scheduled_tool_execution(

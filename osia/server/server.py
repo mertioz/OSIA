@@ -1029,8 +1029,13 @@ async def _broadcast_conversations(exclude: "_OutboundChannel | None" = None) ->
 
 # ── MCP / Connectors server-side plumbing (WOR-44 Phase 4) ──────────────────
 def _cron_notification_frame(payload: dict) -> dict:
+    from osia.notifications import scheduled_notification_outcome
+
     raw_status = str(payload.get("status") or "").strip().lower()
-    status = "failed" if raw_status in {"failed", "error"} else "completed"
+    outcome = scheduled_notification_outcome(raw_status)
+    # Keep the binary field for installed older Mobile clients. The current
+    # client renders the factual outcome when the PC provides one.
+    status = "completed" if raw_status in {"completed", "success_verified"} else "failed"
     created_at = str(payload.get("created_at") or "").strip()
     if not created_at:
         created_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -1057,6 +1062,7 @@ def _cron_notification_frame(payload: dict) -> dict:
         "task_id": task_id,
         "title": "Scheduled task",
         "status": status,
+        **({"outcome": outcome} if raw_status != "completed" else {}),
         "safe_category": safe_category,
         "conversation_id": conversation_id,
         "created_at": created_at,
@@ -7130,13 +7136,9 @@ def _server_notify_cron_task(
     status: str,
     conversation_id: str | None,
 ) -> None:
-    from osia.notifications import notify
+    from osia.notifications import notify, scheduled_notification_text
 
-    if status == "failed":
-        body = "Tâche planifiée échouée"
-    else:
-        body = "Tâche planifiée terminée"
-    notify("OSIA", body)
+    notify("OSIA", scheduled_notification_text(status))
     frame = _cron_notification_frame({
         "task_id": task_id,
         "title": "Scheduled task",

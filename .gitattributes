@@ -10,6 +10,9 @@
 # Canonical Guide artifacts are hashed across the PC and Mobile repositories.
 assets/guide/catalog.v4.json text eol=lf
 
+# The site checks the generated legal artifacts byte for byte.
+osia/legal_documents/legal-manifest.json text eol=lf
+
 # Exact upstream bytes are verified before bundling, including on Windows.
 packaging/windows/licenses/codex/LICENSE text eol=lf
 packaging/windows/licenses/codex/NOTICE text eol=lf

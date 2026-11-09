@@ -116,3 +116,28 @@ def notify(title: object, body: object) -> bool:
     if sys.platform == "win32":
         return _notify_windows(safe_title, safe_body)
     return False
+def scheduled_notification_outcome(status: object) -> str:
+    """Project the canonical Chat terminal status without assuming success."""
+    value = str(status or "").strip().lower()
+    if value in {"completed", "completed_unlinked"}:
+        return "completed_unverified"
+    if value == "error":
+        return "failed"
+    if value in {
+        "success_verified", "completed_unverified", "user_cancelled",
+        "hard_safety_block", "blocked_verified", "failed",
+    }:
+        return value
+    return "outcome_unknown"
+
+
+def scheduled_notification_text(status: object) -> str:
+    return {
+        "success_verified": "Tâche planifiée terminée",
+        "completed_unverified": "Résultat de la tâche planifiée non confirmé",
+        "user_cancelled": "Tâche planifiée annulée",
+        "hard_safety_block": "Tâche planifiée bloquée",
+        "blocked_verified": "Tâche planifiée bloquée",
+        "failed": "Tâche planifiée échouée",
+        "outcome_unknown": "Résultat de la tâche planifiée non confirmé",
+    }[scheduled_notification_outcome(status)]

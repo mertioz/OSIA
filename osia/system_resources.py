@@ -23,6 +23,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from osia.runtime import critical_install_paths
+
 
 SYSTEM_RESOURCE_SCHEMA_VERSION = 1
 
@@ -168,7 +170,7 @@ class SystemResourceEvidence:
             return True
         return (
             self.classification is SystemResourceClassification.PROTECTED_SYSTEM_RESOURCE
-            and self.evidence_category == "catastrophic_os_root"
+            and self.evidence_category in {"catastrophic_os_root", "active_osia_runtime"}
         )
 
     def public_metadata(self) -> dict[str, Any]:
@@ -269,6 +271,7 @@ class WindowsRuntimeAdapter:
         self._system_windows_directory = system_windows_directory
         self._wrp_probe = wrp_probe
         self._storage_rows = tuple(storage_rows) if storage_rows is not None else None
+        self._storage_rows_injected = storage_rows is not None
 
     @staticmethod
     def _directory_api(name: str) -> str:
@@ -333,8 +336,8 @@ class WindowsRuntimeAdapter:
         except (AttributeError, OSError):
             return ""
 
-    def storage_rows(self) -> tuple[Mapping[str, Any], ...]:
-        if self._storage_rows is not None:
+    def storage_rows(self, *, refresh: bool = False) -> tuple[Mapping[str, Any], ...]:
+        if self._storage_rows is not None and (not refresh or self._storage_rows_injected):
             return self._storage_rows
         if sys.platform != "win32":
             self._storage_rows = ()
@@ -751,6 +754,9 @@ class SystemResourceRegistry:
         self.macos = macos or MacOSRuntimeAdapter()
         self.linux = linux or LinuxRuntimeAdapter()
         self._path_resolver = path_resolver
+        self._runtime_paths = (
+            critical_install_paths() if self.platform_family == _platform_family() else ()
+        )
         self._installation_ref = self._resolve_installation_ref()
 
     @property
@@ -828,11 +834,36 @@ class SystemResourceRegistry:
                 resolved = _resolved_for_classification(raw, follow_leaf=follow_leaf)
         except (OSError, ValueError):
             return self._indeterminate("target_resolution_failed", "target_identity", raw)
+        if operation in _HOST_TREE_DESTRUCTION_OPERATIONS:
+            for critical in self._runtime_paths:
+                same_path = os.path.normcase(os.path.normpath(resolved)) == os.path.normcase(str(critical))
+                contains_critical = (
+                    operation is DestructiveOperation.RECURSIVE_DELETE
+                    and _path_within(str(critical), resolved, casefold=self.platform_family == "windows")
+                )
+                if same_path or contains_critical:
+                    return self._protected(resolved, "active_osia_runtime_destruction", "active_osia_runtime")
         if self.platform_family == "windows":
             return self._classify_windows(resolved, operation)
         if self.platform_family == "macos":
             return self._classify_macos(resolved, operation)
         return self._classify_linux(resolved, operation)
+
+    def classify_windows_partition(self, disk_number: int, partition_number: int) -> SystemResourceEvidence:
+        """Use current partition identity; disk numbers can change after hotplug."""
+        target = f"disk:{disk_number}:partition:{partition_number}"
+        rows = self.windows.storage_rows(refresh=True)
+        disk = [row for row in rows if str(row.get("DiskNumber")) == str(disk_number)]
+        matches = [row for row in disk if str(row.get("PartitionNumber")) == str(partition_number)]
+        if len(matches) != 1:
+            return self._indeterminate("unknown_windows_partition", "storage_role", target)
+        row = matches[0]
+        active = row.get("IsBoot") is True or row.get("IsSystem") is True
+        guid = str(row.get("GptType") or "").strip("{} ").lower()
+        active_disk = any(item.get("IsBoot") is True or item.get("IsSystem") is True for item in disk)
+        if active or (active_disk and guid in {_ESP_GUID, _MSR_GUID, _WINRE_GUID}):
+            return self._protected(target, "protected_windows_partition", "boot_recovery_partition", volume=True)
+        return self._not_system(target)
 
     def indeterminate_destructive_target(
         self,
@@ -1048,13 +1079,33 @@ def get_default_system_resource_registry() -> SystemResourceRegistry:
         return _DEFAULT_REGISTRY
 
 
+def _powershell_what_if(args: Sequence[str]) -> bool:
+    return any(
+        re.fullmatch(r"-(?:w|wh|wha|what|whati|whatif)(?::.*)?", item, re.IGNORECASE)
+        and not re.fullmatch(r"-whatif:\s*\$?false", item, re.IGNORECASE)
+        for item in args
+    )
+
+
+def _partition_argument(args: Sequence[str], option: str) -> int | None:
+    values = [
+        item.split(":", 1)[1] if ":" in item else (args[i + 1] if i + 1 < len(args) else "")
+        for i, item in enumerate(args)
+        if item.casefold().split(":", 1)[0] == option
+    ]
+    if len(values) != 1:
+        return None
+    value = values[0].strip("'\"")
+    return int(value) if re.fullmatch(r"[0-9]{1,10}", value) else None
+
+
 def classify_non_deletion_system_mutation(
     tool_name: str,
     arguments: Mapping[str, Any],
     *,
     registry: SystemResourceRegistry | None = None,
 ) -> SystemResourceEvidence | None:
-    """Recognize only a direct, standalone host-volume formatter/wiper."""
+    """Recognize direct, standalone operations on a proven critical volume."""
 
     if str(tool_name or "") not in {"bash", "run_command"}:
         return None
@@ -1085,21 +1136,17 @@ def classify_non_deletion_system_mutation(
                 (item for item in args if re.fullmatch(r"[A-Za-z]:\\?", item)),
                 None,
             )
+        elif executable == "remove-partition" and not _powershell_what_if(args):
+            disk = _partition_argument(args, "-disknumber")
+            partition = _partition_argument(args, "-partitionnumber")
+            if disk is not None and partition is not None and partition > 0:
+                return active.classify_windows_partition(disk, partition)
         elif executable == "format-volume":
             drive_letter_args = [
                 index for index, item in enumerate(args[:-1])
                 if item.casefold() == "-driveletter"
             ]
-            what_if = any(
-                re.fullmatch(
-                    r"-(?:w|wh|wha|what|whati|whatif)(?::.*)?",
-                    item,
-                    re.IGNORECASE,
-                )
-                and not re.fullmatch(r"-whatif:\s*\$?false", item, re.IGNORECASE)
-                for item in args
-            )
-            if what_if or len(drive_letter_args) != 1:
+            if _powershell_what_if(args) or len(drive_letter_args) != 1:
                 return None
             index = drive_letter_args[0]
             if re.fullmatch(r"[A-Za-z]", args[index + 1]):

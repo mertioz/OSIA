@@ -18,6 +18,7 @@ osia/wake_training/synthetic/
 build_osia.py
 config/mobile_token.txt
 config/settings.json
+config/settings.json.lock
 config/.settings.json.*.tmp
 config/.mobile_token.txt.*.tmp
 config/cron.lock

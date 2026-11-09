@@ -1208,30 +1208,19 @@ def prepare_deletion_call(
     else:
         return DeletionPreflight(DeletionPreflightKind.NOT_DELETION)
     active_registry = registry or get_default_system_resource_registry()
-    try:
-        plan = build_deletion_plan(
-            targets,
-            recursive=recursive,
-            registry=active_registry,
-            policy=policy,
-        )
-    except DeletionPlanError as exc:
-        # Keep the catastrophic decision tied to exact target evidence even
-        # when inventory fails; indeterminate evidence remains non-blocking.
-        operation = (
-            DestructiveOperation.RECURSIVE_DELETE
-            if recursive
-            else DestructiveOperation.DELETE
-        )
-        for target in targets:
-            evidence = active_registry.classify_path(
-                target,
-                operation=operation,
-                follow_leaf=False,
-            )
-            if evidence.blocks_destruction:
-                raise DeletionPlanError("system_destruction") from exc
-        raise
+    operation = DestructiveOperation.RECURSIVE_DELETE if recursive else DestructiveOperation.DELETE
+    for target in targets:
+        # A proven critical root needs no inventory traversal. The inventory
+        # still checks the resolved paths and mounts for every permitted root.
+        evidence = active_registry.classify_path(target, operation=operation, follow_leaf=False)
+        if evidence.blocks_destruction:
+            raise DeletionPlanError("system_destruction")
+    plan = build_deletion_plan(
+        targets,
+        recursive=recursive,
+        registry=active_registry,
+        policy=policy,
+    )
     return DeletionPreflight(DeletionPreflightKind.PLANNED, plan)
 
 

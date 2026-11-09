@@ -320,13 +320,13 @@ class DynamicIsland(QWidget):
         so a docked/circle capsule comes back the same way on next launch.
         """
         try:
-            from osia.config import load_settings, save_settings
-            settings = load_settings()
-            settings["island_x"] = self.x()
-            settings["island_y"] = self.y()
-            settings["island_shape"] = self._shape
-            settings["island_dock_side"] = self._dock_side
-            save_settings(settings)
+            from osia.config import edit_settings
+
+            with edit_settings() as settings:
+                settings["island_x"] = self.x()
+                settings["island_y"] = self.y()
+                settings["island_shape"] = self._shape
+                settings["island_dock_side"] = self._dock_side
         except Exception as e:
             print(f"[DynamicIsland] failed to save position: {e}")
 

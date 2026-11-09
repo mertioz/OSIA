@@ -8,6 +8,7 @@ user data continues to be resolved by :mod:`osia.config`.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -93,6 +94,27 @@ def application_dir() -> Path:
     if is_frozen():
         return application_executable().parent
     return resource_root()
+
+
+def critical_install_paths() -> tuple[Path, ...]:
+    """Identify only the running packaged OSIA runtime, never a source checkout."""
+    try:
+        executable = application_executable()
+        resources = resource_root().resolve()
+        if sys.platform == "win32" and is_frozen():
+            root = executable.parent
+            if executable.name.casefold() == "osia.exe" and resources == root / "_internal":
+                return root, executable, resources
+        elif sys.platform.startswith("linux") and not is_frozen():
+            root = resources.parent
+            if resources.name != "app" or not executable.is_relative_to(root / "python"):
+                return ()
+            metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+            if isinstance(metadata, dict) and metadata.get("installerId") == "space.osia.desktop.linux.v1":
+                return root, executable, resources / "osia", root / "bin" / "osia"
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return ()
 
 
 def resource_path(*parts: str) -> Path:

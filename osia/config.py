@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 from collections.abc import Callable
+from contextlib import contextmanager
 
 # <repo>/osia/config.py → <repo>. Dynamic so the package works from any
 # install location / drive (no hardcoded /home/OSIA/code/... path).
@@ -532,13 +533,13 @@ def set_oauth_client(key: str, client: dict) -> None:
 # settings.json on EVERY call (config.py callers: get_setting, iter_keys, the
 # per-skill is_skill_enabled loop, …). On Windows each open triggers an
 # antivirus scan, so the repeated reads cost real time. This cache parses the
-# file at most once per (mtime_ns, size): the fast path only os.stat()s it
-# (cheap, no content scan) and reuses the last parse. It is a TRANSPARENT
+# file at most once per (file identity, mtime_ns, size): the fast path only
+# calls os.stat() (cheap, no content scan) and reuses the last parse. It is a TRANSPARENT
 # read-path optimization — load_settings() still returns the same value and
 # still reflects on-disk changes (the stat catches external/cross-process
 # edits; save_settings invalidates it for in-process writes).
 _settings_cache_lock = threading.Lock()
-# (st_mtime_ns, st_size) of the file the cache was built from, or None when
+# Identity and revision of the file the cache was built from, or None when
 # nothing valid is cached yet (first read, missing file, corrupt parse, write).
 _settings_cache_signature: "tuple | None" = None
 # Last good RAW parse of the file (defaults NOT merged in). Never handed out
@@ -550,7 +551,7 @@ def _read_settings_file() -> dict:
     """Return the raw dict stored in settings.json (no defaults merged), or
     ``{}`` when the file is missing / empty / corrupt.
 
-    Served from an mtime+size cache: when the file is unchanged since the last
+    Served from a file revision cache: when the file is unchanged since the last
     read it is NOT reopened — only ``os.stat`` runs — and an independent
     deep copy of the cached parse is returned. The copy guarantees callers can
     freely mutate ``load_settings()``'s result without corrupting the cache,
@@ -567,9 +568,11 @@ def _read_settings_file() -> dict:
             _settings_cache_data = {}
         return {}
 
-    signature = (st.st_mtime_ns, st.st_size)
+    signature = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
     with _settings_cache_lock:
-        if signature == _settings_cache_signature:
+        # Transactions must start from disk, including on filesystems with
+        # coarse timestamps or no stable inode numbers.
+        if signature == _settings_cache_signature and not getattr(_settings_write_state, "held", False):
             return copy.deepcopy(_settings_cache_data)
 
     # Slow path: file changed (or first read). Do the open+parse OUTSIDE the
@@ -598,7 +601,7 @@ def _read_settings_file() -> dict:
 def load_settings() -> dict:
     """Return the saved settings dict, merging in defaults.
 
-    Reads are served from an mtime+size cache (see :func:`_read_settings_file`)
+    Reads are served from a revision cache (see :func:`_read_settings_file`)
     so an unchanged ``settings.json`` is opened at most once — a transparent
     optimization that matters on Windows, where every file open triggers an
     antivirus scan. The return value is always a fresh, independent dict, so
@@ -623,9 +626,53 @@ def load_settings() -> dict:
     return migrate_settings(base)
 
 
+_settings_write_lock = threading.RLock()
+_settings_write_state = threading.local()
+
+
+@contextmanager
+def _settings_transaction():
+    """Serialize read/modify/write across Desktop and the Mobile server."""
+    with _settings_write_lock:
+        if getattr(_settings_write_state, "held", False):
+            yield
+            return
+        _ensure_config_dir()
+        # Lock a stable sibling, since replacing settings.json swaps its inode.
+        # Closing the handle releases the lock; never remove the lock file.
+        with open(f"{SETTINGS_FILE}.lock", "a+b") as lock:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            _settings_write_state.held = True
+            try:
+                yield
+            finally:
+                _settings_write_state.held = False
+
+
+@contextmanager
+def edit_settings():
+    """Read and commit a group of settings as one transaction."""
+    with _settings_transaction():
+        settings = load_settings()
+        yield settings
+        save_settings(settings)
+
+
 def save_settings(settings: dict) -> None:
+    with _settings_transaction():
+        _write_settings(settings)
+
+
+def _write_settings(settings: dict) -> None:
     global _settings_cache_signature, _settings_cache_data
-    _ensure_config_dir()
     from osia.deepseek import migrate_settings
     settings = migrate_settings(settings)
     # Atomic write (temp + fsync + os.replace), mirroring _save_oauth_store: a
@@ -634,11 +681,8 @@ def save_settings(settings: dict) -> None:
     # the mobile server share this file (e.g. the MCP ``mcp_servers[].enabled``
     # mirror, Phase 1). os.replace is atomic on POSIX and Windows; the temp lives
     # in the same CONFIG_DIR as the target so the replace stays a same-filesystem
-    # rename. (Cross-process read-modify-write *lost updates* are a separate
-    # concern, out of scope here — writes are human-paced. The Phase-2 reconcile
-    # self-heals a lost ENABLE (it keeps converging toward mcp_servers[].enabled);
-    # a lost DISABLE would be re-connected by the reconcile until the user re-acts
-    # — rare and recoverable, not fully self-healing.)
+    # rename. The settings transaction also serializes writers, including the
+    # read that supplies the settings being modified.
     descriptor, tmp = tempfile.mkstemp(
         prefix=f".{Path(SETTINGS_FILE).name}.",
         suffix=".tmp",
@@ -685,9 +729,6 @@ def save_settings(settings: dict) -> None:
         _settings_cache_data = {}
 
 
-_transport_migration_lock = threading.Lock()
-
-
 def migrate_transport_defaults() -> bool:
     """Activate direct-first defaults once for pre-schema installations.
 
@@ -698,7 +739,7 @@ def migrate_transport_defaults() -> bool:
     for recovery instead of risking unrelated local state.
     """
 
-    with _transport_migration_lock:
+    with _settings_transaction():
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8", errors="strict") as f:
                 raw = json.load(f)
@@ -729,39 +770,34 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value) -> None:
-    settings = load_settings()
     if key == "wake_word_enabled":
         value = ACOUSTIC_WAKE_AVAILABLE
     if key == "reasoning":
         value = normalize_reasoning_settings(value)
-    settings[key] = value
-    if key == "selected_model":
-        # Callers that only know a model id (for example the existing mobile
-        # server message) must not inherit a stale provider from an earlier
-        # provider-aware PC selection. The PC model picker writes the exact
-        # provider immediately after writing the model id.
-        settings["selected_model_provider"] = None
-    save_settings(settings)
+    with edit_settings() as settings:
+        settings[key] = value
+        if key == "selected_model":
+            # Callers that only know a model id must not inherit a stale provider.
+            settings["selected_model_provider"] = None
     _notify_setting_changed(key)
 
 
 def set_skill_enabled_state(name: str, enabled: bool) -> int:
     """Atomically persist one skill flag and its next snapshot revision."""
 
-    settings = load_settings()
-    raw_enabled = settings.get("skills_enabled", {}) or {}
-    skills_enabled = dict(raw_enabled) if isinstance(raw_enabled, dict) else {}
-    skills_enabled[str(name)] = bool(enabled)
-    raw_revision = settings.get("skills_state_revision", 0)
-    revision = (
-        raw_revision
-        if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
-        else 0
-    )
-    revision = max(0, revision) + 1
-    settings["skills_enabled"] = skills_enabled
-    settings["skills_state_revision"] = revision
-    save_settings(settings)
+    with edit_settings() as settings:
+        raw_enabled = settings.get("skills_enabled", {}) or {}
+        skills_enabled = dict(raw_enabled) if isinstance(raw_enabled, dict) else {}
+        skills_enabled[str(name)] = bool(enabled)
+        raw_revision = settings.get("skills_state_revision", 0)
+        revision = (
+            raw_revision
+            if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+            else 0
+        )
+        revision = max(0, revision) + 1
+        settings["skills_enabled"] = skills_enabled
+        settings["skills_state_revision"] = revision
     _notify_setting_changed("skills_enabled")
     return revision
 
@@ -886,8 +922,10 @@ def ensure_config_files(create_token: bool = True) -> None:
     # find/edit and so every component reads the same on-disk config.
     if not os.path.exists(SETTINGS_FILE):
         try:
-            save_settings(dict(DEFAULT_SETTINGS))
-            print("[CONFIG] Created settings.json from defaults (saved to disk)")
+            with _settings_transaction():
+                if not os.path.exists(SETTINGS_FILE):
+                    save_settings(dict(DEFAULT_SETTINGS))
+                    print("[CONFIG] Created settings.json from defaults (saved to disk)")
         except Exception as e:
             print(f"[CONFIG] could not create settings.json: {e}")
     try:

@@ -5115,13 +5115,10 @@ def wake_mode():
         status: str,
         conversation_id: str | None,
     ) -> None:
-        from osia.notifications import notify, safe_task_title
+        from osia.notifications import notify, safe_task_title, scheduled_notification_text
 
         safe_title = safe_task_title(title)
-        if status == "failed":
-            body = f"TÃ¢che planifiÃ©e Ã©chouÃ©e: {safe_title}"
-        else:
-            body = f"TÃ¢che planifiÃ©e terminÃ©e: {safe_title}"
+        body = f"{scheduled_notification_text(status)}: {safe_title}"
         notify("OSIA", body)
         _notify_mobile_cron_notification(
             task_id=task_id,
