@@ -63,6 +63,15 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.261", released_on="2026-11-09", public=True,
+        changes_en=(
+            "The Linux installer includes the complete Codex runtime so ChatGPT Account can call OSIA tools.",
+        ),
+        changes_fr=(
+            "L’installateur Linux inclut le runtime Codex complet pour que le compte ChatGPT puisse appeler les outils OSIA.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.260", released_on="2026-11-08", public=True,
         changes_en=(
             "ChatGPT sign-in continues when OSIA Mobile reconnects after opening the browser.",

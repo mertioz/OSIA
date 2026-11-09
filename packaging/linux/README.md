@@ -43,7 +43,7 @@ Launch OSIA from your application menu. The user service runs the mobile
 server on systems with a systemd user manager. To start the same server
 directly, run `~/.local/bin/osia --server`. Browser and desktop tools need a
 display session when the server runs on a remote machine. Local AI models
-are installed separately. The Codex executable for ChatGPT Account is
+are installed separately. The complete Codex runtime for ChatGPT Account is
 included. Connect an account through OSIA and review the provider's terms.
 
 ## Updates

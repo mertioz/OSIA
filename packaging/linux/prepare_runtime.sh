@@ -10,6 +10,7 @@ mkdir -p -- "$1" "$2"
 root="$(realpath -e -- "$1")"
 reports="$(realpath -e -- "$2")"
 source="$(cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+. "$source/packaging/linux/codex_runtime.sh"
 mkdir -p -- "$root"/{downloads,bundle}
 asset=cpython-3.12.16+20261026-x86_64-unknown-linux-gnu-install_only.tar.gz
 digest=6a79e922e50006b601f29e688407659da1c2b86ebcd4e9c7254cf234be8b89de
@@ -54,18 +55,27 @@ if [ ! -f "$root/browsers-ready" ]; then
   "$python" -m playwright install chromium firefox
   touch "$root/browsers-ready"
 fi
-codex_dir="$root/bundle/runtimes/codex/bin"
-if [ ! -x "$codex_dir/codex" ]; then
-  mkdir -p "$codex_dir"
-  archive="$root/downloads/codex-linux-x64-0.166.0.tar.gz"
-  curl -fsSL --retry 2 --max-time 240 \
-    https://github.com/openai/codex/releases/download/rust-v0.166.0/codex-x86_64-unknown-linux-musl.tar.gz \
-    -o "$archive"
-  printf '%s  %s\n' a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978 "$archive" | sha256sum -c
-  tar -xzf "$archive" -C "$codex_dir" codex-x86_64-unknown-linux-musl
-  mv "$codex_dir/codex-x86_64-unknown-linux-musl" "$codex_dir/codex"
-  "$codex_dir/codex" --version
-  cp "$source/packaging/windows/licenses/codex/"{LICENSE,NOTICE} "$codex_dir/../"
+codex_dir="$root/bundle/runtimes/codex"
+if ! validate_codex_runtime "$codex_dir"; then
+  mkdir -p -- "$root/bundle/runtimes"
+  asset=codex-package-x86_64-unknown-linux-musl.tar.gz
+  archive="$root/downloads/${codex_version}-$asset"
+  if [ ! -f "$archive" ]; then
+    curl -fsSL --retry 2 --max-time 240 \
+      "https://github.com/openai/codex/releases/download/rust-v$codex_version/$asset" \
+      -o "$archive.partial"
+    mv -T -- "$archive.partial" "$archive"
+  fi
+  printf '%s  %s\n' 1d44b28bc4ac9937d7d3532264baa68a507ce364956a0d4ebb856f331cdee254 "$archive" | sha256sum -c
+  codex_stage="$(mktemp -d -- "$root/bundle/runtimes/.codex.XXXXXX")"
+  trap 'rm -rf -- "$codex_stage"' EXIT
+  tar -xzf "$archive" --no-same-owner -C "$codex_stage"
+  chmod 0755 "$codex_stage"
+  cp "$source/packaging/windows/licenses/codex/"{LICENSE,NOTICE} "$codex_stage/"
+  validate_codex_runtime "$codex_stage"
+  rm -rf -- "$codex_dir"
+  mv -T -- "$codex_stage" "$codex_dir"
+  trap - EXIT
 fi
 du -sh "$root/bundle/"*
 printf '%s\n' 'OSIA_LINUX_RUNTIME_READY'

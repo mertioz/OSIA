@@ -12,6 +12,7 @@ reports="$(realpath -e -- "$2")"
 mkdir -p -- "$3"
 output="$(realpath -e -- "$3")"
 here="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+. "$here/codex_runtime.sh"
 repo="$(cd -- "$here/../.." && pwd -P)"
 git -C "$repo" diff --quiet HEAD
 revision="$(git -C "$repo" rev-parse HEAD)"
@@ -61,7 +62,7 @@ manifest = {
 PY
 "$python" -I -B "$here/prepare_app.py" "$payload/app"
 "$payload/bin/osia" --version
-"$payload/runtimes/codex/bin/codex" --version
+validate_codex_runtime "$payload/runtimes/codex"
 name=OSIA-Linux-x86_64.tar.xz
 test ! -e "$output/$name"
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
