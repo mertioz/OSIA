@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, Qt
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
@@ -39,6 +41,60 @@ def _snapshot(count: int, revision: int = 1) -> dict:
 def _drain() -> None:
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     APP.processEvents()
+
+
+@pytest.mark.parametrize(("action", "button_name"), [
+    ("rename", "convRename"),
+    ("move", "convMove"),
+])
+def test_conversation_metadata_refresh_keeps_the_visible_scroll_position(
+    monkeypatch, action, button_name,
+):
+    panel = _ConversationsPanel()
+    panel._poll_timer.stop()
+    panel.resize(440, 410)
+    panel.show()
+    panel.activateWindow()
+    initial = _snapshot(60)
+    initial["folders"] = [{"id": "project", "name": "Project", "order": 0}]
+    panel.refresh(snapshot=initial)
+    panel.set_active("conv-18")
+    try:
+        _drain()
+        row = panel._row_widgets["conv-18"]
+        button = row.findChild(QPushButton, button_name)
+        scrollbar = panel._scroll.verticalScrollBar()
+        scrollbar.setValue(row.mapTo(panel._host, QPoint()).y() - 24)
+        button.setFocus(Qt.FocusReason.MouseFocusReason)
+        APP.processEvents()
+        before = scrollbar.value()
+        assert button.hasFocus()
+        assert 0 < before < scrollbar.maximum()
+
+        changed = _snapshot(60, revision=2)
+        changed["folders"] = initial["folders"]
+        if action == "rename":
+            changed["items"][18]["title"] = "Renamed chat"
+        else:
+            changed["items"][18]["folder_id"] = "project"
+        monkeypatch.setattr(
+            "osia.gui.main_popup.conversations.conversation_snapshot",
+            lambda: changed,
+        )
+        panel._poll_canonical_store()
+        _drain()
+
+        assert scrollbar.value() == before
+        new_row = panel._row_widgets["conv-18"]
+        assert new_row.property("active")
+        if action == "rename":
+            assert new_row.accessibleName() == "Renamed chat"
+        else:
+            assert new_row._folder_id == "project"
+    finally:
+        panel.close()
+        panel.deleteLater()
+        _drain()
 
 
 def test_rapid_single_and_duplicate_deletes_do_not_rebuild_or_leave_live_rows():

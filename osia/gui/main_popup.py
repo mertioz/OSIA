@@ -2984,10 +2984,11 @@ class _ConversationsPanel(QWidget):
         self._host_layout.addStretch(1)
         scroll.setWidget(self._host)
         outer.addWidget(scroll, 1)
-        self._folder_scroll_anchor: tuple[str, int, bool] | None = None
-        self._folder_scroll_timer = QTimer(self)
-        self._folder_scroll_timer.setSingleShot(True)
-        self._folder_scroll_timer.timeout.connect(self._restore_folder_scroll)
+        self._scroll_value_to_restore: int | None = None
+        self._folder_focus_to_restore: str | None = None
+        self._scroll_restore_timer = QTimer(self)
+        self._scroll_restore_timer.setSingleShot(True)
+        self._scroll_restore_timer.timeout.connect(self._restore_scroll)
 
         # Re-translate the header + rebuild rows (so per-row labels re-translate)
         # on language change.
@@ -3255,39 +3256,43 @@ class _ConversationsPanel(QWidget):
             "folder_id": folder_id,
         })
 
-    def _capture_folder_scroll(self, snapshot: dict) -> None:
-        self._folder_scroll_timer.stop()
+    def _capture_scroll(self, snapshot: dict) -> None:
+        self._scroll_restore_timer.stop()
         if not self.isVisible():
-            self._folder_scroll_anchor = None
+            self._scroll_value_to_restore = None
+            self._folder_focus_to_restore = None
             return
-        viewport = self._scroll.viewport()
-        scroll_value = self._scroll.verticalScrollBar().value()
+        # Keep the original position if another snapshot arrives before the
+        # scroll area has finished laying out the first one.
+        if self._scroll_value_to_restore is None:
+            self._scroll_value_to_restore = self._scroll.verticalScrollBar().value()
+        focused = QApplication.focusWidget()
+        if focused is None or not self._host.isAncestorOf(focused):
+            return
         for folder in snapshot.get("folders") or []:
             folder_id = str(folder.get("id") or "")
             row = self._folder_widgets.get(folder_id)
-            if row is None or row._collapsed == bool(folder.get("collapsed", False)):
-                continue
-            offset = row.mapTo(viewport, QPoint()).y()
-            focused = row._toggle.hasFocus()
-            if focused or -row.height() < offset < viewport.height():
-                self._folder_scroll_anchor = (folder_id, scroll_value, focused)
-            if focused:
-                # Removing a focused arrow sends Qt through the remaining
-                # buttons and QScrollArea follows them. Park focus on the pane.
-                self._scroll.setFocus(Qt.FocusReason.OtherFocusReason)
+            if (
+                row is not None
+                and row._toggle is focused
+                and row._collapsed != bool(folder.get("collapsed", False))
+            ):
+                self._folder_focus_to_restore = folder_id
                 break
+        # Removing a focused row action sends Qt through the remaining
+        # buttons, and QScrollArea follows them. Park focus before rebuilding.
+        self._scroll.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _restore_folder_scroll(self) -> None:
-        anchor, self._folder_scroll_anchor = self._folder_scroll_anchor, None
-        if anchor is None or not self.isVisible():
-            return
-        folder_id, scroll_value, focused = anchor
-        row = self._folder_widgets.get(folder_id)
-        if row is None:
+    def _restore_scroll(self) -> None:
+        scroll_value, self._scroll_value_to_restore = self._scroll_value_to_restore, None
+        folder_id, self._folder_focus_to_restore = self._folder_focus_to_restore, None
+        if scroll_value is None or not self.isVisible():
             return
         self._host_layout.activate()
-        if focused and self._scroll.hasFocus():
-            row._toggle.setFocus(Qt.FocusReason.OtherFocusReason)
+        if folder_id is not None and self._scroll.hasFocus():
+            row = self._folder_widgets.get(folder_id)
+            if row is not None:
+                row._toggle.setFocus(Qt.FocusReason.OtherFocusReason)
         self._scroll.verticalScrollBar().setValue(scroll_value)
 
     def refresh(self, *, snapshot: dict | None = None) -> None:
@@ -3298,7 +3303,7 @@ class _ConversationsPanel(QWidget):
             < int(self._last_snapshot.get("snapshot_revision") or 0)
         ):
             snapshot = self._last_snapshot
-        self._capture_folder_scroll(snapshot)
+        self._capture_scroll(snapshot)
         active_changed = self._active_id != self._rendered_active_id
         while self._host_layout.count() > 1:
             item = self._host_layout.takeAt(0)
@@ -3339,6 +3344,8 @@ class _ConversationsPanel(QWidget):
             # or sends a first message.
             self._show_empty_label()
             self._rendered_active_id = self._active_id
+            self._scroll_value_to_restore = None
+            self._folder_focus_to_restore = None
             return
         insert_at = 0
 
@@ -3396,9 +3403,9 @@ class _ConversationsPanel(QWidget):
         for conv in ungrouped:
             add_conversation(conv, indented=False)
         self._rendered_active_id = self._active_id
-        if self._folder_scroll_anchor is not None:
+        if self._scroll_value_to_restore is not None:
             # Let the scroll area settle its resized content and range first.
-            self._folder_scroll_timer.start(0)
+            self._scroll_restore_timer.start(0)
 
 
 # ── Model panel ─────────────────────────────────────────────────────────────
