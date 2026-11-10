@@ -63,6 +63,15 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.263", released_on="2026-11-10", public=True,
+        changes_en=(
+            "The conversation list keeps its scroll position after you rename a chat or move it to a project.",
+        ),
+        changes_fr=(
+            "La liste des discussions garde sa position après le renommage d’une discussion ou son déplacement dans un projet.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.262", released_on="2026-11-10", public=True,
         changes_en=(
             "Desktop and Mobile keep model settings consistent when they are saved at the same time.",
