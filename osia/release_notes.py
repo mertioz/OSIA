@@ -63,6 +63,21 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.262", released_on="2026-11-10", public=True,
+        changes_en=(
+            "Desktop and Mobile keep model settings consistent when they are saved at the same time.",
+            "Scheduled tasks preserve concurrent edits and do not launch against a superseded schedule.",
+            "Chat reports when the selected model cannot fit the required context after compaction.",
+            "OSIA protects proven critical installation paths and Windows system disks from direct destructive actions.",
+        ),
+        changes_fr=(
+            "Desktop et Mobile conservent des réglages de modèle cohérents lorsque les deux appareils enregistrent en même temps.",
+            "Les tâches planifiées préservent les modifications concurrentes et ne partent pas à une ancienne échéance.",
+            "Le Chat signale quand le contexte nécessaire dépasse la capacité du modèle sélectionné après compactage.",
+            "OSIA protège les chemins critiques identifiés de son installation et les disques système Windows contre les actions destructives directes.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.261", released_on="2026-11-09", public=True,
         changes_en=(
             "The Linux installer includes the complete Codex runtime so ChatGPT Account can call OSIA tools.",
