@@ -309,6 +309,9 @@ def add_setting_change_listener(callback: Callable[[str], None]) -> Callable[[],
 
 
 def _notify_setting_changed(key: str) -> None:
+    if getattr(_settings_write_state, "held", False):
+        after_settings_transaction(lambda: _notify_setting_changed(key))
+        return
     with _SETTING_CHANGE_LOCK:
         callbacks = tuple(_SETTING_CHANGE_LISTENERS)
     for callback in callbacks:
@@ -631,43 +634,58 @@ _settings_write_state = threading.local()
 
 
 @contextmanager
-def _settings_transaction():
+def settings_transaction():
     """Serialize read/modify/write across Desktop and the Mobile server."""
-    with _settings_write_lock:
-        if getattr(_settings_write_state, "held", False):
-            yield
-            return
-        _ensure_config_dir()
-        # Lock a stable sibling, since replacing settings.json swaps its inode.
-        # Closing the handle releases the lock; never remove the lock file.
-        with open(f"{SETTINGS_FILE}.lock", "a+b") as lock:
-            if sys.platform == "win32":
-                import msvcrt
-
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            _settings_write_state.held = True
-            try:
+    notifications = []
+    try:
+        with _settings_write_lock:
+            if getattr(_settings_write_state, "held", False):
                 yield
-            finally:
-                _settings_write_state.held = False
+                return
+            _ensure_config_dir()
+            # Lock a stable sibling, since replacing settings.json swaps its inode.
+            # Closing the handle releases the lock; never remove the lock file.
+            with open(f"{SETTINGS_FILE}.lock", "a+b") as lock:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                _settings_write_state.held = True
+                _settings_write_state.notifications = notifications
+                try:
+                    yield
+                finally:
+                    _settings_write_state.held = False
+                    del _settings_write_state.notifications
+    finally:
+        for notify in notifications:
+            notify()
+
+
+def after_settings_transaction(notify: Callable[[], None]) -> None:
+    """Run a notification after releasing the outer settings lock."""
+    if getattr(_settings_write_state, "held", False):
+        _settings_write_state.notifications.append(notify)
+    else:
+        notify()
 
 
 @contextmanager
 def edit_settings():
     """Read and commit a group of settings as one transaction."""
-    with _settings_transaction():
+    with settings_transaction():
         settings = load_settings()
         yield settings
         save_settings(settings)
 
 
 def save_settings(settings: dict) -> None:
-    with _settings_transaction():
+    with settings_transaction():
         _write_settings(settings)
 
 
@@ -739,7 +757,7 @@ def migrate_transport_defaults() -> bool:
     for recovery instead of risking unrelated local state.
     """
 
-    with _settings_transaction():
+    with settings_transaction():
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8", errors="strict") as f:
                 raw = json.load(f)
@@ -782,6 +800,14 @@ def set_setting(key: str, value) -> None:
     _notify_setting_changed(key)
 
 
+def set_model_selection(model_id: str, provider_id: str | None) -> None:
+    """Persist the selected model and its provider in one settings revision."""
+    with edit_settings() as settings:
+        settings["selected_model"] = model_id
+        settings["selected_model_provider"] = provider_id
+    _notify_setting_changed("selected_model")
+
+
 def set_skill_enabled_state(name: str, enabled: bool) -> int:
     """Atomically persist one skill flag and its next snapshot revision."""
 
@@ -808,6 +834,15 @@ def get_reasoning_settings() -> dict:
 
 def set_reasoning_settings(value) -> None:
     set_setting("reasoning", normalize_reasoning_settings(value))
+
+
+def set_model_reasoning_option(model_key: str, option_id: str) -> None:
+    """Change one model's reasoning option without replacing concurrent edits."""
+    with edit_settings() as settings:
+        reasoning = normalize_reasoning_settings(settings.get("reasoning"))
+        reasoning["models"][model_key] = option_id
+        settings["reasoning"] = normalize_reasoning_settings(reasoning)
+    _notify_setting_changed("reasoning")
 
 
 # ── Mobile pairing token ───────────────────────────────────────────────────
@@ -922,7 +957,7 @@ def ensure_config_files(create_token: bool = True) -> None:
     # find/edit and so every component reads the same on-disk config.
     if not os.path.exists(SETTINGS_FILE):
         try:
-            with _settings_transaction():
+            with settings_transaction():
                 if not os.path.exists(SETTINGS_FILE):
                     save_settings(dict(DEFAULT_SETTINGS))
                     print("[CONFIG] Created settings.json from defaults (saved to disk)")

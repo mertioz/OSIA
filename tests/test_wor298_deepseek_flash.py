@@ -309,7 +309,12 @@ def test_old_mobile_selection_does_not_fall_back_to_another_provider(monkeypatch
     monkeypatch.setattr(mobile, "account_snapshot", lambda **_kw: {})
     monkeypatch.setattr(mobile, "load_settings", lambda: {})
     selected = {}
-    monkeypatch.setattr(mobile, "set_setting", lambda key, value: selected.update({key: value}))
+    monkeypatch.setattr(
+        mobile, "set_model_selection",
+        lambda model_id, provider_id: selected.update(
+            selected_model=model_id, selected_model_provider=provider_id,
+        ),
+    )
     inventory = mobile.build_model_inventory(models.HARDCODED_MODELS, models.API_PROVIDERS)
     assert inventory
     assert mobile.validate_and_select("deepseek", MODEL_ID) is True

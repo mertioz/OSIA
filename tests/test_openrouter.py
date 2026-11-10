@@ -87,18 +87,18 @@ def test_reasoning_uses_exact_openrouter_model_metadata(catalogue):
     assert reasoning.build_reasoning_kwargs("openrouter", MODEL, shared) == {"reasoning_effort": "medium"}
 
 
-def test_mobile_reasoning_keeps_groq_and_openrouter_settings_separate(monkeypatch, catalogue):
+def test_mobile_reasoning_keeps_groq_and_openrouter_settings_separate(monkeypatch, tmp_path, catalogue):
+    from osia import config
+
     inventory = build_model_inventory(catalogue, {"openrouter"})
-    settings = {"models": {MODEL: "high"}}
-    saved = []
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(config, "_ensure_config_dir", lambda: None)
+    config.set_reasoning_settings({"models": {MODEL: "high"}})
     monkeypatch.setattr(mobile_model_catalogue, "build_catalogue", lambda **kwargs: {
         "models": [mobile_model_catalogue._mobile_model(entry) for entry in inventory],
     })
-    monkeypatch.setattr(mobile_model_catalogue, "get_reasoning_settings", lambda: settings)
-    monkeypatch.setattr(mobile_model_catalogue, "set_reasoning_settings", saved.append)
-
     assert mobile_model_catalogue.validate_and_set_reasoning("openrouter", MODEL, "medium")
-    assert saved[0]["models"] == {MODEL: "high", f"openrouter:{MODEL}": "medium"}
+    assert config.get_reasoning_settings()["models"] == {MODEL: "high", f"openrouter:{MODEL}": "medium"}
 
 
 def _image_input():

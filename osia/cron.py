@@ -39,7 +39,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from osia.config import CONFIG_DIR, get_setting, set_setting
+from osia.config import CONFIG_DIR, get_setting, set_setting, settings_transaction
 from osia.notifications import scheduled_notification_outcome
 
 # How often the scheduler wakes to re-evaluate the job list. 20s keeps
@@ -535,7 +535,10 @@ class CronManager:
         if not task:
             return False
         try:
-            from osia.scheduled_tasks import preflight_scheduled_task
+            from osia.scheduled_tasks import (
+                preflight_scheduled_task,
+                scheduled_occurrence_recorded,
+            )
 
             preflight = preflight_scheduled_task(str(task_id or ""))
         except Exception:
@@ -558,6 +561,9 @@ class CronManager:
             return False
         current_job = preflight.get("job")
         if isinstance(current_job, dict):
+            if signature is not None and _job_signature(current_job) != signature:
+                # The next tick will evaluate the edited job's own due time.
+                return False
             task = str(current_job.get("task") or "").strip()
             schedule = str(current_job.get("schedule") or schedule)
             conversation_id = current_job.get("conversation_id") or None
@@ -587,6 +593,19 @@ class CronManager:
             original_request_id=original_request_id,
             authorization=current_job if isinstance(current_job, dict) else None,
         )
+        if (
+            one_shot and task_id and isinstance(current_job, dict)
+            and scheduled_occurrence_recorded(execution_context, current_job)
+        ):
+            # A previous worker recorded this exact trigger, but could not
+            # persist its disable. Retry only the disable after a restart.
+            try:
+                from osia.scheduled_tasks import disable_scheduled_task
+
+                disable_scheduled_task(task_id, execution=execution_context)
+            except Exception as e:
+                print(f"[CRON] could not disable recorded one-shot: {type(e).__name__}")
+            return False
         conversation_lease_claimed = False
         if conversation_id:
             try:
@@ -617,6 +636,9 @@ class CronManager:
                     pass
 
         def _worker():
+            start_gate.wait()
+            if not launched:
+                return
             try:
                 try:
                     result = self._run_task(
@@ -688,6 +710,7 @@ class CronManager:
                 self._busy.clear()
 
         self._busy.set()
+        start_gate = threading.Event()
         admitted = False
         launched = False
         try:
@@ -709,6 +732,11 @@ class CronManager:
             # Keep the original due time for a one-shot until it is disabled.
             # A failed final write must not re-arm the same occurrence in memory.
             timing = {} if one_shot else {"next_run_at": next_run_at, "next_run_schedule": schedule}
+            # Ensure a worker exists before advancing the schedule. It cannot
+            # dispatch until the occurrence and next due time are persisted.
+            threading.Thread(
+                target=_worker, name="osia-cron-task", daemon=True,
+            ).start()
             if not update_scheduled_occurrence_status(
                 execution_context,
                 last_run_at=now.astimezone().isoformat(timespec="seconds"),
@@ -718,9 +746,6 @@ class CronManager:
             ):
                 return False
             print(f"[CRON] firing scheduled task ({schedule}): {task[:80]}")
-            threading.Thread(
-                target=_worker, name="osia-cron-task", daemon=True,
-            ).start()
             launched = True
             st.update(last_run=now, last_date=now.date(), anchor_date=now.date())
             st.pop("pending_due_date", None)
@@ -740,6 +765,7 @@ class CronManager:
                     print(f"[CRON] could not settle task admission: {type(e).__name__}")
                 finally:
                     self._busy.clear()
+            start_gate.set()
 
     @staticmethod
     def _next_run_after(schedule: str, now: datetime) -> str | None:
@@ -810,25 +836,24 @@ class CronManager:
         """Best-effort metadata update for Settings/Mobile status displays."""
 
         try:
-            jobs = get_setting("cron_jobs", []) or []
-            if not isinstance(jobs, list):
-                return
-            target = None
-            if task_id:
-                for i, job in enumerate(jobs):
-                    if isinstance(job, dict) and job.get("id") == task_id:
-                        target = i
-                        break
-            if target is None and idx is not None and 0 <= idx < len(jobs):
-                job = jobs[idx]
-                if isinstance(job, dict) and (sig is None or _job_signature(job) == sig):
+            with settings_transaction():
+                jobs = get_setting("cron_jobs", []) or []
+                if not isinstance(jobs, list):
+                    return
+                target = None
+                if task_id:
+                    for i, job in enumerate(jobs):
+                        if isinstance(job, dict) and job.get("id") == task_id:
+                            target = i
+                            break
+                elif idx is not None and 0 <= idx < len(jobs) and isinstance(jobs[idx], dict):
                     target = idx
-            if target is None:
-                return
-            jobs[target].update({k: v for k, v in fields.items() if v is not None})
-            jobs[target]["updated_at"] = datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            )
-            set_setting("cron_jobs", jobs)
+                if target is None or (sig is not None and _job_signature(jobs[target]) != sig):
+                    return
+                jobs[target].update({k: v for k, v in fields.items() if v is not None})
+                jobs[target]["updated_at"] = datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+                set_setting("cron_jobs", jobs)
         except Exception as e:
             print(f"[CRON] could not update job status: {e}")

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta
 
@@ -40,6 +42,8 @@ def scheduled_runtime(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scheduled_tasks.config, "get_setting", fake_get)
     monkeypatch.setattr(scheduled_tasks.config, "set_setting", fake_set)
+    monkeypatch.setattr(scheduled_tasks.config, "SETTINGS_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(scheduled_tasks.config, "_ensure_config_dir", lambda: None)
     monkeypatch.setattr(cron, "get_setting", fake_get)
     monkeypatch.setattr(cron, "set_setting", fake_set)
     yield values
@@ -358,6 +362,37 @@ def test_mobile_payload_and_notification_are_sanitized(scheduled_runtime):
     assert frame["safe_category"] == "safe_local_setting"
 
 
+def test_cron_editor_revision_ignores_run_metadata_but_rejects_stale_definitions(
+    scheduled_runtime,
+):
+    created = _create_sensitive()
+    jobs = scheduled_tasks.scheduler_jobs_snapshot()
+    revision = scheduled_tasks.cron_jobs_revision(jobs)
+    execution = _execution(_current(created["id"]), "occurrence:test")
+    assert scheduled_tasks.update_scheduled_occurrence_status(
+        execution, last_status="running", next_run_at="2026-07-27T12:10:00",
+    )
+    assert scheduled_tasks.cron_jobs_revision(scheduled_tasks.scheduler_jobs_snapshot()) == revision
+
+    jobs[0]["title"] = "Edited from the first editor"
+    saved = scheduled_tasks.replace_scheduled_tasks_from_settings(
+        jobs, expected_cron_jobs_revision=revision,
+    )
+    assert saved["ok"]
+    assert saved["jobs"][0]["last_status"] == "running"
+    assert saved["cron_jobs_revision"] != revision
+    second = _create_sensitive(35)
+
+    conflict = scheduled_tasks.replace_scheduled_tasks_from_settings(
+        [], expected_cron_jobs_revision=revision,
+    )
+    assert conflict["code"] == scheduled_tasks.ERROR_SETTINGS_CONFLICT
+    assert [job["id"] for job in conflict["jobs"]] == [created["id"], second["id"]]
+    assert conflict["jobs"][0]["title"] == "Edited from the first editor"
+    assert conflict["jobs"] == scheduled_tasks.scheduler_jobs_snapshot()
+    assert conflict["cron_jobs_revision"] == scheduled_tasks.cron_jobs_revision(conflict["jobs"])
+
+
 @pytest.fixture
 def cron_workers(monkeypatch):
     workers = []
@@ -427,8 +462,113 @@ def test_job_write_failure_does_not_strand_the_scheduler(
     assert executed[-1] == second["task"]
 
 
-def test_one_shot_is_not_relaunched_when_disabling_fails(
+def test_edited_schedule_is_not_launched_from_an_old_due_snapshot(
     scheduled_runtime, cron_workers, monkeypatch,
+):
+    created = _create_sensitive()
+    due = datetime(2026, 7, 27, 12, 5)
+    original = _current(created["id"])
+    executed = []
+    manager = cron.CronManager(
+        lambda task, *_args: executed.append(task) or {"status": "success_verified"}
+    )
+
+    def stale_poll():
+        updated = scheduled_tasks.update_scheduled_task(
+            task_id=created["id"],
+            schedule={"type": "interval", "every": 1, "unit": "hours"},
+            now=due,
+        )
+        assert updated["ok"], updated
+        return [original]
+
+    with monkeypatch.context() as poll:
+        poll.setattr(scheduled_tasks, "scheduler_jobs_snapshot", stale_poll)
+        manager._check_jobs(due)
+        cron_workers()
+    assert executed == []
+    manager._check_jobs(due + timedelta(hours=1))
+    cron_workers()
+    assert executed == [original["task"]]
+
+
+def test_worker_start_failure_leaves_occurrence_due(
+    scheduled_runtime, cron_workers, monkeypatch,
+):
+    job = _create_sensitive()
+    due = datetime(2026, 7, 27, 12, 5)
+    executed = []
+    manager = cron.CronManager(
+        lambda task, *_args: executed.append(task) or {"status": "success_verified"}
+    )
+
+    class UnstartableWorker:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start test worker")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(cron.threading, "Thread", UnstartableWorker)
+        manager._check_jobs(due)
+    current = _current(job["id"])
+    assert cron._parse_job_datetime(current["next_run_at"]) == due
+    assert current["execution_state"] != scheduled_tasks.RUNNING
+    assert executed == []
+    manager._check_jobs(due + timedelta(seconds=1))
+    cron_workers()
+    assert executed == [job["task"]]
+
+
+def test_desktop_and_mobile_job_creates_keep_both_rows(tmp_path, monkeypatch):
+    config = scheduled_tasks.config
+    path = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(path))
+    monkeypatch.setattr(config, "_ensure_config_dir", lambda: None)
+    config.save_settings({"cron_jobs": []})
+    script = """
+import sys
+from osia import config, scheduled_tasks
+
+config.SETTINGS_FILE = sys.argv[1]
+config._ensure_config_dir = lambda: None
+print("ready", flush=True)
+result = scheduled_tasks.create_scheduled_task(
+    instruction="Return mobile status",
+    schedule={"type": "interval", "every": 5, "unit": "minutes"},
+    source="mobile_settings",
+)
+if not result["ok"]:
+    raise RuntimeError(result)
+"""
+    writer = None
+    try:
+        with config.settings_transaction():
+            writer = subprocess.Popen(
+                [sys.executable, "-B", "-c", script, str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert writer.stdout.readline().strip() == "ready"
+            with pytest.raises(subprocess.TimeoutExpired):
+                writer.wait(timeout=0.25)
+            _create_sensitive()
+        _, err = writer.communicate(timeout=10)
+        assert writer.returncode == 0, err
+        assert {job["task"] for job in scheduled_tasks.scheduler_jobs_snapshot()} == {
+            "Set volume to 25", "Return mobile status",
+        }
+    finally:
+        if writer is not None and writer.poll() is None:
+            writer.kill()
+            writer.communicate()
+
+
+@pytest.mark.parametrize("edit_before_restart", [False, True])
+def test_one_shot_is_not_relaunched_when_disabling_fails(
+    scheduled_runtime, cron_workers, monkeypatch, edit_before_restart,
 ):
     now = datetime(2026, 7, 27, 12, 0)
     due = now + timedelta(minutes=5)
@@ -447,15 +587,36 @@ def test_one_shot_is_not_relaunched_when_disabling_fails(
 
     def run_task(task, *_args):
         runs.append(task)
-        return {"status": "success_verified"}
+        return {"status": "outcome_unknown"}
 
-    monkeypatch.setattr(scheduled_tasks, "disable_scheduled_task", fail_disable)
     manager = cron.CronManager(run_task)
-    manager._check_jobs(due)
-    cron_workers()
-    manager._check_jobs(due + timedelta(minutes=1))
-    cron_workers()
+    with monkeypatch.context() as failure:
+        failure.setattr(scheduled_tasks, "disable_scheduled_task", fail_disable)
+        manager._check_jobs(due)
+        cron_workers()
+        manager._check_jobs(due + timedelta(minutes=1))
+        cron_workers()
     assert runs == ["Return status"]
+    task_id = result["job"]["id"]
+    recorded = _current(task_id)["occurrence_records"]
+    assert [record["outcome"] for record in recorded] == ["outcome_unknown"]
+    if edit_before_restart:
+        edited = scheduled_tasks.update_scheduled_task(
+            task_id=task_id, instruction="Return the edited status",
+        )
+        assert edited["ok"], edited
+
+    restarted = cron.CronManager(run_task)
+    restarted._check_jobs(due + timedelta(minutes=2))
+    cron_workers()
+    job = _current(task_id)
+    assert job["enabled"] is False
+    if edit_before_restart:
+        assert runs == ["Return status", "Return the edited status"]
+        assert len(job["occurrence_records"]) == 2
+    else:
+        assert runs == ["Return status"]
+        assert job["occurrence_records"] == recorded
 
 
 @pytest.mark.parametrize(("terminal", "outcome", "wire_status"), [

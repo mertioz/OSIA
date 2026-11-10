@@ -1071,6 +1071,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Standard-/aktuelles Modell",
         "es": "Modelo predeterminado/actual",
     },
+    "cron.conflict": {
+        "en": "Scheduled tasks changed elsewhere. The list was refreshed. Please reapply your edit.",
+        "fr": "Les tâches planifiées ont changé ailleurs. La liste a été actualisée. Réappliquez votre modification.",
+    },
     "cron.model_invalid": {
         "en": "Choose a valid model.",
         "fr": "Choisissez un modÃ¨le valide.",

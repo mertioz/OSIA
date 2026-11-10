@@ -68,6 +68,8 @@ _PROVEN_PROVIDER_FACT_BLOCKERS = frozenset({
     "provider_billing_restricted",
     "provider_hard_quota_exhausted",
     "provider_contract_incompatible",
+    "provider_context_too_large",
+    "provider_context_invalid",
 })
 
 # Frontier strategy emitted by osia.execution_strategy when productive effects

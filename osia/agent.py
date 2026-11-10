@@ -214,6 +214,8 @@ _PROVIDER_FACT_BLOCKER_CODES = frozenset({
     "provider_billing_restricted",
     "provider_hard_quota_exhausted",
     "provider_contract_incompatible",
+    "provider_context_too_large",
+    "provider_context_invalid",
 })
 
 _PROVIDER_FACT_BLOCKER_TEXT = {
@@ -262,6 +264,16 @@ _PROVIDER_FACT_BLOCKER_TEXT = {
         "aboutir en l’état.",
         "The selected model is incompatible with OSIA’s request contract "
         "(explicit provider response); this path cannot proceed as-is.",
+    ),
+    "provider_context_too_large": (
+        "Les éléments nécessaires à ce tour ne tiennent pas dans le contexte "
+        "du modèle sélectionné après compactage.",
+        "The context required for this turn does not fit the selected model, "
+        "even after compaction.",
+    ),
+    "provider_context_invalid": (
+        "OSIA n’a pas pu construire un contexte valide pour ce tour.",
+        "OSIA could not build a valid context for this turn.",
     ),
 }
 
@@ -317,6 +329,14 @@ def _provider_terminal_fact(error: BaseException) -> str:
     limits, temporary outages) return an empty string.
     """
 
+    from osia.conversation_context import ContextBuildError
+
+    if isinstance(error, ContextBuildError):
+        # Compaction has already been attempted by the wire builder. Repeating
+        # this local failure cannot send a request or produce a new receipt.
+        if error.category in {"required_context_too_large", "oversized_message"}:
+            return "provider_context_too_large"
+        return "provider_context_invalid"
     explicit = str(getattr(error, "reason_code", "") or "")
     if explicit in _PROVIDER_FACT_BLOCKER_CODES:
         return explicit
@@ -10195,11 +10215,11 @@ class OSIAAgent:
 
         if not provider:
             try:
-                from osia.config import get_setting
-                saved_model = str(get_setting("selected_model", "") or "").strip()
-                saved_provider = str(
-                    get_setting("selected_model_provider", "") or ""
-                ).strip()
+                from osia.config import load_settings
+
+                settings = load_settings()
+                saved_model = str(settings.get("selected_model") or "").strip()
+                saved_provider = str(settings.get("selected_model_provider") or "").strip()
                 if model_id == saved_model and saved_provider in PROVIDERS:
                     provider = saved_provider
             except Exception:

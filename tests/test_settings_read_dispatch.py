@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
 
-from osia import conversations, mobile_model_catalogue
+from osia import config, conversations, mobile_model_catalogue, scheduled_tasks
 from osia.chatgpt_account import provider
 from osia.durable_transport import DurableTransportStore
 from osia.server import server
@@ -166,3 +166,54 @@ def test_device_sign_in_survives_mobile_reconnect_and_logout(tmp_path, monkeypat
     finally:
         finish_login.set()
         unsubscribe()
+
+
+def test_stale_mobile_cron_write_returns_fresh_config_without_deleting_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(config, "_ensure_config_dir", lambda: None)
+    monkeypatch.setattr(server, "MOBILE_TOKEN", "test-only")
+    monkeypatch.setattr(server, "_DURABLE_TRANSPORT", DurableTransportStore(tmp_path / "transport"))
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
+    monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(server, "ATTACHMENT_UPLOAD_DIR", tmp_path / "attachments")
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+    monkeypatch.setattr(server, "_pending_cron_notifications", lambda: [])
+    monkeypatch.setattr(mobile_model_catalogue, "request_remote_refresh", lambda callback: None)
+
+    app = Starlette(routes=[WebSocketRoute("/ws", server.websocket_endpoint)])
+    with TestClient(app, client=("127.0.0.1", 54321)) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json({"type": "auth", "token": "test-only", "event_cursors": {}})
+            while socket.receive_json().get("type") != "conversations":
+                pass
+            socket.send_json({"type": "get_config"})
+            while (frame := socket.receive_json()).get("type") != "config":
+                pass
+            original = frame["config"]
+            assert original["cron_jobs"] == []
+            assert original["cron_jobs_revision"]
+            created = scheduled_tasks.create_scheduled_task(
+                instruction="Return desktop status",
+                schedule={"type": "interval", "every": 5, "unit": "minutes"},
+                source="settings",
+            )
+            assert created["ok"]
+
+            socket.send_json({
+                "type": "set_setting",
+                "key": "cron_jobs",
+                "value": [],
+                "expected_cron_jobs_revision": original["cron_jobs_revision"],
+            })
+            for _ in range(20):
+                frame = socket.receive_json()
+                assert frame.get("type") != "status", frame
+                if frame.get("type") == "config" and frame["config"].get("cron_jobs_conflict"):
+                    break
+            else:
+                pytest.fail("Missing cron conflict config")
+            fresh = frame["config"]
+            assert fresh["cron_jobs_revision"] != original["cron_jobs_revision"]
+            assert [job["id"] for job in fresh["cron_jobs"]] == [created["task_id"]]
+            assert fresh["cron_jobs"][0]["task_redacted"] is True
+            assert [job["id"] for job in scheduled_tasks.scheduler_jobs_snapshot()] == [created["task_id"]]

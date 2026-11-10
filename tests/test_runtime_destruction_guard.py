@@ -30,9 +30,35 @@ def test_partition_guard_uses_exact_current_system_identity():
     command = "Remove-Partition -PartitionNumber 2 -DiskNumber 5"
     assert blocked(command)
     assert not blocked(command + " -WhatIf")
+    assert not blocked(command + " -CimSession remote-fixture")
     assert not blocked("Remove-Partition -PartitionNumber 3 -DiskNumber 5")
     adapter.is_system = False  # The same numeric target has a different role now.
     assert not blocked(command)
+
+
+def test_disk_clear_and_drive_letter_partition_use_proven_local_targets(monkeypatch):
+    adapter = system_resources.WindowsRuntimeAdapter(storage_rows=[
+        {"DiskNumber": 7, "PartitionNumber": 1, "IsSystem": True},
+        {"DiskNumber": 8, "PartitionNumber": 1, "IsSystem": False},
+    ])
+    registry = system_resources.SystemResourceRegistry(platform_family="windows", windows=adapter)
+    drive_checks = []
+    monkeypatch.setattr(
+        registry, "classify_path",
+        lambda target, **_: drive_checks.append(target),
+    )
+
+    def classify(command):
+        return system_resources.classify_non_deletion_system_mutation(
+            "run_command", {"command": command}, registry=registry,
+        )
+
+    assert classify("Clear-Disk -Number 7 -RemoveData").blocks_destruction
+    assert not classify("Clear-Disk -Number 8 -RemoveData").blocks_destruction
+    assert classify("Clear-Disk -Number 7 -RemoveData -wi") is None
+    assert classify("Clear-Disk -Number 7 -RemoveData -Session remote-fixture") is None
+    classify("Remove-Partition -DriveLetter R")
+    assert drive_checks == ["R:\\"]
 
 
 def test_linux_packaged_runtime_is_protected_but_old_release_is_not(tmp_path, monkeypatch):
@@ -58,6 +84,12 @@ def test_linux_packaged_runtime_is_protected_but_old_release_is_not(tmp_path, mo
         "delete_directory", {"path": str(inactive), "recursive": True}, registry=registry,
     ).plan
     assert not plan.system_destruction
+    classifier = system_resources.classify_non_deletion_system_mutation
+    assert classifier("write_file", {"path": str(active / "bin" / "osia")}, registry=registry).blocks_destruction
+    assert classifier("rename_file", {
+        "old_path": str(active.parent), "new_path": str(tmp_path / "moved"),
+    }, registry=registry).blocks_destruction
+    assert classifier("write_file", {"path": str(inactive / "bin" / "osia")}, registry=registry) is None
 
     # Merely naming a source directory "app" doesn't confer runtime protection.
     monkeypatch.setattr(runtime, "application_executable", lambda: tmp_path / "outside" / "python3")

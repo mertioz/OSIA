@@ -53,7 +53,9 @@ def test_malformed_no_dispatch_and_recoverable(dispatch, monkeypatch, raw):
 
 def test_exact_fixture_real_dispatch_and_receipt(dispatch, monkeypatch):
     command = '\necho GROQ_FIXTURE_OK\n'
-    a, requests = scripted(monkeypatch, [dialect(command), 'Observed GROQ_FIXTURE_OK.'])
+    draft = 'Observed GROQ_FIXTURE_OK.'
+    reviewed = 'The command printed GROQ_FIXTURE_OK.'
+    a, requests = scripted(monkeypatch, [dialect(command), draft, reviewed])
     a.provider = 'groq'
     records = []
     original = runtime._execute_tool_with_policy
@@ -67,9 +69,15 @@ def test_exact_fixture_real_dispatch_and_receipt(dispatch, monkeypatch):
     tool, args, result = records[0]
     assert (tool, args) == ('bash', {'command': command})
     assert result.dispatched and 'GROQ_FIXTURE_OK' in str(result.result)
-    assert len(requests) == 2
-    assert any('GROQ_FIXTURE_OK' in m.get('content', '') and m['role'] in {'tool', 'user'} for m in requests[-1]['messages'])
-    assert final == 'Observed GROQ_FIXTURE_OK.'
+    assert len(requests) == 3
+    for request in requests[1:]:
+        assert any(
+            'GROQ_FIXTURE_OK' in m.get('content', '')
+            and '[OSIA receipt:' in m.get('content', '')
+            and m['role'] in {'tool', 'user'}
+            for m in request['messages']
+        )
+    assert final == reviewed
 
 
 def test_multiple_calls_and_existing_json_unchanged():

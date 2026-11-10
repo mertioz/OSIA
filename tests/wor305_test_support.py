@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from osia import agent as runtime
 from osia.turn_terminality import TurnTerminalityController
 
@@ -21,6 +23,16 @@ def controller(tmp_path, objective="Create and build the requested project", req
 
 
 def scripted(monkeypatch, responses):
+    from osia import conversation_context
+
+    resolve_context_limit = conversation_context.resolve_context_limit
+
+    def fixture_context_limit(provider, model):
+        # The fake model has no catalogue entry. Allow the tool inventory and
+        # receipts to fit when the test is exercising dispatch, not sizing.
+        return 128_000 if model == "fixture" else resolve_context_limit(provider, model)
+
+    monkeypatch.setattr(conversation_context, "resolve_context_limit", fixture_context_limit)
     calls = []
 
     class Client:
@@ -30,7 +42,8 @@ def scripted(monkeypatch, responses):
         def create(self, **kwargs):
             agent._test_controller = agent._terminality_controller
             calls.append(kwargs)
-            assert responses, "Completion added an unexpected provider round"
+            if not responses:
+                pytest.fail("Completion added an unexpected provider round", pytrace=False)
             message = SimpleNamespace(
                 content=responses.pop(0),
                 tool_calls=None,

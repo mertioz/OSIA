@@ -203,7 +203,7 @@ def test_canonical_resume_leaves_unknown_click_to_the_selected_model(
 
     assert answer == final
     assert reads == (["Fixture Game"] if read_again else [])
-    assert len(provider_calls) == 1 + len(responses)
+    assert len(provider_calls) == 2 + len(responses)
     assert all(request["model"] == "gpt-6-luna" for request in provider_calls)
     wire = json.dumps(provider_calls[0]["messages"])
     assert "fresh observation shows a download in progress" in wire

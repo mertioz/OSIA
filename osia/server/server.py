@@ -5515,14 +5515,18 @@ def _build_config_snapshot() -> dict:
     from osia.config import load_settings, load_api_keys, get_setting
     from osia import personality
     cfg = load_settings()
+    cfg.pop("cron_jobs_conflict", None)
     try:
         from osia import scheduled_tasks
 
-        cfg["cron_jobs"] = scheduled_tasks.sanitized_mobile_jobs(
-            cfg.get("cron_jobs")
-        )
+        jobs = cfg.get("cron_jobs")
+        if not isinstance(jobs, list):
+            jobs = []
+        cfg["cron_jobs"] = scheduled_tasks.sanitized_mobile_jobs(jobs)
+        cfg["cron_jobs_revision"] = scheduled_tasks.cron_jobs_revision(jobs)
     except Exception:
         cfg["cron_jobs"] = []
+        cfg["cron_jobs_revision"] = ""
     cfg["reasoning"] = _normalize_mobile_reasoning_setting(cfg.get("reasoning"))
     cfg["mcp_servers"] = _sanitize_mobile_mcp_servers(cfg.get("mcp_servers"))
     try:
@@ -9636,16 +9640,26 @@ async def websocket_endpoint(ws: WebSocket):
                     elif setting_key == "cron_jobs":
                         from osia import scheduled_tasks
 
+                        expected_revision = msg.get("expected_cron_jobs_revision")
+                        if "expected_cron_jobs_revision" in msg and not isinstance(expected_revision, str):
+                            await out.send_json({"type": "status", "status": "error"})
+                            continue
                         result = scheduled_tasks.replace_scheduled_tasks_from_settings(
                             setting_value,
                             source_default="mobile_settings",
+                            expected_cron_jobs_revision=expected_revision,
                         )
                         if not result.get("ok"):
                             print(
                                 "[OSIA Server] set_setting cron_jobs rejected: "
                                 f"{result.get('code')}: {result.get('message')}"
                             )
-                            await out.send_json({"type": "status", "status": "error"})
+                            if result.get("code") == scheduled_tasks.ERROR_SETTINGS_CONFLICT:
+                                cfg = await asyncio.to_thread(_build_config_snapshot)
+                                cfg["cron_jobs_conflict"] = True
+                                await out.send_json({"type": "config", "config": cfg})
+                            else:
+                                await out.send_json({"type": "status", "status": "error"})
                             continue
                         logged_detail = f"{len(result.get('jobs', []))} job(s)"
                     else:

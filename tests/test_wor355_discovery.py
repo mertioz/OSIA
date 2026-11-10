@@ -120,7 +120,7 @@ def test_mobile_rejects_direct_selection_of_unverified_entry(monkeypatch):
     ]})
     def no_write(*args):
         pytest.fail("An unavailable model must not change selected configuration")
-    monkeypatch.setattr(mobile, "set_setting", no_write)
+    monkeypatch.setattr(mobile, "set_model_selection", no_write)
     assert not mobile.validate_and_select("openai", "gpt-6.1-sol")
 
 

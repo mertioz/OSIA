@@ -834,11 +834,14 @@ class SystemResourceRegistry:
                 resolved = _resolved_for_classification(raw, follow_leaf=follow_leaf)
         except (OSError, ValueError):
             return self._indeterminate("target_resolution_failed", "target_identity", raw)
-        if operation in _HOST_TREE_DESTRUCTION_OPERATIONS:
+        if operation in _HOST_TREE_DESTRUCTION_OPERATIONS or operation in {
+            DestructiveOperation.TRUNCATE, DestructiveOperation.REPLACE_UNUSABLE,
+            DestructiveOperation.MOVE_OUT,
+        }:
             for critical in self._runtime_paths:
                 same_path = os.path.normcase(os.path.normpath(resolved)) == os.path.normcase(str(critical))
                 contains_critical = (
-                    operation is DestructiveOperation.RECURSIVE_DELETE
+                    operation in {DestructiveOperation.RECURSIVE_DELETE, DestructiveOperation.MOVE_OUT}
                     and _path_within(str(critical), resolved, casefold=self.platform_family == "windows")
                 )
                 if same_path or contains_critical:
@@ -864,6 +867,17 @@ class SystemResourceRegistry:
         if active or (active_disk and guid in {_ESP_GUID, _MSR_GUID, _WINRE_GUID}):
             return self._protected(target, "protected_windows_partition", "boot_recovery_partition", volume=True)
         return self._not_system(target)
+
+    def classify_windows_disk(self, disk_number: int) -> SystemResourceEvidence:
+        target = f"disk:{disk_number}"
+        rows = self.windows.storage_rows(refresh=True)
+        if any(
+            str(row.get("DiskNumber")) == str(disk_number)
+            and (row.get("IsBoot") is True or row.get("IsSystem") is True)
+            for row in rows
+        ):
+            return self._protected(target, "active_windows_disk", "active_os_volume", volume=True)
+        return self._indeterminate("windows_disk_not_proven_system", "storage_role", target)
 
     def indeterminate_destructive_target(
         self,
@@ -1081,21 +1095,25 @@ def get_default_system_resource_registry() -> SystemResourceRegistry:
 
 def _powershell_what_if(args: Sequence[str]) -> bool:
     return any(
-        re.fullmatch(r"-(?:w|wh|wha|what|whati|whatif)(?::.*)?", item, re.IGNORECASE)
-        and not re.fullmatch(r"-whatif:\s*\$?false", item, re.IGNORECASE)
+        re.fullmatch(r"-(?:w|wi|wh|wha|what|whati|whatif)(?::.*)?", item, re.IGNORECASE)
+        and item.partition(":")[2].strip().casefold() not in {"$false", "false"}
         for item in args
     )
 
 
-def _partition_argument(args: Sequence[str], option: str) -> int | None:
+def _powershell_literal_argument(args: Sequence[str], option: str) -> str:
     values = [
         item.split(":", 1)[1] if ":" in item else (args[i + 1] if i + 1 < len(args) else "")
         for i, item in enumerate(args)
         if item.casefold().split(":", 1)[0] == option
     ]
     if len(values) != 1:
-        return None
-    value = values[0].strip("'\"")
+        return ""
+    return values[0].strip("'\"")
+
+
+def _storage_number(args: Sequence[str], option: str) -> int | None:
+    value = _powershell_literal_argument(args, option)
     return int(value) if re.fullmatch(r"[0-9]{1,10}", value) else None
 
 
@@ -1105,11 +1123,29 @@ def classify_non_deletion_system_mutation(
     *,
     registry: SystemResourceRegistry | None = None,
 ) -> SystemResourceEvidence | None:
-    """Recognize direct, standalone operations on a proven critical volume."""
+    """Recognize writes to the running OSIA bundle and direct volume operations."""
 
+    values = dict(arguments) if isinstance(arguments, Mapping) else {}
+    if tool_name in {"write_file", "edit_file_lines", "rename_file"}:
+        active = registry or get_default_system_resource_registry()
+        if not active._runtime_paths:
+            return None
+        if tool_name == "rename_file":
+            targets = (
+                ("old_path", DestructiveOperation.MOVE_OUT, False),
+                ("new_path", DestructiveOperation.REPLACE_UNUSABLE, False),
+            )
+        else:
+            targets = (("path", DestructiveOperation.TRUNCATE, True),)
+        for key, operation, follow_leaf in targets:
+            target = values.get(key)
+            if isinstance(target, str):
+                evidence = active.classify_path(target, operation=operation, follow_leaf=follow_leaf)
+                if evidence.blocks_destruction:
+                    return evidence
+        return None
     if str(tool_name or "") not in {"bash", "run_command"}:
         return None
-    values = dict(arguments) if isinstance(arguments, Mapping) else {}
     command = str(values.get("command") or "").strip()
     if not command or any(char in command for char in "\r\n;&|<>`"):
         return None
@@ -1131,26 +1167,35 @@ def classify_non_deletion_system_mutation(
         return None
     target = None
     if active.platform_family == "windows":
+        if executable in {"clear-disk", "format-volume", "remove-partition"}:
+            # CIM sessions can use the same disk numbers and drive letters on
+            # a different host. Local partition data is not evidence for them.
+            options = {item.casefold().partition(":")[0] for item in args if item.startswith("-")}
+            if _powershell_what_if(args) or any(
+                len(option) >= 3 and (
+                    "-cimsession".startswith(option) or "-session".startswith(option)
+                )
+                for option in options
+            ):
+                return None
         if executable in {"format", "format.com"}:
             target = next(
                 (item for item in args if re.fullmatch(r"[A-Za-z]:\\?", item)),
                 None,
             )
-        elif executable == "remove-partition" and not _powershell_what_if(args):
-            disk = _partition_argument(args, "-disknumber")
-            partition = _partition_argument(args, "-partitionnumber")
+        elif executable == "clear-disk":
+            disk = _storage_number(args, "-number")
+            if disk is not None:
+                return active.classify_windows_disk(disk)
+        elif executable == "remove-partition":
+            disk = _storage_number(args, "-disknumber")
+            partition = _storage_number(args, "-partitionnumber")
             if disk is not None and partition is not None and partition > 0:
                 return active.classify_windows_partition(disk, partition)
-        elif executable == "format-volume":
-            drive_letter_args = [
-                index for index, item in enumerate(args[:-1])
-                if item.casefold() == "-driveletter"
-            ]
-            if _powershell_what_if(args) or len(drive_letter_args) != 1:
-                return None
-            index = drive_letter_args[0]
-            if re.fullmatch(r"[A-Za-z]", args[index + 1]):
-                target = args[index + 1] + ":\\"
+        if executable in {"format-volume", "remove-partition"}:
+            letter = _powershell_literal_argument(args, "-driveletter")
+            if re.fullmatch(r"[A-Za-z]", letter):
+                target = letter + ":\\"
     else:
         if executable == "wipefs":
             recognized_flags = {"-a", "--all", "-f", "--force", "-q", "--quiet"}

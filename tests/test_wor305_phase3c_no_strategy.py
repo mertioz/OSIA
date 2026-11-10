@@ -39,7 +39,7 @@ def test_model_order_repeats_and_shell_without_strategy(dispatch, monkeypatch, t
                  call("read_file", path=str(path)) +
                  call("write_file", path=str(path), content="second"),
                  call("run_command", command=command), call("run_command", command=command),
-                 call("read_file", path=str(path)), "Done."]
+                 call("read_file", path=str(path)), "Done.", "Done."]
     a, requests = scripted(monkeypatch, responses)
     original = runtime._execute_tool_with_policy
     order = []
@@ -62,6 +62,27 @@ def test_model_order_repeats_and_shell_without_strategy(dispatch, monkeypatch, t
     assert not state["outcome_contract"]["declared"]
     assert len([f for e in state["typed_evidence"] for f in e.get("facts", []) if f.get("kind") == "process"]) == 2
     assert not any(m.get("_execution_strategy") for r in requests for m in r["messages"])
+
+
+def test_unbuildable_context_is_a_factual_blocker_not_a_provider_retry(dispatch, monkeypatch):
+    from osia.conversation_context import ContextBuildError
+
+    agent, requests = scripted(monkeypatch, [])
+    builds = []
+
+    def cannot_fit():
+        if builds:
+            pytest.fail("The same failed context was rebuilt without new evidence")
+        builds.append(True)
+        raise ContextBuildError("required_context_too_large")
+
+    monkeypatch.setattr(agent, "_wire_messages", cannot_fit)
+    final = agent.run_terminal_turn("Review these records.", turn_id="3c-context-blocked")
+    assert not requests
+    assert "does not fit" in final
+    result = agent.terminality_result("3c-context-blocked")
+    assert result["terminal_state"] == "blocked_verified"
+    assert result["reason_code"] == "provider_context_too_large"
 
 
 def test_optional_notes_use_controller_directly(dispatch, monkeypatch, forbid_strategy):

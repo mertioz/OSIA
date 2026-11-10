@@ -1871,6 +1871,7 @@ def wake_mode():
         ACOUSTIC_WAKE_AVAILABLE,
         ACOUSTIC_WAKE_UNAVAILABLE_REASON,
         load_settings,
+        set_model_selection,
         set_setting,
     )
     from osia.models import discover_models_async
@@ -4615,8 +4616,7 @@ def wake_mode():
         except Exception as e:
             print(f"âš ï¸  Could not switch model: {e}")
             return
-        set_setting("selected_model", model)
-        set_setting("selected_model_provider", provider)
+        set_model_selection(model, provider)
         popup.set_current_model(model, provider)
         print(f"ðŸ”„ Model changed to: {model} (provider: {agent.provider})")
 

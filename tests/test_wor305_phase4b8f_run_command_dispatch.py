@@ -223,6 +223,7 @@ def test_real_executor_receipt_returns_to_the_same_selected_model(
     agent, calls = scripted(monkeypatch, [
         call("run_command", command=command),
         f"I observed {marker} in the command output.",
+        f"I observed {marker} in the command output.",
     ])
     agent.provider = "chatgpt_account"
     agent.model = "gpt-5.6-sol"
@@ -254,7 +255,7 @@ def test_real_executor_receipt_returns_to_the_same_selected_model(
     )
 
     assert final == f"I observed {marker} in the command output."
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert all(call_args["model"] == "gpt-5.6-sol" for call_args in calls)
     assert marker in str(calls[1]["messages"])
     assert len(executed) == 1

@@ -9,8 +9,8 @@ from osia.config import (
     get_reasoning_settings,
     load_api_keys,
     load_settings,
-    set_reasoning_settings,
-    set_setting,
+    set_model_reasoning_option,
+    set_model_selection,
 )
 from osia.chatgpt_account.rate_limits import quota_windows
 from osia.models import (
@@ -541,8 +541,7 @@ def validate_and_select(provider_id: str, model_id: str) -> bool:
         from osia.chatgpt_account.provider import get_account_provider
 
         get_account_provider().set_selected_model(model_id)
-    set_setting("selected_model", model_id)
-    set_setting("selected_model_provider", provider_id)
+    set_model_selection(model_id, provider_id)
     return True
 
 
@@ -565,12 +564,8 @@ def validate_and_set_reasoning(provider_id: str, model_id: str, option_id: str) 
     valid_options = {item["id"] for item in model["reasoning"]["options"]}
     if option_id not in valid_options:
         return False
-    settings = get_reasoning_settings()
-    levels = dict(settings.get("models") or {})
     key = model_reasoning_settings_key(provider_id, model_id)
-    levels[key] = option_id
-    settings["models"] = levels
-    set_reasoning_settings(settings)
+    set_model_reasoning_option(key, option_id)
     return True
 
 

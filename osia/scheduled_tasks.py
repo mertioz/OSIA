@@ -13,7 +13,6 @@ import hashlib
 import json
 import re
 import secrets
-import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta
@@ -37,6 +36,7 @@ ERROR_MODEL_AMBIGUOUS = "model_ambiguous"
 ERROR_BLOCKED = "execution_blocked"
 ERROR_DISABLED = "task_disabled"
 ERROR_STALE = "task_definition_changed"
+ERROR_SETTINGS_CONFLICT = "cron_jobs_conflict"
 
 SCHEDULED_TASK_SCHEMA_VERSION = 2
 DISABLED = "disabled"
@@ -54,7 +54,6 @@ _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _SUPPORTED_SOURCES = {"chat", "settings", "mobile_settings"}
 _CHANGE_CALLBACK: Callable[[], None] | None = None
 _CHANGE_CALLBACKS: list[Callable[[], None]] = []
-_JOBS_LOCK = threading.RLock()
 
 # Obsolete WOR-195 authorization fields stripped from every loaded job.
 _OBSOLETE_AUTHORIZATION_FIELDS = (
@@ -159,11 +158,14 @@ def add_change_callback(callback: Callable[[], None]) -> Callable[[], None]:
 
 
 def _notify_changed() -> None:
-    for callback in list(_CHANGE_CALLBACKS):
-        try:
-            callback()
-        except Exception as exc:
-            print(f"[SCHEDULED_TASKS] change callback failed: {exc}")
+    def notify() -> None:
+        for callback in list(_CHANGE_CALLBACKS):
+            try:
+                callback()
+            except Exception as exc:
+                print(f"[SCHEDULED_TASKS] change callback failed: {exc}")
+
+    config.after_settings_transaction(notify)
 
 
 def _now() -> datetime:
@@ -1067,19 +1069,27 @@ def _normalize_existing_job(
     return clean, changed
 
 
+def _normalize_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    for job in jobs:
+        clean, job_changed = _normalize_existing_job(job)
+        normalized.append(clean)
+        changed = changed or job_changed
+    return normalized, changed
+
+
 def _load_normalized_jobs(*, persist: bool = True) -> list[dict[str, Any]]:
-    with _JOBS_LOCK:
-        jobs = _load_jobs()
-        normalized: list[dict[str, Any]] = []
-        changed = False
-        for job in jobs:
-            clean, job_changed = _normalize_existing_job(job)
-            normalized.append(clean)
-            changed = changed or job_changed
-        if changed and persist:
-            _save_jobs(normalized)
-            _notify_changed()
-        return normalized
+    normalized, changed = _normalize_jobs(_load_jobs())
+    if changed and persist:
+        # Migrations are writes too. Re-read once the cross-process lock is
+        # held so a read-side migration cannot overwrite another job edit.
+        with config.settings_transaction():
+            normalized, changed = _normalize_jobs(_load_jobs())
+            if changed:
+                _save_jobs(normalized)
+                _notify_changed()
+    return normalized
 
 
 def _find_index(jobs: list[dict[str, Any]], task_id: str) -> int:
@@ -1202,7 +1212,7 @@ def create_scheduled_task(
             job["conversation_title"] = resolved_conversation_title
         job["definition_hash"] = task_definition_hash(job)
         job["capability_summary"] = _safe_capability_summary(job)
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             jobs.append(job)
             _save_jobs(jobs)
@@ -1256,12 +1266,8 @@ def update_scheduled_task(
         clean_id = str(task_id or "").strip()
         if not clean_id:
             raise ScheduledTaskError(ERROR_VALIDATION, "task_id is required")
-        with _JOBS_LOCK:
-            jobs = _load_normalized_jobs()
-            idx = _find_index(jobs, clean_id)
-            if idx < 0:
-                raise ScheduledTaskError(ERROR_NOT_FOUND, "scheduled task not found")
-            job = dict(jobs[idx])
+        original = _current_job(clean_id)
+        job = dict(original)
         previous_hash = str(job.get("definition_hash") or task_definition_hash(job))
         next_title = str(title).strip() if title is not None else str(job.get("title") or "")
         next_task = (
@@ -1340,11 +1346,13 @@ def update_scheduled_task(
             job["definition_hash"] = previous_hash
             job["updated_at"] = _iso()
         job["capability_summary"] = _safe_capability_summary(job)
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, clean_id)
             if idx < 0:
                 raise ScheduledTaskError(ERROR_NOT_FOUND, "scheduled task not found")
+            if jobs[idx] != original:
+                raise ScheduledTaskError(ERROR_STALE, "scheduled task changed during edit")
             jobs[idx] = job
             _save_jobs(jobs)
             verified = _load_jobs()
@@ -1370,7 +1378,7 @@ def delete_scheduled_task(
         clean_id = str(task_id or "").strip()
         if not clean_id:
             raise ScheduledTaskError(ERROR_VALIDATION, "task_id is required")
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, clean_id)
             if idx < 0:
@@ -1389,18 +1397,49 @@ def delete_scheduled_task(
         return _result_error(ERROR_STORAGE, str(exc))
 
 
+def cron_jobs_revision(jobs: Any) -> str:
+    """Identify the ordered editor snapshot without timing or execution fields."""
+    return canonical_hash([
+        {
+            "id": str(job.get("id") or ""),
+            "title": str(job.get("title") or ""),
+            "task": str(job.get("task") or ""),
+            "schedule": str(job.get("schedule") or ""),
+            "timezone": str(job.get("timezone") or ""),
+            "enabled": bool(job.get("enabled", False)),
+            "desired_enabled": bool(job.get("desired_enabled", job.get("enabled", False))),
+            "conversation_id": str(job.get("conversation_id") or ""),
+            "model": _model_identity(job),
+        }
+        for job in (jobs if isinstance(jobs, list) else [])
+        if isinstance(job, dict)
+    ])
+
+
 def replace_scheduled_tasks_from_settings(
     jobs: Any,
     *,
     source_default: str = "mobile_settings",
+    expected_cron_jobs_revision: str | None = None,
 ) -> dict[str, Any]:
     """Normalize a whole settings-list write while preserving metadata."""
 
     try:
         if not isinstance(jobs, list):
             raise ScheduledTaskError(ERROR_VALIDATION, "cron_jobs must be a list")
-        with _JOBS_LOCK:
-            existing = _load_normalized_jobs()
+        if expected_cron_jobs_revision is not None and not isinstance(expected_cron_jobs_revision, str):
+            raise ScheduledTaskError(ERROR_VALIDATION, "expected_cron_jobs_revision must be a string")
+        with config.settings_transaction():
+            stored = _load_jobs()
+            current_revision = cron_jobs_revision(stored)
+            if expected_cron_jobs_revision is not None and expected_cron_jobs_revision != current_revision:
+                return _result_error(
+                    ERROR_SETTINGS_CONFLICT,
+                    "Scheduled tasks changed during editing.",
+                    jobs=stored,
+                    cron_jobs_revision=current_revision,
+                )
+            existing, _ = _normalize_jobs(stored)
             existing_by_id = {
                 str(item.get("id") or ""): item for item in existing
                 if str(item.get("id") or "")
@@ -1500,8 +1539,13 @@ def replace_scheduled_tasks_from_settings(
                 normalized.append(candidate)
 
             _save_jobs(normalized)
+            persisted = _load_jobs()
         _notify_changed()
-        return _result_ok(jobs=normalized, count=len(normalized))
+        return _result_ok(
+            jobs=persisted,
+            count=len(persisted),
+            cron_jobs_revision=cron_jobs_revision(persisted),
+        )
     except ScheduledTaskError as exc:
         return _result_error(exc.code, exc.message)
     except Exception as exc:
@@ -1517,13 +1561,15 @@ def _current_job(task_id: str) -> dict[str, Any]:
     return dict(jobs[idx])
 
 
-def _save_current_job(job: dict[str, Any]) -> None:
+def _save_current_job(job: dict[str, Any], *, expected: dict[str, Any]) -> None:
     task_id = str(job.get("id") or "")
-    with _JOBS_LOCK:
+    with config.settings_transaction():
         jobs = _load_normalized_jobs()
         idx = _find_index(jobs, task_id)
         if idx < 0:
             raise ScheduledTaskError(ERROR_NOT_FOUND, "scheduled task not found")
+        if jobs[idx] != expected:
+            raise ScheduledTaskError(ERROR_STALE, "scheduled task changed during migration")
         jobs[idx] = copy.deepcopy(job)
         _save_jobs(jobs)
     _notify_changed()
@@ -1579,7 +1625,7 @@ def disable_scheduled_task(
     """Disable a task as an execution-relevant edit (scheduler stop semantics)."""
 
     try:
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, str(task_id or "").strip())
             if idx < 0:
@@ -1614,10 +1660,10 @@ def preflight_scheduled_task(task_id: str) -> dict[str, Any]:
             )
         expected_hash = task_definition_hash(job)
         if expected_hash != str(job.get("definition_hash") or ""):
-            job = _bump_execution_revision(job, increment_task_revision=True)
-            job["definition_hash"] = expected_hash
-            job["enabled"] = bool(job.get("desired_enabled", False))
-            _save_current_job(job)
+            migrated = _bump_execution_revision(job, increment_task_revision=True)
+            migrated["definition_hash"] = expected_hash
+            migrated["enabled"] = bool(migrated.get("desired_enabled", False))
+            _save_current_job(migrated, expected=job)
             return _result_error(
                 ERROR_STALE,
                 "task definition changed",
@@ -1704,7 +1750,7 @@ def mark_scheduled_task_running(execution: dict[str, Any]) -> bool:
     """Atomically enter RUNNING only for the still-current enabled task."""
 
     task_id = str(execution.get("task_id") or "")
-    with _JOBS_LOCK:
+    with config.settings_transaction():
         jobs = _load_normalized_jobs()
         idx = _find_index(jobs, task_id)
         if idx < 0:
@@ -1724,7 +1770,7 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
     """Clear RUNNING without overwriting a concurrent edit/disable."""
 
     task_id = str(execution.get("task_id") or "")
-    with _JOBS_LOCK:
+    with config.settings_transaction():
         jobs = _load_normalized_jobs()
         idx = _find_index(jobs, task_id)
         if idx < 0:
@@ -1742,7 +1788,7 @@ def mark_scheduled_task_finished(execution: dict[str, Any]) -> None:
 def update_scheduled_occurrence_status(execution: dict[str, Any], **fields: Any) -> bool:
     """Save timing and presentation metadata only for the current revision."""
     try:
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, str(execution.get("task_id") or ""))
             if idx < 0 or not _matches_scheduled_revision(execution, jobs[idx]):
@@ -1792,7 +1838,7 @@ def record_scheduled_tool_execution(
     else:
         safe_outcome = "outcome_unknown"
     task_id = str(execution.get("task_id") or "")
-    with _JOBS_LOCK:
+    with config.settings_transaction():
         jobs = _load_normalized_jobs()
         idx = _find_index(jobs, task_id)
         if idx < 0:
@@ -1820,6 +1866,30 @@ def record_scheduled_tool_execution(
     _notify_changed()
 
 
+def _scheduled_occurrence_identity(execution: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "occurrence_id": str(execution.get("occurrence_id") or ""),
+        "task_revision": execution.get("task_revision"),
+        "definition_hash": execution.get("definition_hash"),
+        "authorization_revision": execution.get("authorization_revision"),
+    }
+
+
+def scheduled_occurrence_recorded(execution: dict[str, Any], job: dict[str, Any]) -> bool:
+    """Check a terminal record for the same scheduled occurrence and revision."""
+    identity = _scheduled_occurrence_identity(execution)
+    if not identity["occurrence_id"] or not _matches_scheduled_revision(execution, job):
+        return False
+    records = job.get("occurrence_records")
+    if not isinstance(records, list):
+        return False
+    return any(
+        isinstance(record, dict)
+        and all(key in record and record[key] == value for key, value in identity.items())
+        for record in records
+    )
+
+
 def record_scheduled_occurrence(
     execution: dict[str, Any],
     *,
@@ -1839,7 +1909,7 @@ def record_scheduled_occurrence(
         safe_outcome = "blocked_execution"
     try:
         task_id = str(execution.get("task_id") or "")
-        with _JOBS_LOCK:
+        with config.settings_transaction():
             jobs = _load_normalized_jobs()
             idx = _find_index(jobs, task_id)
             if idx < 0:
@@ -1855,7 +1925,7 @@ def record_scheduled_occurrence(
                 safe_outcome = "outcome_unknown"
             records = list(job.get("occurrence_records") or [])
             records.append({
-                "occurrence_id": occurrence_id,
+                **_scheduled_occurrence_identity(execution),
                 "outcome": safe_outcome,
                 "recorded_at": _iso(),
             })

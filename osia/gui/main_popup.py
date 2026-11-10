@@ -67,7 +67,7 @@ from osia.config import (
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
     delete_mcp_oauth, get_mcp_oauth, set_mcp_oauth,
     get_oauth_client, set_oauth_client,
-    get_reasoning_settings, set_reasoning_settings,
+    get_reasoning_settings, set_model_reasoning_option,
 )
 from osia.reasoning import get_reasoning_options, model_reasoning_settings_key
 from osia.mobile_model_catalogue import (
@@ -3627,12 +3627,8 @@ class _ModelRow(QFrame):
         option_id = str(option_id or "auto").strip().lower()
         if option_id not in option_ids:
             option_id = "auto"
-        cfg = get_reasoning_settings()
-        models = dict((cfg or {}).get("models") or {})
         model_key = model_reasoning_settings_key(self._provider, self._mid)
-        models[model_key] = option_id
-        cfg["models"] = models
-        set_reasoning_settings(cfg)
+        set_model_reasoning_option(model_key, option_id)
         self._refresh_reasoning_chip()
 
     def _retranslate_reasoning(self) -> None:
@@ -6700,6 +6696,7 @@ class _SettingsPanel(QWidget):
 
         # Source-of-truth job list + the layout its row widgets render into.
         self._cron_jobs: list[dict] = []
+        self._cron_jobs_revision = ""
         host_wrap = QWidget()
         self._cron_host = QVBoxLayout(host_wrap)
         self._cron_host.setContentsMargins(0, 0, 0, 0)
@@ -6733,6 +6730,10 @@ class _SettingsPanel(QWidget):
             item = host.takeAt(0)
             w = item.widget()
             if w is not None:
+                # Discarded inputs must not save through focus-loss signals
+                # after a conflicting snapshot has replaced their rows.
+                for control in w.findChildren(QWidget):
+                    control.blockSignals(True)
                 w.deleteLater()
         if not self._cron_jobs:
             empty = QLabel(i18n.t("cron.empty"))
@@ -7189,6 +7190,7 @@ class _SettingsPanel(QWidget):
         result = scheduled_tasks.list_scheduled_tasks()
         if result.get("ok"):
             self._cron_jobs = result.get("tasks", [])
+            self._cron_jobs_revision = scheduled_tasks.cron_jobs_revision(self._cron_jobs)
         self._render_cron()
 
     def _cron_pill_text(self, conv_id) -> str:
@@ -7242,10 +7244,17 @@ class _SettingsPanel(QWidget):
         result = scheduled_tasks.replace_scheduled_tasks_from_settings(
             clean,
             source_default="settings",
+            expected_cron_jobs_revision=self._cron_jobs_revision,
         )
         if result.get("ok"):
             self._cron_jobs = result.get("jobs", clean)
+            self._cron_jobs_revision = result["cron_jobs_revision"]
             self._set_cron_error(None)
+        elif result.get("code") == scheduled_tasks.ERROR_SETTINGS_CONFLICT:
+            self._cron_jobs = result["jobs"]
+            self._cron_jobs_revision = result["cron_jobs_revision"]
+            self._set_cron_error(i18n.t("cron.conflict"))
+            self._render_cron()
         else:
             self._set_cron_error(
                 result.get("message") or i18n.t("cron.model_invalid")
@@ -10234,7 +10243,12 @@ class _SettingsPanel(QWidget):
         self._apply_liveapi_visibility()
 
         # Scheduled tasks (Bloc 5) — rebuild the cron job editor.
+        from osia import scheduled_tasks
+
         cron_jobs = settings.get("cron_jobs", []) or []
+        if not isinstance(cron_jobs, list):
+            cron_jobs = []
+        self._cron_jobs_revision = scheduled_tasks.cron_jobs_revision(cron_jobs)
         self._cron_jobs = []
         for j in cron_jobs:
             if not isinstance(j, dict):

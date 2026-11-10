@@ -84,13 +84,14 @@ def test_same_selected_model_continues_to_real_read_and_final(dispatch, monkeypa
         _call("run_command", command="synthetic-block"),
         _call("read_file", path=str(path)),
         "The harmless file contains safe observation.",
+        "The harmless file contains safe observation.",
     ])
     result = agent.run_terminal_turn("Inspect the harmless file.", turn_id="3b")
     assert result == "The harmless file contains safe observation."
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert all(call["model"] == "fixture" for call in calls)
     assert "BLOCK_SYSTEM_DESTRUCTION" in str(calls[1]["messages"])
-    assert "safe observation" in str(calls[2]["messages"])
+    assert all("safe observation" in str(call["messages"]) for call in calls[2:])
     state = agent._test_controller.snapshot()
     assert state["terminal_state"] == "success_verified"
     assert state["terminal_reason"] == "selected_model_completed"
