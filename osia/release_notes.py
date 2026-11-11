@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.264", released_on="2026-11-11", public=True,
+        changes_en=(
+            "Projects smoothly reveal and hide their conversations, keeping the list position and keyboard focus.",
+            "Managed browser page actions, form filling and screenshots run without automatically bringing the browser to the foreground.",
+            "Native controls can still activate the target window when physical input is needed.",
+        ),
+        changes_fr=(
+            "Les projets affichent et masquent leurs discussions avec une animation fluide, en gardant la position de la liste et le focus clavier.",
+            "Les actions web, le remplissage des formulaires et les captures fonctionnent sans ramener automatiquement le navigateur au premier plan.",
+            "Les outils natifs peuvent toujours activer la fenêtre cible lorsqu’une saisie physique est nécessaire.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.263", released_on="2026-11-10", public=True,
         changes_en=(
             "The conversation list keeps its scroll position after you rename a chat or move it to a project.",
