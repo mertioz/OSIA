@@ -1739,11 +1739,9 @@ class _AsyncBrowserOwner:
         if self._page_is_closed(page):
             raise BrowserReferenceError()
         if activate:
+            # Select the managed page without taking focus from the user's app.
+            # Native mouse/keyboard actions activate their exact window separately.
             self._active_page = page
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
             self._publish()
         return page, self._current_state(page)
 
@@ -2419,10 +2417,6 @@ class _AsyncBrowserOwner:
                     evidence=evidence,
                 )
             after = self._current_state(page)
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
         self._active_page = page
         self._publish()
         return self._receipt_success(
@@ -2617,7 +2611,6 @@ class _AsyncBrowserOwner:
         try:
             page = self._state_tracker.validate(state_ref)
             before = self._current_state(self._active_page) if self._active_page else None
-            await page.bring_to_front()
             self._active_page = page
             after = self._current_state(page)
             self._publish()
@@ -2666,7 +2659,6 @@ class _AsyncBrowserOwner:
                 return self._receipt_failure(
                     before=before, started_at=started, code="opener_unavailable",
                 )
-            await opener.bring_to_front()
             self._active_page = opener
             after = self._current_state(opener)
             self._publish()
@@ -2798,10 +2790,6 @@ class _AsyncBrowserOwner:
         after = self._current_state(page)
         if after.document_epoch == created.document_epoch:
             after = self._state_tracker.note_navigation(page, reason="new_tab_navigation")
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
         self._active_page = page
         self._publish()
         data = {
@@ -3730,11 +3718,6 @@ class _AsyncBrowserOwner:
             )
             await self._disconnect_active_browser()
             return None
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-        _raise_browser_window(self._active_browser_type)
         state = self._current_state(page)
         if url:
             return await self._op_navigate_safe(url, state.to_dict())
@@ -3778,11 +3761,6 @@ class _AsyncBrowserOwner:
             return None
         label = _canonical_browser_name(binary)
         verb = "Reusing existing" if reused else "Opened"
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-        _raise_browser_window(self._active_browser_type)
         state = self._current_state(page)
         if url:
             return await self._op_navigate_safe(url, state.to_dict())
@@ -3950,6 +3928,8 @@ class _AsyncBrowserOwner:
         description = str(description).strip()
         try:
             page = await self._ensure_browser()
+            if await page.evaluate("document.visibilityState") != "visible":
+                return None
             from osia.tools import desktop_control as desktop
 
             target_norm = desktop._normalize_label(description)
@@ -4100,6 +4080,11 @@ class _AsyncBrowserOwner:
         page = self._reconcile_pages(self._context)
         if page is None:
             return {"available": False, "reason": "no live page"}
+        try:
+            if await page.evaluate("document.visibilityState") != "visible":
+                return {"available": False, "reason": "managed tab is not visible"}
+        except Exception:
+            return {"available": False, "reason": "page visibility unavailable"}
         try:
             url = await self._page_url(page)
         except Exception:

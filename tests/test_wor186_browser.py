@@ -847,6 +847,64 @@ def test_exact_browser_extraction_and_nested_scroll_with_mouse_disabled(
     ) == 120
 
 
+@pytest.mark.parametrize("mouse_disabled", [False, True])
+def test_real_form_keyboard_and_capture_without_page_activation(
+    controlled_browser, monkeypatch, mouse_disabled,
+):
+    from playwright.async_api import Page
+    from osia.slash_commands import chat_command_scope
+
+    activations = []
+
+    async def activated(page):
+        activations.append("page")
+
+    monkeypatch.setattr(Page, "bring_to_front", activated)
+    monkeypatch.setattr(browser, "_raise_browser_window", activations.append)
+    monkeypatch.setattr(
+        "osia.conversations.conversation_special_mode", lambda _: mouse_disabled,
+    )
+    owner = controlled_browser.owner
+
+    async def observe():
+        page = await owner._ensure_browser()
+        return {
+            "focused": await page.evaluate("document.activeElement.id"),
+            "first": await page.locator("#first").input_value(),
+            "second": await page.locator("#second").input_value(),
+            "screenshot": await owner._screenshot_b64(page),
+        }
+
+    monkeypatch.setattr(owner, "_op_test_background_observe", observe, raising=False)
+    with chat_command_scope("background-browser", None):
+        state = _navigate(controlled_browser.web.base + "/background")
+        fields = json.loads(browser.inspect_form_fields())["fields"]
+        first_ref = next(
+            field["field_ref"] for field in fields if field.get("html_name") == "first"
+        )
+        assert json.loads(browser.fill_form_field(first_ref, "First value"))["verified"]
+        assert browser.press_key("Tab") == "Pressed key: Tab"
+        assert owner.call("test_background_observe")["focused"] == "second"
+        assert browser.type_text("#second", "Second value").startswith("Text entered")
+        assert browser.press_key("Shift+Tab") == "Pressed key: Shift+Tab"
+        observed = owner.call("test_background_observe")
+        assert observed["focused"] == "first"
+        assert observed["first"] == "First value"
+        assert observed["second"] == "Second value"
+        assert observed["screenshot"]
+
+        next_state = _success(browser.open_new_browser_tab(
+            controlled_browser.web.base + "/page/2", state, reuse_existing=False,
+        ))["state"]
+        _success(browser.select_browser_tab(state))
+        _success(browser.return_to_browser_opener(next_state))
+        page_two = _navigate(controlled_browser.web.base + "/page/2", state)
+        previous = _success(browser.browser_back(page_two))["state"]
+        forward = _success(browser.browser_forward(previous))["state"]
+        _success(browser.reload_browser_page(forward))
+    assert not activations
+
+
 def test_browser_rejects_replaced_dom_node_before_acting(controlled_browser):
     state = _navigate(controlled_browser.web.base + "/audit-browser")
     before = _success(browser.inspect_browser_page(state))

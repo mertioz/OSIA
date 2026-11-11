@@ -932,7 +932,6 @@ class SemanticFormSession:
                 return form_fill_error_receipt(
                     "stale_reference", field_ref, dispatched=False,
                 )
-            await page.bring_to_front()
         except Exception:
             return form_fill_error_receipt(
                 "page_unavailable", field_ref, dispatched=False,

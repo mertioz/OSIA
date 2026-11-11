@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import threading
 import time
@@ -136,6 +137,7 @@ class FakePage(FakeEmitter):
         self.pressed = []
         self.content_revision = 0
         self.scroll_position = 0
+        self.visibility = "visible"
 
     @property
     def url(self):
@@ -182,6 +184,8 @@ class FakePage(FakeEmitter):
 
     async def evaluate(self, expression):
         self.control.check("page.evaluate")
+        if expression == "document.visibilityState":
+            return self.visibility
         if "return window.scrollY - before;" in expression:
             before = self.scroll_position
             delta = int(expression.split("top: ", 1)[1].split(",", 1)[0])
@@ -531,6 +535,62 @@ def test_navigation_click_fill_keyboard_tabs_and_state(owner_harness):
             "selector_found": True,
         },
     }
+
+
+@pytest.mark.parametrize("backend", ["cdp", "bidi"])
+@pytest.mark.parametrize("mouse_disabled", [False, True])
+def test_page_tools_preserve_background_focus(
+    owner_harness, monkeypatch, backend, mouse_disabled,
+):
+    from osia.slash_commands import chat_command_scope
+
+    control, owner = owner_harness
+    monkeypatch.setattr(
+        "osia.conversations.conversation_special_mode", lambda _: mouse_disabled,
+    )
+    raises = []
+    monkeypatch.setattr(browser, "_raise_browser_window", raises.append)
+
+    async def capture():
+        page = await owner._ensure_browser()
+        return await owner._screenshot_b64(page)
+
+    owner._op_test_capture = capture
+    with chat_command_scope("background-browser", None):
+        if backend == "bidi":
+            opened = owner.call("open_firefox_bidi", "https://background.test")
+        else:
+            opened = owner.call("open_cdp_browser", "fake-brave", "https://background.test")
+        assert opened["ok"]
+        original = opened["data"]["state"]
+        assert browser.click("#button")["ok"]
+        assert browser.fill("#field", "value").startswith("Field filled")
+        assert browser.type_text("#field", "abc").startswith("Text entered")
+        for key in ("Tab", "Shift+Tab", "Enter"):
+            assert browser.press_key(key) == f"Pressed key: {key}"
+        assert base64.b64decode(owner.call("test_capture")) == b"shot:https://background.test"
+        new_tab = browser.open_new_browser_tab("https://second.test", reuse_existing=False)
+        assert new_tab["ok"]
+        assert browser.select_browser_tab(original)["ok"]
+        assert browser.return_to_browser_opener(new_tab["data"]["state"])["ok"]
+
+    assert "page.bring_to_front" not in control.operations
+    assert not raises
+
+
+def test_native_browser_bridge_cannot_use_a_background_tab(owner_harness):
+    control, owner = owner_harness
+    assert browser.navigate("https://background.test")["ok"]
+
+    async def hide_selected_tab():
+        owner._active_page.visibility = "hidden"
+
+    owner._op_test_hide_selected_tab = hide_selected_tab
+    owner.call("test_hide_selected_tab")
+    previous_clicks = control.operations.count("page.click")
+    assert browser.dom_click("Continue") is None
+    assert browser.get_web_state()["available"] is False
+    assert control.operations.count("page.click") == previous_clicks
 
 
 def test_exact_tab_reuse_and_intentionally_separate_tab(owner_harness):

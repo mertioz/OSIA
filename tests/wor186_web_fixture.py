@@ -197,6 +197,13 @@ class Wor186WebFixture:
                     self._send("""<!doctype html><main id="items"><p>Item 1</p></main><script>
                     let n=1;addEventListener('scroll',()=>{if(n<3){n++;let p=document.createElement('p');p.textContent='Item '+n;items.appendChild(p)}})</script>""")
                     return
+                if path == "/background":
+                    self._send("""<!doctype html><title>Background control</title>
+                    <form onsubmit="event.preventDefault();document.querySelector('#status').textContent='Saved'">
+                    <label for="first">First field</label><input id="first" name="first">
+                    <label for="second">Second field</label><input id="second" name="second">
+                    <button type="submit">Save</button></form><p id="status">Ready</p>""")
+                    return
                 if path == "/form":
                     self._send("""<!doctype html><form aria-label="Synthetic form"><label for="name">Name</label>
                     <input id="name" name="name"><label for="file">File</label><input id="file" name="file" type="file">
