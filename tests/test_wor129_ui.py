@@ -301,6 +301,12 @@ class QtUiLifecycleTests(unittest.TestCase):
             for index, folder_id in enumerate(["above"] * 8 + ["target"] * 12 + [None] * 20)
         ]
         snapshot = {"snapshot_revision": 1, "folders": folders, "items": items}
+        snapshot_patch = patch(
+            "osia.gui.main_popup.conversations.conversation_snapshot",
+            return_value=snapshot,
+        )
+        snapshot_patch.start()
+        self.addCleanup(snapshot_patch.stop)
 
         def update(request):
             folders[1]["collapsed"] = request["collapsed"]
@@ -314,22 +320,26 @@ class QtUiLifecycleTests(unittest.TestCase):
             QTest.qWait(25)
             scrollbar = panel._scroll.verticalScrollBar()
             header = panel._folder_widgets["target"]
-            scrollbar.setValue(header.y() - 55)
+            scrollbar.setValue(header.mapTo(panel._host, QPoint()).y() - 55)
             initial = scrollbar.value()
             for collapsed in (False, True):
                 if collapsed:
                     QTest.keyClick(header._toggle, Qt.Key.Key_Space)
                 else:
                     QTest.mouseClick(header._toggle, Qt.MouseButton.LeftButton)
+                self.app.processEvents()
+                header = panel._folder_widgets["target"]
                 self.assertTrue(header._toggle.hasFocus())
-                # The canonical polling refresh runs after the click returns.
+                # Further snapshots may arrive while the transition is running.
                 panel.refresh(snapshot=snapshot)
                 panel.refresh(snapshot=snapshot)
                 QTest.qWait(25)
                 header = panel._folder_widgets["target"]
                 self.assertEqual(header._collapsed, collapsed)
                 self.assertEqual(scrollbar.value(), initial)
-                self.assertEqual(header.y() - scrollbar.value(), 55)
+                self.assertEqual(
+                    header.mapTo(panel._host, QPoint()).y() - scrollbar.value(), 55,
+                )
                 self.assertTrue(header._toggle.hasFocus())
         finally:
             panel.close()

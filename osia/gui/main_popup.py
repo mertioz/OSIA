@@ -2903,6 +2903,54 @@ class _FolderRow(QFrame):
             self.rename_clicked.emit(self._folder_id, name)
 
 
+class _FolderContents(QWidget):
+    """Reveal project conversations without changing the popup geometry."""
+
+    def __init__(self, collapsed: bool, parent: QWidget):
+        super().__init__(parent)
+        self._collapsed = collapsed
+        self.setMinimumHeight(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._rows_host = QWidget(self)
+        self._rows_layout = QVBoxLayout(self._rows_host)
+        self._rows_layout.setContentsMargins(0, 6, 0, 0)
+        self._rows_layout.setSpacing(6)
+        clip = QVBoxLayout(self)
+        clip.setContentsMargins(0, 0, 0, 0)
+        clip.setSpacing(0)
+        clip.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+        clip.addWidget(self._rows_host, 0, Qt.AlignmentFlag.AlignTop)
+        self._animation = QPropertyAnimation(self, b"maximumHeight", self)
+        self._animation.setDuration(MOTION.page_ms)
+        self._animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._animation.finished.connect(self._finish_animation)
+
+    def reveal_from(self, height: int | None) -> None:
+        if self._rows_layout.isEmpty():
+            self.hide()
+            return
+        content_height = self._rows_layout.sizeHint().height()
+        end = 0 if self._collapsed else content_height
+        self.setEnabled(not self._collapsed)
+        if height is None or not self.isVisible() or reduced_motion_requested(self):
+            self._finish_animation()
+            return
+        # Clip the full-size rows instead of squeezing their text and buttons.
+        self._rows_host.setFixedHeight(content_height)
+        self.setMaximumHeight(height)
+        self._animation.setStartValue(height)
+        self._animation.setEndValue(end)
+        self._animation.start()
+
+    def _finish_animation(self) -> None:
+        if self._collapsed:
+            self.hide()
+        else:
+            self._rows_host.setMinimumHeight(0)
+            self._rows_host.setMaximumHeight(16777215)
+            self.setMaximumHeight(16777215)
+
+
 class _ConversationsPanel(QWidget):
     """List of past conversations + 'new chat' action."""
 
@@ -2921,6 +2969,7 @@ class _ConversationsPanel(QWidget):
         self._last_snapshot: dict | None = None
         self._row_widgets: dict[str, _ConvRow] = {}
         self._folder_widgets: dict[str, _FolderRow] = {}
+        self._folder_contents: dict[str, _FolderContents] = {}
         self._empty_label: QLabel | None = None
         self._optimistic_hidden_ids: set[str] = set()
         self._optimistic_restore_items: dict[str, dict] = {}
@@ -3054,7 +3103,7 @@ class _ConversationsPanel(QWidget):
                 if row is not None:
                     row.setEnabled(False)
                     row.hide()
-                    self._host_layout.removeWidget(row)
+                    row.parentWidget().layout().removeWidget(row)
                     row.deleteLater()
             if not self._row_widgets and not (self._last_snapshot or {}).get("folders"):
                 self._show_empty_label()
@@ -3203,6 +3252,7 @@ class _ConversationsPanel(QWidget):
             "folder_id": folder_id,
             "collapsed": collapsed,
         })
+        self._poll_canonical_store()
 
     def _emit_new_in_folder(self, folder_id: str) -> None:
         self.folder_mutation_requested.emit({
@@ -3272,11 +3322,7 @@ class _ConversationsPanel(QWidget):
         for folder in snapshot.get("folders") or []:
             folder_id = str(folder.get("id") or "")
             row = self._folder_widgets.get(folder_id)
-            if (
-                row is not None
-                and row._toggle is focused
-                and row._collapsed != bool(folder.get("collapsed", False))
-            ):
+            if row is not None and row._toggle is focused:
                 self._folder_focus_to_restore = folder_id
                 break
         # Removing a focused row action sends Qt through the remaining
@@ -3303,6 +3349,20 @@ class _ConversationsPanel(QWidget):
             < int(self._last_snapshot.get("snapshot_revision") or 0)
         ):
             snapshot = self._last_snapshot
+        animation_starts = {}
+        for folder in snapshot.get("folders") or []:
+            folder_id = str(folder.get("id") or "")
+            row = self._folder_widgets.get(folder_id)
+            contents = self._folder_contents.get(folder_id)
+            if contents is not None and (
+                row._collapsed != bool(folder.get("collapsed", False))
+                or contents._animation.state() == QPropertyAnimation.State.Running
+            ):
+                animation_starts[folder_id] = (
+                    0 if contents.isHidden() else contents.height()
+                )
+        for contents in self._folder_contents.values():
+            contents._animation.stop()
         self._capture_scroll(snapshot)
         active_changed = self._active_id != self._rendered_active_id
         while self._host_layout.count() > 1:
@@ -3313,6 +3373,7 @@ class _ConversationsPanel(QWidget):
                 w.deleteLater()
         self._row_widgets.clear()
         self._folder_widgets.clear()
+        self._folder_contents.clear()
         self._empty_label = None
         self._last_snapshot = {
             "items": [dict(item) for item in snapshot.get("items") or []],
@@ -3349,8 +3410,7 @@ class _ConversationsPanel(QWidget):
             return
         insert_at = 0
 
-        def add_conversation(conv: dict, *, indented: bool) -> None:
-            nonlocal insert_at
+        def make_conversation(conv: dict, *, indented: bool) -> _ConvRow:
             row = _ConvRow(
                 conv,
                 is_active=(conv.get("id") == self._active_id),
@@ -3361,12 +3421,12 @@ class _ConversationsPanel(QWidget):
             row.rename_clicked.connect(self.rename_conversation.emit)
             row.delete_clicked.connect(self.delete_conversation.emit)
             row.move_clicked.connect(self._emit_move)
-            self._host_layout.insertWidget(insert_at, row)
-            self._row_widgets[str(conv.get("id") or "")] = row
-            row.show()
+            return row
+
+        def register_conversation(row: _ConvRow) -> None:
+            self._row_widgets[str(row._conv_id or "")] = row
             if active_changed and row.property("active"):
                 self._motion.fade_in(row, MOTION.state_ms)
-            insert_at += 1
 
         if folders:
             label = QLabel(i18n.t("conversations.projects"))
@@ -3387,12 +3447,29 @@ class _ConversationsPanel(QWidget):
             folder_row.context_policy_changed.connect(self._emit_folder_context)
             folder_row.reorder_clicked.connect(self._emit_folder_reorder)
             folder_row.delete_clicked.connect(self._emit_delete_folder)
-            self._host_layout.insertWidget(insert_at, folder_row)
+            section = QWidget(self._host)
+            section.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed,
+            )
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(0, 0, 0, 0)
+            section_layout.setSpacing(0)
+            section_layout.addWidget(folder_row)
+            contents = _FolderContents(bool(folder.get("collapsed", False)), section)
+            section_layout.addWidget(contents)
+            self._host_layout.insertWidget(insert_at, section)
             self._folder_widgets[folder_id] = folder_row
+            self._folder_contents[folder_id] = contents
             insert_at += 1
-            if not folder.get("collapsed", False):
+            section.show()
+            if not contents._collapsed or folder_id in animation_starts:
                 for conv in members:
-                    add_conversation(conv, indented=True)
+                    row = make_conversation(conv, indented=True)
+                    contents._rows_layout.addWidget(row)
+                    row.show()
+                    if not contents._collapsed:
+                        register_conversation(row)
+            contents.reveal_from(animation_starts.get(folder_id))
 
         ungrouped = [item for item in items if not item.get("folder_id")]
         if folders and ungrouped:
@@ -3401,7 +3478,11 @@ class _ConversationsPanel(QWidget):
             self._host_layout.insertWidget(insert_at, label)
             insert_at += 1
         for conv in ungrouped:
-            add_conversation(conv, indented=False)
+            row = make_conversation(conv, indented=False)
+            self._host_layout.insertWidget(insert_at, row)
+            row.show()
+            register_conversation(row)
+            insert_at += 1
         self._rendered_active_id = self._active_id
         if self._scroll_value_to_restore is not None:
             # Let the scroll area settle its resized content and range first.

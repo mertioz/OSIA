@@ -28,19 +28,11 @@ def _item(conv_id: str, *, folder_id: str | None = None) -> dict:
 
 
 def _rows(panel: _ConversationsPanel) -> list[str]:
-    return [
-        widget._conv_id
-        for index in range(panel._host_layout.count())
-        if isinstance((widget := panel._host_layout.itemAt(index).widget()), _ConvRow)
-    ]
+    return panel.visible_conversation_ids()
 
 
 def _conversation_rows(panel: _ConversationsPanel) -> list[_ConvRow]:
-    return [
-        widget
-        for index in range(panel._host_layout.count())
-        if isinstance((widget := panel._host_layout.itemAt(index).widget()), _ConvRow)
-    ]
+    return list(panel._row_widgets.values())
 
 
 def test_single_delete_persists_and_removes_project_membership(
@@ -246,10 +238,7 @@ def test_bulk_delete_projection_preserves_folder_rows_and_selected_chat(
     assert _rows(panel) == ["b"]
     assert _conversation_rows(panel)[0].property("active")
     assert panel._host_layout.count() > 0
-    assert any(
-        isinstance(panel._host_layout.itemAt(index).widget(), _FolderRow)
-        for index in range(panel._host_layout.count())
-    )
+    assert any(row.isVisible() for row in panel.findChildren(_FolderRow))
 
     canonical.update(
         items=[_item("b", folder_id="folder")],
