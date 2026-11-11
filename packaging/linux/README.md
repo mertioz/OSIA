@@ -63,3 +63,29 @@ with bash, curl, gcc, coreutils and tar. Use
 `packaging/linux/build_linux.sh WORK_DIR REPORT_DIR OUTPUT_DIR` from the
 clean release commit. This creates the stable archive name, SHA-256 file
 and build metadata. Versioned artifacts and their hashes are immutable.
+
+## Release signatures
+
+Linux releases use a detached OpenPGP signature of the exact published archive.
+The primary OSIA Release Signing key fingerprint is
+`5980 65BD 2712 E46B 4DF7 624C 0D99 E609 887B 0F28`.
+Its public key is tracked in `packaging/linux/keys/osia-release-signing.asc`.
+The operator's private key, encrypted passphrase, backup and revocation
+certificate are stored in the local release signing vault, outside Git.
+
+After building and checking an archive, run `packaging/linux/sign_release.py`
+with its original manifest, the signing key fingerprint and protected keyring.
+Supply the passphrase on standard input. The local bounded Windows entry point
+is `%LOCALAPPDATA%/OSIA-Release/Signing/Invoke-OSIALinuxSigning.ps1`.
+For a new release, update that local wrapper's explicit version, source and
+artifact pins after verification.
+The signer validates the release identity, size and SHA-256 before signing.
+It verifies the result with a separate public-key-only keyring.
+
+Publish the archive's `.asc`, the content-addressed public key and the signed
+manifest and its `.asc` as new immutable objects. Keep the original archive,
+checksum and build manifest at their existing URLs. The signature-enriched
+manifest goes under `linux/<version>/signing/release-manifest.json`.
+Only after public verification, update the Linux Stable channel and site
+metadata to include the signature and key fingerprint. Keep the existing
+installer identity, version, release sequence and manual update behavior.
