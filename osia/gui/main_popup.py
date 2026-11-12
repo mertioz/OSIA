@@ -4213,9 +4213,9 @@ class _ProviderCard(QFrame):
     """One AI provider as a compact configuration card.
 
     A "Get API key" row at the top opens the provider's official key page in
-    the system browser. Beneath it, a row holds the colored status dot, the
-    provider name, an API-key input and a Save button (which flashes green
-    once the key is persisted). Every provider authenticates with its API
+    the system browser. Beneath it, a row holds the provider name, an API-key
+    input and a Save button (which flashes green once the key is persisted).
+    Every provider authenticates with its API
     key only — there is no OAuth.
     """
 
@@ -4251,14 +4251,9 @@ class _ProviderCard(QFrame):
             self._get_key_label = None
             self._browse_btn = None
 
-        # Compact row: dot + name + key input + Save
+        # Compact row: name + key input + Save
         key_row = QHBoxLayout()
         key_row.setSpacing(8)
-
-        self._status_dot = QLabel()
-        self._status_dot.setObjectName("statusDot")
-        self._status_dot.setFixedSize(8, 8)
-        self._status_dot.setProperty("state", "stopped")
 
         name = QLabel("Claude API" if provider == "anthropic" else cfg["name"])
         name.setObjectName("providerName")
@@ -4275,7 +4270,6 @@ class _ProviderCard(QFrame):
         self._save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_btn.clicked.connect(self._on_save)
 
-        key_row.addWidget(self._status_dot)
         key_row.addWidget(name)
         # Free-tier "!" info badge for providers that have one (Google, Groq).
         freetier_key = FREETIER_INFO_KEYS.get(provider)
@@ -4342,18 +4336,9 @@ class _ProviderCard(QFrame):
         self._key_input.setText(key or "")
         if self._workspace_input is not None:
             self._workspace_input.setText(str(get_setting("anthropic_workspace_id", "") or ""))
-        self._update_status_dot()
 
     def current_key(self) -> str:
         return self._key_input.text().strip()
-
-    def _update_status_dot(self) -> None:
-        connected = bool(self.current_key())
-        self._status_dot.setProperty(
-            "state", "running" if connected else "stopped"
-        )
-        self._status_dot.style().unpolish(self._status_dot)
-        self._status_dot.style().polish(self._status_dot)
 
     def _on_save(self) -> None:
         key = self.current_key()
@@ -4364,7 +4349,6 @@ class _ProviderCard(QFrame):
         else:
             set_api_key(self._provider, "")
         self._flash_saved()
-        self._update_status_dot()
         self.saved.emit(self._provider)
 
     def _flash_saved(self) -> None:
