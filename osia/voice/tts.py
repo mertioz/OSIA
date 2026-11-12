@@ -309,11 +309,13 @@ def _get_kokoro_pipeline(lang_code: str):
 
 
 def detect_language(text: str) -> str:
-    """Return 'fr' or 'en'."""
+    """Select a speech locale from emitted text; never steer the Chat model."""
+    from osia.turn_context import normalize_locale
+
     try:
-        return "fr" if detect(text) == "fr" else "en"
+        return normalize_locale(detect(text)) or ""
     except Exception:
-        return "en"
+        return ""
 
 
 def _authoritative_tts_language(language: str | None, text: str) -> str:
@@ -789,6 +791,8 @@ def _synthesize_to_buffer(text: str, provider: str, voice):
 
         # local / unknown provider → Kokoro (offline)
         lang = detect_language(text)
+        if not local_tts_supports(lang):
+            return None
         lang_code = "f" if lang == "fr" else "a"
         kvoice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
         _debug(f"greeting cache: synth kokoro (voice={kvoice})")

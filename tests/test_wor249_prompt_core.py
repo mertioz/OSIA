@@ -11,9 +11,6 @@ from osia.tool_contracts import effective_static_tool_specs
 from osia.turn_context import resolve_turn_context
 
 
-def _without_language_contract(prompt: str) -> str:
-    return prompt.rsplit("\n\n[TURN RESPONSE LANGUAGE]\n", 1)[0]
-
 
 def _stable_prompt(lang: str, *, persona: str = "", skills: str = "", mcp: str = "") -> str:
     with (
@@ -24,23 +21,18 @@ def _stable_prompt(lang: str, *, persona: str = "", skills: str = "", mcp: str =
         return agent.get_system_prompt(lang, "fixture-model", "deepseek")
 
 
-def test_one_canonical_english_core_and_separate_target_language():
+def test_one_canonical_core_independent_of_ui_locale():
     english = _stable_prompt("en")
     french = _stable_prompt("fr")
-
     assert agent.SYSTEM_PROMPT_EN is agent.SYSTEM_PROMPT_CORE
     assert not hasattr(agent, "SYSTEM_PROMPT_FR")
-    assert _without_language_contract(english) == _without_language_contract(french)
-    assert english.count("[TURN RESPONSE LANGUAGE]") == 1
-    assert french.count("[TURN RESPONSE LANGUAGE]") == 1
+    assert english == french
+    assert "[TURN RESPONSE LANGUAGE]" not in english
     assert "selected provider/model remains the semantic authority" in english.lower()
     assert "produce one truthful final response" in english.lower()
-    assert "English (en)" in english.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
-    assert "French (fr)" in french.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
-
 
 def test_tool_outcomes_are_factual_and_unknown_does_not_veto_a_fresh_request():
-    core = _without_language_contract(_stable_prompt("en")).lower()
+    core = _stable_prompt("en").lower()
     assert "outcome_unknown is not success" in core
     assert "does not block a distinct fresh model-requested call" in core
     assert "does not require reconciliation before such a call" in core
@@ -90,23 +82,12 @@ def test_personality_and_skills_remain_lower_priority_than_system_contracts():
     assert prompt.count("WOR249_SKILL") == 1
     assert prompt.index("## Essential protections") < prompt.index("WOR249_PERSONA")
     assert prompt.index("## Essential protections") < prompt.index("WOR249_SKILL")
-    assert prompt.rfind("[TURN RESPONSE LANGUAGE]") > prompt.index("WOR249_SKILL")
-    assert "French (fr)" in prompt.rsplit("[TURN RESPONSE LANGUAGE]", 1)[1]
+    assert "[TURN RESPONSE LANGUAGE]" not in prompt
 
 
-def test_language_switch_and_ambiguous_follow_up_stay_conversation_scoped():
-    first = resolve_turn_context("Bonjour, aide-moi.", saved_language="fr")
-    second = resolve_turn_context(
-        "Answer in English.", previous_language=first.canonical_language,
-    )
-    ambiguous = resolve_turn_context(
-        "OK", previous_language=second.canonical_language,
-    )
-    final = resolve_turn_context(
-        "Réponds maintenant en français.",
-        previous_language=ambiguous.canonical_language,
-    )
-
-    assert [item.canonical_language for item in (first, second, ambiguous, final)] == [
-        "fr", "en", "en", "fr",
-    ]
+def test_user_language_requests_do_not_become_application_decisions():
+    for message in ("Bonjour, aide-moi.", "Answer in English.", "OK", "Réponds maintenant en français."):
+        context = resolve_turn_context(message, saved_language="de")
+        assert context.mode == "model" and context.target_language is None
+        assert context.allowed_languages == ()
+        assert context.language == "de"  # UI locale only.

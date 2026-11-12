@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-turn language ownership and privacy-safe turn observability (WOR-177)."""
+"""UI localization and privacy-safe turn observability; response language is model-owned."""
 
 from __future__ import annotations
 
@@ -8,125 +8,58 @@ import hashlib
 import logging
 import re
 import secrets
-import unicodedata
 
-from langdetect import DetectorFactory, detect_langs
 
 from osia import i18n
 
 
 _LOG = logging.getLogger("osia.turn")
-DetectorFactory.seed = 0
-_TURN_LANGUAGES = frozenset({
+_UI_LOCALES = frozenset({
     "ar", "de", "el", "en", "es", "fr", "he", "hi", "it", "ja",
     "ko", "nl", "pl", "pt", "ru", "th", "tr", "zh",
 })
-_LANGUAGE_NAMES = {
-    "en": ("english", "anglais", "inglés", "ingles", "englisch"),
-    "fr": ("french", "français", "francais", "französisch", "franzoesisch"),
-    "zh": ("chinese", "chinois", "chino", "chinesisch", "中文", "普通话", "普通話"),
-    "ja": ("japanese", "japonais", "japonés", "japones", "japanisch", "日本語"),
-    "de": ("german", "allemand", "alemán", "aleman", "deutsch"),
-    "es": ("spanish", "espagnol", "español", "espanol", "spanisch"),
-    "ar": ("arabic", "arabe", "árabe", "arabisch", "العربية"),
-    "ru": ("russian", "russe", "ruso", "russisch", "русский"),
-    "it": ("italian", "italien", "italiano", "italienisch"),
-    "pt": ("portuguese", "portugais", "português", "portugues"),
-    "ko": ("korean", "coréen", "coreen", "한국어"),
-}
-_LANG_LABELS = {
-    "ar": "Arabic", "de": "German", "el": "Greek", "en": "English",
-    "es": "Spanish", "fr": "French", "he": "Hebrew", "hi": "Hindi",
-    "it": "Italian", "ja": "Japanese", "ko": "Korean", "nl": "Dutch",
-    "pl": "Polish", "pt": "Portuguese", "ru": "Russian", "th": "Thai",
-    "tr": "Turkish", "zh": "Chinese",
-}
-_LEXICAL_HINTS = {
-    "en": frozenset({
-        "please", "thanks", "thank", "hello", "could", "would", "answer",
-        "show", "how", "help", "doing", "well", "sure", "okay",
-        "continuing", "now",
-    }),
-    "fr": frozenset({
-        "bonjour", "salut", "merci", "sûr", "sur", "donc", "peux", "réponds",
-        "reponds", "fais", "produire", "pourquoi", "français", "francais",
-    }),
-    "de": frozenset({
-        "hallo", "danke", "bitte", "kannst", "antwort", "warum", "deutsch",
-    }),
-    "es": frozenset({
-        "hola", "gracias", "puedes", "responde", "muestra", "español",
-        "espanol", "porqué", "porque", "cómo", "como",
-    }),
-    "it": frozenset({"ciao", "grazie", "italiano", "perché", "perche"}),
-    "pt": frozenset({"olá", "ola", "obrigado", "português", "portugues"}),
-}
-_ASSISTANT_LEXICAL_HINTS = {
-    **_LEXICAL_HINTS,
-    "en": _LEXICAL_HINTS["en"] | frozenset({
-        "yes", "done", "ready", "welcome", "sorry", "response",
-    }),
-    "fr": _LEXICAL_HINTS["fr"] | frozenset({
-        "oui", "terminé", "termine", "prêt", "pret", "prête", "prete",
-        "désolé", "desole", "désolée", "desolee", "volontiers",
-    }),
-    "de": _LEXICAL_HINTS["de"] | frozenset({
-        "ja", "klar", "fertig", "bereit", "gerne",
-    }),
-    "es": _LEXICAL_HINTS["es"] | frozenset({
-        "sí", "si", "claro", "listo", "hecho",
-    }),
-    "it": _LEXICAL_HINTS["it"] | frozenset({
-        "sì", "si", "certo", "fatto", "pronto",
-    }),
-    "pt": _LEXICAL_HINTS["pt"] | frozenset({
-        "sim", "claro", "feito", "pronto", "obrigada",
-    }),
-}
-
-_SCRIPT_PATTERNS = (
-    ("ja", re.compile(r"[\u3040-\u30ff]")),
-    ("ko", re.compile(r"[\uac00-\ud7af]")),
-    ("ar", re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]")),
-    ("he", re.compile(r"[\u0590-\u05ff]")),
-    ("hi", re.compile(r"[\u0900-\u097f]")),
-    ("th", re.compile(r"[\u0e00-\u0e7f]")),
-    ("ru", re.compile(r"[\u0400-\u04ff]")),
-    ("el", re.compile(r"[\u0370-\u03ff]")),
-    ("zh", re.compile(r"[\u3400-\u9fff]")),
-)
 
 
 @dataclass(frozen=True)
 class TurnContext:
-    """One response-language preference attached only to the current user turn."""
+    """Turn correlation plus locale for application-owned notices, never AI prose.
+
+    Legacy fields remain readable by callers restoring older turn metadata.
+    They do not select, validate or constrain the language of model output.
+    """
 
     language: str
     source: str
     turn_ref: str
-    mode: str = "single-language"
+    mode: str = "model"
     allowed_languages: tuple[str, ...] = ()
     source_language: str | None = None
     target_language: str | None = None
 
     def __post_init__(self) -> None:
-        canonical = (
-            normalize_locale(self.target_language)
-            or normalize_locale(self.language)
-            or i18n.DEFAULT_LANG
-        )
-        object.__setattr__(self, "language", canonical)
-        object.__setattr__(self, "target_language", canonical)
+        object.__setattr__(self, "language", normalize_locale(self.language) or i18n.DEFAULT_LANG)
+        object.__setattr__(self, "mode", "model")
+        object.__setattr__(self, "allowed_languages", ())
+        object.__setattr__(self, "source_language", None)
+        object.__setattr__(self, "target_language", None)
 
     @property
     def canonical_language(self) -> str:
-        """The preferred output language for this turn."""
+        """Compatibility alias for the UI locale, not an output-language decision."""
+        return self.language
 
-        return self.target_language or self.language
+    @property
+    def speech_language(self) -> None:
+        """Let the speech backend select a voice from the actual emitted text."""
+        return None
+
+    def message_metadata(self) -> dict:
+        """Record model ownership without pretending to know its response language."""
+        return {"_language_mode": "model"}
 
 
 def normalize_locale(value) -> str | None:
-    """Normalize a locale to OSIA's bounded turn-language registry."""
+    """Normalize a locale to OSIA's UI/localization locale registry."""
 
     if not isinstance(value, str):
         return None
@@ -137,14 +70,7 @@ def normalize_locale(value) -> str | None:
     if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", candidate):
         return None
     code = candidate.split("-", 1)[0]
-    return code if code in _TURN_LANGUAGES else None
-
-
-def _fold(text: str) -> str:
-    return "".join(
-        char for char in unicodedata.normalize("NFKD", text.casefold())
-        if not unicodedata.combining(char)
-    )
+    return code if code in _UI_LOCALES else None
 
 
 def _display_text(value) -> str:
@@ -156,192 +82,6 @@ def _display_text(value) -> str:
             for part in value if isinstance(part, dict) and part.get("type") == "text"
         )
     return str(value or "")
-
-
-def _lexical_language(words, *, hints_by_language=None) -> str | None:
-    """Return one unambiguous language represented by the lexical registry."""
-
-    registry = hints_by_language or _LEXICAL_HINTS
-    folded_words = [_fold(str(word)) for word in words]
-    lexical_scores = {
-        code: sum(word in {_fold(item) for item in hints} for word in folded_words)
-        for code, hints in registry.items()
-    }
-    ranked = sorted(lexical_scores.items(), key=lambda item: item[1], reverse=True)
-    if (
-        ranked
-        and ranked[0][1] >= 1
-        and (len(ranked) == 1 or ranked[0][1] > ranked[1][1])
-    ):
-        return ranked[0][0]
-    return None
-
-
-def _without_foreign_evidence(text: str) -> str:
-    """Remove quoted/code/tool payloads before conversational language scoring."""
-
-    visible = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    visible = re.sub(r"`[^`]*`", " ", visible)
-    visible = re.sub(r"<tool_(?:call|result)>.*?</tool_(?:call|result)>", " ", visible,
-                     flags=re.DOTALL | re.IGNORECASE)
-    visible = re.sub(r'"[^"\n]*"|“[^”\n]*”|«[^»\n]*»', " ", visible)
-    visible = re.sub(r"https?://\S+", " ", visible)
-    return visible
-
-
-def _mentioned_languages(text: str) -> tuple[str, ...]:
-    visible = _without_foreign_evidence(_display_text(text))
-    folded = _fold(visible)
-    matches: list[tuple[int, str]] = []
-    for code, names in _LANGUAGE_NAMES.items():
-        positions = []
-        for name in names:
-            alias = _fold(name)
-            match = re.search(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", folded)
-            if match:
-                positions.append(match.start())
-        if positions:
-            matches.append((min(positions), code))
-    return tuple(code for _position, code in sorted(matches))
-
-
-def _translation_target(text: str) -> str | None:
-    visible = _without_foreign_evidence(_display_text(text))
-    folded = _fold(visible)
-    if not re.search(
-        r"\b(?:translate|translation|traduis|traduire|traduction|traduce|"
-        r"traducir|ubersetze|uebersetze|traduza)\b",
-        folded,
-    ):
-        return None
-    mentioned = _mentioned_languages(visible)
-    if not mentioned:
-        return None
-    for code in reversed(mentioned):
-        aliases = "|".join(re.escape(_fold(name)) for name in _LANGUAGE_NAMES[code])
-        if re.search(
-            r"\b(?:to|into|en|vers|al|a|auf|para)\s+(?:le |la |l')?(?:"
-            + aliases + r")(?!\w)",
-            folded,
-        ):
-            return code
-    return mentioned[-1]
-
-
-def _multilingual_languages(text: str) -> tuple[str, ...]:
-    visible = _without_foreign_evidence(_display_text(text))
-    folded = _fold(visible)
-    mentioned = _mentioned_languages(visible)
-    if len(mentioned) < 2:
-        return ()
-    if re.search(
-        r"\b(?:bilingual|bilingue|multilingual|multilingue|both|deux|"
-        r"languages|langues|idiomas)\b|\b(?:and|et|y)\b|[+/]",
-        folded,
-    ):
-        return mentioned[:4]
-    return ()
-
-
-def explicit_language(text: str) -> str | None:
-    """Return one explicitly requested response language, if present."""
-
-    visible = _without_foreign_evidence(_display_text(text))
-    folded = _fold(visible)
-    if _translation_target(visible) or _multilingual_languages(visible):
-        return None
-    if not re.search(
-        r"\b(?:reply|respond|answer|write|speak|continue|switch|use|give|"
-        r"summarize|reponds|repondre|ecris|parle|passe|donne|resume|"
-        r"responde|escribe|habla|"
-        r"antworte|schreibe|sprich)\b",
-        folded,
-    ):
-        return None
-    mentioned = _mentioned_languages(visible)
-    return mentioned[0] if mentioned else None
-
-
-def detect_request_language(
-    text: str, *, previous_language: str | None = None,
-) -> str | None:
-    """Infer user-authored prose with scripts, langdetect, then lexical hints."""
-
-    visible = _without_foreign_evidence(_display_text(text)).strip()
-    if not visible:
-        return None
-    if re.fullmatch(r"[A-Z0-9_:@./+-]+", visible):
-        # Opaque identifiers and redacted fixture tokens are not natural prose.
-        # Let the persisted/client fallback own these otherwise neutral turns.
-        return None
-    script_counts = [
-        (len(pattern.findall(visible)), code) for code, pattern in _SCRIPT_PATTERNS
-    ]
-    script_count, script_language = max(script_counts, default=(0, ""))
-    if script_count >= 2:
-        return script_language
-    words = re.findall(r"[^\W\d_]+", visible.casefold(), flags=re.UNICODE)
-    if not words:
-        return None
-    lexical_language = _lexical_language(words)
-    try:
-        candidates = detect_langs(visible)
-        best = candidates[0] if candidates else None
-        detected = normalize_locale(getattr(best, "lang", None))
-        confidence = float(getattr(best, "prob", 0.0))
-    except Exception:
-        detected, confidence = None, 0.0
-    previous = normalize_locale(previous_language)
-    short = len(words) <= 4
-    if short:
-        # One- and two-word replies are usually acknowledgements, commands or
-        # shared technical terms ("OK", "continue", "do it", "encore").
-        # ``langdetect`` is confidently wrong on several of these and used to
-        # flip an otherwise stable conversation.  They are not a clear language
-        # change: keep the previous turn when one exists, and otherwise prefer a
-        # lexical signal/client locale over a guessed language.
-        if len(words) <= 2:
-            if lexical_language:
-                return lexical_language
-            if previous:
-                return None
-            return None
-        if lexical_language:
-            return lexical_language
-        # A highly confident statistical guess is still unreliable for short
-        # continuations such as "d'accord. continue" (misdetected as Italian).
-        # Distinctive lexical cues and explicit requests remain authoritative.
-        if previous and detected != previous:
-            return None
-        return detected if confidence >= 0.80 else None
-    if detected and confidence >= 0.80:
-        return detected
-    return lexical_language
-
-
-def _history_language(history) -> tuple[str | None, str | None]:
-    if not isinstance(history, list):
-        return None, None
-    language = None
-    for message in history:
-        if (
-            not isinstance(message, dict)
-            or message.get("role") != "user"
-            or message.get("_internal")
-            or message.get("_provisional")
-        ):
-            continue
-        persisted = normalize_locale(message.get("_language"))
-        if persisted:
-            language = persisted
-            continue
-        text = _display_text(message.get("content"))
-        detected = explicit_language(text) or detect_request_language(
-            text, previous_language=language,
-        )
-        if detected:
-            language = detected
-    return (language, "recent_user_context") if language else (None, None)
 
 
 def _turn_ref(reference: str | None = None) -> str:
@@ -358,73 +98,18 @@ def resolve_turn_context(
     previous_language=None,
     reference: str | None = None,
 ) -> TurnContext:
-    """Resolve a lightweight response-language preference for this user turn."""
+    """Create turn identity and UI locale without inspecting user text or history.
 
-    text = _display_text(user_input)
-    history_language, history_source = _history_language(history)
-    previous = history_language or normalize_locale(previous_language)
-    requested = explicit_language(text)
-    if requested:
-        context = TurnContext(
-            requested, "explicit_request", _turn_ref(reference),
-            allowed_languages=(requested,),
-            target_language=requested,
-        )
-        log_turn_context(context)
-        return context
-    translation_target = _translation_target(text)
-    if translation_target:
-        source_language = detect_request_language(text, previous_language=previous)
-        allowed = tuple(dict.fromkeys(
-            code for code in (source_language, translation_target) if code
-        ))
-        context = TurnContext(
-            translation_target,
-            "translation_target",
-            _turn_ref(reference),
-            mode="translation",
-            allowed_languages=allowed or (translation_target,),
-            source_language=source_language,
-            target_language=translation_target,
-        )
-        log_turn_context(context)
-        return context
-    multilingual = _multilingual_languages(text)
-    if multilingual:
-        dominant = detect_request_language(text, previous_language=previous)
-        context = TurnContext(
-            dominant if dominant in multilingual else multilingual[0],
-            "explicit_multilingual",
-            _turn_ref(reference),
-            mode="multilingual",
-            allowed_languages=multilingual,
-            target_language=(
-                dominant if dominant in multilingual else multilingual[0]
-            ),
-        )
-        log_turn_context(context)
-        return context
-    candidates = (
-        (detect_request_language(text, previous_language=previous), "current_request"),
-        (previous, history_source or "recent_user_context"),
+    The unused input/history arguments preserve the existing PC, voice and
+    server call signatures. The model receives the user's original messages.
+    """
+    locale = (
+        normalize_locale(client_locale)
+        or normalize_locale(saved_language)
+        or normalize_locale(i18n.get_language())
+        or i18n.DEFAULT_LANG
     )
-    for language, source in candidates:
-        if language:
-            context = TurnContext(
-                language, source, _turn_ref(reference),
-                allowed_languages=(language,),
-                target_language=language,
-            )
-            log_turn_context(context)
-            return context
-
-    context = TurnContext(
-        i18n.DEFAULT_LANG,
-        "natural_model",
-        _turn_ref(reference),
-        allowed_languages=(i18n.DEFAULT_LANG,),
-        target_language=i18n.DEFAULT_LANG,
-    )
+    context = TurnContext(locale, "ui_locale", _turn_ref(reference))
     log_turn_context(context)
     return context
 
@@ -434,179 +119,19 @@ def fixed_turn_context(
     *,
     source: str,
     reference: str | None = None,
-    mode: str = "single-language",
+    mode: str = "model",
     allowed_languages=(),
     source_language: str | None = None,
     target_language: str | None = None,
 ) -> TurnContext:
-    """Restore the preference of one already-running/resumed user turn."""
-
-    normalized = normalize_locale(language) or i18n.DEFAULT_LANG
-    canonical = normalize_locale(target_language) or normalized
-    allowed = tuple(
-        dict.fromkeys(
-            code for code in (normalize_locale(item) for item in allowed_languages)
-            if code
-        )
-    )
-    if mode not in {"single-language", "translation", "multilingual"}:
-        mode = "single-language"
-    context = TurnContext(
-        canonical,
-        source,
-        _turn_ref(reference),
-        mode=mode,
-        allowed_languages=allowed or (canonical,),
-        source_language=normalize_locale(source_language),
-        target_language=canonical,
-    )
+    """Restore a turn's UI locale while retiring legacy output-language controls."""
+    context = TurnContext(normalize_locale(language) or i18n.DEFAULT_LANG, source, _turn_ref(reference))
     log_turn_context(context)
     return context
 
 
-def language_instruction(language: str | TurnContext) -> str:
-    context = language if isinstance(language, TurnContext) else None
-    code = normalize_locale(
-        context.canonical_language if context else language
-    ) or i18n.DEFAULT_LANG
-    if context is not None and context.mode == "translation":
-        allowed = ", ".join(
-            _LANG_LABELS[item] for item in context.allowed_languages
-            if item in _LANG_LABELS
-        )
-        mode_instruction = (
-            f"Translation target for this turn: {_LANG_LABELS[code]}. "
-            f"Requested languages: {allowed or _LANG_LABELS[code]}; preserve source "
-            "text where the translation requires it."
-        )
-    elif context is not None and context.mode == "multilingual":
-        allowed = ", ".join(
-            _LANG_LABELS[item] for item in context.allowed_languages
-            if item in _LANG_LABELS
-        )
-        mode_instruction = f"Requested response languages for this turn: {allowed}."
-    elif context is not None and context.source == "natural_model":
-        mode_instruction = (
-            "No response language preference was resolved for this turn; respond "
-            "naturally to the current user message."
-        )
-    else:
-        mode_instruction = (
-            f"Preferred response language for this turn: {_LANG_LABELS[code]} ({code})."
-        )
-    return (
-        "[TURN RESPONSE LANGUAGE]\n"
-        f"{mode_instruction} This preference applies only to the current turn. "
-        "UI labels, code, names, quotations, and tool output keep their source text."
-    )
-
-
-_SOURCE_VALUE_LINE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:source|original|quotation|quote|citation|"
-    r"extrait|valeur(?:\s+source)?|texte\s+source|fuente|texto\s+original|"
-    r"cita|valor(?:\s+de\s+origen)?)\s*:",
-    re.IGNORECASE,
-)
-
-def _assistant_prose_for_language_check(text) -> str:
-    """Return probable assistant prose without quoted or labelled source data."""
-
-    visible = _without_foreign_evidence(_display_text(text))
-    visible = re.sub(
-        r"\u201c[^\u201d\n]*\u201d|\u00ab[^\u00bb\n]*\u00bb",
-        " ",
-        visible,
-    )
-    kept: list[str] = []
-    for line in visible.splitlines():
-        stripped = line.strip()
-        if (
-            not stripped
-            or stripped.startswith(">")
-            or _SOURCE_VALUE_LINE.match(stripped)
-            or re.fullmatch(r"[A-Z0-9_:@./+-]+", stripped)
-        ):
-            continue
-        if stripped.startswith("|") and stripped.endswith("|"):
-            # Markdown tables commonly carry exact external field values.
-            continue
-        stripped = re.sub(r"^\s*(?:#{1,6}|[-*+]\s+|\d+[.)]\s+)", "", stripped)
-        kept.append(stripped)
-    return "\n".join(kept)
-
-
-def _strong_prose_language(text: str) -> str | None:
-    words = re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
-    lexical = _lexical_language(
-        words, hints_by_language=_ASSISTANT_LEXICAL_HINTS,
-    )
-    if lexical:
-        return lexical
-    for code, pattern in _SCRIPT_PATTERNS:
-        if pattern.search(str(text or "")):
-            return code
-    if len(words) < 4 or sum(len(word) for word in words) < 12:
-        return None
-    try:
-        candidates = detect_langs(text)
-        best = candidates[0] if candidates else None
-        language = normalize_locale(getattr(best, "lang", None))
-        confidence = float(getattr(best, "prob", 0.0))
-    except Exception:
-        return None
-    return language if language and confidence >= 0.85 else None
-
-
-def _language_signal_confidence(text: str, detected: str) -> float:
-    """Return deterministic confidence for an already accepted strong signal."""
-
-    words = re.findall(r"[^\W\d_]+", str(text or ""), flags=re.UNICODE)
-    if _lexical_language(words, hints_by_language=_ASSISTANT_LEXICAL_HINTS) == detected:
-        return 1.0
-    for code, pattern in _SCRIPT_PATTERNS:
-        if code == detected and pattern.search(str(text or "")):
-            return 1.0
-    try:
-        for candidate in detect_langs(text):
-            if normalize_locale(getattr(candidate, "lang", None)) == detected:
-                return round(float(getattr(candidate, "prob", 0.0)), 6)
-    except Exception:
-        pass
-    return 0.0
-
-
-def response_language_drift_diagnostic(
-    text, context: TurnContext | None,
-) -> dict | None:
-    """Describe foreign prose found only in the user-facing final candidate."""
-
-    if (
-        not isinstance(context, TurnContext)
-        or context.mode != "single-language"
-        or context.source == "natural_model"
-    ):
-        return None
-    target = normalize_locale(context.canonical_language)
-    if not target:
-        return None
-    visible = _assistant_prose_for_language_check(text)
-    if not visible.strip():
-        return None
-    detected = _strong_prose_language(visible)
-    if detected and detected != target:
-        return {
-            "analysis_scope": "user_facing_final_answer",
-            "expected_language": target,
-            "detected_final_answer_language": detected,
-            "analyzed_text_span": visible.strip(),
-            "confidence": _language_signal_confidence(visible, detected),
-            "reason": "foreign_assistant_prose_response",
-        }
-    return None
-
-
 def persisted_language_drift_diagnostic(value) -> dict | None:
-    """Return the bounded, reasoning-free diagnostic safe for turn metadata."""
+    """Read a legacy diagnostic without analyzing new prose or steering models."""
 
     if not isinstance(value, dict):
         return None
@@ -639,38 +164,6 @@ def persisted_language_drift_diagnostic(value) -> dict | None:
         "confidence": round(confidence, 6),
         "reason": reason,
     }
-
-
-def response_language_drift(text, context: TurnContext | None) -> str | None:
-    """Return a clearly foreign assistant-prose language, if one is present.
-
-    This is a presentation-repair signal, never a terminal validity decision. It
-    is disabled for unresolved, translation and multilingual turns and ignores
-    quotations, code, URLs, labelled source values and Markdown tables so exact
-    external evidence remains untouched.
-    """
-
-    diagnostic = response_language_drift_diagnostic(text, context)
-    if diagnostic is None:
-        return None
-    return str(diagnostic["detected_final_answer_language"])
-
-
-def response_prose_language(text, context: TurnContext | None) -> str | None:
-    """Return a strong language signal for bounded assistant prose.
-
-    This shares the final-boundary evidence filtering used by
-    :func:`response_language_drift`, but exposes only a confident positive
-    signal.  Streaming callers can therefore hold a small prefix until its
-    canonical language is known without buffering the complete response.
-    """
-
-    if not isinstance(context, TurnContext):
-        return None
-    visible = _assistant_prose_for_language_check(text)
-    if not visible.strip():
-        return None
-    return _strong_prose_language(visible)
 
 
 class ValidatedLiveAssistantChunk(str):
@@ -828,40 +321,12 @@ def localized_text(key: str, language: str, **values) -> str:
         return rendered
 
 
-_LANGUAGE_CONSISTENCY_RETRY = {
-    "en": (
-        "The previous candidate changed the language of OSIA-authored prose. "
-        "Rewrite the same final answer in the preferred language for this turn. Preserve "
-        "proper nouns, exact source values and direct quotations unchanged. Do not "
-        "call another tool or mention this correction."
-    ),
-    "fr": (
-        "La r\u00e9ponse pr\u00e9c\u00e9dente a chang\u00e9 la langue du texte r\u00e9dig\u00e9 "
-        "par OSIA. R\u00e9cris la m\u00eame r\u00e9ponse finale dans la langue pr\u00e9f\u00e9r\u00e9e "
-        "pour ce tour. Conserve les noms propres, les valeurs sources exactes et les citations "
-        "directes sans les modifier. N'appelle aucun autre outil et ne mentionne pas "
-        "cette correction."
-    ),
-    "es": (
-        "La respuesta anterior cambi\u00f3 el idioma del texto redactado por OSIA. "
-        "Reescribe la misma respuesta final en el idioma preferido para este turno. Conserva "
-        "sin cambios los nombres propios, los valores exactos de la fuente y las "
-        "citas directas. No llames a otra herramienta ni menciones esta correcci\u00f3n."
-    ),
-}
-
-def language_consistency_retry_text(language: str) -> str:
-    code = normalize_locale(language) or i18n.DEFAULT_LANG
-    return (
-        _LANGUAGE_CONSISTENCY_RETRY.get(code)
-        or _LANGUAGE_CONSISTENCY_RETRY["en"]
-    )
 def content_hash(text) -> str:
     return hashlib.sha256(_display_text(text).encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def log_turn_context(context: TurnContext) -> None:
-    _LOG.info("turn_language language=%s source=%s turn_ref=%s",
+    _LOG.info("turn_ui_locale locale=%s source=%s turn_ref=%s",
               context.canonical_language, context.source, context.turn_ref)
 
 
@@ -872,6 +337,6 @@ def log_round(context: TurnContext, round_number: int, state: str) -> None:
 
 def log_final(context: TurnContext, text) -> None:
     rendered = _display_text(text)
-    _LOG.info("turn_final turn_ref=%s language=%s length=%d hash=%s",
+    _LOG.info("turn_final turn_ref=%s ui_locale=%s length=%d hash=%s",
               context.turn_ref, context.canonical_language,
               len(rendered), content_hash(rendered))

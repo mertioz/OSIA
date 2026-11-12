@@ -12,6 +12,10 @@ tickets, tests, comments, and documentation when they conflict.
 - There is one canonical Chat runtime. The selected provider/model remains the
   semantic authority through the turn; do not hand work to an Autonomous
   runtime, second planner, static router, or hidden progress agent.
+- The selected model owns response language from the user's original messages
+  and history. Do not infer or inject a target language, rewrite responses, or
+  gate streaming/tool execution by language. UI localization and speech voice
+  selection remain presentation concerns and must not steer Chat output.
 - Every technically available tool remains visible and callable by the selected
   model. Do not reject or reroute a call because of task length, semantic domain,
   mode, strategy, or an application/tool relevance classifier.

@@ -37,14 +37,10 @@ from osia import i18n
 from osia.turn_context import (
     TurnContext,
     ValidatedLiveAssistantChunk,
-    language_consistency_retry_text,
-    language_instruction,
     localized_text,
     log_final,
     log_round,
     normalize_locale,
-    response_language_drift_diagnostic,
-    response_prose_language,
     resolve_turn_context,
 )
 
@@ -519,11 +515,7 @@ def get_system_prompt(
     # WOR-300: this inventory is surface- and request-independent — an engine
     # restriction must never masquerade as a reduced model-visible tool list.
     body = _with_mcp_tool_block(body)
-    # Keep the per-turn contract last. Connected-tool descriptions and user
-    # personality/skill text may contain another language, but they are evidence
-    # and lower-priority context; the final instruction owns every provider
-    # round, including a provider fallback later in the same turn.
-    return body + "\n\n" + language_instruction(turn_context or lang)
+    return body
 
 
 # Default system prompt
@@ -6987,7 +6979,6 @@ class OSIAAgent:
         self.provider = "ollama"
         self.lang = normalize_locale(lang) or i18n.get_language()
         self.turn_context: TurnContext | None = None
-        self._has_turn_language = False
         # API endpoint fallback (Bloc 5) state — populated for real by
         # set_model(); seeded here so the attributes always exist.
         self._api_key = "ollama"
@@ -7222,13 +7213,12 @@ class OSIAAgent:
         )
 
     def set_turn_context(self, context: TurnContext) -> None:
-        """Apply one already-resolved language decision to subsequent model calls."""
+        """Attach turn correlation and the locale used for application-owned notices."""
 
         if not isinstance(context, TurnContext):
             raise TypeError("context must be a TurnContext")
         self.turn_context = context
         self.lang = context.canonical_language
-        self._has_turn_language = True
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {
                 "role": "system",
@@ -10529,36 +10519,6 @@ class OSIAAgent:
             if route and route != [self.provider, self.model]:
                 frame["content"] = frame.get("_response_fallback", "")
 
-        # Restate the current turn's authoritative target language at
-        # the end of the latest user/provider-continuation payload. This is a
-        # wire-only copy: persisted user text and external evidence remain
-        # byte-for-byte unchanged. Putting the contract here covers the first
-        # request, tool-result reinjection, provider retries and account-thread
-        # continuations even when their cached system context is stale.
-        instruction = language_instruction(self.turn_context or self.lang)
-        latest_user = next((
-            index for index in range(len(logical) - 1, -1, -1)
-            if isinstance(logical[index], dict)
-            and logical[index].get("role") == "user"
-        ), None)
-        if latest_user is not None:
-            content = logical[latest_user].get("content")
-            if isinstance(content, str):
-                if not content.rstrip().endswith(instruction):
-                    logical[latest_user]["content"] = (
-                        content.rstrip() + "\n\n" + instruction
-                    )
-            elif isinstance(content, list):
-                parts = list(content)
-                last_text = next((
-                    str(part.get("text") or "")
-                    for part in reversed(parts)
-                    if isinstance(part, dict) and part.get("type") == "text"
-                ), "")
-                if not last_text.rstrip().endswith(instruction):
-                    parts.append({"type": "text", "text": instruction})
-                logical[latest_user]["content"] = parts
-
         def _build_wire_context(context_messages: list):
             return build_context(
                 context_messages,
@@ -10815,11 +10775,11 @@ class OSIAAgent:
             if sentence:
                 cleaned = clean_response(sentence)
                 if cleaned and cleaned.strip():
-                    on_sentence(cleaned)
+                    on_sentence(ValidatedLiveAssistantChunk(cleaned))
         if flush and speakable.strip():
             cleaned = clean_response(speakable.strip())
             if cleaned and cleaned.strip():
-                on_sentence(cleaned)
+                on_sentence(ValidatedLiveAssistantChunk(cleaned))
             speakable = ""
         return speakable
 
@@ -10994,42 +10954,6 @@ class OSIAAgent:
             self._emit_sentences(speakable, on_sentence, flush=True)
 
         return full
-
-    def _finish_language_presentation_fallback(
-        self, *, candidate: str, on_sentence=None, round_number: int,
-    ) -> str:
-        """Deliver useful prose when the one presentation rewrite is imperfect."""
-
-        self.last_run_diagnostic = {
-            "stage": "response_generation",
-            "reason_code": "language_presentation_repair_incomplete",
-            "repair_attempted": True,
-            "delivered_useful_candidate": True,
-            **dict(getattr(self, "_language_consistency_diagnostic", None) or {}),
-        }
-        content = clean_response(
-            self._redact_semantic_form_values(str(candidate or ""))
-        )
-        if not content:
-            content = self._empty_response_fallback()
-        if on_sentence is not None:
-            try:
-                on_sentence(content)
-            except Exception:
-                pass
-        self._mark_document_private_history()
-        final_message = {"role": "assistant", "content": content}
-        if self._document_private_run:
-            final_message["_document_private"] = True
-        self.messages.append(final_message)
-        if self.turn_context is not None:
-            log_round(
-                self.turn_context,
-                round_number,
-                "language_presentation_fallback",
-            )
-            log_final(self.turn_context, content)
-        return content
 
     def _empty_response_fallback(self) -> str:
         """Return a localized, non-assertive fallback for an unusable final."""
@@ -13271,7 +13195,6 @@ class OSIAAgent:
         )
         self.last_run_diagnostic = None
         self.last_tool_argument_diagnostic = None
-        self._language_consistency_diagnostic = None
         self.last_execution_strategy_snapshot = None
         prior_artifacts = self.last_run_artifacts
         if not prior_artifacts:
@@ -13313,8 +13236,7 @@ class OSIAAgent:
                 user_input,
                 history=history,
                 client_locale=client_locale,
-                saved_language=i18n.get_language(),
-                previous_language=self.lang if self._has_turn_language else None,
+                saved_language=self.lang,
                 reference=current_conversation_id,
             )
         self.set_turn_context(turn_context)
@@ -13777,15 +13699,11 @@ class OSIAAgent:
 
         # Provider sentences remain provisional until the canonical `response`
         # event, but safe prose may be projected live as a replaceable draft.
-        # Hold only a bounded language prefix while a current-turn preference is
-        # known. A mismatch remains private for the optional presentation repair,
-        # but never invalidates the useful final answer. Callers must not
+        # Public prose is forwarded in the language the model emits. Callers must not
         # persist or speak these callbacks until `run()` returns its one final.
         _stream_emitted = {"v": False}
         provisional_sentences: list[str] = []
         visible_round_sentences: list[str] = []
-        language_prefix_sentences: list[str] = []
-        stream_language_accepted = {"v": False}
         schedule_guard_state = {
             "ignored_unrelated_tool": False,
             "failure_retry_used": False,
@@ -13797,36 +13715,23 @@ class OSIAAgent:
                 _flag=_stream_emitted,
                 _schedule_state=schedule_guard_state,
             ):
+                parser_approved = isinstance(_text, ValidatedLiveAssistantChunk)
                 _text = self._redact_semantic_form_values(_text)
                 provisional_sentences.append(_text)
                 if _schedule_state["ignored_unrelated_tool"]:
                     _schedule_state["buffered_sentences"].append(_text)
                     return None
-                language_prefix_sentences.append(_text)
-                prefix = " ".join(language_prefix_sentences).strip()
-                if not stream_language_accepted["v"]:
-                    if (
-                        self.turn_context is not None
-                        and self.turn_context.mode == "single-language"
-                        and self.turn_context.source != "natural_model"
-                    ):
-                        detected = response_prose_language(
-                            prefix, self.turn_context,
-                        )
-                        if detected != self.turn_context.canonical_language:
-                            return None
-                    stream_language_accepted["v"] = True
-                    ready = list(language_prefix_sentences)
-                    language_prefix_sentences.clear()
-                else:
-                    ready = [language_prefix_sentences.pop()]
-                for sentence in ready:
-                    try:
-                        on_sentence(ValidatedLiveAssistantChunk(sentence))
-                    except Exception:
-                        continue
-                    visible_round_sentences.append(sentence)
-                    _flag["v"] = True
+                # Legacy/raw callbacks have not established whether a fragment
+                # belongs to public prose, a tool round or private reasoning.
+                # Only the parser's public chunks may be projected live.
+                if not parser_approved:
+                    return None
+                try:
+                    on_sentence(ValidatedLiveAssistantChunk(_text))
+                except Exception:
+                    return None
+                visible_round_sentences.append(_text)
+                _flag["v"] = True
                 return None
         else:
             _on_sentence_cb = on_sentence
@@ -13850,8 +13755,6 @@ class OSIAAgent:
         scheduled_task_tool_succeeded = False
         scheduled_task_request_retry_used = False
         scheduled_task_claim_retry_used = False
-        language_consistency_retry_used = False
-        language_repair_fallback = ""
         argument_repair_used = False
         argument_repair_active = False
         argument_repair_provider_model: tuple[str, str] | None = None
@@ -13997,8 +13900,6 @@ class OSIAAgent:
             self._mark_document_private_history()
             provisional_sentences.clear()
             visible_round_sentences.clear()
-            language_prefix_sentences.clear()
-            stream_language_accepted["v"] = False
             schedule_guard_state["buffered_sentences"] = []
             reasoning_request = None
             reasoning_outcome_recorded = False
@@ -14115,12 +14016,6 @@ class OSIAAgent:
                         reasoning_request.get("diagnostic") or {},
                         accepted=False,
                         error=e,
-                    )
-                if language_consistency_retry_used:
-                    return self._finish_language_presentation_fallback(
-                        candidate=language_repair_fallback,
-                        on_sentence=on_sentence,
-                        round_number=round_number,
                     )
                 reformulatable_native_action = bool(
                     self.provider == "chatgpt_account"
@@ -14382,15 +14277,6 @@ class OSIAAgent:
                     "content": instruction,
                 })
                 continue
-            if tool_calls and language_consistency_retry_used:
-                # The bounded consistency retry is synthesis-only. A provider
-                # must not turn it into another dispatch or replay an earlier
-                # tool after OSIA has rejected the candidate final.
-                return self._finish_language_presentation_fallback(
-                    candidate=language_repair_fallback,
-                    on_sentence=on_sentence,
-                    round_number=round_number,
-                )
             if tool_calls and self.provider == "chatgpt_account":
                 _account_attempt_committed = True
 
@@ -15389,8 +15275,7 @@ class OSIAAgent:
                     )
                 feedback_text = (
                     f"<tool_result>\n{feedback}\n</tool_result>\n"
-                    f"{synthesis_instruction}\n\n"
-                    f"{language_instruction(self.turn_context or self.lang)}"
+                    f"{synthesis_instruction}"
                 )
                 from osia.claude_messages import tool_feedback
                 native_feedback = tool_feedback(message, tool_calls, tool_results, feedback_text)
@@ -15774,12 +15659,6 @@ class OSIAAgent:
                     f"tools_executed={len(guard.actions)}, "
                     f"empty_retry_used={empty_retry_used})"
                 )
-                if language_consistency_retry_used:
-                    return self._finish_language_presentation_fallback(
-                        candidate=language_repair_fallback,
-                        on_sentence=on_sentence,
-                        round_number=round_number,
-                    )
                 if not empty_retry_used:
                     empty_retry_used = True
                     print(
@@ -15818,48 +15697,6 @@ class OSIAAgent:
                     time.sleep(0.5)
                     continue
                 content = self._empty_response_fallback()
-            language_content = content
-            if self._terminality_controller is not None:
-                from osia.outcome_contract import parse_completion, CompletionValidationError
-                try:
-                    language_content = parse_completion(content).answer
-                except CompletionValidationError:
-                    pass
-            drift_diagnostic = response_language_drift_diagnostic(
-                language_content, self.turn_context,
-            )
-            drift_language = (
-                str(drift_diagnostic["detected_final_answer_language"])
-                if drift_diagnostic is not None else None
-            )
-            if drift_language:
-                self._language_consistency_diagnostic = dict(drift_diagnostic)
-                if not language_consistency_retry_used:
-                    language_consistency_retry_used = True
-                    language_repair_fallback = content
-                    if self.turn_context is not None:
-                        log_round(
-                            self.turn_context,
-                            round_number,
-                            "language_presentation_repair_requested",
-                        )
-                    self.messages.append({
-                        "role": "assistant",
-                        "_internal": True,
-                        "_provisional": True,
-                        "content": content,
-                    })
-                    self.messages.append({
-                        "role": "user",
-                        "_internal": True,
-                        "content": language_consistency_retry_text(self.lang),
-                    })
-                    continue
-                return self._finish_language_presentation_fallback(
-                    candidate=language_repair_fallback or content,
-                    on_sentence=on_sentence,
-                    round_number=round_number,
-                )
             if unresolved_tool_timeout and self.last_run_diagnostic is None:
                 failure_reason = (
                     "tool_timeout" if turn_has_tool_timeout else "task_execution_failure"

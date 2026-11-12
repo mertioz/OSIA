@@ -151,7 +151,7 @@ def test_server_reveals_only_verified_canonical_text_after_provider_completion()
     asyncio.run(exercise())
 
 
-def test_agent_language_guard_releases_a_bounded_prefix_before_completion():
+def test_agent_parser_approved_prose_streams_before_completion():
     agent = OSIAAgent(lang="fr")
     release = threading.Event()
     first_fragment = threading.Event()
@@ -161,10 +161,10 @@ def test_agent_language_guard_releases_a_bounded_prefix_before_completion():
     def fake_stream(self, callback, *, on_first_token=None, guard=None):
         if on_first_token is not None:
             on_first_token()
-        callback("Cette première phrase française est visible immédiatement.")
+        self._emit_sentences("Cette première phrase française est visible immédiatement.", callback, flush=True)
         first_fragment.set()
         assert release.wait(2.0)
-        callback("La deuxième arrive avant la réponse finale.")
+        self._emit_sentences("La deuxième arrive avant la réponse finale.", callback, flush=True)
         return (
             "Cette première phrase française est visible immédiatement. "
             "La deuxième arrive avant la réponse finale."

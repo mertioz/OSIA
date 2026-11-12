@@ -1319,11 +1319,7 @@ def _persist_agent_delta(
             context = getattr(agent, "turn_context", None)
             metadata = None
             if context is not None:
-                metadata = {
-                    "_language": context.language,
-                    "_language_mode": context.mode,
-                    "_allowed_languages": list(context.allowed_languages),
-                }
+                metadata = context.message_metadata()
             if (
                 clean.get("role") == "user"
                 and isinstance(clean.get("_attachments"), list)
@@ -1503,11 +1499,7 @@ def _persist_exchange(conv_id, user_text, assistant_text, turn_context=None):
     try:
         metadata = None
         if turn_context is not None:
-            metadata = {
-                "_language": turn_context.language,
-                "_language_mode": turn_context.mode,
-                "_allowed_languages": list(turn_context.allowed_languages),
-            }
+            metadata = turn_context.message_metadata()
         user_receipt = conversations.commit_message(
             conv_id, "user", user_text, metadata=metadata,
         )
@@ -1798,11 +1790,7 @@ def voice_mode():
                     turn_context=turn_context,
                 ),
                 turn_meta=turn_meta,
-                metadata={
-                    "_language": turn_context.language,
-                    "_language_mode": turn_context.mode,
-                    "_allowed_languages": list(turn_context.allowed_languages),
-                },
+                metadata=turn_context.message_metadata(),
             )
         except Exception as exc:
             print(f"[voice] turn failed: {type(exc).__name__}")
@@ -1827,7 +1815,7 @@ def voice_mode():
             print("[voice] canonical assistant persistence failed")
             continue
         print(f"[TTS] main.voice_mode: calling speak() ({len(response)} chars)", flush=True)
-        speak(response, language=turn_context.language)
+        speak(response, language=turn_context.speech_language)
         print("[TTS] main.voice_mode: speak() returned", flush=True)
 
 
@@ -2907,7 +2895,7 @@ def wake_mode():
                         speak_streaming(
                             clean_response(display),
                             session_id=tts_session_id,
-                            language=turn_context.language,
+                            language=turn_context.speech_language,
                         )
                 except Exception as presentation_error:
                     print(
@@ -3072,7 +3060,7 @@ def wake_mode():
                 speak_streaming(
                     clean_response(display),
                     session_id=tts_session_id,
-                    language=turn_context.language,
+                    language=turn_context.speech_language,
                 )
         except Exception as e:
             if canonical_committed[0]:
@@ -3126,7 +3114,7 @@ def wake_mode():
                 speak_streaming(
                     clean_response(display),
                     session_id=tts_session_id,
-                    language=turn_context.language,
+                    language=turn_context.speech_language,
                 )
             return
         finally:

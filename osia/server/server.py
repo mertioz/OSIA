@@ -4597,7 +4597,9 @@ def _persist_accepted_user_message(
             ),
         }
         language = normalize_locale(turn_meta.get("language"))
-        if language:
+        if turn_meta.get("language_mode") == "model":
+            metadata["_language_mode"] = "model"
+        elif language:
             metadata["_language"] = language
         attachment_metadata = turn_meta.get("attachment_metadata")
         if isinstance(attachment_metadata, list) and attachment_metadata:
@@ -4704,7 +4706,7 @@ def _persist_completed_assistant_message(
             "_terminal_event_id": event_id,
             "_terminal_sequence": sequence,
             "_terminal": True,
-            "_language": normalize_locale(turn_meta.get("language")) or "",
+            "_language_mode": str(turn_meta.get("language_mode") or "model"),
             "_terminal_status": str(terminal_frame.get("status") or "done"),
             "_stage": str(terminal_frame.get("stage") or ""),
             "_error_category": str(
@@ -12143,9 +12145,11 @@ class _ResponseTTSSession:
         except Exception:
             self._synthesize_accepts_language = False
         self.language = (
-            normalize_locale(language)
-            or normalize_locale(turn_meta.get("language"))
-            or i18n.DEFAULT_LANG
+            None if turn_meta.get("language_mode") == "model" else (
+                normalize_locale(language)
+                or normalize_locale(turn_meta.get("language"))
+                or i18n.DEFAULT_LANG
+            )
         )
         self._max_pending = max(1, int(max_pending))
         self._pending: deque[tuple[int, int, str]] = deque()
@@ -12703,10 +12707,8 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
         })
         await ws.send_json(conversations.conversation_snapshot())
 
-    # Resolve from the original user-authored turn before attachment manifests
-    # or other generated English metadata can enter the provider input. Keep
-    # persisted ``_language`` metadata visible for this one decision, then strip
-    # all transport metadata before the provider sees history.
+    # Keep UI localization separate from the model-owned response language.
+    # User text and attached source content are passed through unchanged.
     original_user_text = (
         turn_meta.get("_original_user_text")
         if isinstance(turn_meta, dict) else None
@@ -13307,7 +13309,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                         and turn_meta.get("_response_media_cancelled") is not True
                     ):
                         resumed_tts = _ResponseTTSSession(
-                            ws, turn_meta, t0, language=turn_context.language,
+                            ws, turn_meta, t0, language=turn_context.speech_language,
                         )
                         if _track_response_audio_task(
                             resumed_tts.start(), turn_meta, ws,
@@ -13943,7 +13945,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                     ws,
                                     turn_meta,
                                     t0,
-                                    language=turn_context.language,
+                                    language=turn_context.speech_language,
                                 )
                                 if _track_response_audio_task(
                                     resumed_tts.start(), turn_meta, ws,
@@ -14141,7 +14143,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                                         ws,
                                         turn_meta,
                                         t0,
-                                        language=turn_context.language,
+                                        language=turn_context.speech_language,
                                     )
                                     if _track_response_audio_task(
                                         resumed_tts.start(), turn_meta, ws,
@@ -14483,7 +14485,7 @@ async def _run_agent_and_respond(ws: "_OutboundChannel", text, history: list,
                             ws,
                             turn_meta,
                             t0,
-                            language=turn_context.language,
+                            language=turn_context.speech_language,
                         )
                         if _track_response_audio_task(
                             resumed_tts.start(), turn_meta, ws,

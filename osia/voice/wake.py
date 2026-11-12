@@ -843,7 +843,7 @@ def default_callback():
     print(f"[voice] assistant response accepted ({len(response)} chars).")
 
     # Speak response
-    speak(response, language=turn_context.language)
+    speak(response, language=turn_context.speech_language)
 
 
 if __name__ == "__main__":

@@ -187,8 +187,6 @@ def test_canonical_run_streams_commentary_without_final_sentence_consumer(monkey
     agent.configure_execution_trace(conversation_id="conv_v3", request_id="req_v3", turn_id="turn_v3",
                                     provider_id=agent.provider, model_id=agent.model, callback=frames.append)
     monkeypatch.setattr(agent, "_resolve_route", lambda _: ("medium", []))
-    # Isolate the commentary boundary from probabilistic language detection.
-    monkeypatch.setattr(module, "response_language_drift_diagnostic", lambda *_: None)
     monkeypatch.setattr("osia.turn_terminality.CONFIG_DIR", str(tmp_path))
     monkeypatch.setitem(module.TOOL_MAP, "list_files", lambda path: order.append("tool") or "two files")
     monkeypatch.setattr("osia.action_policy.guard_tool_call", lambda *a, **k: None)

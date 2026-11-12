@@ -57,7 +57,6 @@ _PLANNING_DEVELOPER_INSTRUCTIONS = (
     "desktop, or OSIA tools. Produce only the schema-constrained final JSON."
 )
 
-_LANGUAGE_MARKER = "\n\n[TURN RESPONSE LANGUAGE]\n"
 
 _DIRECT_VISUAL_TOOL_NAMES = frozenset({
     "request_visual_observation", "desktop_click",
@@ -204,7 +203,7 @@ def _same_messages(left: list[dict], right: list[dict]) -> bool:
 def _message_digest(message: dict) -> str:
     payload = _public_message(message)
     if isinstance(payload["content"], str):
-        payload["content"] = payload["content"].partition(_LANGUAGE_MARKER)[0].rstrip()
+        payload["content"] = payload["content"].rstrip()
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -286,22 +285,9 @@ def _turn_input(messages: list[dict]) -> str | list[dict]:
     return parts
 
 
-def _insert_before_turn_language(text: str, addition: str) -> str:
-    """Keep provider-owned additions above the current-turn preference."""
-
-    block = str(addition or "").strip()
-    if not block:
-        return str(text or "").strip()
-    if _LANGUAGE_MARKER in text:
-        before, after = text.rsplit(_LANGUAGE_MARKER, 1)
-        return (
-            before.rstrip()
-            + "\n\n"
-            + block
-            + _LANGUAGE_MARKER
-            + after
-        ).strip()
-    return (str(text or "").rstrip() + "\n\n" + block).strip()
+def _append_instructions(text: str, addition: str) -> str:
+    """Append provider context without adding any response-language preference."""
+    return (str(text or "").rstrip() + "\n\n" + str(addition or "").strip()).strip()
 
 
 def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
@@ -326,7 +312,7 @@ def _sanitized_system_prompt(system: str, messages: list[dict]) -> str:
         "",
     )
     if desktop_path and re.search(r"\b(desktop|bureau)\b", latest_user, re.IGNORECASE):
-        cleaned = _insert_before_turn_language(
+        cleaned = _append_instructions(
             cleaned, f"[DESKTOP PATH: {desktop_path}]",
         )
     return cleaned.strip()
@@ -574,7 +560,7 @@ class ChatGPTAccountProvider:
             base_instructions = _PLANNING_BASE_INSTRUCTIONS
             developer_instructions = _PLANNING_DEVELOPER_INSTRUCTIONS
         else:
-            base_instructions = _insert_before_turn_language(
+            base_instructions = _append_instructions(
                 system, _CONTAINMENT_INSTRUCTIONS,
             )
             developer_instructions = _DEVELOPER_INSTRUCTIONS
@@ -732,7 +718,7 @@ class ChatGPTAccountProvider:
         state.strategy_revision = strategy_revision
         state.world_revision = world_revision
         state.application_context = (
-            _insert_before_turn_language(
+            _append_instructions(
                 base_instructions,
                 "Use native calls only for tools declared on this thread. "
                 "Use OSIA's textual format for other available tools.",

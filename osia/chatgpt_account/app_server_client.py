@@ -453,20 +453,11 @@ def _latest_user_text(turn_content: str | list[dict]) -> str:
 
 
 def _native_action_refusal(turn_content: str | list[dict]) -> str:
-    """Return the user-language refusal for blocked native actions."""
+    """Return the UI-localized refusal for blocked native actions."""
     from osia import i18n
-    from osia.turn_context import normalize_locale, resolve_turn_context
+    from osia.turn_context import normalize_locale
 
-    saved_language = normalize_locale(i18n.get_language())
-    language = resolve_turn_context(
-        _latest_user_text(turn_content),
-        saved_language=saved_language,
-    )
-    language = (
-        saved_language
-        if language.source == "natural_model" and saved_language else
-        language.language
-    )
+    language = normalize_locale(i18n.get_language()) or i18n.DEFAULT_LANG
     translations = i18n.TRANSLATIONS.get(_NATIVE_ACTION_REFUSAL_KEY, {})
     return translations.get(language) or i18n.t(_NATIVE_ACTION_REFUSAL_KEY)
 
