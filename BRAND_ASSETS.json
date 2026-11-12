@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "policyVersion": "1.0",
+  "effectiveDate": "2026-11-12",
+  "rightsHolder": "Aymen Gherbi (OSIA), entrepreneur individuel",
+  "permissionContact": "contact@osia.space",
+  "policy": "TRADEMARKS.md",
+  "artworkLicense": "LicenseRef-OSIA-Brand-Assets-1.0",
+  "scope": "Original OSIA artwork only; no rights claimed in third-party elements or Apache-licensed UI code.",
+  "assets": [
+    {
+      "path": "assets/onboarding/settings-api-provider.png",
+      "sha256": "7ab504b6ef55ea84bbb8384955cfb84c8875c9e988ef69a679fbc521e1914c29"
+    },
+    {
+      "path": "assets/onboarding/settings-chatgpt-account.png",
+      "sha256": "cc15655a9921308a5af83a31c847b508d325ae2e73c0bca7d699b6d1e8acfa4b"
+    },
+    {
+      "path": "assets/onboarding/settings-menu.png",
+      "sha256": "6d5c2a2196f33b47d3bd7c8eaf16a629105492e47e2eb848f4f288fe4f549d7f"
+    },
+    {
+      "path": "assets/onboarding/settings-mobile-pairing.png",
+      "sha256": "cd5c89e797a56d8796d8f229126ddf4b6114dc32111135fa243feef575113d8f"
+    },
+    {
+      "path": "assets/onboarding/settings-model-hierarchy.png",
+      "sha256": "81a02766f434b53005f8ac1a8a60fd2772db24ca668626b52493a1a0172eed18"
+    },
+    {
+      "path": "assets/onboarding/settings-voice.png",
+      "sha256": "960020a2640832e2d95d4ce2ae2a5d3a3256b18fab6d2dddca088e3e55e70f58"
+    },
+    {
+      "path": "assets/osia_icon.png",
+      "sha256": "9551b7266614e0da332c87887837db897a876b404e621cb88014303eeeb5b694"
+    },
+    {
+      "path": "assets/osia_logo.png",
+      "sha256": "3cb10405954b6bdb60bdc9340b7aef04b57bfc717034ae6d2c7ff2e5f94ba95a"
+    }
+  ],
+  "excludedThirdPartyOrPreviouslyLicensedMaterial": [],
+  "hashBasis": "SHA-256 of Git source blobs; SVG line endings normalized to LF."
+}

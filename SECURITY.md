@@ -12,11 +12,10 @@ Do not open a public issue, discussion, or pull request containing a
 vulnerability, credential, token, private key, user data, or reproduction that
 would expose one.
 
-Use GitHub private vulnerability reporting for this repository if the owner has
-enabled it. Otherwise, contact the maintainer through a private channel you have
-already established. Before public release, the repository owner must review
-this paragraph and configure a public, non-personal security contact. OSIA does
-not currently claim a bug-bounty program.
+Use GitHub private vulnerability reporting when available. Otherwise, email
+contact@osia.space privately with a minimal, redacted description. Never place
+credentials or user data in a public issue or pull request. OSIA does not
+currently claim a bug-bounty program.
 
 Include the affected component and a minimal reproduction, but replace every
 credential and user record with a non-secret synthetic value.

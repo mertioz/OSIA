@@ -8,10 +8,10 @@ from osia import legal
 
 class LegalManifestTests(unittest.TestCase):
     def test_bundled_manifest_matches_canonical_version_and_urls(self):
-        self.assertEqual(legal.TERMS_VERSION, "2026-10-22.1")
-        self.assertEqual(legal.PRIVACY_VERSION, "2026-10-22.1")
-        self.assertEqual(legal.LAST_UPDATED, "2026-10-22")
-        self.assertEqual(legal.EFFECTIVE_DATE, "2026-10-22")
+        self.assertEqual(legal.TERMS_VERSION, "2026-11-12.1")
+        self.assertEqual(legal.PRIVACY_VERSION, "2026-11-12.1")
+        self.assertEqual(legal.LAST_UPDATED, "2026-11-12")
+        self.assertEqual(legal.EFFECTIVE_DATE, "2026-11-12")
         self.assertEqual(legal.PUBLIC_CONTACT_EMAIL, "contact@osia.space")
         self.assertEqual(legal.GOVERNING_LAW, "France")
         self.assertIsNone(legal.MINIMUM_AGE)

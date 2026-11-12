@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "version": "2026-10-22.1",
-  "termsVersion": "2026-10-22.1",
-  "privacyVersion": "2026-10-22.1",
-  "lastUpdated": "2026-10-22",
-  "effectiveDate": "2026-10-22",
+  "version": "2026-11-12.1",
+  "termsVersion": "2026-11-12.1",
+  "privacyVersion": "2026-11-12.1",
+  "lastUpdated": "2026-11-12",
+  "effectiveDate": "2026-11-12",
   "languages": [
     "en",
     "fr"
@@ -43,5 +43,5 @@
       "manifest": "https://osia.space/legal-manifest.json"
     }
   },
-  "contentSha256": "bc7cf249228bf82d0cd54ef5aa38d311a3b9e14778e2a990e35af2879ac8dd94"
+  "contentSha256": "dc417820accdacc4cc368185693c360bb8f865baffd614917eed83a713079f34"
 }
