@@ -63,6 +63,21 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.265", released_on="2026-11-12", public=True,
+        changes_en=(
+            "The selected AI chooses its response language from your messages and conversation, without an application language detector or automatic language rewrites.",
+            "Public replies stream without waiting for language classification; private reasoning and internal tool markup remain hidden.",
+            "A refused physical action no longer brings its target window to the foreground. Web commands can work in the background while necessary native input remains available.",
+            "Interface localization and speech voice selection stay separate from the AI's response language.",
+        ),
+        changes_fr=(
+            "L’IA choisit la langue de réponse à partir de vos messages et de la conversation, sans détecteur applicatif ni réécriture automatique de langue.",
+            "Les réponses s’affichent en continu sans attendre de classification linguistique ; le raisonnement privé et les balises internes des outils restent masqués.",
+            "Une action physique refusée ne ramène plus sa fenêtre au premier plan. Les commandes web peuvent fonctionner en arrière-plan et les saisies natives nécessaires restent disponibles.",
+            "La langue de l’interface et le choix de la voix restent séparés de la langue de réponse de l’IA.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.264", released_on="2026-11-11", public=True,
         changes_en=(
             "Projects smoothly reveal and hide their conversations, keeping the list position and keyboard focus.",
