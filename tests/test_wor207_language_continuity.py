@@ -75,6 +75,43 @@ def test_short_or_language_neutral_messages_preserve_previous_turn(
     assert context.source == "recent_user_context"
 
 
+@pytest.mark.parametrize("message", [
+    "d'accord. continue", "D’accord, continue", "ok, tu peux continuer",
+])
+def test_short_acknowledgement_does_not_override_french_history(message):
+    context = resolve_turn_context(
+        message,
+        history=[
+            {"role": "user", "content": "Peux-tu vérifier le résultat ?"},
+            {"role": "assistant", "content": "Je continue la vérification.", "_language": "fr"},
+        ],
+    )
+    assert context.language == "fr"
+    assert context.source in {"recent_user_context", "current_request"}
+
+
+def test_unannotated_acknowledgements_in_history_do_not_change_user_language():
+    history = [
+        {"role": "user", "content": "Peux-tu vérifier le résultat ?"},
+        {"role": "assistant", "content": "Je continue la vérification.", "_language": "fr"},
+        {"role": "user", "content": "d'accord. continue"},
+        {"role": "assistant", "content": "Testo precedente in italiano.", "_language": "it"},
+        {"role": "user", "content": "Synthetic English tool receipt", "_internal": True},
+    ]
+    context = resolve_turn_context("continue", history=history)
+    assert (context.language, context.source) == ("fr", "recent_user_context")
+
+
+def test_short_real_language_switches_and_translation_remain_available():
+    history = [{"role": "user", "content": "Peux-tu vérifier le résultat ?", "_language": "fr"}]
+    assert resolve_turn_context("Réponds en italien", history=history).language == "it"
+    assert resolve_turn_context("Grazie, continua pure", history=history).language == "it"
+    translated = resolve_turn_context("Traduis en anglais : « bonjour »", history=history)
+    assert (translated.language, translated.mode) == ("en", "translation")
+    bilingual = resolve_turn_context("Réponds en français et anglais", history=history)
+    assert bilingual.mode == "multilingual" and set(bilingual.allowed_languages) == {"fr", "en"}
+
+
 def test_quotes_code_technical_terms_and_tool_payloads_do_not_switch_language():
     french = resolve_turn_context(
         'Peux-tu résumer "Please reset the database" et vérifier `HTTP 500` ?',

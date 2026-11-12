@@ -168,6 +168,22 @@ def test_background_observation_leaves_focus_and_pointer_untouched(tmp_path):
     assert harness.capture_count == 1
 
 
+@pytest.mark.parametrize("kind", ["click", "type", "keypress", "scroll"])
+def test_denied_background_action_does_not_activate_its_window(tmp_path, kind):
+    harness = _Harness(tmp_path / "denied-background")
+    harness.window["foreground_hwnd"] = 202
+    frame = harness.screenshot()
+    harness.loop._permission_check = lambda *_: (False, "test_action_unavailable")
+    action = ComputerAction(
+        kind, frame.frame_id, x=100, y=50, text="fixture", key="Tab",
+        direction="down", amount=1,
+    )
+    result = harness.loop.execute(action)
+    assert result["status"] == "PERMISSION_DENIED"
+    assert not harness.activation_calls and not harness.dispatches
+    assert harness.window["foreground_hwnd"] == 202
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Win32 exact window references")
 def test_named_capture_prefers_exact_titles_and_refuses_ambiguous_apps(monkeypatch):
     from osia.computer_use_v4_integration import _resolve_window
@@ -526,7 +542,7 @@ def test_activation_color_highlight_does_not_stale_target(tmp_path):
     assert len(harness.dispatches) == 1
 
 
-def test_permission_denied_after_activation_never_dispatches(tmp_path):
+def test_permission_denied_before_activation_never_dispatches(tmp_path):
     harness = _Harness(tmp_path / "activation-permission")
     frame = harness.screenshot()
     harness.window["foreground_hwnd"] = 202
@@ -537,7 +553,8 @@ def test_permission_denied_after_activation_never_dispatches(tmp_path):
     assert result["status"] == "PERMISSION_DENIED"
     assert result["reason_code"] == "permission_revoked"
     assert result["dispatch_count"] == 0
-    assert len(harness.activation_calls) == 1
+    assert not harness.activation_calls
+    assert harness.window["foreground_hwnd"] == 202
     assert harness.dispatches == []
 
 

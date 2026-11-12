@@ -385,6 +385,11 @@ def test_app_server_delivers_v4_pixels_and_continues_on_same_native_model(
     )
 
     class _V4ImageServer(_UnifiedChatAppServer):
+        def start(self):
+            # This in-process transport represents an initialized App Server;
+            # its transcript exercises turn/image delivery, not process startup.
+            pass
+
         def _simulate(self, thread_id):
             self._dispatch_notification(
                 "turn/started",
@@ -571,9 +576,10 @@ def test_foreground_preparation_precedes_policy_actiontruth_dispatch(
 
 
 def test_failed_foreground_preparation_is_typed_for_same_model_continuation(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     harness = _UnifiedHarness(tmp_path / "attempts")
+    _bind_store(monkeypatch, harness.store)
     harness.window["foreground_hwnd"] = 202
     harness.activate_foreground = lambda _frame, state: {
         "attempted": True,
@@ -588,12 +594,16 @@ def test_failed_foreground_preparation_is_typed_for_same_model_continuation(
         turn_id="turn_wor289_v4",
     ), harness.scope():
         screenshot = tool_computer_screenshot("Fixture")
-        result = tool_computer_click(
-            screenshot["receipt"]["frame_id"],
-            220,
-            120,
-            "click test",
+        record = _execute_tool_with_policy(
+            "computer_click",
+            {
+                "frame_id": screenshot["receipt"]["frame_id"],
+                "x": 220, "y": 120, "intent": "click test",
+            },
+            user_request="Clique le contrôle exactement une fois.",
+            attempt_context=_attempt_context(),
         )
+        result = record.result
 
     assert result["receipt"]["dispatch_state"] == "not_dispatched"
     assert result["receipt"]["outcome"] == "confirmed_failure_before_effect"

@@ -308,7 +308,10 @@ def detect_request_language(
             return None
         if lexical_language:
             return lexical_language
-        if previous and detected != previous and confidence < 0.80:
+        # A highly confident statistical guess is still unreliable for short
+        # continuations such as "d'accord. continue" (misdetected as Italian).
+        # Distinctive lexical cues and explicit requests remain authoritative.
+        if previous and detected != previous:
             return None
         return detected if confidence >= 0.80 else None
     if detected and confidence >= 0.80:
@@ -319,17 +322,26 @@ def detect_request_language(
 def _history_language(history) -> tuple[str | None, str | None]:
     if not isinstance(history, list):
         return None, None
-    for message in reversed(history):
-        if not isinstance(message, dict) or message.get("role") != "user":
+    language = None
+    for message in history:
+        if (
+            not isinstance(message, dict)
+            or message.get("role") != "user"
+            or message.get("_internal")
+            or message.get("_provisional")
+        ):
             continue
         persisted = normalize_locale(message.get("_language"))
         if persisted:
-            return persisted, "recent_user_context"
+            language = persisted
+            continue
         text = _display_text(message.get("content"))
-        language = explicit_language(text) or detect_request_language(text)
-        if language:
-            return language, "recent_user_context"
-    return None, None
+        detected = explicit_language(text) or detect_request_language(
+            text, previous_language=language,
+        )
+        if detected:
+            language = detected
+    return (language, "recent_user_context") if language else (None, None)
 
 
 def _turn_ref(reference: str | None = None) -> str:

@@ -1076,12 +1076,12 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("scroll_down", "Scroll the managed browser downward",
               _object({"amount": _nullable(_integer(1, 100_000))}), RL, C, NC,
               preconditions=("managed_browser",), real=RealValidationRequirement.USER_VISIBLE),
-        _spec("type_text", "Type into one managed-browser element",
+        _spec("type_text", "Type into one managed-browser element in the background without activating its OS window",
               _object({"selector": _string(maximum=4096), "text": TEXT},
                       required=("selector", "text")), EM, N, NC,
               preconditions=("managed_browser",),
               observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY, real=external_real),
-        _spec("press_key", "Press one managed-browser key",
+        _spec("press_key", "Press one managed-browser key or shortcut, including Tab, Shift+Tab and Escape, in the background without activating its OS window",
               _object({"key": _string(maximum=80)}, required=("key",)), DY, D, FC,
               preconditions=("managed_browser",), real=RealValidationRequirement.USER_VISIBLE),
         _spec("open_browser", "Open one supported managed browser",
@@ -1242,7 +1242,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "computer_type",
-              "Type text into the focused element of the exact window bound to frame_id. V4 revalidates the frame and ActionTruth before the existing native keyboard primitive. Call computer_screenshot after an unbatched action",
+              "Physically type text into the focused element of the exact window bound to frame_id; this may activate that window. For a managed web-page field, type_text operates in the background. V4 revalidates the frame and ActionTruth before the existing native keyboard primitive. Call computer_screenshot after an unbatched action",
               _object({
                   "frame_id": IDENTIFIER,
                   "text": TEXT,
@@ -1255,7 +1255,7 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
               real=RealValidationRequirement.USER_VISIBLE),
         _spec(
               "computer_keypress",
-              "Press one key or shortcut in the exact window bound to frame_id. Enter/Return and other commit-like keys retain the existing final-action permission classification. Call computer_screenshot after the result",
+              "Physically press one key or shortcut in the exact window bound to frame_id; this may activate that window. For a managed web-page keypress, press_key operates in the background. Screenshots do not need a preparatory physical keypress. Enter/Return and other commit-like keys retain the existing final-action permission classification. Call computer_screenshot after the result",
               _object({
                   "frame_id": IDENTIFIER,
                   "key": _string(maximum=80),

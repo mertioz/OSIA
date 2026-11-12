@@ -1014,6 +1014,7 @@ class ComputerUseV4:
         target_hwnd: int | None,
         verify_target: bool,
         allow_foreground_preparation: bool = True,
+        preflight_only: bool = False,
     ) -> tuple[str, str, dict[str, Any]]:
         preparation = {
             "attempted": False,
@@ -1063,6 +1064,9 @@ class ComputerUseV4:
             return state_status, state_reason, preparation
         foreground_hwnd = int(state.get("foreground_hwnd") or 0)
         preparation["before_foreground_hwnd"] = str(foreground_hwnd)
+        if preflight_only:
+            preparation["reason_code"] = "window_identity_verified_before_activation"
+            return "READY", state_reason, preparation
         if foreground_hwnd != frame.hwnd:
             if not allow_foreground_preparation:
                 preparation.update({
@@ -1347,6 +1351,7 @@ class ComputerUseV4:
             target_hwnd=action.target_hwnd,
             verify_target=verify_target,
             allow_foreground_preparation=not allow_pending_batch,
+            preflight_only=True,
         )
         if guard_status != "READY":
             return self._result(
@@ -1358,6 +1363,20 @@ class ComputerUseV4:
             return self._result(
                 "PERMISSION_DENIED", permission_reason,
                 action=action, frame=frame,
+                foreground_preparation=foreground_preparation,
+            )
+        # Foreground activation is a real desktop effect. Only prepare it once
+        # the exact action has passed the existing technical dispatch check.
+        guard_status, guard_reason, foreground_preparation = self._guard(
+            frame,
+            action=action,
+            target_hwnd=action.target_hwnd,
+            verify_target=verify_target,
+            allow_foreground_preparation=not allow_pending_batch,
+        )
+        if guard_status != "READY":
+            return self._result(
+                guard_status, guard_reason, action=action, frame=frame,
                 foreground_preparation=foreground_preparation,
             )
         post_permission_state = dict(
