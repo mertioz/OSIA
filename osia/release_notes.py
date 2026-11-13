@@ -63,6 +63,27 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.266", released_on="2026-11-13", public=True,
+        changes_en=(
+            "Chat shows compaction progress and a confirmed completion notice directly in the conversation.",
+            "Opening a conversation restores its last known context usage without requiring a new message.",
+            "On Windows, the floating capsule restores its always-on-top state without taking focus.",
+            "ChatGPT Account uses each model's maximum context window advertised by Codex and its native compaction.",
+            "Web tasks prefer structured page and form tools, with vision available when needed or explicitly requested.",
+            "Provider rows no longer show the small status square beside their names.",
+            "Desktop source is available under Apache 2.0, with the OSIA name and visual identity covered by the separate branding policy.",
+        ),
+        changes_fr=(
+            "Le Chat affiche la progression de la compaction et sa fin confirmée directement dans la conversation.",
+            "L’ouverture d’une discussion restaure sa dernière mesure de contexte connue, sans envoyer de nouveau message.",
+            "Sous Windows, la capsule flottante rétablit son affichage au-dessus des fenêtres sans prendre le focus.",
+            "Le compte ChatGPT utilise la fenêtre maximale annoncée par Codex pour chaque modèle et sa compaction native.",
+            "Les tâches web privilégient les outils structurés de page et de formulaire, avec la vision en recours si nécessaire ou sur demande explicite.",
+            "Les lignes des fournisseurs n’affichent plus le petit carré d’état à côté de leur nom.",
+            "Les sources Desktop sont disponibles sous Apache 2.0 ; le nom et l’identité visuelle OSIA relèvent de la politique de marque distincte.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.265", released_on="2026-11-12", public=True,
         changes_en=(
             "The selected AI chooses its response language from your messages and conversation, without an application language detector or automatic language rewrites.",
