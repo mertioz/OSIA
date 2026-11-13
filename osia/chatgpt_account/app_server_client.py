@@ -790,6 +790,7 @@ class AppServerClient:
         self._attempts: dict[str, _TurnAttempt] = {}
         self._browser_work_by_thread: dict[str, tuple[str, str, deque]] = {}
         self._context_usage: dict[str, tuple[int, int]] = {}
+        self._saved_context_usage: dict[str, tuple] = {}
         self._compacting_threads: set[str] = set()
         self._compaction_requests: dict[str, _CompactionRequest] = {}
         self._reader_thread: threading.Thread | None = None
@@ -4591,6 +4592,94 @@ class AppServerClient:
                 "used": usage[0], "maximum": usage[1], "estimated": False,
                 "compacting": thread_id in self._compacting_threads,
             }
+
+    def saved_thread_context_usage(self, thread_id: str) -> dict | None:
+        """Read native token metadata without resuming a thread or starting a turn."""
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(thread_id or "")):
+            return None
+        root = (self.home_dir / "sessions").resolve()
+        if not root.is_dir():
+            return None
+        with self._state_lock:
+            cached = self._saved_context_usage.get(thread_id)
+        if cached:
+            path, stamp, value = cached
+            if path is None:
+                return None
+            try:
+                info = path.stat()
+                if path.resolve().is_relative_to(root) and (info.st_mtime_ns, info.st_size) == stamp:
+                    return dict(value) if value is not None else None
+            except OSError:
+                pass
+        try:
+            candidates = sorted(
+                root.rglob(f"*{thread_id}.jsonl"),
+                key=lambda path: path.stat().st_mtime_ns, reverse=True,
+            )
+            for path in candidates:
+                if not path.resolve().is_relative_to(root):
+                    continue
+                source_info = path.stat()
+                with path.open("rb") as stream:
+                    header = stream.readline(1_048_576)
+                    try:
+                        first = json.loads(header)
+                    except (ValueError, UnicodeDecodeError, RecursionError):
+                        continue
+                    if (
+                        not isinstance(first, dict) or first.get("type") != "session_meta"
+                        or not isinstance(first.get("payload"), dict)
+                        or first["payload"].get("id") != thread_id
+                    ):
+                        continue
+                    stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, stream.tell() - 1_048_576))
+                    if stream.tell():
+                        stream.readline()
+                    current_model, measured_model, usage, invalidated = "", "", None, False
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except (ValueError, UnicodeDecodeError, RecursionError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        payload = event.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+                        if event.get("type") == "turn_context":
+                            current_model = payload.get("model") if isinstance(payload.get("model"), str) else ""
+                        elif event.get("type") == "compacted":
+                            usage = None
+                            invalidated = True
+                        elif event.get("type") == "event_msg" and payload.get("type") == "token_count":
+                            info = payload.get("info")
+                            if not isinstance(info, dict):
+                                continue
+                            last = info.get("last_token_usage")
+                            used = last.get("total_tokens") if isinstance(last, dict) else None
+                            maximum = info.get("model_context_window")
+                            if type(used) is int and used >= 0 and type(maximum) is int and maximum > 0:
+                                usage = {"used": used, "maximum": maximum, "estimated": False, "compacting": False}
+                                measured_model = current_model
+                                invalidated = False
+                    value = (
+                        {**usage, "model": measured_model}
+                        if usage
+                        else {"invalidated": True} if invalidated else None
+                    )
+                    with self._state_lock:
+                        self._saved_context_usage[thread_id] = (
+                            path, (source_info.st_mtime_ns, source_info.st_size), value,
+                        )
+                    return dict(value) if value is not None else None
+        except OSError:
+            return None
+        with self._state_lock:
+            self._saved_context_usage[thread_id] = (None, None, None)
+        return None
 
     def compact_thread(self, thread_id: str) -> None:
         """Compact an idle thread and wait for its correlated completion."""

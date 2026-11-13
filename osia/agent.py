@@ -10572,7 +10572,10 @@ class OSIAAgent:
                 frame["content"] = _history_text_for_hygiene(frame["content"])
             result = _bounded_context(logical)
             wire = _adapt_context(result)
-        self.last_context_receipt = record_context_receipt(result.receipt)
+        self.last_context_receipt = record_context_receipt(
+            result.receipt,
+            conversation_id=getattr(self, "_chatgpt_conversation_id", None),
+        )
         return wire
 
     def _reasoning_request(self) -> dict:

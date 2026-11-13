@@ -650,6 +650,8 @@ class _ContextMeter(QWidget):
             label += f" · {counts} " + ("jetons" if french else "tokens")
             if usage.get("estimated"):
                 label += " (estimation)" if french else " (estimated)"
+            elif usage.get("restored"):
+                label += " (dernière mesure connue)" if french else " (last known measurement)"
         else:
             self._fraction = 0.0
             label += " · " + ("usage inconnu" if french else "usage unavailable")
@@ -1404,6 +1406,8 @@ class _ChatPage(QWidget):
         self._messages_layout.setContentsMargins(12, 12, 7, 12)
         self._messages_layout.setSpacing(10)
         self._messages_layout.addStretch(1)
+        self._context_notices: dict[str, QLabel] = {}
+        self._compaction_progress: QLabel | None = None
         self._scroll.setWidget(self._messages_host)
         self._syncing_bubble_geometry = False
         self._scroll.viewport().installEventFilter(self)
@@ -1855,6 +1859,8 @@ class _ChatPage(QWidget):
         )
 
     def clear_messages(self) -> None:
+        self._context_notices.clear()
+        self._compaction_progress = None
         self._stream_screenshots = None
         self._stream.clear()
         self._stream_bubble = None
@@ -1884,6 +1890,12 @@ class _ChatPage(QWidget):
         # entirely — an empty bubble renders as a phantom thin violet line.
         renderable = []
         for m in messages:
+            from osia.conversation_context import context_compaction_notice
+
+            notice = context_compaction_notice(m)
+            if notice:
+                renderable.append(("system", notice["content"], m))
+                continue
             if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
                 continue
             text = _display_text(m.get("content"))
@@ -1893,6 +1905,9 @@ class _ChatPage(QWidget):
             return
         try:
             for role, text, message in renderable:
+                if role == "system":
+                    self.sync_context_notices([message])
+                    continue
                 trace = message.get("_execution_trace_v1")
                 if role == "assistant" and isinstance(trace, dict):
                     historical = dict(trace)
@@ -1928,6 +1943,44 @@ class _ChatPage(QWidget):
             return
         self._append_bubble(role, text)
         self._scroll_timer.start(0)
+
+    def _context_notice_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("chatNotice")
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._messages_layout.insertWidget(self._messages_layout.count() - 1, label)
+        return label
+
+    def set_context_compacting(self, compacting: bool) -> None:
+        if compacting:
+            if self._compaction_progress is None:
+                self._compaction_progress = self._context_notice_label("")
+                self._compaction_progress.setProperty("contextCompactionProgress", True)
+                self._scroll_timer.start(0)
+            self._compaction_progress.setText(
+                "Compaction en cours…" if i18n.get_language() == "fr" else "Compacting context…"
+            )
+        elif self._compaction_progress is not None:
+            label, self._compaction_progress = self._compaction_progress, None
+            self._messages_layout.removeWidget(label)
+            label.hide()
+            label.deleteLater()
+
+    def sync_context_notices(self, messages: list[dict]) -> None:
+        from osia.conversation_context import context_compaction_notice
+
+        for message in messages:
+            notice = context_compaction_notice(message)
+            if not notice or not notice["message_id"]:
+                continue
+            key = notice["message_id"]
+            if key not in self._context_notices:
+                self._context_notices[key] = self._context_notice_label(notice["content"])
+                self._scroll_timer.start(0)
+            else:
+                self._context_notices[key].setText(notice["content"])
 
     @classmethod
     def _binding_key(

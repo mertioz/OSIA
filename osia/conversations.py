@@ -1229,6 +1229,13 @@ def store_chatgpt_thread(
         if str(previous.get("thread_id") or "") != previous_thread_id:
             return False
         binding = dict(binding)
+        if (
+            "context_usage" not in binding
+            and previous.get("thread_id") == binding.get("thread_id")
+            and previous.get("account_scope") == binding.get("account_scope")
+            and "context_usage" in previous
+        ):
+            binding["context_usage"] = previous["context_usage"]
         prior_ids = previous.get("previous_thread_ids")
         if isinstance(prior_ids, list):
             binding["previous_thread_ids"] = list(prior_ids)
@@ -1244,6 +1251,55 @@ def conversation_context_compacted(conv_id: str) -> bool:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(conv_id or "")):
         return False
     return (get_conversation(conv_id) or {}).get("_context_compacted") is True
+
+
+def store_context_usage(conv_id: str, usage: dict) -> bool:
+    """Keep metadata-only context measurements with their canonical chat."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(conv_id or "")):
+        return False
+    if not isinstance(usage, dict):
+        return False
+    if any(usage.get(key) is not None and not isinstance(usage.get(key), str) for key in ("provider", "model")):
+        return False
+    used, maximum = usage.get("used"), usage.get("maximum")
+    if type(used) is not int or used < 0 or type(maximum) is not int or maximum <= 0:
+        return False
+    usage = {
+        "used": used, "maximum": maximum,
+        "estimated": usage.get("estimated") is not False,
+        "provider": str(usage.get("provider") or ""),
+        "model": str(usage.get("model") or ""),
+    }
+    with _store_lock():
+        conv = get_conversation(conv_id)
+        if not isinstance(conv, dict) or conv.get("id") != conv_id:
+            return False
+        if conv.get("_context_usage") != usage:
+            conv["_context_usage"] = dict(usage)
+            _write_atomic(_path_for(conv_id), conv)
+        return True
+
+
+def context_compaction_active(conversation: dict) -> bool:
+    lease = (conversation or {}).get("_background_execution_lease") or {}
+    return bool(
+        isinstance(lease, dict)
+        and str(lease.get("lease_id") or "").startswith("context_compaction_")
+        and _background_execution_lease_active(conversation)
+    )
+
+
+def conversation_version_stamp(conv_id: str) -> tuple | None:
+    """Cheap invalidation for read-only projections of one selected chat."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(conv_id or "")):
+        return None
+    try:
+        info = _path_for(conv_id).stat()
+    except OSError:
+        return None
+    return info.st_ino, info.st_mtime_ns, info.st_size
 
 
 def mark_conversation_context_compacted(conv_id: str, lease_id: str) -> bool:

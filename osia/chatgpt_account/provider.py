@@ -532,10 +532,13 @@ class ChatGPTAccountProvider:
         return scope
 
     @staticmethod
-    def _store_thread_state(conversation_id: str, state: _ConversationState, previous_thread_id: str) -> bool:
+    def _store_thread_state(
+        conversation_id: str, state: _ConversationState, previous_thread_id: str,
+        *, capture_usage: bool = False,
+    ) -> bool:
         from osia.conversations import store_chatgpt_thread
 
-        return store_chatgpt_thread(conversation_id, {
+        binding = {
             "thread_id": state.thread_id,
             "account_scope": state.account_scope,
             "history_cursor": list(state.history_cursor),
@@ -543,7 +546,19 @@ class ChatGPTAccountProvider:
             "system_fingerprint": state.system_fingerprint,
             "tool_schema_fingerprint": state.tool_schema_fingerprint,
             "native_tool_names": list(state.native_tool_names),
-        }, previous_thread_id=previous_thread_id)
+            "model": state.model,
+        }
+        read_usage = getattr(state.runtime_client, "thread_context_usage", None)
+        if capture_usage and callable(read_usage):
+            usage = read_usage(state.thread_id)
+            from osia.conversation_context import _context_usage_snapshot
+
+            binding["context_usage"] = _context_usage_snapshot({
+                **(usage or {}), "provider": ACCOUNT_PROVIDER_ID, "model": state.model,
+            })
+        return store_chatgpt_thread(
+            conversation_id, binding, previous_thread_id=previous_thread_id,
+        )
 
     @staticmethod
     def _thread_key(conversation_id: str, planning_only: bool) -> str:
@@ -817,7 +832,10 @@ class ChatGPTAccountProvider:
                 state.last_turn_id = str(osia_turn_id or "")
             if state.account_scope:
                 try:
-                    self._store_thread_state(conversation_id, state, state.thread_id)
+                    self._store_thread_state(
+                        conversation_id, state, state.thread_id,
+                        capture_usage=assistant_text is not None,
+                    )
                 except OSError:
                     # The already accepted provider turn remains authoritative.
                     pass
@@ -912,15 +930,47 @@ class ChatGPTAccountProvider:
         if state:
             state.runtime_client.cancel_turn(thread_id=state.thread_id)
 
-    def conversation_context_usage(self, conversation_id: str, *, model: str = "") -> dict | None:
+    def conversation_context_usage(
+        self, conversation_id: str, *, model: str = "", conversation: dict | None = None,
+    ) -> dict | None:
+        if conversation is not None and (not isinstance(conversation, dict) or str(conversation.get("id") or "") != conversation_id):
+            return None
         with self._lock:
             state = self._threads.get(conversation_id)
-        if (
-            state is None or (model and state.model != model)
-            or state.account_generation != getattr(state.runtime_client, "account_generation", 0)
-        ):
+        if state is not None and state.account_generation != getattr(state.runtime_client, "account_generation", 0):
             return None
-        return state.runtime_client.thread_context_usage(state.thread_id)
+        if state is not None and not (model and state.model != model):
+            read_usage = getattr(state.runtime_client, "thread_context_usage", None)
+            usage = read_usage(state.thread_id) if callable(read_usage) else None
+            if usage:
+                return usage
+        from osia import conversations
+        from osia.conversation_context import _context_usage_snapshot
+
+        conv = conversation if conversation is not None else conversations.get_conversation(conversation_id) or {}
+        if not isinstance(conv, dict):
+            return None
+        binding = conv.get("_chatgpt_account_thread") or {}
+        if not isinstance(binding, dict) or not binding.get("thread_id"):
+            return None
+        client = state.runtime_client if state is not None else self.client
+        read_saved = getattr(client, "saved_thread_context_usage", None)
+        native = read_saved(binding["thread_id"]) if callable(read_saved) else None
+        candidate = native if native is not None else binding.get("context_usage")
+        if not isinstance(candidate, dict):
+            return None
+        measured_model = str(candidate.get("model") or binding.get("model") or "")
+        if model and measured_model and model != measured_model:
+            return None
+        usage = _context_usage_snapshot({
+            **candidate, "provider": ACCOUNT_PROVIDER_ID, "model": measured_model,
+        })
+        if not usage:
+            return None
+        return {
+            "used": usage["used"], "maximum": usage["maximum"], "estimated": usage["estimated"],
+            "compacting": False, "restored": True,
+        }
 
     def compact_conversation(self, conversation_id: str, model: str) -> bool:
         """Compact the same saved ChatGPT thread without adding a chat message."""
@@ -949,6 +999,21 @@ class ChatGPTAccountProvider:
                         return False
                     raise
             client.compact_thread(thread_id)
+            read_usage = getattr(client, "thread_context_usage", None)
+            from osia.conversation_context import _context_usage_snapshot
+
+            usage = read_usage(thread_id) if callable(read_usage) else None
+            conversations_binding = {
+                **binding, "model": model,
+                "context_usage": _context_usage_snapshot({
+                    **(usage or {}), "provider": ACCOUNT_PROVIDER_ID, "model": model,
+                }),
+            }
+            from osia.conversations import store_chatgpt_thread
+
+            store_chatgpt_thread(
+                conversation_id, conversations_binding, previous_thread_id=thread_id,
+            )
             return True
 
     def release_ephemeral_conversation(self, conversation_id: str) -> None:

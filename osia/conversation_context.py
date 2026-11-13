@@ -466,6 +466,19 @@ def _opaque_message_id(value: str) -> str:
     return f"msgref_{digest[:24]}"
 
 
+def _is_compaction_notice(message) -> bool:
+    return bool(
+        isinstance(message, dict) and message.get("role") == "system"
+        and not message.get("_internal")
+        and isinstance(message.get("_context_compaction_state"), str)
+        and message.get("_context_compaction_state") in {"completed", "unchanged", "failed"}
+        and re.fullmatch(
+            r"context_compaction_[0-9a-f]{32}",
+            str(message.get("_context_compaction_id") or ""),
+        )
+    )
+
+
 def _canonical_entries(messages: list, conversation_id: str) -> tuple[list[_Entry], int]:
     if not isinstance(messages, list) or len(messages) > MAX_HISTORY_MESSAGES:
         raise ContextBuildError("malformed_or_oversized_history")
@@ -476,6 +489,8 @@ def _canonical_entries(messages: list, conversation_id: str) -> tuple[list[_Entr
     for index, raw in enumerate(messages):
         if not isinstance(raw, dict):
             raise ContextBuildError("malformed_history_message")
+        if _is_compaction_notice(raw):
+            continue
         role = str(raw.get("role") or "")
         if role not in _ALLOWED_ROLES:
             raise ContextBuildError("malformed_history_role")
@@ -1146,7 +1161,23 @@ def build_context(
     )
 
 
-def record_context_receipt(receipt: dict) -> dict:
+def _context_usage_snapshot(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    if any(value.get(key) is not None and not isinstance(value.get(key), str) for key in ("provider", "model")):
+        return None
+    used, maximum = value.get("used"), value.get("maximum")
+    if type(used) is not int or used < 0 or type(maximum) is not int or maximum <= 0:
+        return None
+    return {
+        "used": used, "maximum": maximum,
+        "estimated": value.get("estimated") is not False,
+        "provider": str(value.get("provider") or ""),
+        "model": str(value.get("model") or ""),
+    }
+
+
+def record_context_receipt(receipt: dict, *, conversation_id: str | None = None) -> dict:
     """Log only the already-sanitized metadata receipt."""
 
     safe = copy.deepcopy(receipt) if isinstance(receipt, dict) else {}
@@ -1161,19 +1192,79 @@ def record_context_receipt(receipt: dict) -> dict:
             _USAGE_BY_CONVERSATION.move_to_end(conversation)
             if len(_USAGE_BY_CONVERSATION) > 128:
                 _USAGE_BY_CONVERSATION.popitem(last=False)
+        if conversation_id and conversation == _safe_identifier(conversation_id, "conv"):
+            from osia.conversations import store_context_usage
+
+            try:
+                store_context_usage(conversation_id, _context_usage_snapshot({
+                    "used": used, "maximum": maximum, "estimated": True,
+                    "provider": safe.get("provider_id"), "model": safe.get("model_id"),
+                }))
+            except (OSError, ValueError):
+                _LOG.warning("context_usage_persistence_failed")
     _LOG.info("conversation_context_receipt %s", json.dumps(safe, sort_keys=True))
     return safe
 
 
-def conversation_context_usage(conversation_id: str) -> dict | None:
+def conversation_context_usage(conversation_id: str, *, conversation: dict | None = None) -> dict | None:
     if not conversation_id:
         return None
+    if conversation is not None and (not isinstance(conversation, dict) or str(conversation.get("id") or "") != conversation_id):
+        return None
+    if conversation is not None:
+        saved = _context_usage_snapshot(conversation.get("_context_usage"))
+        if saved:
+            return saved
     with _USAGE_LOCK:
         usage = _USAGE_BY_CONVERSATION.get(_safe_identifier(conversation_id, "conv"))
-        return dict(usage) if usage else None
+        if usage:
+            return dict(usage)
+    from osia.conversations import get_conversation
+
+    try:
+        stored = conversation if conversation is not None else get_conversation(conversation_id)
+    except (OSError, ValueError, TypeError, RecursionError):
+        stored = None
+    usage = _context_usage_snapshot(stored.get("_context_usage") if isinstance(stored, dict) else None)
+    if usage:
+        with _USAGE_LOCK:
+            key = _safe_identifier(conversation_id, "conv")
+            _USAGE_BY_CONVERSATION[key] = usage
+            _USAGE_BY_CONVERSATION.move_to_end(key)
+            if len(_USAGE_BY_CONVERSATION) > 128:
+                _USAGE_BY_CONVERSATION.popitem(last=False)
+    return dict(usage) if usage else None
 
 
-def compact_conversation_context(conversation_id: str, provider: str, model: str) -> dict:
+def context_compaction_notice(message: dict, *, locale: str | None = None) -> dict | None:
+    """Recognize only application-authored compaction notices, never prompts."""
+
+    if not _is_compaction_notice(message):
+        return None
+    state = message.get("_context_compaction_state")
+    operation_id = str(message.get("_context_compaction_id") or "")
+    from osia import i18n
+
+    french = str(locale or i18n.get_language()).startswith("fr")
+    labels = {
+        "completed": ("Contexte compacté.", "Context compacted."),
+        "unchanged": ("Le contexte est déjà court.", "The context is already short."),
+        "failed": ("Le résultat de la compaction n’a pas pu être confirmé.", "The context compaction result could not be confirmed."),
+    }
+    request_id = str(message.get("_context_compaction_request_id") or "")
+    if not re.fullmatch(r"compact_[A-Za-z0-9_-]{1,112}|context_compaction_[0-9a-f]{32}", request_id):
+        request_id = operation_id
+    return {
+        "state": state, "operation_id": operation_id,
+        "request_id": request_id,
+        "message_id": str(message.get("_message_id") or ""),
+        "content": labels[state][0 if french else 1],
+    }
+
+
+def compact_conversation_context(
+    conversation_id: str, provider: str, model: str, *, on_started=None, request_id: str = "",
+) -> dict:
     """Compact a provider view while keeping the canonical transcript intact."""
     from osia import conversations
     from osia.agent import _sanitize_persisted_history_message, get_system_prompt
@@ -1183,7 +1274,27 @@ def compact_conversation_context(conversation_id: str, provider: str, model: str
     lease = "context_compaction_" + uuid.uuid4().hex
     if not conversations.claim_background_execution(conversation_id, lease):
         raise ContextBuildError("conversation_busy")
+
+    def record_notice(state: str) -> None:
+        metadata = {
+            "_message_id": f"{lease}_{state}",
+            "_conversation_id": conversation_id,
+            "_context_compaction_id": lease,
+            "_context_compaction_state": state,
+            "_context_compaction_request_id": request_id or lease,
+        }
+        notice = context_compaction_notice({"role": "system", **metadata})
+        if conversations.add_message(
+            conversation_id, "system", notice["content"], metadata=metadata,
+        ) is None:
+            raise ContextBuildError("conversation_not_found")
+
     try:
+        if on_started is not None:
+            try:
+                on_started()
+            except Exception:
+                _LOG.warning("context_compaction_display_callback_failed")
         conv = conversations.get_conversation(conversation_id) or {}
         history = [
             clean for message in conv.get("messages") or []
@@ -1202,15 +1313,25 @@ def compact_conversation_context(conversation_id: str, provider: str, model: str
             from osia.chatgpt_account.provider import get_account_provider
 
             native = get_account_provider().compact_conversation(conversation_id, model)
+            if not native:
+                raise ContextBuildError("native_compaction_unavailable")
         receipt = compacted.receipt
         changed = native or receipt["estimated_tokens_after"] < receipt["estimated_tokens_before"]
-        record_context_receipt(receipt)
+        record_context_receipt(receipt, conversation_id=conversation_id)
         if changed and not conversations.mark_conversation_context_compacted(conversation_id, lease):
             raise ContextBuildError("conversation_not_found")
+        record_notice("completed" if changed else "unchanged")
         return {
             "changed": changed,
             "usage": conversation_context_usage(conversation_id),
         }
+    except Exception as error:
+        try:
+            record_notice("failed")
+            error.context_compaction_notice_recorded = True
+        except (ContextBuildError, OSError, ValueError):
+            _LOG.warning("context_compaction_notice_unavailable")
+        raise
     finally:
         conversations.release_background_execution(conversation_id, lease)
 

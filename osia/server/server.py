@@ -1109,6 +1109,7 @@ def _conversation_history_frame(conv: dict) -> dict:
         "title": conv.get("title"),
         "revision": int(conv.get("revision") or 0),
         "operation_id": str(conv.get("last_operation_id") or ""),
+        "context_compacting": conversations.context_compaction_active(conv),
         "messages": _displayable_history(list(conv.get("messages") or [])),
     }
 
@@ -8753,17 +8754,32 @@ async def websocket_endpoint(ws: WebSocket):
                 async def respond_context_compaction(conv_id=conv_id, operation_id=operation_id):
                     from osia.conversation_context import ContextBuildError, compact_conversation_context
 
+                    loop = asyncio.get_running_loop()
+
+                    def started():
+                        conv = conversations.get_conversation(conv_id)
+                        if conv:
+                            frame = _conversation_history_frame(conv)
+                            frame["context_compaction_update"] = True
+                            asyncio.run_coroutine_threadsafe(_send_conversation_frame(frame), loop)
+
                     try:
                         route = _resolve_chat_route_binding()
                         result = await asyncio.to_thread(
                             compact_conversation_context,
                             conv_id, route["provider_id"], route["model_id"],
+                            on_started=started, request_id=operation_id,
                         )
                     except ContextBuildError as exc:
                         result = {"error": exc.category}
                     except Exception as exc:
                         print(f"[OSIA Server] context compaction failed ({type(exc).__name__})")
                         result = {"error": "compaction_failed"}
+                    settled = conversations.get_conversation(conv_id)
+                    if settled:
+                        frame = _conversation_history_frame(settled)
+                        frame["context_compaction_update"] = True
+                        await _send_conversation_frame(frame)
                     snapshot = conversations.conversation_snapshot()
                     snapshot.update(
                         operation_id=operation_id, compact_conversation_id=conv_id,
@@ -11648,6 +11664,19 @@ def _displayable_history(history: list) -> list[dict]:
         # carries the marker), but drop it here too in case one ever reaches a
         # frame straight from in-memory history.
         if msg.get("_internal"):
+            continue
+        from osia.conversation_context import context_compaction_notice
+
+        notice = context_compaction_notice(msg)
+        if notice:
+            out.append({
+                "role": "system", "content": notice["content"],
+                "message_id": notice["message_id"],
+                "conversation_id": str(msg.get("_conversation_id") or ""),
+                "context_compaction_state": notice["state"],
+                "context_compaction_id": notice["operation_id"],
+                "context_compaction_request_id": notice["request_id"],
+            })
             continue
         role = msg.get("role")
         if role not in ("user", "assistant"):

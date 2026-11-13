@@ -4815,31 +4815,57 @@ def wake_mode():
             conversation_context_usage, estimate_messages_tokens, resolve_context_limit,
         )
 
-        conv = active_conv or {}
-        conv_id = str(conv.get("id") or "")
+        selected_conv = active_conv or {}
+        conv_id = str(selected_conv.get("id") or "")
+        snapshot_key = (conv_id, conversations.conversation_version_stamp(conv_id))
+        if meter_cache.get("snapshot_key") != snapshot_key:
+            meter_cache["snapshot_key"] = snapshot_key
+            try:
+                snapshot = conversations.get_conversation(conv_id) if conv_id and snapshot_key[1] else {}
+            except (OSError, ValueError, TypeError, RecursionError):
+                snapshot = None
+            meter_cache["snapshot"] = snapshot if isinstance(snapshot, dict) and snapshot.get("id") == conv_id else {}
+        conv = meter_cache.get("snapshot") or {}
+        if conv_id and not conv:
+            popup._chat.set_context_compacting(False)
+            popup._chat._context_meter.set_usage({})
+            return
+        compacting = conv_id in pending_compactions or conversations.context_compaction_active(conv)
+        popup._chat.set_context_compacting(compacting)
+        popup._chat.sync_context_notices(conv.get("messages") or [])
         binding = _active_chat_turn_for_conversation(conv_id).get("binding") or {}
-        provider = str(binding.get("provider_id") or agent.provider or "")
-        model = str(binding.get("model_id") or agent.model or "")
-        usage = conversation_context_usage(conv_id)
+        selected = load_settings() or {}
+        provider = str(binding.get("provider_id") or selected.get("selected_model_provider") or agent.provider or "")
+        model = str(binding.get("model_id") or selected.get("selected_model") or agent.model or "")
+        usage = conversation_context_usage(conv_id, conversation=conv)
         if usage and (usage.get("provider"), usage.get("model")) != (provider, model):
             usage = None
         if provider == "chatgpt_account" and conv_id:
             from osia.chatgpt_account.provider import get_account_provider
 
-            native = get_account_provider().conversation_context_usage(conv_id, model=model)
-            usage = native or usage
+            native = get_account_provider().conversation_context_usage(
+                conv_id, model=model, conversation=conv,
+            )
+            if native:
+                usage = native
+            elif conv.get("_chatgpt_account_thread"):
+                # Public transcript size cannot measure a persistent native thread.
+                usage = {"maximum": resolve_context_limit(provider, model)}
         if usage is None:
             key = (conv_id, conv.get("revision"), provider, model)
             if meter_cache.get("key") != key:
                 meter_cache["key"] = key
                 meter_cache["usage"] = {
-                    "used": estimate_messages_tokens(conv["messages"]) if conv.get("messages") else 0,
+                    "used": estimate_messages_tokens([
+                        message for message in conv.get("messages") or []
+                        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+                    ]),
                     "maximum": resolve_context_limit(provider, model),
                     "estimated": True,
                 }
             usage = meter_cache["usage"]
         popup._chat._context_meter.set_usage({
-            **usage, "compacting": conv_id in pending_compactions or bool(usage.get("compacting")),
+            **usage, "compacting": compacting or bool(usage.get("compacting")),
         })
 
     def handle_context_compaction() -> None:
@@ -4855,7 +4881,9 @@ def wake_mode():
         if conv_id in pending_compactions:
             return
         epoch = selection_epoch[0]
-        provider, model = str(agent.provider or ""), str(agent.model or "")
+        selected = load_settings() or {}
+        provider = str(selected.get("selected_model_provider") or agent.provider or "")
+        model = str(selected.get("selected_model") or agent.model or "")
         pending_compactions.add(conv_id)
         refresh_context_meter()
 
@@ -4863,10 +4891,16 @@ def wake_mode():
             try:
                 result = compact_conversation_context(conv_id, provider, model)
             except ContextBuildError as exc:
-                result = {"error": exc.category}
+                result = {
+                    "error": exc.category,
+                    "notice_recorded": bool(getattr(exc, "context_compaction_notice_recorded", False)),
+                }
             except Exception as exc:
                 print(f"[OSIA] context compaction failed ({type(exc).__name__})")
-                result = {"error": "compaction_failed"}
+                result = {
+                    "error": "compaction_failed",
+                    "notice_recorded": bool(getattr(exc, "context_compaction_notice_recorded", False)),
+                }
             try:
                 bridge.context_compaction_ready.emit(epoch, conv_id, result)
             except RuntimeError:
@@ -4876,20 +4910,16 @@ def wake_mode():
 
     def handle_context_compaction_ready(epoch: int, conv_id: str, result: dict) -> None:
         pending_compactions.discard(conv_id)
-        if epoch != selection_epoch[0]:
+        if conv_id != str((active_conv or {}).get("id") or ""):
             return
         french = i18n.get_language() == "fr"
         if result.get("error") == "conversation_busy":
             popup.show_conversation_busy_notice()
-        elif result.get("error"):
+        elif result.get("error") and not result.get("notice_recorded"):
             popup._chat.show_notice(
-                "La compaction du contexte a échoué."
-                if french else "Context compaction failed."
+                "Le résultat de la compaction n’a pas pu être confirmé."
+                if french else "The context compaction result could not be confirmed."
             )
-        elif result.get("changed"):
-            popup._chat.show_notice("Contexte compacté." if french else "Context compacted.")
-        else:
-            popup._chat.show_notice("Le contexte est déjà court." if french else "The context is already short.")
         refresh_context_meter()
 
     context_meter_timer = QTimer(popup)
