@@ -127,6 +127,7 @@ class _ConversationState:
     history_cursor: tuple[str, ...] = ()
     last_turn_id: str = ""
     application_context: str = ""
+    context_policy: tuple[int, int] = ()
 
 
 def _with_native_frontier_receipt(
@@ -208,7 +209,7 @@ def _message_digest(message: dict) -> str:
 
 
 def _thread_delta(state: _ConversationState, messages: list[dict], turn_id: str) -> list[dict]:
-    """Append unseen input to the same thread after local history compaction."""
+    """Append unseen input to the same thread across history projection changes."""
     from osia.conversation_context import _is_tool_result
 
     if state.expected_messages and _same_messages(state.expected_messages, messages):
@@ -232,7 +233,7 @@ def _thread_delta(state: _ConversationState, messages: list[dict], turn_id: str)
 
 
 def _native_rebuild_history(messages: list[dict]) -> list[dict]:
-    """Replay the already bounded visual context selected by the Chat runtime."""
+    """Replay the canonical visual context selected by the Chat runtime."""
     return [dict(message) for message in messages if message.get("role") != "system"]
 
 
@@ -620,6 +621,12 @@ class ChatGPTAccountProvider:
             refresh_account_storage()
         if callable(start_runtime):
             start_runtime()
+        read_capacity = getattr(runtime_client, "model_context_capacity", None)
+        capacity = read_capacity(model) if callable(read_capacity) else None
+        context_policy = (
+            (capacity["context_window"], capacity["auto_compact_token_limit"])
+            if capacity else ()
+        )
         account_generation = getattr(runtime_client, "account_generation", 0)
         scope = self._account_scope(runtime_client) if conv is not None else ""
         stored = (conv or {}).get("_chatgpt_account_thread") or {}
@@ -682,6 +689,7 @@ class ChatGPTAccountProvider:
                 and state.generation == runtime_client.generation
                 and state.account_generation == account_generation
                 and state.account_scope == scope
+                and state.context_policy == context_policy
                 and (not scope or (saved and state.thread_id == stored_id))
                 and (not saved or state.history_cursor == tuple(stored.get("history_cursor") or ()))
             )
@@ -721,6 +729,7 @@ class ChatGPTAccountProvider:
                 account_scope=scope,
                 history_cursor=tuple(stored.get("history_cursor") or ()) if saved else (),
                 last_turn_id=str(stored.get("last_turn_id") or "") if saved else "",
+                context_policy=context_policy,
             )
             if scope and not saved and not self._store_thread_state(conversation_id, state, stored_id):
                 raise AppServerError(
@@ -986,18 +995,17 @@ class ChatGPTAccountProvider:
             client.start()
             if not binding.get("account_scope") or binding["account_scope"] != self._account_scope(client):
                 return False
-            with self._lock:
-                state = self._threads.get(conversation_id)
-            if state is None or state.thread_id != thread_id or state.generation != client.generation:
-                try:
-                    client.start_or_resume_conversation(
-                        thread_id=thread_id, model=model, base_instructions="",
-                        developer_instructions="", persistent=True,
-                    )
-                except AppServerError as exc:
-                    if exc.category == "thread_missing":
-                        return False
-                    raise
+            # Resume the exact thread even when already loaded: the user may
+            # have changed the selected model/window without sending a turn.
+            try:
+                client.start_or_resume_conversation(
+                    thread_id=thread_id, model=model, base_instructions="",
+                    developer_instructions="", persistent=True,
+                )
+            except AppServerError as exc:
+                if exc.category == "thread_missing":
+                    return False
+                raise
             client.compact_thread(thread_id)
             read_usage = getattr(client, "thread_context_usage", None)
             from osia.conversation_context import _context_usage_snapshot

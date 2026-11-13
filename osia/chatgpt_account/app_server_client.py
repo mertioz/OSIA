@@ -791,6 +791,7 @@ class AppServerClient:
         self._browser_work_by_thread: dict[str, tuple[str, str, deque]] = {}
         self._context_usage: dict[str, tuple[int, int]] = {}
         self._saved_context_usage: dict[str, tuple] = {}
+        self._model_context_cache: tuple | None = None
         self._compacting_threads: set[str] = set()
         self._compaction_requests: dict[str, _CompactionRequest] = {}
         self._reader_thread: threading.Thread | None = None
@@ -4484,6 +4485,73 @@ class AppServerClient:
             self._active_login = None
             self._login_events.clear()
 
+    def model_context_capacity(self, model: str) -> dict | None:
+        """Read Codex's own per-model limits without starting it or importing user config.
+
+        model/list omits context sizes. The isolated runtime's catalog retains
+        both the default and maximum windows, including its usable percentage.
+        Unknown or malformed entries leave Codex's defaults in charge.
+        """
+        path = self.home_dir / "models_cache.json"
+        try:
+            if path.resolve().parent != self.home_dir.resolve():
+                return None
+            stat = path.stat()
+            stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            version = self._resolved_runtime[1] if self._resolved_runtime else None
+            key = (stamp, version)
+            with self._state_lock:
+                cached = self._model_context_cache
+            if cached is None or cached[0] != key:
+                if stat.st_size > 32 * 1024 * 1024:
+                    return None
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    return None
+                if version and _version_tuple(str(data.get("client_version") or "")) != _version_tuple(version):
+                    return None
+                capacities = {}
+                for entry in data.get("models") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("slug")
+                    default = entry.get("context_window")
+                    maximum = entry.get("max_context_window")
+                    percent = entry.get("effective_context_window_percent")
+                    if (
+                        not isinstance(name, str) or not name
+                        or type(default) is not int or default < 8192
+                        or type(percent) is not int or not 1 <= percent <= 100
+                    ):
+                        continue
+                    window = maximum if type(maximum) is int and maximum >= default else default
+                    usable = window * percent // 100
+                    if usable < 8192:
+                        continue
+                    capacities[name] = {
+                        "context_window": window, "maximum": usable,
+                        # Native compaction keeps response/tool headroom within
+                        # the enlarged window; this never ends the user turn.
+                        "auto_compact_token_limit": usable * 95 // 100,
+                    }
+                cached = (key, capacities)
+                with self._state_lock:
+                    self._model_context_cache = cached
+            capacity = cached[1].get(model)
+            return dict(capacity) if capacity else None
+        except (OSError, ValueError, TypeError, RecursionError):
+            return None
+
+    def _thread_context_config(self, model: str, *, persistent: bool) -> dict:
+        config = {"compact_prompt": _COMPACT_PROMPT} if persistent else {}
+        capacity = self.model_context_capacity(model)
+        if capacity:
+            config.update({
+                "model_context_window": capacity["context_window"],
+                "model_auto_compact_token_limit": capacity["auto_compact_token_limit"],
+            })
+        return {"config": config} if config else {}
+
     def list_models(self) -> list[dict]:
         models: list[dict] = []
         cursor = None
@@ -4725,7 +4793,7 @@ class AppServerClient:
                 "approvalPolicy": "on-request",
                 "sandbox": "read-only",
                 "excludeTurns": True,
-                **({"config": {"compact_prompt": _COMPACT_PROMPT}} if persistent else {}),
+                **self._thread_context_config(model, persistent=persistent),
             })
             thread = result.get("thread") or {}
             if result.get("instructionSources"):
@@ -4755,7 +4823,7 @@ class AppServerClient:
                     _canonical_native_tools()
                     if dynamic_tools is None else list(dynamic_tools)
                 ),
-                **({"config": {"compact_prompt": _COMPACT_PROMPT}} if persistent else {}),
+                **self._thread_context_config(model, persistent=persistent),
             },
         )
         if result.get("instructionSources"):

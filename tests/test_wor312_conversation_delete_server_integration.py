@@ -136,7 +136,15 @@ def test_mobile_context_compaction_targets_the_canonical_chat(tmp_path, monkeypa
         assert ack["compact_changed"] and not ack["compact_error"]
     assert conversations.conversation_context_compacted(target)
     assert not conversations.conversation_context_compacted(other)
-    assert conversations.get_conversation(target)["messages"] == transcript
+    stored = conversations.get_conversation(target)["messages"]
+    assert stored[:-1] == transcript
+    from osia.conversation_context import context_compaction_notice
+
+    notice = context_compaction_notice(stored[-1])
+    assert notice is not None and notice["state"] == "completed"
+    assert stored[-1]["_conversation_id"] == target
+    assert stored[-1]["_context_compaction_request_id"] == "compact_fixture"
+    assert conversations.get_conversation(other)["messages"] == []
 
 
 def test_real_store_single_bulk_and_desktop_server_deletion_paths(

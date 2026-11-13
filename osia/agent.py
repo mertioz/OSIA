@@ -10491,6 +10491,8 @@ class OSIAAgent:
 
         The deterministic context builder then keeps the full logical history
         while it fits, or adds a local critical-excerpt note plus recent turns.
+        ChatGPT Account keeps the full projection for Codex's native thread and
+        compaction instead of receiving that local excerpt note.
         """
         import copy
 
@@ -10543,6 +10545,10 @@ class OSIAAgent:
             try:
                 return _build_wire_context(context_messages)
             except ContextBuildError as error:
+                if self.provider == "chatgpt_account":
+                    # Codex owns its persistent history and native compaction.
+                    # Never replace it with OSIA's local excerpt fallback.
+                    raise
                 # Compact only the context of this same canonical turn.
                 for keep_recent in (16, 10, 6, 2):
                     try:

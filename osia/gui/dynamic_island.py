@@ -24,7 +24,7 @@ import math
 import sys
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QRect, QRectF, QPointF, pyqtSignal, QPropertyAnimation,
+    Qt, QTimer, QRect, QRectF, QPointF, QEvent, pyqtSignal, QPropertyAnimation,
     QEasingCurve, QVariantAnimation, QAbstractAnimation,
 )
 from PyQt6.QtGui import (
@@ -91,6 +91,34 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def _restore_windows_topmost(hwnd: int) -> bool:
+    """Repair only this window's native topmost band without taking focus."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        if not hwnd or not user32.IsWindow(hwnd):
+            return False
+        if user32.GetWindowLongW(hwnd, -20) & 0x00000008:  # GWL_EXSTYLE, WS_EX_TOPMOST
+            return True
+        return bool(user32.SetWindowPos(
+            hwnd, wintypes.HWND(-1), 0, 0, 0, 0,  # HWND_TOPMOST
+            0x0001 | 0x0002 | 0x0010 | 0x0200,  # no size/move/activate/owner reorder
+        ))
+    except (AttributeError, OSError):
+        return False
+
+
 class DynamicIsland(QWidget):
     """Top-center floating capsule with state-driven animations."""
 
@@ -98,6 +126,16 @@ class DynamicIsland(QWidget):
 
     def __init__(self):
         super().__init__()
+
+        # A native handle can be recreated after Qt applies its initial flags.
+        # Check after that work, and repair a lost Windows topmost style only.
+        # Already-topmost windows are never raised over another application's UI.
+        self._stacking_deferred = QTimer(self)
+        self._stacking_deferred.setSingleShot(True)
+        self._stacking_deferred.timeout.connect(self._ensure_topmost)
+        self._stacking_timer = QTimer(self)
+        self._stacking_timer.setInterval(2000)
+        self._stacking_timer.timeout.connect(self._ensure_topmost)
 
         self._theme = get_theme_manager()
         self._theme_transition = ThemeTransition(self)
@@ -339,6 +377,35 @@ class DynamicIsland(QWidget):
         # mid-conversation or clobbering the live slide-out state.
         self._apply_shape_geometry(animate=False, slid_out=self._docked_slid_out)
         self.raise_()
+        if sys.platform == "win32":
+            self._stacking_deferred.start(0)
+            self._stacking_timer.start()
+
+    def hideEvent(self, event):
+        self._stacking_deferred.stop()
+        self._stacking_timer.stop()
+        super().hideEvent(event)
+
+    def event(self, event):
+        result = super().event(event)
+        if (
+            event.type() == QEvent.Type.WinIdChange
+            and sys.platform == "win32"
+            and self.isVisible()
+            and hasattr(self, "_stacking_deferred")
+        ):
+            self._stacking_deferred.start(0)
+        return result
+
+    def _ensure_topmost(self) -> None:
+        if (
+            sys.platform == "win32" and self.isVisible()
+            and QApplication.platformName() == "windows"
+        ):
+            # effectiveWinId does not create a new window after a hide/destroy.
+            hwnd = self.effectiveWinId()
+            if hwnd:
+                _restore_windows_topmost(int(hwnd))
 
     def _tick(self) -> None:
         if reduced_motion_requested(self):

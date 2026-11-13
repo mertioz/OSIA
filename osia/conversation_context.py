@@ -1,8 +1,8 @@
-"""Deterministic, privacy-safe conversation context construction (WOR-210).
+"""Provider-aware, privacy-safe conversation context construction (WOR-210).
 
 The conversation store remains the source of truth.  This module only builds a
-bounded provider view and a metadata-only receipt; it never rewrites stored
-messages and never asks a provider to summarize private history.
+provider view and a metadata-only receipt; it never rewrites stored messages.
+API providers use local compaction. Codex owns its native history/compaction.
 """
 
 from __future__ import annotations
@@ -366,6 +366,14 @@ def resolve_context_limit(provider, model) -> int:
 
     provider_id = str(provider or "").strip().lower()
     model_id = str(model or "").strip()
+    if provider_id == "chatgpt_account":
+        from osia.chatgpt_account.provider import get_account_provider
+
+        client = getattr(get_account_provider(), "client", None)
+        read_capacity = getattr(client, "model_context_capacity", None)
+        capacity = read_capacity(model_id) if callable(read_capacity) else None
+        if capacity:
+            return capacity["maximum"]
     from osia.models import model_metadata
     metadata = model_metadata(provider_id, model_id) or {}
     limit = metadata.get("context_window")
@@ -892,7 +900,9 @@ def build_context(
         raise ContextBuildError("invalid_context_limit")
     budget = _input_budget(resolved_limit)
     before_tokens = estimate_messages_tokens(before)
-    if before_tokens <= budget and (not force_compaction or len(entries) <= RECENT_MESSAGE_COUNT + 1):
+    native_compaction = str(provider or "").strip().lower() == "chatgpt_account"
+    full_history = before_tokens <= budget and (not force_compaction or len(entries) <= RECENT_MESSAGE_COUNT + 1)
+    if native_compaction or full_history:
         included = set(range(len(entries)))
         receipt = _receipt(
             provider=provider,
@@ -907,7 +917,7 @@ def build_context(
             included_entry_indexes=included,
             compacted_source_ids=[],
             summarized_source_ids=[],
-            strategy="full_history",
+            strategy="full_history" if full_history else "provider_native",
             duplicates_removed=duplicates_removed,
             metadata_messages=metadata_messages if metadata_messages is not None else messages,
         )
@@ -1296,34 +1306,37 @@ def compact_conversation_context(
             except Exception:
                 _LOG.warning("context_compaction_display_callback_failed")
         conv = conversations.get_conversation(conversation_id) or {}
-        history = [
-            clean for message in conv.get("messages") or []
-            if (clean := _sanitize_persisted_history_message(message)) is not None
-        ]
-        messages = [
-            {"role": "system", "content": get_system_prompt(model=model, provider=provider)},
-            *history,
-        ]
-        compacted = build_context(
-            messages, provider=provider, model=model,
-            conversation_id=conversation_id, force_compaction=True,
-        )
-        native = False
-        if provider == "chatgpt_account" and conv.get("_chatgpt_account_thread"):
+        if provider == "chatgpt_account":
             from osia.chatgpt_account.provider import get_account_provider
 
-            native = get_account_provider().compact_conversation(conversation_id, model)
-            if not native:
+            account = get_account_provider()
+            if not account.compact_conversation(conversation_id, model):
                 raise ContextBuildError("native_compaction_unavailable")
-        receipt = compacted.receipt
-        changed = native or receipt["estimated_tokens_after"] < receipt["estimated_tokens_before"]
-        record_context_receipt(receipt, conversation_id=conversation_id)
+            changed = True
+            usage = account.conversation_context_usage(conversation_id, model=model)
+        else:
+            history = [
+                clean for message in conv.get("messages") or []
+                if (clean := _sanitize_persisted_history_message(message)) is not None
+            ]
+            messages = [
+                {"role": "system", "content": get_system_prompt(model=model, provider=provider)},
+                *history,
+            ]
+            compacted = build_context(
+                messages, provider=provider, model=model,
+                conversation_id=conversation_id, force_compaction=True,
+            )
+            receipt = compacted.receipt
+            changed = receipt["estimated_tokens_after"] < receipt["estimated_tokens_before"]
+            record_context_receipt(receipt, conversation_id=conversation_id)
+            usage = conversation_context_usage(conversation_id)
         if changed and not conversations.mark_conversation_context_compacted(conversation_id, lease):
             raise ContextBuildError("conversation_not_found")
         record_notice("completed" if changed else "unchanged")
         return {
             "changed": changed,
-            "usage": conversation_context_usage(conversation_id),
+            "usage": usage,
         }
     except Exception as error:
         try:
