@@ -1,0 +1,36 @@
+name: Linux 0.9.267 isolated build
+
+on:
+  push:
+    branches: [codex/linux-0.9.267-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the build driver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ curl xz-utils libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0 xvfb
+      - name: Build the exact authorized release commit
+        run: bash .github/scripts/build-linux-09267.sh
+      - name: Save verified build artifacts and reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: osia-linux-0.9.267
+          path: |
+            ${{ runner.temp }}/osia-linux-09267/artifacts
+            ${{ runner.temp }}/osia-linux-09267/reports
+            ${{ runner.temp }}/osia-linux-09267/logs
+          if-no-files-found: error
+          retention-days: 14
