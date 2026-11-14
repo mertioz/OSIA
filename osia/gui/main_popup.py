@@ -2811,7 +2811,7 @@ class _FolderIcon(QWidget):
         painter.end()
 
 
-class _FolderRow(QFrame):
+class _FolderRow(_PointerStyledButton):
     """Visually distinct canonical folder header and its compact settings."""
 
     collapsed_changed = pyqtSignal(str, bool)
@@ -2828,22 +2828,21 @@ class _FolderRow(QFrame):
         self._folder_id = str(folder.get("id") or "")
         self._folder_name = str(folder.get("name") or "")
         self._collapsed = bool(folder.get("collapsed", False))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(self._folder_name)
+        self.setCheckable(True)
+        self.setChecked(not self._collapsed)
+        self.clicked.connect(self._request_toggle)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(10, 8, 8, 8)
         row.setSpacing(7)
-        toggle = self._toggle = QPushButton("▸" if self._collapsed else "▾")
-        toggle.setObjectName("folderToggle")
-        toggle.setFixedSize(24, 24)
-        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        toggle.clicked.connect(
-            lambda: self.collapsed_changed.emit(
-                self._folder_id, not self._collapsed,
-            )
-        )
-        title = QLabel(self._folder_name)
+        icon = _FolderIcon()
+        title = _ConversationTitle(self._folder_name)
         title.setTextFormat(Qt.TextFormat.PlainText)
         title.setObjectName("folderTitle")
+        title.setToolTip(f"<qt>{html.escape(self._folder_name)}</qt>")
         title.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
@@ -2857,11 +2856,29 @@ class _FolderRow(QFrame):
         settings.clicked.connect(
             lambda: self._show_settings(settings, index, total)
         )
-        row.addWidget(toggle)
-        row.addWidget(_FolderIcon())
+        for decoration in (icon, title, count_label):
+            decoration.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(icon)
         row.addWidget(title, 1)
         row.addWidget(count_label)
         row.addWidget(settings)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt method name)
+        return self.layout().sizeHint()
+
+    def _request_toggle(self) -> None:
+        # The PC snapshot confirms expansion; a failed mutation must not leave
+        # the accessible checked state ahead of the actual project contents.
+        self.setChecked(not self._collapsed)
+        self.collapsed_changed.emit(self._folder_id, not self._collapsed)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not event.isAutoRepeat():
+                self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def set_member_count(self, count: int) -> None:
         self._count_label.setText(str(count))
@@ -3375,7 +3392,7 @@ class _ConversationsPanel(QWidget):
         for folder in snapshot.get("folders") or []:
             folder_id = str(folder.get("id") or "")
             row = self._folder_widgets.get(folder_id)
-            if row is not None and row._toggle is focused:
+            if row is focused:
                 self._folder_focus_to_restore = folder_id
                 break
         # Removing a focused row action sends Qt through the remaining
@@ -3391,7 +3408,7 @@ class _ConversationsPanel(QWidget):
         if folder_id is not None and self._scroll.hasFocus():
             row = self._folder_widgets.get(folder_id)
             if row is not None:
-                row._toggle.setFocus(Qt.FocusReason.OtherFocusReason)
+                row.setFocus(Qt.FocusReason.OtherFocusReason)
         self._scroll.verticalScrollBar().setValue(scroll_value)
 
     def refresh(self, *, snapshot: dict | None = None) -> None:
@@ -3452,6 +3469,14 @@ class _ConversationsPanel(QWidget):
         for index, item in sorted(restore_items, key=lambda pair: pair[0]):
             items.insert(min(max(index, 0), len(items)), item)
         folders = list(snapshot.get("folders") or [])
+        members_by_folder: dict[str, list[dict]] = {}
+        ungrouped = []
+        for item in items:
+            folder_id = item.get("folder_id")
+            if not folder_id:
+                ungrouped.append(item)
+            elif isinstance(folder_id, str):
+                members_by_folder.setdefault(folder_id, []).append(item)
         if not items and not folders:
             # An empty list is a valid state — never auto-create here. A new
             # conversation is created only when the user clicks "New chat"
@@ -3488,9 +3513,7 @@ class _ConversationsPanel(QWidget):
             insert_at += 1
         for index, folder in enumerate(folders):
             folder_id = str(folder.get("id") or "")
-            members = [
-                item for item in items if item.get("folder_id") == folder_id
-            ]
+            members = members_by_folder.get(folder_id, [])
             folder_row = _FolderRow(folder, len(members), index, len(folders))
             folder_row.collapsed_changed.connect(self._emit_folder_state)
             folder_row.new_conversation_clicked.connect(
@@ -3524,7 +3547,6 @@ class _ConversationsPanel(QWidget):
                         register_conversation(row)
             contents.reveal_from(animation_starts.get(folder_id))
 
-        ungrouped = [item for item in items if not item.get("folder_id")]
         if folders and ungrouped:
             label = QLabel(i18n.t("conversations.ungrouped"))
             label.setObjectName("folderSectionLabel")
@@ -13198,10 +13220,16 @@ class MainPopup(QWidget):
             QPushButton#convRow[active="true"]:hover {
                 background: rgba(196, 181, 245, 0.29);
             }
-            QFrame#folderRow {
+            QPushButton#folderRow {
                 background: rgba(196, 181, 245, 0.10);
                 border: none;
                 border-radius: 10px;
+            }
+            QPushButton#folderRow:hover, QPushButton#folderRow:focus {
+                background: rgba(196, 181, 245, 0.22);
+            }
+            QPushButton#folderRow:pressed {
+                background: rgba(196, 181, 245, 0.34);
             }
             QLabel#folderTitle {
                 font-size: 12px;
@@ -13212,7 +13240,7 @@ class MainPopup(QWidget):
                 font-size: 10px;
                 color: #9d9aad;
             }
-            QPushButton#folderToggle, QPushButton#convRename,
+            QPushButton#convRename,
             QPushButton#convMove, QPushButton#convActionDel {
                 background: rgba(196, 181, 245, 0.08);
                 border: none;
@@ -13238,12 +13266,11 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.30);
                 color: #e8e6f0;
             }
-            QPushButton#folderToggle:hover, QPushButton#folderToggle:focus,
             QPushButton#convRename:hover, QPushButton#convRename:focus,
             QPushButton#convMove:hover, QPushButton#convMove:focus {
                 background: rgba(196, 181, 245, 0.22);
             }
-            QPushButton#folderToggle:pressed, QPushButton#convRename:pressed,
+            QPushButton#convRename:pressed,
             QPushButton#convMove:pressed {
                 background: rgba(196, 181, 245, 0.34);
             }

@@ -8,8 +8,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtTest import QSignalSpy, QTest
+from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia.gui import main_popup
 
@@ -55,7 +55,7 @@ def panel(monkeypatch):
 
 def _toggle(panel):
     QTest.mouseClick(
-        panel._folder_widgets["stage"]._toggle, Qt.MouseButton.LeftButton,
+        panel._folder_widgets["stage"], Qt.MouseButton.LeftButton,
     )
     APP.processEvents()
     return panel._folder_contents["stage"]
@@ -165,4 +165,46 @@ def test_unacknowledged_toggle_keeps_canonical_project_state(panel):
     contents = _toggle(panel)
     assert contents.isHidden()
     assert panel._folder_widgets["stage"]._collapsed
+    assert not panel._folder_widgets["stage"].isChecked()
     assert panel.visible_conversation_ids() == []
+
+
+@pytest.mark.parametrize("decoration", ["folderTitle", "folderCount", "icon"])
+def test_project_title_icon_and_count_are_part_of_one_click_target(panel, decoration):
+    header = panel._folder_widgets["stage"]
+    child = (
+        header.findChild(main_popup._FolderIcon)
+        if decoration == "icon" else header.findChild(QLabel, decoration)
+    )
+    position = child.mapTo(panel, child.rect().center())
+    target = panel.childAt(position)
+    assert target is header
+    assert header.findChild(QPushButton, "folderToggle") is None
+    QTest.mouseClick(target, Qt.MouseButton.LeftButton, pos=target.mapFrom(panel, position))
+    APP.processEvents()
+    assert not panel._folder_widgets["stage"]._collapsed
+    assert panel._folder_widgets["stage"].isChecked()
+    assert panel.visible_conversation_ids() == [str(index) for index in range(8)]
+
+
+@pytest.mark.parametrize("key", [Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter])
+def test_project_header_remains_keyboard_accessible(panel, key):
+    header = panel._folder_widgets["stage"]
+    QTest.keyClick(header, key)
+    APP.processEvents()
+    assert not panel._folder_widgets["stage"]._collapsed
+
+
+def test_project_settings_click_does_not_toggle_the_project(panel, monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        main_popup._FolderRow, "_show_settings",
+        lambda row, *_args: opened.append(row._folder_id),
+    )
+    requests = QSignalSpy(panel.folder_mutation_requested)
+    button = panel._folder_widgets["stage"].findChild(QPushButton, "folderMenu")
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    APP.processEvents()
+    assert opened == ["stage"]
+    assert not requests
+    assert panel._folder_widgets["stage"]._collapsed

@@ -142,6 +142,11 @@ def smart_title(text, *, min_words: int = 2, max_words: int = 4) -> str:
 
 # Re-entrant so add_message() can call get_conversation() while holding it.
 _lock = threading.RLock()
+# Read-only list projections retain summaries, never full message histories.
+# Access stays under _store_lock; file identities detect writes by either PC
+# process, including atomic replacements which preserve timestamps and size.
+_summary_cache_root: Path | None = None
+_summary_cache: dict[Path, tuple[tuple, dict]] = {}
 
 
 # ── Internals ──────────────────────────────────────────────────────────────
@@ -1314,16 +1319,21 @@ def mark_conversation_context_compacted(conv_id: str, lease_id: str) -> bool:
         return True
 
 
-def _list_conversations_unlocked(state: dict) -> list[dict]:
-    _ensure_dir()
-    memberships = state.get("memberships") or {}
-    items: list[dict] = []
-    for path in CONVERSATIONS_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        items.append({
+def _summary_file_stamp(path: Path) -> tuple:
+    info = path.stat()
+    return (
+        info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+    )
+
+
+def _conversation_summary_unlocked(path: Path) -> dict | None:
+    try:
+        stamp = _summary_file_stamp(path)
+        cached = _summary_cache.get(path)
+        if cached is not None and cached[0] == stamp:
+            return dict(cached[1])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        summary = {
             "id": data.get("id"),
             "title": data.get("title") or DEFAULT_TITLE,
             "created_at": data.get("created_at"),
@@ -1331,9 +1341,40 @@ def _list_conversations_unlocked(state: dict) -> list[dict]:
             "message_count": len(data.get("messages") or []),
             "revision": int(data.get("revision") or 0),
             "operation_id": str(data.get("last_operation_id") or ""),
-            "folder_id": memberships.get(str(data.get("id") or "")),
             "special_mode": data.get("special_mode") is True,
-        })
+        }
+        # A writer outside the canonical lock may replace a file during this
+        # read. Do not cache that mixed observation for future refreshes.
+        if _summary_file_stamp(path) == stamp:
+            _summary_cache[path] = stamp, dict(summary)
+        else:
+            _summary_cache.pop(path, None)
+        return summary
+    except (OSError, json.JSONDecodeError):
+        _summary_cache.pop(path, None)
+        return None
+
+
+def _list_conversations_unlocked(state: dict) -> list[dict]:
+    global _summary_cache_root
+
+    _ensure_dir()
+    root = CONVERSATIONS_DIR.resolve()
+    if root != _summary_cache_root:
+        _summary_cache.clear()
+        _summary_cache_root = root
+    memberships = state.get("memberships") or {}
+    items: list[dict] = []
+    present = set()
+    for path in root.glob("*.json"):
+        present.add(path)
+        summary = _conversation_summary_unlocked(path)
+        if summary is None:
+            continue
+        summary["folder_id"] = memberships.get(str(summary.get("id") or ""))
+        items.append(summary)
+    for path in _summary_cache.keys() - present:
+        _summary_cache.pop(path, None)
     items.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
     return items
 

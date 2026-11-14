@@ -324,12 +324,12 @@ class QtUiLifecycleTests(unittest.TestCase):
             initial = scrollbar.value()
             for collapsed in (False, True):
                 if collapsed:
-                    QTest.keyClick(header._toggle, Qt.Key.Key_Space)
+                    QTest.keyClick(header, Qt.Key.Key_Space)
                 else:
-                    QTest.mouseClick(header._toggle, Qt.MouseButton.LeftButton)
+                    QTest.mouseClick(header, Qt.MouseButton.LeftButton)
                 self.app.processEvents()
                 header = panel._folder_widgets["target"]
-                self.assertTrue(header._toggle.hasFocus())
+                self.assertTrue(header.hasFocus())
                 # Further snapshots may arrive while the transition is running.
                 panel.refresh(snapshot=snapshot)
                 panel.refresh(snapshot=snapshot)
@@ -340,7 +340,7 @@ class QtUiLifecycleTests(unittest.TestCase):
                 self.assertEqual(
                     header.mapTo(panel._host, QPoint()).y() - scrollbar.value(), 55,
                 )
-                self.assertTrue(header._toggle.hasFocus())
+                self.assertTrue(header.hasFocus())
         finally:
             panel.close()
             panel.deleteLater()
