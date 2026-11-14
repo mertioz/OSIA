@@ -126,22 +126,33 @@ class MotionController(QObject):
         if state is None:
             return
         _widget, _effect, animation = state
-        animation.stop()
-        animation.deleteLater()
+        try:
+            animation.stop()
+            animation.deleteLater()
+        except RuntimeError:
+            # A parent can destroy its animation children before the target
+            # widget emits destroyed. Its native animation is already stopped.
+            pass
 
     def _finish(self, key: int, force_opacity: float | None = None) -> None:
         state = self._states.pop(key, None)
         if state is None:
             return
         widget, effect, animation = state
-        animation.stop()
-        if force_opacity is not None:
-            effect.setOpacity(force_opacity)
         try:
+            animation.stop()
+        except RuntimeError:
+            pass
+        try:
+            if force_opacity is not None:
+                effect.setOpacity(force_opacity)
             widget.setGraphicsEffect(None)
         except RuntimeError:
             pass
-        animation.deleteLater()
+        try:
+            animation.deleteLater()
+        except RuntimeError:
+            pass
 
     def settle(self) -> None:
         for key in tuple(self._states):

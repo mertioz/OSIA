@@ -88,6 +88,7 @@ from osia.gui.motion import (
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
+from osia.gui.cursors import ButtonCursorPolicy
 from osia.gui.thinking_orbs import ThinkingOrbs
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
 from osia.desktop_attachments import (
@@ -11888,6 +11889,7 @@ class MainPopup(QWidget):
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._theme.theme_changed.connect(self._theme_transition.start)
         self._apply_style()
+        self._button_cursor_policy = ButtonCursorPolicy(self)
         self._stack.setCurrentIndex(self.PAGE_CHAT)
         QTimer.singleShot(0, self._request_local_models_refresh)
 

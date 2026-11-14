@@ -1610,6 +1610,14 @@ class MCPManager:
         # Snapshot server ids under the map lock (the documented guard).
         with self._lock:
             sids = list(self._servers.keys())
+            connections = list(self._servers.values())
+        # Transports unwind on their original _serve tasks. Start every close
+        # before waiting so healthy connections do not close one by one.
+        for conn in connections:
+            try:
+                self._signal_stop(conn)
+            except Exception:
+                pass
         for sid in sids:
             try:
                 self.disconnect(sid, timeout=timeout)
@@ -1658,3 +1666,11 @@ def get_manager() -> MCPManager:
         if _manager_singleton is None:
             _manager_singleton = MCPManager()
         return _manager_singleton
+
+
+def shutdown_manager() -> None:
+    """Close the existing process manager without creating one at exit."""
+    with _singleton_lock:
+        manager = _manager_singleton
+    if manager is not None:
+        manager.shutdown()

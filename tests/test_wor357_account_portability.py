@@ -25,12 +25,13 @@ def test_standalone_codex_license_is_in_release_inventory(monkeypatch, tmp_path)
     monkeypatch.setattr(build, 'LEGAL_STAGE', tmp_path)
     monkeypatch.setattr(build.importlib.metadata, 'distributions', lambda: [])
     dependencies = build._stage_legal()
+    version = build.CODEX_RUNTIME_VERSION
     assert dependencies == [{
-        'name': 'OpenAI Codex', 'version': '0.144.1',
+        'name': 'OpenAI Codex', 'version': version,
         'license': 'Apache-2.0', 'homepage': 'https://github.com/openai/codex',
     }]
-    assert (tmp_path/'licenses/codex-0.144.1/LICENSE').read_bytes() == (ROOT/'packaging/windows/licenses/codex/LICENSE').read_bytes()
-    assert (tmp_path/'licenses/codex-0.144.1/NOTICE').read_bytes() == (ROOT/'packaging/windows/licenses/codex/NOTICE').read_bytes()
+    assert (tmp_path/f'licenses/codex-{version}/LICENSE').read_bytes() == (ROOT/'packaging/windows/licenses/codex/LICENSE').read_bytes()
+    assert (tmp_path/f'licenses/codex-{version}/NOTICE').read_bytes() == (ROOT/'packaging/windows/licenses/codex/NOTICE').read_bytes()
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='native Windows dependency probe')

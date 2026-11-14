@@ -551,7 +551,7 @@ class UpdateController(QObject):
         self._publish(status="launching", bannerVisible=True, error=None)
         app = QApplication.instance()
         if app is not None:
-            QTimer.singleShot(400, app.quit)
+            QTimer.singleShot(0, app.quit)
 
 
 class UpdateBanner(QFrame):

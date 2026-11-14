@@ -1364,6 +1364,14 @@ def get_cached_account_models() -> list[dict]:
     return get_account_provider().cached_models()
 
 
+def shutdown_account_provider() -> None:
+    """Close an existing account runtime without creating one during exit."""
+    with _PROVIDER_LOCK:
+        provider = _PROVIDER
+    if provider is not None:
+        provider.shutdown()
+
+
 def delete_saved_chatgpt_threads(bindings: list[tuple[str, str]]) -> None:
     """Clean up only the native threads of canonical, committed deletions."""
     exact = {

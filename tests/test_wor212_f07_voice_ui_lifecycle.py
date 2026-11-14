@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import threading
 from pathlib import Path
 
@@ -300,12 +301,12 @@ def test_main_wires_one_ready_boundary_and_no_scattered_voice_idle_writes():
     source = (Path(__file__).parents[1] / "osia" / "main.py").read_text(
         encoding="utf-8"
     )
-    voice_path = source[source.index("def handle_wake("):source.index(
-        "# \u2500\u2500 Text handler"
-    )]
-    new_chat_handler = source[source.index("def handle_voice_new_chat("):source.index(
-        "def handle_open_conversation("
-    )]
+    functions = {
+        node.name: node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+    }
+    voice_path = ast.get_source_segment(source, functions["handle_wake"])
+    new_chat_handler = ast.get_source_segment(source, functions["handle_voice_new_chat"])
 
     assert source.count('_emit_voice_state("listening")') == 1
     assert "on_ready=_mark_listening_ready" in voice_path

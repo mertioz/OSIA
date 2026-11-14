@@ -1572,6 +1572,29 @@ def _start_popup_hotkey_listener(callback):
 
 # â”€â”€ Voice shutdown lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+def _shutdown_independent_integrations(stops) -> None:
+    """Finish independent owned resources together, preserving their cleanup."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    stops = tuple(stops)
+    if not stops:
+        return
+    # Each subsystem retains its own ordering, grace period and ownership
+    # checks. Wait for every cleanup, without summing independent delays.
+    with ThreadPoolExecutor(
+        max_workers=len(stops), thread_name_prefix="osia-integration-stop",
+    ) as workers:
+        pending = [(name, workers.submit(stop)) for name, stop in stops]
+        for name, result in pending:
+            try:
+                result.result()
+            except Exception as exc:
+                print(
+                    f"[shutdown] {name} cleanup failed ({type(exc).__name__})",
+                    flush=True,
+                )
+
+
 def _shutdown_voice_runtime(
     *,
     close_acceptance,
@@ -5286,21 +5309,23 @@ def wake_mode():
                 "its obsolete TTS session remains invalidated",
                 flush=True,
             )
-        try:
-            from osia.chatgpt_account.provider import get_account_provider
-            get_account_provider().shutdown()
-        except Exception:
-            pass
-        try:
-            from osia.mcp_client import get_manager
-            get_manager().shutdown()
-        except Exception:
-            pass
-        try:
+        def stop_account():
+            from osia.chatgpt_account.provider import shutdown_account_provider
+            shutdown_account_provider()
+
+        def stop_connectors():
+            from osia.mcp_client.manager import shutdown_manager
+            shutdown_manager()
+
+        def stop_browser():
             from osia.tools.browser_controller import close_browser
             close_browser()
-        except Exception:
-            pass
+
+        _shutdown_independent_integrations((
+            ("account", stop_account),
+            ("connectors", stop_connectors),
+            ("browser", stop_browser),
+        ))
 
     app.aboutToQuit.connect(on_quit)
 
