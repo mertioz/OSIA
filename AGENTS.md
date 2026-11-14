@@ -119,6 +119,34 @@ tickets, tests, comments, and documentation when they conflict.
   and migration compatibility. Clearly disclose beta, signing and acceptance
   status and unverified commercial ChatGPT Account eligibility.
 
+## Primary checkout synchronization and Drive reporting
+
+- The primary OSIA PC checkout (on this Windows setup, `%USERPROFILE%\osia`)
+  is the canonical source checkout. Check its
+  branch, local changes, HEAD and freshly fetched `origin/main` at the beginning
+  and end of every task. A current build checkout or GitHub branch does not
+  substitute for an up-to-date primary checkout.
+- After every validated fix, commit and safely push the requested changes,
+  then synchronize the primary checkout with `main` before writing the fix
+  report to Google Drive. Verify that primary HEAD, freshly fetched
+  `origin/main` and `git ls-remote origin refs/heads/main` agree. Never report a
+  fix as delivered while the primary checkout still lacks its committed code.
+- Preserve existing local changes, private configuration, conversations and
+  credentials. Back up overlapping files outside Git, reconcile their changes
+  with the current source, and verify preservation. Do not use destructive
+  reset/clean/stash, force-push, broad staging, or publish unrelated local work.
+  Disclose any preserved local differences; a dirty checkout is not a reason
+  to leave the primary source behind `main`.
+- Run the relevant compile/import and focused regression checks from the
+  synchronized primary checkout. Before the Drive report, record the exact
+  commit, checked paths, results and any remaining local differences or limits.
+- Check the source root and identity of the actual running server/application.
+  Distinguish synchronized files from code already loaded in a process. Do not
+  silently interrupt active work or claim a fix is active without runtime
+  evidence; record any graceful restart or operator acceptance still pending.
+- This ordering is mandatory: validated fix, commit/push, primary checkout
+  synchronization and verification, then Google Drive fix report.
+
 ## Change and verification workflow
 
 1. Keep scope to the requested work. Before changing a function or protocol,
