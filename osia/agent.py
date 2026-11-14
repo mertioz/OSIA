@@ -490,6 +490,16 @@ def get_system_prompt(
             "Leave the physical desktop pointer untouched. Use targeted window captures, "
             "image analysis, keyboard input or structured tools for this conversation."
         )
+    if chat_directives.capability_requirements.current_web:
+        body += (
+            "\n\n[User selected /web for this turn.] "
+            "You must attempt a relevant web search before answering, even for a simple question. "
+            "Use the available web research tools or provider-hosted search. "
+            "Useful results are not required: if search is unavailable, fails, or finds nothing relevant, "
+            "continue and answer from your existing knowledge when appropriate. "
+            "Briefly explain when current information could not be verified; do not invent current "
+            "facts, successful research, or sources. This request applies only to this turn."
+        )
     if chat_directives.skill_creator:
         body += (
             "\n\n[User selected /skillcreator for this turn.] "
@@ -15716,23 +15726,6 @@ class OSIAAgent:
                     "stage": "task_execution",
                     "error_category": failure_reason,
                     "reason_code": failure_reason,
-                }
-            if (
-                self._slash_turn_directives is not None
-                and self._slash_turn_directives.capability_requirements.current_web
-                and not self.last_slash_capability_receipt
-            ):
-                content = (
-                    "ERROR: aucune preuve web actuelle vérifiée n’a été "
-                    "obtenue pour ce tour."
-                    if self.lang == "fr" else
-                    "ERROR: no verified current web evidence was obtained for "
-                    "this turn."
-                )
-                self.last_run_diagnostic = {
-                    "stage": "slash_directives",
-                    "error_category": "capability_evidence_missing",
-                    "reason_code": "current_web_evidence_required",
                 }
             if (
                 self._slash_turn_directives is not None

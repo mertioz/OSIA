@@ -111,6 +111,7 @@ class ConnectorHint:
 
 @dataclass(frozen=True)
 class CapabilityRequirements:
+    # Stable wire identity: request a search attempt, not a successful result.
     current_web: bool = False
 
     @classmethod
@@ -757,18 +758,8 @@ def validate_live(
                 "connector_unavailable", "The selected connector is unavailable.",
                 "Le connecteur sélectionné est indisponible.",
             )
-    if directives.capability_requirements.current_web:
-        if directives.model_override is not None:
-            provider = directives.model_override.provider_id
-        else:
-            from osia.config import load_settings
-
-            provider = str(load_settings().get("selected_model_provider") or "")
-        if not current_web_available(provider):
-            raise SlashDirectiveError(
-                "current_web_unavailable", "Current web evidence is unavailable.",
-                "La preuve web actuelle est indisponible.",
-            )
+    # /web is a model-owned attempt request. A capability disappearing after
+    # composition must not prevent the model from answering with that limit.
     selected_model = None
     if directives.model_override is not None:
         selected_model = next(

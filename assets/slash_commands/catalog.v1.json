@@ -4,8 +4,8 @@
     {
       "id": "web.current",
       "canonical_alias": "web",
-      "name": {"en": "Current web", "fr": "Web actuel"},
-      "description": {"en": "Require current web evidence for this turn", "fr": "Exiger une preuve web actuelle pour ce tour"},
+      "name": {"en": "Web research", "fr": "Recherche web"},
+      "description": {"en": "Try a web search before answering, even if no useful results are found", "fr": "Tenter une recherche web avant de répondre, même sans résultat utile"},
       "argument_hint": {"en": "", "fr": ""},
       "kind": "modifier",
       "availability_predicate": "current_web_available",

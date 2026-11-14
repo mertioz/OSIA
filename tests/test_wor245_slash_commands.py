@@ -479,7 +479,7 @@ def test_connector_hint_does_not_change_permission_and_web_proof_is_typed():
     assert not tool_is_current_web_evidence("read_file")
 
 
-def test_web_requirement_uses_the_active_provider_without_exact_override(
+def test_web_request_does_not_require_an_available_search_route(
     monkeypatch,
 ):
     providers = []
@@ -489,12 +489,12 @@ def test_web_requirement_uses_the_active_provider_without_exact_override(
     )
     monkeypatch.setattr(
         "osia.slash_commands.current_web_available",
-        lambda provider: providers.append(provider) or True,
+        lambda provider: providers.append(provider) or False,
     )
     validate_live(SlashTurnDirectivesV1(
         capability_requirements=CapabilityRequirements(current_web=True),
     ))
-    assert providers == ["chatgpt_account"]
+    assert providers == []
 
 
 def test_configured_disconnected_gmail_is_visible_but_disabled(monkeypatch):
