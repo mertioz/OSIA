@@ -63,6 +63,23 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.267", released_on="2026-11-14", public=True,
+        changes_en=(
+            "Click a project header to reveal or hide its conversations; the conversation list refreshes without rereading unchanged histories.",
+            "Independent integration cleanups run together during exit, and the extra pause before an update is removed while cleanup completion is still awaited.",
+            "Buttons keep the pointing-hand cursor after clicks and page refreshes; text fields retain their text cursor.",
+            "Windows application tasks prefer available, suitable UI Automation controls before vision and physical mouse interaction.",
+            "Animation cleanup tolerates Qt objects already destroyed during exit, preventing a late shutdown exception.",
+        ),
+        changes_fr=(
+            "Cliquez sur l’en-tête d’un projet pour afficher ou masquer ses discussions ; la liste se rafraîchit sans relire les historiques inchangés.",
+            "Les nettoyages indépendants s’exécutent ensemble à la fermeture et l’attente supplémentaire avant mise à jour est retirée, tout en attendant leur fin.",
+            "Les boutons conservent le curseur en forme de main après les clics et rafraîchissements ; les champs gardent le curseur de texte.",
+            "Les tâches dans les applications Windows privilégient les contrôles UI Automation disponibles et adaptés avant la vision et la souris physique.",
+            "Le nettoyage des animations tolère les objets Qt déjà détruits à la fermeture pour éviter une exception tardive.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.266", released_on="2026-11-13", public=True,
         changes_en=(
             "Chat shows compaction progress and a confirmed completion notice directly in the conversation.",
