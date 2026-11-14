@@ -72,7 +72,8 @@ CIRCLE_ACTIVE_SCALE = 0.7
 # edge. Only DOCK_PEEK px (exactly half its width) stays on screen while idle;
 # active states expose the same narrow pill fully, never the horizontal capsule.
 DOCK_PILL_W = 28           # docked pill width (px) — narrow vertical pill
-DOCK_PILL_H = 80           # docked pill height (px) — tall vertical pill
+DOCK_PILL_H = 96           # docked height: 20% taller, with the same narrow width
+DOCK_CORNER_RADIUS = 6.0   # keep the side handle rounded, without a pill end
 DOCK_PEEK = DOCK_PILL_W // 2   # px of the pill kept on screen (exactly half)
 DOCK_ACTIVE_PEEK = DOCK_PILL_W  # 28 logical px, 8.75% of ISLAND_W
 SHAPE_MARGIN = 8           # gap kept from the screen edge for visible shapes
@@ -642,10 +643,11 @@ class DynamicIsland(QWidget):
 
     def _capsule_path(self) -> QPainterPath:
         rect = self._capsule_rect()
-        # Radius follows the live geometry: a wide pill keeps the 26px rounding,
-        # and as the window squares off toward CIRCLE_SIZE² it becomes a full
-        # circle — the morph between shapes needs no separate radius animation.
+        # Capsule/circle rounding follows the live geometry. The side handle
+        # keeps smaller corners, shared by painting and pointer hit testing.
         radius = min(rect.width(), rect.height()) / 2
+        if self._shape == SHAPE_DOCKED:
+            radius = min(radius, DOCK_CORNER_RADIUS)
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
         return path
@@ -698,22 +700,24 @@ class DynamicIsland(QWidget):
             self._paint_speaking(p)
 
     def _paint_docked_ear(self, p: QPainter) -> None:
-        """A subtle three-dot grip on the visible (inner) half of the docked
-        pill, hinting it can be pulled out. Docked left → the right half is on
-        screen; docked right → the left half is, so the grip hugs that side.
+        """A thin neutral rail centred in the visible half of the side handle.
+
+        Docked left → the right half is on screen; docked right → the left half
+        is, so centre the grip in that exposed half rather than the full widget.
         """
         rect = self._capsule_rect()
-        cy = rect.center().y()
         if self._dock_side == "right":
-            gx = rect.left() + rect.width() * 0.30
+            gx = rect.left() + rect.width() * 0.25
         else:
-            gx = rect.right() - rect.width() * 0.30
-        p.setPen(Qt.PenStyle.NoPen)
-        color = QColor(self._primary_color)
-        color.setAlpha(200)
-        p.setBrush(color)
-        for dy in (-7.0, 0.0, 7.0):
-            p.drawEllipse(QPointF(gx, cy + dy), 1.6, 1.6)
+            gx = rect.right() - rect.width() * 0.25
+        color = self._theme.palette.color("muted_text", 200)
+        color.setHsl(0, 0, color.lightness(), color.alpha())
+        pen = QPen(color, 1.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        padding = min(10.0, rect.height() / 4)
+        p.drawLine(QPointF(gx, rect.top() + padding),
+                   QPointF(gx, rect.bottom() - padding))
 
     def _paint_docked_active(self, p: QPainter) -> None:
         """Sweep light up and down a vertical rail in the side capsule."""

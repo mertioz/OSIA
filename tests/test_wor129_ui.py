@@ -426,7 +426,7 @@ class QtUiLifecycleTests(unittest.TestCase):
 
         self.assertEqual(
             (ISLAND_W, ISLAND_H, CIRCLE_SIZE, DOCK_PILL_W, DOCK_PILL_H),
-            (320, 52, 60, 28, 80),
+            (320, 52, 60, 28, 96),
         )
         self.assertEqual(MORPH_MS, 300)
         with patch("osia.config.load_settings", return_value={}):
