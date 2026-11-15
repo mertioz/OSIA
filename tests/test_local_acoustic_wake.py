@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import threading
 import time
@@ -38,6 +39,34 @@ def test_command_handoff_excludes_the_observed_wake_phrase():
     scorer._keyword_end = 16000
     window = np.arange(acoustic.WINDOW_SAMPLES, dtype=np.int16)
     np.testing.assert_array_equal(scorer.command_audio(window), window[16000:].astype(np.float32)/32768)
+
+
+def test_other_conversation_work_does_not_mute_voice_input():
+    from osia import main
+    from pathlib import Path
+    tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8-sig"))
+    body = next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="wake_mode").body
+    names = {"wake_gate", "wake_detector"}
+    nodes = [node for node in body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id in names for t in node.targets)]
+    lock = threading.Lock()
+    playback = [False]
+    namespace = {
+        "WakeAcceptanceGate": wake.WakeAcceptanceGate,
+        "WakeWordDetector": lambda **kwargs: SimpleNamespace(**kwargs),
+        "handler_lock": lock,
+        "tts_playback_active": lambda: playback[0],
+        "_any_conversation_busy": lambda: True,
+        "bridge": SimpleNamespace(wake_detected=SimpleNamespace(emit=lambda _generation: None)),
+    }
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),"<actual voice admission>","exec"),namespace)
+    gate, detector = namespace["wake_gate"],namespace["wake_detector"]
+    assert detector.is_blocked() is False
+    assert gate.reserve(7)
+    assert detector.is_blocked() is True
+    gate.cancel(7)
+    playback[0] = True
+    assert detector.is_blocked() is True
+    assert gate.reserve(8) is False
 
 
 def test_post_wake_silence_keeps_manual_no_speech_window(monkeypatch):

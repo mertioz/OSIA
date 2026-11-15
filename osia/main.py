@@ -2078,13 +2078,8 @@ def wake_mode():
 
     island_lifecycle = IslandLifecycle(bridge.island_state.emit)
 
-    def _any_conversation_busy() -> bool:
-        with busy_lock:
-            return bool(busy_conversations)
-
     wake_gate = WakeAcceptanceGate(
         handler_lock,
-        is_busy=_any_conversation_busy,
         is_tts_active=tts_playback_active,
     )
     voice_ui_lifecycle = VoiceSessionLifecycle()
@@ -2093,9 +2088,9 @@ def wake_mode():
         callback=bridge.wake_detected.emit,
         acceptance_gate=wake_gate.reserve,
         acceptance_cancel=wake_gate.cancel,
-        is_blocked=lambda: (
-            handler_lock.locked() or _any_conversation_busy() or tts_playback_active()
-        ),
+        # Canonical busy/cancellation checks apply to the target conversation
+        # after STT. Another Chat or durable-final wait must not mute input.
+        is_blocked=lambda: handler_lock.locked() or tts_playback_active(),
     )
     wake_setting = [None]
 
