@@ -93,3 +93,29 @@ def test_empty_acoustic_wake_finalizes_without_spoken_fallback(monkeypatch):
     assert listen.call_args.kwargs["no_speech_timeout"] == 4.0
     speak.assert_not_called()
     finish.assert_called_once_with()
+
+
+def test_manual_capture_ignores_legacy_spoken_greeting_settings(monkeypatch):
+    tree = ast.parse(Path(main.__file__).read_text(encoding="utf-8-sig"))
+    wake_mode = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "wake_mode")
+    handle = next(n for n in wake_mode.body if isinstance(n, ast.FunctionDef) and n.name == "handle_wake")
+    process = next(n for n in handle.body if isinstance(n, ast.FunctionDef) and n.name == "process")
+    shutdown = threading.Event()
+    greeting, speak, finish = Mock(), Mock(), Mock()
+
+    def capture(**_options):
+        greeting.assert_not_called()
+        speak.assert_not_called()
+        shutdown.set()
+        return ""
+
+    monkeypatch.setattr(stt, "listen_for_command", capture)
+    namespace = {"generation": 0, "wake_audio": None,
+                 "voice_shutdown_requested": shutdown,
+                 "live_settings": {"wake_greeting_enabled": True, "wake_greeting_text": "Old greeting"},
+                 "voice_tts_session": 7, "_finish_wake_turn": finish, "speak": speak,
+                 "speak_greeting_cached": greeting, "_emit_voice_state": Mock()}
+    exec(compile(ast.Module(body=[process], type_ignores=[]), "<manual voice worker>", "exec"), namespace)
+    namespace["process"]()
+    greeting.assert_not_called()
+    finish.assert_called_once_with()

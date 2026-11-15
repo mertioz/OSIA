@@ -967,7 +967,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
               "voz (TTS) se desactivan automáticamente cuando la Live API está "
               "activa.",
     },
-    # — Wake-word greeting response —
+    # — Optional wake-word activation —
     "settings.wake_word_enabled": {
         "en": "Activate by saying “Hé OSIA” (O-ssia)",
         "fr": "Déclencher en disant « Hé OSIA » (O-ssia)",
@@ -975,14 +975,6 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ja": "「Hé OSIA」（O-ssia）と呼んで起動",
         "de": "Mit „Hé OSIA“ (O-ssia) aktivieren",
         "es": "Activar diciendo «Hé OSIA» (O-ssia)",
-    },
-    "settings.wake_greeting": {
-        "en": "Manual voice response",
-        "fr": "Réponse à l'activation manuelle",
-        "zh": "手动语音响应",
-        "ja": "手動音声起動の応答",
-        "de": "Antwort bei manueller Sprachaktivierung",
-        "es": "Respuesta de activación manual",
     },
     "settings.wake_development": {
         "en": "Local voice activation · Preview",
@@ -992,38 +984,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Lokale Sprachaktivierung · Vorschau",
         "es": "Activación de voz local · Vista previa",
     },
-    "settings.wake_greeting_desc": {
+    "settings.wake_description": {
         "en": "Optional offline listening for “Hé OSIA”. Microphone audio stays in memory and is not saved. Ctrl+Alt+P always starts manual listening. Preview: detection may vary with your voice and microphone.",
         "fr": "Écoute facultative et hors ligne de « Hé OSIA ». Le son du micro reste en mémoire, sans sauvegarde. Ctrl+Alt+P lance toujours l’écoute manuelle. Aperçu : la détection peut varier selon votre voix et votre micro.",
         "zh": "可选的离线“Hé OSIA”唤醒。麦克风音频仅保留在内存中，不保存。Ctrl+Alt+P 始终可手动聆听。预览：效果因声音和麦克风而异。",
         "ja": "任意のオフライン「Hé OSIA」検出。音声はメモリ内のみで保存されません。Ctrl+Alt+P で手動起動できます。プレビュー：声やマイクにより精度が変わります。",
         "de": "Optionales Offline-Erkennen von „Hé OSIA“. Mikrofon-Audio bleibt im Speicher und wird nicht gespeichert. Ctrl+Alt+P startet weiterhin manuell. Vorschau: Erkennung variiert je nach Stimme und Mikrofon.",
         "es": "Escucha opcional y sin conexión de «Hé OSIA». El audio permanece en memoria y no se guarda. Ctrl+Alt+P siempre inicia la escucha manual. Vista previa: la detección varía según la voz y el micrófono.",
-    },
-    "wake.greeting_enabled": {
-        "en": "Speak greeting before manual listening",
-        "fr": "Dire un message avant l'écoute manuelle",
-        "zh": "手动聆听前播放问候语",
-        "ja": "手動聞き取り前に挨拶を話す",
-        "de": "Begrüßung vor dem manuellen Zuhören sprechen",
-        "es": "Decir saludo antes de la escucha manual",
-    },
-    "wake.greeting_placeholder": {
-        "en": "Greeting text",
-        "fr": "Texte du message",
-        "zh": "问候语文本",
-        "ja": "挨拶のテキスト",
-        "de": "Begrüßungstext",
-        "es": "Texto del saludo",
-    },
-    # Default greeting, auto-filled into the text field per the active language.
-    "wake.greeting_default": {
-        "en": "I'm listening",
-        "fr": "Je vous écoute",
-        "zh": "我在听",
-        "ja": "お聞きしています",
-        "de": "Ich höre zu",
-        "es": "Te escucho",
     },
     # — Scheduled Tasks / Cron (Bloc 5) —
     "settings.cron": {

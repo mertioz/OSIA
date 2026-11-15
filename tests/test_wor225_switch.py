@@ -302,22 +302,19 @@ class TestCanonicalSwitch:
 
 
 class TestSensitiveIntegrationContracts:
-    def test_wake_controls_are_disabled_and_voice_controls_stay_available(self):
+    def test_unavailable_wake_is_disabled_and_voice_controls_stay_available(self):
         with (
             patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher"),
             patch.object(_SettingsPanel, "_load_state"),
+            patch("osia.voice.wake.verifier_available", return_value=False),
             patch("osia.gui.main_popup.set_setting") as save,
         ):
             panel = _SettingsPanel()
             try:
-                assert all(not control.isEnabled() for control in (
-                    panel._wake_word_toggle, panel._wake_enabled_toggle, panel._wake_text_input,
-                ))
+                assert not panel._wake_word_toggle.isEnabled()
                 assert panel._tts_provider_combo.isEnabled()
                 assert panel._stt_provider_combo.isEnabled()
                 panel._wake_word_toggle.click()
-                panel._wake_enabled_toggle.click()
-                panel._wake_text_input.editingFinished.emit()
                 save.assert_not_called()
             finally:
                 panel.deleteLater()
@@ -357,8 +354,8 @@ class TestSensitiveIntegrationContracts:
         assert "self._hier_enabled_toggle = OsiaSwitch()" in source
         assert '_save_hierarchy_setting("ai_hierarchy_enabled"' in source
         assert "self._wake_word_toggle = OsiaSwitch()" in source
-        assert "self._wake_enabled_toggle = OsiaSwitch()" in source
-        assert 'set_setting("wake_greeting_enabled", enabled)' in source
+        assert "self._wake_enabled_toggle" not in source
+        assert "self._wake_text_input" not in source
         assert "self._tts_provider_combo = QComboBox()" in source
 
 

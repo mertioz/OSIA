@@ -1865,7 +1865,6 @@ def wake_mode():
         shutdown as tts_shutdown,
         playback_active as tts_playback_active,
         speak,
-        speak_greeting_cached,
         speak_streaming,
         start_tts_session,
         start_streaming_session,
@@ -3893,17 +3892,6 @@ def wake_mode():
                 from osia.voice.stt import WAKE_NO_SPEECH_SECONDS, listen_for_command
                 if voice_shutdown_requested.is_set():
                     return
-                # Optional spoken greeting before listening. When enabled, OSIA
-                # speaks the preconfigured text first, then starts capturing the
-                # command (speak() is synchronous, so the greeting finishes
-                # before the mic opens â€” it never bleeds into the recording).
-                if not generation and live_settings.get("wake_greeting_enabled"):
-                    greeting = (live_settings.get("wake_greeting_text") or "").strip()
-                    if greeting:
-                        _emit_voice_state("speaking")
-                        speak_greeting_cached(
-                            greeting, session_id=voice_tts_session,
-                        )
                 if voice_shutdown_requested.is_set():
                     return
 

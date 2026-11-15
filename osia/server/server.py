@@ -9534,7 +9534,6 @@ async def websocket_endpoint(ws: WebSocket):
                     "stt_fallback_provider", "stt_local_model", "stt_groq_model",
                     "ui_theme",
                     "wake_word_enabled",
-                    "wake_greeting_enabled", "wake_greeting_text",
                     "cron_jobs", "ai_hierarchy_enabled",
                     # Flat aliases for the two AI-hierarchy fallback chains; the
                     # write path below folds them into ai_hierarchy.{heavy,medium}.

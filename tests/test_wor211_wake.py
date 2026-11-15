@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import sys
 import threading
 from pathlib import Path
@@ -50,6 +51,23 @@ def test_acoustic_setting_is_opt_in_and_can_be_disabled(monkeypatch):
     config.set_setting("wake_word_enabled", True)
     config.set_setting("wake_word_enabled", False)
     assert saved == [{"wake_word_enabled": True}, {"wake_word_enabled": False}]
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_fresh_install_is_off_and_existing_opt_in_is_preserved(monkeypatch, tmp_path, frozen):
+    example = json.loads((ROOT / "config" / "settings.example.json").read_text(encoding="utf-8"))
+    assert example["wake_word_enabled"] is False
+    assert "wake_greeting_enabled" not in example
+    assert "wake_greeting_text" not in example
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(settings_file))
+    monkeypatch.setattr(config, "ACOUSTIC_WAKE_AVAILABLE", True)
+    monkeypatch.setattr(sys, "frozen", frozen, raising=False)
+    assert not settings_file.exists()
+    assert config.load_settings()["wake_word_enabled"] is False
+    assert config.get_setting("wake_word_enabled") is False
+    settings_file.write_text(json.dumps({"wake_word_enabled": True}), encoding="utf-8")
+    assert config.load_settings()["wake_word_enabled"] is True
 
 
 def test_unavailable_detector_start_loads_no_model_stream_or_listener(monkeypatch):

@@ -132,16 +132,12 @@ DEFAULT_SETTINGS = {
     "liveapi_enabled": False,                  # master switch
     "liveapi_provider": "google",              # "google", "openai", "claude"
     "liveapi_model": "gemini-3.1-flash-live",  # provider-specific live model id
-    # Compatibility key retained for older settings/mobile clients. The
-    # release contract above forces its effective value to False.
+    # First installation never starts an always-listening microphone.
+    # Existing profiles retain their explicit opt-in across updates.
     "wake_word_enabled": False,
     # Physical desktop output preference; microphone input and client audio
     # projections keep their independent controls.
     "desktop_speech_enabled": True,
-    # Manual voice greeting: when enabled, OSIA speaks ``wake_greeting_text``
-    # after Ctrl+Alt+P and before command listening. Empty text = no greeting.
-    "wake_greeting_enabled": False,
-    "wake_greeting_text": "",
     # Scheduled tasks (Bloc 5): list of cron entries. Each entry is
     # ``{"task": <description>, "schedule": <spec>, "enabled": <bool>}``.
     # ``schedule`` is one of "every <N> minutes|hours|days" or "at HH:MM"

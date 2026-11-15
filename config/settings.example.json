@@ -29,8 +29,6 @@
   "liveapi_provider": "google",
   "liveapi_model": "gemini-3.1-flash-live",
   "wake_word_enabled": false,
-  "wake_greeting_enabled": false,
-  "wake_greeting_text": "",
   "cron_jobs": [],
   "heartbeat_enabled": false,
   "heartbeat_interval_minutes": 5,

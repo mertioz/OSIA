@@ -73,3 +73,10 @@ def test_speech_switch_loads_saved_mute_without_stopping_audio_again(panel, monk
     panel._load_state()
     assert not panel._desktop_speech_toggle.isChecked()
     stop.assert_not_called()
+
+
+def test_wake_section_has_only_the_opt_in_and_no_greeting_controls(panel):
+    assert not panel._wake_word_toggle.isChecked()
+    assert not hasattr(panel, "_wake_enabled_toggle")
+    assert not hasattr(panel, "_wake_text_input")
+    assert not hasattr(panel, "_on_wake_enabled_changed")
