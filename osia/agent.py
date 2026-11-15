@@ -5334,7 +5334,7 @@ def _execute_tool_with_policy(
             0, False, False, contract,
         )
 
-    if tool_name == "open_application" and sys.platform == "win32":
+    if tool_name == "open_application" and sys.platform == "win32" and not preflight_error:
         try:
             from osia.tools.desktop_control import application_launch_error
         except ImportError:

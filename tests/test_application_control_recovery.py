@@ -91,6 +91,20 @@ def test_existing_absolute_executable_keeps_the_original_argument_and_dispatch(m
     assert result.result == "launch fixture returned" and result.dispatched is True
 
 
+def test_existing_integrity_rejection_keeps_priority_over_missing_path(monkeypatch):
+    monkeypatch.setattr(agent.sys, "platform", "win32")
+    monkeypatch.setattr(desktop.os.path, "isfile", lambda path: False)
+    launch = Mock(side_effect=AssertionError("rejected call must never dispatch"))
+    monkeypatch.setitem(agent.TOOL_MAP, "open_application", launch)
+    result = agent._execute_tool_with_policy("open_application", {"name": r"C:\Missing\Example.exe"},
+                                            preflight_error="ERROR: BLOCK_SYSTEM_DESTRUCTION",
+                                            preflight_reason_code="block_system_destruction")
+    assert result.outcome == ExecutionOutcome.REJECTED_BEFORE_EXECUTION
+    assert result.reason_code == "block_system_destruction"
+    assert result.dispatched is False
+    launch.assert_not_called()
+
+
 def test_application_name_lookup_and_non_windows_launches_keep_their_contract(monkeypatch):
     monkeypatch.setattr(desktop.sys, "platform", "win32")
     assert desktop.application_launch_error("Messenger") is None
