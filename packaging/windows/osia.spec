@@ -59,6 +59,7 @@ for package in (
     "reportlab",
     "rapidocr",
     "soundfile",
+    "vosk",
     "onnxruntime",
     "uiautomation",
     "tzdata",

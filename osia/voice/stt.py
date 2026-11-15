@@ -245,6 +245,7 @@ def record_audio_vad(
     max_seconds: float = VAD_MAX_SECONDS,
     min_seconds: float = VAD_MIN_SECONDS,
     on_ready: Callable[[], None] | None = None,
+    initial_audio: np.ndarray | None = None,
 ) -> np.ndarray:
     """Record from the mic until the user stops talking, using a simple
     RMS-based Voice Activity Detection.
@@ -267,6 +268,10 @@ def record_audio_vad(
     if not _AUDIO_OK:
         print("⚠️  [STT] no audio backend — cannot record (VAD).")
         return np.zeros(0, dtype=np.float32)
+    if silence_rms is None and initial_audio is not None:
+        # The wake worker has just released the microphone. Do not discard the
+        # beginning of the spoken command in a new ambient calibration stream.
+        silence_rms = _calibrated_silence_rms or VAD_SILENCE_RMS
     if silence_rms is None:
         silence_rms = _get_ambient_threshold(sample_rate)
     silence_rms = _bounded_vad_threshold(silence_rms)
@@ -278,8 +283,14 @@ def record_audio_vad(
 
     WAITING_FOR_SPEECH = "waiting_for_speech"
     IN_SPEECH = "in_speech"
+    prefix = (
+        np.asarray(initial_audio, dtype=np.float32).reshape(-1).copy()
+        if initial_audio is not None else np.zeros(0, dtype=np.float32)
+    )
+    # A wake handoff can contain only post-keyword silence. Wait for actual
+    # command speech, preserving the same no-speech window as manual capture.
     state = WAITING_FOR_SPEECH
-    chunks: list[np.ndarray] = []
+    chunks: list[np.ndarray] = [prefix] if prefix.size else []
     recorded_seconds = 0.0
     trailing_silence_seconds = 0.0
 
@@ -721,6 +732,7 @@ def listen(duration: int = RECORD_SECONDS) -> str:
 def listen_for_command(
     max_retries: int = 3,
     on_ready: Callable[[], None] | None = None,
+    initial_audio: np.ndarray | None = None,
 ) -> str:
     """Keep recording (via VAD) until a valid command is received.
 
@@ -741,7 +753,10 @@ def listen_for_command(
 
     for attempt in range(1, max_retries + 1):
         print(f"👂 Listening... (attempt {attempt}/{max_retries})")
-        audio = record_audio_vad(on_ready=emit_ready_once)
+        options = {}
+        if attempt == 1 and initial_audio is not None:
+            options["initial_audio"] = initial_audio
+        audio = record_audio_vad(on_ready=emit_ready_once, **options)
 
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
             print("   ⚠️  Silent chunk, retrying...")
@@ -752,6 +767,18 @@ def listen_for_command(
             sample_rate=VAD_SAMPLE_RATE,
             return_result=True,
         )
+        if initial_audio is not None:
+            # This is transcription cleanup AFTER an acoustic wake was proven,
+            # never a text/alias-based activation or an STT prompt injection.
+            text = raw_result.text if isinstance(raw_result, TranscriptionResult) else (raw_result or "")
+            text = re.sub(r"^\s*(?:(?:h[eé]y?|eh)\s+)?(?:osia|ossia|ozia|ocia)\b[\s,.:!?—-]*", "", text, count=1, flags=re.IGNORECASE).strip()
+            if not text:
+                continue
+            if isinstance(raw_result, TranscriptionResult):
+                from dataclasses import replace
+                raw_result = replace(raw_result, text=text)
+            else:
+                raw_result = text
         if isinstance(raw_result, TranscriptionResult):
             result = raw_result
         else:

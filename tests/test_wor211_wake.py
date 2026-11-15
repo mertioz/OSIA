@@ -16,27 +16,31 @@ from osia.voice import wake
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_acoustic_release_contract_is_false_in_source_and_packaged_modes(
+def test_missing_model_disables_acoustic_in_source_and_packaged_modes(
     monkeypatch, tmp_path,
 ):
     retired_model = tmp_path / "osia_verifier.pkl"
     retired_model.write_bytes(b"retired")
     monkeypatch.setattr(wake, "VERIFIER_PATH", str(retired_model), raising=False)
+    def missing():
+        raise FileNotFoundError("packaged keyword model missing")
+    monkeypatch.setattr(wake, "model_manifest", missing)
 
     for frozen in (False, True):
         monkeypatch.setattr(sys, "frozen", frozen, raising=False)
         assert wake.verifier_available() is False
         assert wake.acoustic_wake_status() == {
             "acoustic_wake_available": False,
-            "reason": "release_disabled_no_reliable_local_verifier",
+            "reason": "local_wake_model_or_audio_unavailable",
         }
+        assert wake._get_verifier() is None
 
 
-def test_legacy_persisted_true_and_future_setting_write_stay_disabled(monkeypatch):
+def test_acoustic_setting_is_opt_in_and_can_be_disabled(monkeypatch):
     monkeypatch.setattr(
         config,
         "_read_settings_file",
-        lambda: {"wake_word_enabled": True},
+        lambda: {},
     )
     assert config.load_settings()["wake_word_enabled"] is False
 
@@ -44,10 +48,11 @@ def test_legacy_persisted_true_and_future_setting_write_stay_disabled(monkeypatc
     monkeypatch.setattr(config, "load_settings", lambda: {"wake_word_enabled": True})
     monkeypatch.setattr(config, "save_settings", lambda settings: saved.append(settings))
     config.set_setting("wake_word_enabled", True)
-    assert saved == [{"wake_word_enabled": False}]
+    config.set_setting("wake_word_enabled", False)
+    assert saved == [{"wake_word_enabled": True}, {"wake_word_enabled": False}]
 
 
-def test_retired_detector_start_loads_no_model_stream_or_listener(monkeypatch):
+def test_unavailable_detector_start_loads_no_model_stream_or_listener(monkeypatch):
     calls = []
 
     def forbidden(name):
@@ -62,15 +67,13 @@ def test_retired_detector_start_loads_no_model_stream_or_listener(monkeypatch):
         "sd",
         SimpleNamespace(InputStream=forbidden("input_stream")),
     )
+    monkeypatch.setattr(wake, "verifier_available", lambda: False)
     before = [
         thread for thread in threading.enumerate()
         if thread.name == "osia-wake-listener"
     ]
     detector = wake.WakeWordDetector(
         callback=forbidden("callback"),
-        _feature_extractor_factory=forbidden("openwakeword"),
-        _verifier_factory=forbidden("verifier"),
-        _vad_factory=forbidden("vad"),
         _stream_factory=forbidden("input_stream"),
     )
 
@@ -236,14 +239,15 @@ def test_popup_hotkey_remains_ctrl_alt_o_and_cleans_up(monkeypatch):
     assert listeners[0].stopped == 1
 
 
-def test_main_uses_only_intentional_manual_activation_and_preserves_access_paths():
+def test_acoustic_and_manual_activation_share_one_guarded_pipeline():
     from osia import main
 
     source = inspect.getsource(main.wake_mode)
-    assert "WakeWordDetector" not in source
-    assert "verifier_available" not in source
+    assert "WakeWordDetector" in source
     assert "No wake model found" not in source
-    assert "ACOUSTIC_WAKE_UNAVAILABLE_REASON" in source
+    assert "wake_detector.is_generation_current(generation)" in source
+    assert "wake_detector.pause()" in source
+    assert "wake_detector.take_audio(generation)" in source
     assert "_start_ctrl_alt_p_listener(_manual_wake)" in source
     assert "if not manual_activation_open.is_set():" in source
     assert "if not wake_gate.reserve(0):" in source
@@ -252,19 +256,18 @@ def test_main_uses_only_intentional_manual_activation_and_preserves_access_paths
     assert "wake_gate.cancel(0)" in source
     assert "island.clicked.connect(popup.toggle)" in source
     assert "_start_popup_hotkey_listener(bridge.toggle_popup.emit)" in source
-    assert "wake_word_enabled_changed.connect" not in source
+    assert "wake_word_enabled_changed.connect" in source
 
 
-def test_settings_surface_is_disabled_and_truthful():
+def test_settings_surface_is_opt_in_and_truthful():
     popup_source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
-    assert "self._wake_word_toggle.setEnabled(False)" in popup_source
-    assert "set_setting(\"wake_word_enabled\", False)" in popup_source
-    assert 'self._wake_word_toggle.setChecked(False)' in popup_source
+    assert "self._wake_word_toggle.setEnabled(wake_available)" in popup_source
+    assert 'set_setting("wake_word_enabled", enabled)' in popup_source
     assert i18n.TRANSLATIONS["settings.wake_word_enabled"]["en"] == (
-        "Press Ctrl+Alt+P to talk to OSIA."
+        "Activate by saying “Hé OSIA” (O-ssia)"
     )
     assert i18n.TRANSLATIONS["settings.wake_word_enabled"]["fr"] == (
-        "Pour parler à OSIA, appuyez sur Ctrl+Alt+P."
+        "Déclencher en disant « Hé OSIA » (O-ssia)"
     )
 
 

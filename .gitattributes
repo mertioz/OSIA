@@ -22,3 +22,4 @@ packaging/windows/licenses/codex/NOTICE text eol=lf
 *.pkl       binary
 *.png       binary
 *.exe       binary
+assets/wake/vosk-fr/** binary

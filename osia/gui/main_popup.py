@@ -6181,14 +6181,15 @@ class _SettingsPanel(QWidget):
         self._wake_desc.setWordWrap(True)
         l.addWidget(self._wake_desc)
 
-        # Compatibility row for the retired acoustic listener. It stays visibly
-        # disabled and explains the supported Ctrl+Alt+P release path.
+        # Opt-in local wake. Unavailable audio/model assets leave manual voice
+        # activation and the rest of the application usable.
         ww_row = QHBoxLayout()
         self._wake_word_label = QLabel(i18n.t("settings.wake_word_enabled"))
         self._wake_word_label.setObjectName("providerName")
         self._wake_word_label.setWordWrap(True)
         self._wake_word_toggle = OsiaSwitch()
-        self._wake_word_toggle.setEnabled(False)
+        from osia.voice.wake import verifier_available
+        self._wake_word_toggle.setEnabled(verifier_available())
         self._wake_word_toggle.setToolTip(
             i18n.t("settings.wake_word_enabled")
         )
@@ -6221,11 +6222,11 @@ class _SettingsPanel(QWidget):
         return wrap
 
     def _on_wake_word_enabled_changed(self, _state) -> None:
-        self._wake_word_toggle.blockSignals(True)
-        self._wake_word_toggle.setChecked(False)
-        self._wake_word_toggle.blockSignals(False)
-        set_setting("wake_word_enabled", False)
-        self.wake_word_enabled_changed.emit(False)
+        if not self._wake_word_toggle.isEnabled():
+            return
+        enabled = self._wake_word_toggle.isChecked()
+        set_setting("wake_word_enabled", enabled)
+        self.wake_word_enabled_changed.emit(enabled)
 
     def _on_wake_enabled_changed(self, _state) -> None:
         if not self._wake_enabled_toggle.isEnabled():
@@ -10311,10 +10312,11 @@ class _SettingsPanel(QWidget):
         self._tts_provider_combo.blockSignals(False)
         self._populate_voice_combo(provider, voice)
 
-        # Acoustic wake is intentionally unavailable in this release.
+        from osia.voice.wake import verifier_available
+        wake_available = verifier_available()
         self._wake_word_toggle.blockSignals(True)
-        self._wake_word_toggle.setChecked(False)
-        self._wake_word_toggle.setEnabled(False)
+        self._wake_word_toggle.setChecked(wake_available and bool(settings.get("wake_word_enabled")))
+        self._wake_word_toggle.setEnabled(wake_available)
         self._wake_word_toggle.blockSignals(False)
 
         # Keep the saved greeting visible while its controls are disabled.

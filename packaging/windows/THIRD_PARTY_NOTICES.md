@@ -18,6 +18,12 @@ clean-Windows acceptance gates are documented separately before distribution.
 
 ## Bundled model assets
 
+- **Vosk small French 0.22** (`vosk-model-small-fr-0.22`) is provided under
+  Apache-2.0 by Alpha Cephei and contributors. The source model README,
+  `assets/wake/LICENSE.vosk`, `NOTICE` and file hashes are retained. OSIA's
+  local phonetic wake configuration recognizes “Hé OSIA”; no service key or
+  runtime model download is required. Source: https://alphacephei.com/vosk/models
+
 - **Kokoro-82M** (`hexgrad/Kokoro-82M`, pinned revision
   `f3ff3571791e39611d31c381e3a41a3af07b4987`) is provided under the Apache
   License 2.0. The bundled `ff_siwis` voice is credited to SIWIS and provided

@@ -1843,7 +1843,7 @@ def voice_mode():
 
 
 def wake_mode():
-    """Desktop voice mode with intentional Ctrl+Alt+P manual activation."""
+    """Desktop voice mode with opt-in local wake and Ctrl+Alt+P activation."""
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QObject, pyqtSignal, Qt, QTimer
     from PyQt6.QtGui import QGuiApplication, QIcon
@@ -1854,7 +1854,7 @@ def wake_mode():
     from osia.utils.assets import ICON_PATH, ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
-    from osia.voice.wake import VoiceSessionLifecycle, WakeAcceptanceGate
+    from osia.voice.wake import VoiceSessionLifecycle, WakeAcceptanceGate, WakeWordDetector
     # NOTE: osia.voice.stt (faster_whisper, ~4.3s to import on Windows) is NOT
     # imported here. listen_for_command is only used on the wake daemon thread â€”
     # it is imported lazily inside handle_wake()'s process() worker so the heavy
@@ -1879,8 +1879,6 @@ def wake_mode():
     )
     from osia import scheduled_tasks
     from osia.config import (
-        ACOUSTIC_WAKE_AVAILABLE,
-        ACOUSTIC_WAKE_UNAVAILABLE_REASON,
         load_settings,
         set_model_selection,
         set_setting,
@@ -2091,14 +2089,32 @@ def wake_mode():
     )
     voice_ui_lifecycle = VoiceSessionLifecycle()
 
-    # WOR-211 release contract: no detector is constructed and no idle
-    # microphone stream is opened. Ctrl+Alt+P enters the same guarded voice
-    # workflow intentionally; this does not depend on a missing model file.
-    assert not ACOUSTIC_WAKE_AVAILABLE
-    print(
-        "[wake] acoustic activation unavailable: "
-        f"{ACOUSTIC_WAKE_UNAVAILABLE_REASON}. Use Ctrl+Alt+P."
+    wake_detector = WakeWordDetector(
+        callback=bridge.wake_detected.emit,
+        acceptance_gate=wake_gate.reserve,
+        acceptance_cancel=wake_gate.cancel,
+        is_blocked=lambda: (
+            handler_lock.locked() or _any_conversation_busy() or tts_playback_active()
+        ),
     )
+    wake_setting = [None]
+
+    def _sync_wake_setting() -> None:
+        # Reuse the existing settings poll so a canonical setting changed by
+        # another PC/Mobile process also controls this PC's microphone.
+        enabled = bool(load_settings().get("wake_word_enabled", False))
+        if enabled == wake_setting[0]:
+            if enabled and not wake_detector.running and wake_detector.last_error is None:
+                # A quick off/on may outlive stop's bounded join while the old
+                # native session is still loading. Retry without overlapping
+                # workers; an actual backend error waits for explicit re-enable.
+                wake_detector.start()
+            return
+        wake_setting[0] = enabled
+        if enabled:
+            wake_detector.start()
+        else:
+            wake_detector.stop()
     manual_activation_open = threading.Event()
     manual_activation_open.set()
     voice_shutdown_requested = threading.Event()
@@ -2154,6 +2170,10 @@ def wake_mode():
             return
         if not wake_gate.reserve(0):
             print("[wake] manual activation rejected: busy", flush=True)
+            return
+        if not wake_detector.pause():
+            wake_gate.cancel(0)
+            print("[wake] manual activation postponed: microphone still closing", flush=True)
             return
         print("[wake] manual activation accepted", flush=True)
         bridge.wake_detected.emit(0)
@@ -3771,10 +3791,14 @@ def wake_mode():
     def handle_wake(generation: int):
         if not wake_gate.consume(
             generation,
-            is_current=manual_activation_open.is_set() and generation == 0,
+            is_current=manual_activation_open.is_set() and (
+                generation == 0 or wake_detector.is_generation_current(generation)
+            ),
         ):
             print("âš ï¸  Stale or unreserved wake event â€” ignored.")
             return
+
+        wake_audio = wake_detector.take_audio(generation) if generation else None
 
         voice_session = object()
         if not voice_ui_lifecycle.begin(voice_session):
@@ -3806,12 +3830,14 @@ def wake_mode():
             def _emit_post_voice_state() -> None:
                 island_lifecycle.finish("voice", voice_session)
 
-            voice_ui_lifecycle.finalize(
+            finalized = voice_ui_lifecycle.finalize(
                 voice_session,
                 wait_for_playback=_wait_for_owned_playback,
                 release_gate=wake_gate.finish,
                 emit_final_state=_emit_post_voice_state,
             )
+            if finalized and manual_activation_open.is_set():
+                wake_detector.request_rearm(generation if generation else None)
 
         # Bloc 4 â€” Live API voice-to-voice. When enabled, OSIA's local STT
         # (Whisper) transcription and TTS speak steps are bypassed entirely:
@@ -3873,7 +3899,7 @@ def wake_mode():
                 # speaks the preconfigured text first, then starts capturing the
                 # command (speak() is synchronous, so the greeting finishes
                 # before the mic opens â€” it never bleeds into the recording).
-                if live_settings.get("wake_greeting_enabled"):
+                if not generation and live_settings.get("wake_greeting_enabled"):
                     greeting = (live_settings.get("wake_greeting_text") or "").strip()
                     if greeting:
                         _emit_voice_state("speaking")
@@ -3887,9 +3913,11 @@ def wake_mode():
                     if not voice_shutdown_requested.is_set():
                         _emit_voice_state("listening")
 
+                voice_options = {}
+                if wake_audio is not None:
+                    voice_options["initial_audio"] = wake_audio
                 user_text = listen_for_command(
-                    max_retries=3,
-                    on_ready=_mark_listening_ready,
+                    max_retries=3, on_ready=_mark_listening_ready, **voice_options,
                 )
                 if voice_shutdown_requested.is_set():
                     return
@@ -4995,6 +5023,10 @@ def wake_mode():
     popup.chatgpt_status_changed.connect(handle_chatgpt_status_changed)
     # WOR-22: the "Show the floating capsule" toggle hides/shows the capsule.
     popup.capsule_visibility_changed.connect(island.set_capsule_visible)
+    popup.wake_word_enabled_changed.connect(
+        lambda _enabled: _sync_wake_setting()
+    )
+    context_meter_timer.timeout.connect(_sync_wake_setting)
 
     # Initial population â€” no active conversation yet; the panel shows the
     # stored list (or its "No conversations" placeholder when empty).
@@ -5284,6 +5316,7 @@ def wake_mode():
         voice_ui_lifecycle.close()
         island_lifecycle.close()
         owned_stops = [
+            wake_detector.stop,
             cron_manager.stop,
             unsubscribe_cron_wake,
             heartbeat_monitor.stop,
@@ -5331,6 +5364,7 @@ def wake_mode():
 
     # Reattach exact local direct-Chat receipts.
     QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
+    QTimer.singleShot(0, _sync_wake_setting)
 
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())

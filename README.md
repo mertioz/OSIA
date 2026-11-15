@@ -17,6 +17,14 @@ For the existing Linux package workflow, see packaging/linux/README.md.
 User configuration, provider credentials and runtime data are local and are not
 part of the source distribution. Start with the supplied example configuration.
 
+## Voice activation preview
+
+In Settings → Wake word, enable **Activate by saying “Hé OSIA”** to try local,
+offline wake detection. Say “Hé OSIA” (O-ssia, with an s), wait for the listening indication, then
+speak your request. Ctrl+Alt+P always starts manual listening. Acoustic listening
+is off by default, and microphone audio is not saved. Command transcription
+uses your configured STT provider. See [model, training and acceptance details](assets/wake/MODEL_CARD.md).
+
 ## License and brand
 
 OSIA-authored code is open source under **Apache License 2.0**. Commercial reuse,

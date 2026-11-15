@@ -58,3 +58,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+## Local French wake phrase
+
+Vosk small French 0.22 (Alpha Cephei and contributors) and the Vosk API are
+Apache-2.0. The model README, full license, NOTICE and file hashes are kept
+under assets/wake. Source: https://alphacephei.com/vosk/models

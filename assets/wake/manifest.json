@@ -1,0 +1,79 @@
+{
+  "format": "osia-french-phonetic-v1",
+  "sample_rate": 16000,
+  "window_samples": 32000,
+  "threshold": 0.8,
+  "phrase": "Hé OSIA",
+  "pronunciation": "Hé O-ssia, unvoiced s; user confirmed 2026-11-15",
+  "grammar": [
+    "hé oh sia",
+    "hé aussi",
+    "hé océan",
+    "hé osier",
+    "hé sophia",
+    "hé asia",
+    "[unk]"
+  ],
+  "files": {
+    "vosk-fr/README": {
+      "size": 354,
+      "sha256": "a036c27a5f30d95910f739ce9466539a5772cd13541e5fdddfbfae187993f8d8"
+    },
+    "vosk-fr/am/final.mdl": {
+      "size": 15978979,
+      "sha256": "580d99752e3f6f31fb4a03403b0b2a3a78b9665937e2823668b46d9c9ce1a1a1"
+    },
+    "vosk-fr/conf/mfcc.conf": {
+      "size": 153,
+      "sha256": "6c326fea5741c2d78be12f76eb1b36ea2ace040da9e355e4cfe6bb80e5f7d5ab"
+    },
+    "vosk-fr/conf/model.conf": {
+      "size": 289,
+      "sha256": "d8d91d310a9659fed2d89f8ea4996af6163a43c3ab008cd278e4264120551712"
+    },
+    "vosk-fr/graph/disambig_tid.int": {
+      "size": 380,
+      "sha256": "fd844580478d2c0dbb01e408f77fce92a343a9fe05c304fea57a0d8e3122d7b1"
+    },
+    "vosk-fr/graph/Gr.fst": {
+      "size": 24029163,
+      "sha256": "4d5aefc6af664d1c47979ae3b9eb7e972c196e843ff4eee65e4c7b0c064723cf"
+    },
+    "vosk-fr/graph/HCLr.fst": {
+      "size": 18331442,
+      "sha256": "6562aee2cffac5ad2e569584bc8ca22b1bae0ce9e6e03f0f9898d9d7c267eaa5"
+    },
+    "vosk-fr/ivector/final.dubm": {
+      "size": 168048,
+      "sha256": "15c6736f097e9a1fbc3811a75a666da39cb9aa4526acea29d25f2a3003357acc"
+    },
+    "vosk-fr/ivector/final.ie": {
+      "size": 9927287,
+      "sha256": "bd52bc5aeef1f35349c7a6fd3fb671a4a877ba04181da30d99f2cf01d4b75dd5"
+    },
+    "vosk-fr/ivector/final.mat": {
+      "size": 44975,
+      "sha256": "61818a44ae3519708e9a31701da4ab351f3e19d7bd3e4ddfd820fd7f121cfad0"
+    },
+    "vosk-fr/ivector/global_cmvn.stats": {
+      "size": 1076,
+      "sha256": "9d94d076adc26cd578cc4cf702dc41e5ea6de202f4563d6f0d4b4d4fdbb46bc1"
+    },
+    "vosk-fr/ivector/online_cmvn.conf": {
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "vosk-fr/ivector/splice.conf": {
+      "size": 35,
+      "sha256": "9f0c5f7c82d18eaf25d8bce470efa9f7741f88411fe428774bc0a9bb69a24756"
+    },
+    "vosk-fr/graph/phones/word_boundary.int": {
+      "size": 1626,
+      "sha256": "262452069835201f18fd4de64c4816a2333a54c80b4114084d75e1c4eb273836"
+    }
+  },
+  "source_url": "https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip",
+  "source_archive_sha256": "cabf6180e177eb9b3a9a9d43a437bd5e549f3a7d09525e5d69a3fed787be12ad",
+  "license": "Apache-2.0",
+  "acceptance": "source_preview_physical_acceptance_pending"
+}

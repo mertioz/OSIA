@@ -73,6 +73,7 @@ def test_application_exit_keeps_voice_cancellation_before_integration_cleanup(mo
     stop = lambda: None
     namespace = {
         "codex_update_stop": SimpleNamespace(set=lambda: order.append("updater_stop")),
+        "wake_detector": SimpleNamespace(stop=stop),
         "voice_ui_lifecycle": lifecycle, "island_lifecycle": lifecycle,
         "cron_manager": SimpleNamespace(stop=stop), "unsubscribe_cron_wake": stop,
         "heartbeat_monitor": SimpleNamespace(stop=stop), "stop_manual_hotkey": None,

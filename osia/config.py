@@ -32,11 +32,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRANSPORT_DEFAULTS_SCHEMA_VERSION = 1
 PRODUCTION_STUN_URL = "stun:stun.cloudflare.com:3478"
 
-# WOR-211 release contract. Acoustic wake remains unavailable until WOR-214
-# supplies a locally packaged verifier that passes the lexical-safety gate.
-# This is deliberately independent of persisted settings and model files.
-ACOUSTIC_WAKE_AVAILABLE = False
-ACOUSTIC_WAKE_UNAVAILABLE_REASON = "release_disabled_no_reliable_local_verifier"
+# Local keyword spotting is opt-in. The detector additionally checks its bundled
+# model and audio backend; missing assets never disable manual voice activation.
+ACOUSTIC_WAKE_AVAILABLE = True
+ACOUSTIC_WAKE_UNAVAILABLE_REASON = "local_wake_model_or_audio_unavailable"
 
 
 def _resolve_config_dir() -> str:
@@ -622,8 +621,7 @@ def load_settings() -> dict:
         "personal_browser_instance_hint",
     ):
         base.pop(legacy_key, None)
-    # A legacy persisted true value must never reactivate acoustic detection.
-    base["wake_word_enabled"] = ACOUSTIC_WAKE_AVAILABLE
+    base["wake_word_enabled"] = bool(base.get("wake_word_enabled")) and ACOUSTIC_WAKE_AVAILABLE
     base["reasoning"] = normalize_reasoning_settings(base.get("reasoning"))
     from osia.deepseek import migrate_settings
     return migrate_settings(base)
@@ -789,7 +787,7 @@ def get_setting(key: str, default=None):
 
 def set_setting(key: str, value) -> None:
     if key == "wake_word_enabled":
-        value = ACOUSTIC_WAKE_AVAILABLE
+        value = bool(value) and ACOUSTIC_WAKE_AVAILABLE
     if key == "reasoning":
         value = normalize_reasoning_settings(value)
     with edit_settings() as settings:

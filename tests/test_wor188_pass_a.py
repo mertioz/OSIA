@@ -356,21 +356,9 @@ def test_progressive_tts_uses_the_turns_authoritative_language(monkeypatch):
     assert any(frame.get("type") == "audio" for frame in channel.frames)
 
 
-def test_standalone_wake_callback_reuses_one_turn_context_for_text_and_tts(monkeypatch):
-    from osia import agent as agent_module
-    from osia.voice import stt
-
-    seen = {}
-    spoken = []
-
-    def run_agent(_text, **kwargs):
-        seen["context"] = kwargs.get("turn_context")
-        return "R\u00e9ponse fran\u00e7aise."
-
-    monkeypatch.setattr(stt, "listen_for_command", lambda max_retries=3: "Bonjour, explique.")
-    monkeypatch.setattr(agent_module, "run_agent", run_agent)
-    monkeypatch.setattr(tts, "speak", lambda text, **kwargs: spoken.append((text, kwargs)))
-    wake.default_callback()
-
-    assert seen["context"].mode == "model"
-    assert spoken[-1] == ("R\u00e9ponse fran\u00e7aise.", {"language": None})
+def test_wake_module_entry_uses_canonical_desktop_instead_of_a_second_agent():
+    import inspect
+    source = inspect.getsource(wake)
+    assert "from osia.main import main" in source
+    assert "from osia.agent import" not in source
+    assert "def default_callback(" not in source

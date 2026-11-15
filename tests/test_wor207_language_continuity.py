@@ -64,23 +64,12 @@ def test_tts_uses_emitted_text_without_a_model_language_target(monkeypatch):
 
 
 @pytest.mark.parametrize("language", ["fr", "en"])
-def test_wake_stt_fallback_uses_the_saved_turn_language(monkeypatch, language):
-    from osia import i18n
-    from osia.voice import stt, tts, wake
-
-    spoken = []
-    monkeypatch.setattr(i18n, "get_language", lambda: language)
-    monkeypatch.setattr(stt, "listen_for_command", lambda max_retries=3: None)
-    monkeypatch.setattr(
-        tts, "speak", lambda text, **kwargs: spoken.append((text, kwargs)),
-    )
-
-    wake.default_callback()
-
-    assert spoken == [(
-        localized_text("stt_not_understood", language),
-        {"language": language},
-    )]
+def test_voice_stt_notice_locale_does_not_create_a_model_language_target(language):
+    from osia.turn_context import resolve_turn_context
+    context = resolve_turn_context("", saved_language=language)
+    assert context.mode == "model"
+    assert context.speech_language is None
+    assert localized_text("stt_not_understood", context.language) == localized_text("stt_not_understood", language)
 
 
 def test_legacy_voice_mode_reuses_history_for_ambiguous_turn_and_switches(

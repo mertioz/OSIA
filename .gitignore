@@ -7,9 +7,9 @@ __pycache__/
 *.pkl
 osia/wake_training/positive/
 osia/wake_training/negative/
-# Offline-only synthetic training corpus (~85MB of WAVs, read solely by
-# train.py/generate_dataset.py). The runtime loads only osia_verifier.pkl, which
-# stays tracked — keep clones light by not committing this dataset.
+# Legacy synthetic corpus, for offline training only. The retired pickle
+# verifier is never loaded. The current runtime uses assets/wake/manifest.json;
+# keep new training corpora/checkpoints outside the source checkout as well.
 osia/wake_training/synthetic/
 .env
 .env.*

@@ -231,7 +231,7 @@ def test_no_speech_and_local_command_paths_do_not_print_voice_content(
     )
     voice_path = main_source[
         main_source.index("def handle_wake("):
-        main_source.index("# ── Text handler")
+        main_source.index("    def _send_user_input(")
     ]
     assert "Voice command recognised: new chat" not in voice_path
     assert "local command accepted" in voice_path
@@ -290,6 +290,7 @@ def test_manual_voice_response_diagnostics_do_not_print_response_content():
     assert 'print(f"💬 OSIA: {response}")' not in main_source
     assert 'print(f"💬 OSIA: {response}")' not in wake_source
     assert "assistant response accepted" in main_source
-    assert "assistant response accepted" in wake_source
+    assert "from osia.agent import" not in wake_source
+    assert "from osia.main import main" in wake_source
     assert "_persist_exchange(" in main_source
-    assert "bridge.assistant_stream_final.emit(conv_id, display)" in main_source
+    assert "bridge.assistant_stream_final.emit(dict(turn_binding), display)" in main_source
