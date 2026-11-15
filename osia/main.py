@@ -1861,6 +1861,7 @@ def wake_mode():
     # import never blocks GUI startup (WOR perf fix).
     from osia.voice.commands import is_new_chat_command
     from osia.voice.tts import (
+        desktop_speech_enabled,
         shutdown as tts_shutdown,
         playback_active as tts_playback_active,
         speak,
@@ -2779,7 +2780,7 @@ def wake_mode():
         canonical_projected = [False]
 
         def _voice_tts_allowed() -> bool:
-            return voice_response and not (
+            return voice_response and desktop_speech_enabled() and not (
                 voice_cancelled is not None and voice_cancelled()
             )
 
@@ -3803,6 +3804,8 @@ def wake_mode():
         owned_tts_session = [None]
 
         def _emit_voice_state(state: str) -> bool:
+            if state == "speaking" and not desktop_speech_enabled():
+                state = "idle"
             return voice_ui_lifecycle.emit_if_current(
                 voice_session,
                 # Model activity is owned by the correlated Chat turn. Voice
@@ -3906,7 +3909,18 @@ def wake_mode():
 
                 def _mark_listening_ready() -> None:
                     if not voice_shutdown_requested.is_set():
-                        _emit_voice_state("listening")
+                        current = _emit_voice_state("listening")
+                        if current and generation:
+                            # Input is already open: never delay or discard the
+                            # start of the command while playing the short cue.
+                            from osia.voice.feedback import play_wake_chime
+
+                            play_wake_chime(cancelled=lambda: (
+                                voice_shutdown_requested.is_set()
+                                or not voice_ui_lifecycle.emit_if_current(
+                                    voice_session, lambda: None,
+                                )
+                            ))
 
                 voice_options = {}
                 if wake_audio is not None:

@@ -135,6 +135,9 @@ DEFAULT_SETTINGS = {
     # Compatibility key retained for older settings/mobile clients. The
     # release contract above forces its effective value to False.
     "wake_word_enabled": False,
+    # Physical desktop output preference; microphone input and client audio
+    # projections keep their independent controls.
+    "desktop_speech_enabled": True,
     # Manual voice greeting: when enabled, OSIA speaks ``wake_greeting_text``
     # after Ctrl+Alt+P and before command listening. Empty text = no greeting.
     "wake_greeting_enabled": False,

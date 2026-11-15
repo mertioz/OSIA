@@ -6091,6 +6091,21 @@ class _SettingsPanel(QWidget):
         self._voice_desc.setWordWrap(True)
         l.addWidget(self._voice_desc)
 
+        speech_row = QHBoxLayout()
+        self._desktop_speech_label = QLabel(i18n.t("settings.desktop_speech_enabled"))
+        self._desktop_speech_label.setObjectName("providerName")
+        self._desktop_speech_label.setWordWrap(True)
+        self._desktop_speech_toggle = OsiaSwitch()
+        self._desktop_speech_toggle.setAccessibleName(self._desktop_speech_label.text())
+        self._desktop_speech_toggle.stateChanged.connect(self._on_desktop_speech_changed)
+        speech_row.addWidget(self._desktop_speech_label, 1)
+        speech_row.addWidget(self._desktop_speech_toggle)
+        l.addLayout(speech_row)
+        self._desktop_speech_hint = QLabel(i18n.t("settings.desktop_speech_hint"))
+        self._desktop_speech_hint.setObjectName("sectionDesc")
+        self._desktop_speech_hint.setWordWrap(True)
+        l.addWidget(self._desktop_speech_hint)
+
         # Active provider selector.
         prov_row = QHBoxLayout()
         self._voice_prov_label = QLabel(i18n.t("settings.active_provider"))
@@ -10302,6 +10317,10 @@ class _SettingsPanel(QWidget):
         self._autostart_toggle.blockSignals(False)
 
         # Voice (TTS)
+        self._desktop_speech_toggle.blockSignals(True)
+        self._desktop_speech_toggle.setChecked(
+            settings.get("desktop_speech_enabled", True) is not False)
+        self._desktop_speech_toggle.blockSignals(False)
         provider = settings.get("tts_provider", "local") or "local"
         voice = settings.get("tts_voice")
         self._tts_provider_combo.blockSignals(True)
@@ -10568,6 +10587,15 @@ class _SettingsPanel(QWidget):
 
     # ── Handlers ──────────────────────────────────────────────────────────
 
+    def _on_desktop_speech_changed(self, _state) -> None:
+        enabled = self._desktop_speech_toggle.isChecked()
+        set_setting("desktop_speech_enabled", enabled)
+        if not enabled:
+            # Stop only audio, leaving the canonical Chat turn and text intact.
+            from osia.voice.tts import stop as stop_tts
+
+            stop_tts()
+
     def _on_tts_provider_changed(self, _idx: int) -> None:
         # A provider change must not let an already-queued response continue
         # with a mixture of old/new voices.  Import lazily so GUI startup keeps
@@ -10723,6 +10751,9 @@ class _SettingsPanel(QWidget):
         self._voice_title.setText(i18n.t("settings.voice_providers"))
         self._voice_sub.setText(i18n.t("settings.voice_providers_sub"))
         self._voice_desc.setText(i18n.t("settings.voice_providers_desc"))
+        self._desktop_speech_label.setText(i18n.t("settings.desktop_speech_enabled"))
+        self._desktop_speech_toggle.setAccessibleName(self._desktop_speech_label.text())
+        self._desktop_speech_hint.setText(i18n.t("settings.desktop_speech_hint"))
         self._voice_prov_label.setText(i18n.t("settings.active_provider"))
         self._voice_voice_label.setText(i18n.t("settings.voice"))
         self._kokoro_tag.setText(i18n.t("tts.kokoro_desc"))

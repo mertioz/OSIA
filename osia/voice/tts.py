@@ -131,6 +131,11 @@ _tts_epoch = 0
 _tts_accepting = True
 
 
+def desktop_speech_enabled() -> bool:
+    """Presentation preference only; never cancel or change a Chat turn."""
+    return get_setting("desktop_speech_enabled", True) is not False
+
+
 def _session_is_current(session_id: int) -> bool:
     with _playback_condition:
         return _tts_accepting and session_id == _tts_epoch
@@ -262,10 +267,14 @@ def _play_samples_if_current(
 ) -> bool:
     """Start playback atomically only while the owning epoch is current."""
 
+    if not desktop_speech_enabled():
+        return False
     epoch = _resolve_session_id(session_id)
     if epoch is None:
         return False
     with _playback_start_lock:
+        if not desktop_speech_enabled():
+            return False
         if not _session_is_current(epoch):
             _debug(
                 f"discarding stale synthesized audio "
@@ -342,6 +351,8 @@ def speak_kokoro(
     session_id: int | None = None,
 ) -> bool:
     """Synthesize with Kokoro (local provider). Returns True on success."""
+    if not desktop_speech_enabled():
+        return True  # Output intentionally suppressed; do not try a fallback.
     session_id = _resolve_session_id(session_id)
     if session_id is None or not _session_is_current(session_id):
         return False
@@ -406,6 +417,8 @@ def speak_openai(
     exhausted does the caller fall back to Kokoro. Playback stays OUTSIDE the
     rotation so a sounddevice failure never burns API keys.
     """
+    if not desktop_speech_enabled():
+        return True
     session_id = _resolve_session_id(session_id)
     if session_id is None or not _session_is_current(session_id):
         return False
@@ -514,6 +527,8 @@ def speak_google(
     Tries the newest model first, falling back to the stable preview model if
     the user's tier rejects it. Audio is base64 24kHz 16-bit PCM mono.
     """
+    if not desktop_speech_enabled():
+        return True
     session_id = _resolve_session_id(session_id)
     if session_id is None or not _session_is_current(session_id):
         return False
@@ -623,6 +638,8 @@ def get_active_tts_provider() -> str:
 def _speak_blocking(text: str, language: str | None = None):
     """One synthesis pass through the dispatcher. Used by both the public
     ``speak`` entrypoint and the streaming worker."""
+    if not desktop_speech_enabled():
+        return
     if not _AUDIO_OK:
         _debug("_speak_blocking: no audio backend — skipping playback")
         return
@@ -667,6 +684,8 @@ def speak(
     Voice settings panel. Reads them fresh on every call so changes take
     effect without a restart.
     """
+    if not desktop_speech_enabled():
+        return
     if not text or not text.strip():
         _debug("speak() called with empty text — nothing to do")
         return
@@ -837,6 +856,8 @@ def _speak_greeting_cached(text: str, session_id: int) -> None:
     Falls back to the normal blocking ``speak`` path if anything goes wrong, so
     the greeting always plays even when the cache can't be read or written.
     """
+    if not desktop_speech_enabled():
+        return
     if not text or not text.strip():
         _debug("speak_greeting_cached: empty text — nothing to do")
         return
@@ -1015,6 +1036,8 @@ def speak_streaming(
     invalidated turn are discarded. Non-blocking.
     """
     global _stream_thread
+    if not desktop_speech_enabled():
+        return
     if not text or not text.strip():
         _debug("speak_streaming() called with empty text — nothing to queue")
         return

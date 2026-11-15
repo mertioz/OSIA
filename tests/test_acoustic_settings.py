@@ -44,3 +44,32 @@ def test_missing_backend_prevents_microphone_opt_in(panel, monkeypatch):
     panel._load_state()
     assert not panel._wake_word_toggle.isEnabled()
     assert not panel._wake_word_toggle.isChecked()
+
+
+def test_speech_switch_stops_audio_only_and_preserves_microphone_preference(panel, monkeypatch):
+    from osia.voice import tts
+    from unittest.mock import Mock
+
+    writes, wake_changes = [], []
+    stop = Mock()
+    monkeypatch.setattr(main_popup, "set_setting", lambda *args: writes.append(args))
+    monkeypatch.setattr(tts, "stop", stop)
+    panel.wake_word_enabled_changed.connect(wake_changes.append)
+    panel._desktop_speech_toggle.setChecked(False)
+    panel._desktop_speech_toggle.setChecked(True)
+    assert writes == [("desktop_speech_enabled", False), ("desktop_speech_enabled", True)]
+    stop.assert_called_once_with()
+    assert wake_changes == []
+
+
+def test_speech_switch_loads_saved_mute_without_stopping_audio_again(panel, monkeypatch):
+    from osia.voice import tts
+    from unittest.mock import Mock
+
+    settings = dict(main_popup.load_settings(), desktop_speech_enabled=False)
+    monkeypatch.setattr(main_popup, "load_settings", lambda: settings)
+    stop = Mock()
+    monkeypatch.setattr(tts, "stop", stop)
+    panel._load_state()
+    assert not panel._desktop_speech_toggle.isChecked()
+    stop.assert_not_called()

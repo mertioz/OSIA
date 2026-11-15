@@ -551,6 +551,22 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "de": "Hier legen Sie die Stimme fest, mit der OSIA antwortet. Lokal (Kokoro) ist kostenlos, privat und benötigt keinen Schlüssel; OpenAI und Google bieten natürlichere Cloud-Stimmen, erfordern aber einen API-Schlüssel.",
         "es": "Esto controla la voz que OSIA usa para responderte. Local (Kokoro) es gratis, privada y no necesita clave; OpenAI y Google ofrecen voces en la nube más naturales pero requieren una clave API.",
     },
+    "settings.desktop_speech_enabled": {
+        "en": "Spoken replies on this PC",
+        "fr": "Réponses parlées sur ce PC",
+        "zh": "在此电脑上朗读回复",
+        "ja": "この PC で返答を読み上げる",
+        "de": "Gesprochene Antworten auf diesem PC",
+        "es": "Respuestas habladas en este PC",
+    },
+    "settings.desktop_speech_hint": {
+        "en": "Turn off to stop speech immediately and keep text replies. The wake sound stays active.",
+        "fr": "Désactivez pour couper immédiatement la voix et garder les réponses écrites. Le son de réveil reste actif.",
+        "zh": "关闭可立即停止朗读并保留文字回复。唤醒提示音仍然启用。",
+        "ja": "オフにすると読み上げをすぐに停止し、テキストの返答を続けます。起動音は鳴ります。",
+        "de": "Ausschalten stoppt die Sprachausgabe sofort; Textantworten bleiben erhalten. Der Weckton bleibt aktiv.",
+        "es": "Desactiva para detener la voz al instante y conservar las respuestas escritas. El sonido de activación sigue activo.",
+    },
     "tts.local_option": {
         "en": "Local (Kokoro)",
         "fr": "Local (Kokoro)",
