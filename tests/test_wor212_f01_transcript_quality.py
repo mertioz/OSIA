@@ -175,6 +175,7 @@ def test_strong_french_result_is_preserved_and_reaches_downstream_once(monkeypat
     assert result.segment_count == 1
     assert result.accepted
     assert fake_model.calls == 2
+    assert all(call.get("initial_prompt") is None for call in fake_model.kwargs)
 
 
 def test_strong_english_result_is_accepted_without_french_bias(monkeypatch):
