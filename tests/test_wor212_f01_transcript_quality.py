@@ -194,6 +194,29 @@ def test_strong_short_command_is_not_rejected_for_word_count(monkeypatch):
     assert stt.listen_for_command(max_retries=1) == "Bonjour"
 
 
+def test_local_decoder_filters_non_speech_without_prompts_or_forced_language(monkeypatch):
+    _, model = _install_fakes(monkeypatch, [_plan("Ça va ?")])
+    assert stt.listen_for_command(max_retries=1) == "Ça va ?"
+    options = model.kwargs[0]
+    assert options["task"] == "transcribe"
+    assert options["temperature"] == 0.0
+    assert options["condition_on_previous_text"] is False
+    assert options["vad_filter"] is True
+    assert options["language"] is None
+    assert not any(options.get(key) for key in ("initial_prompt", "prefix", "hotwords"))
+
+
+def test_real_english_thanks_are_not_blacklisted(monkeypatch):
+    _install_fakes(monkeypatch, [_plan("Thank you.", language="en")])
+    assert stt.listen_for_command(max_retries=1) == "Thank you."
+
+
+def test_legitimate_amara_reference_is_not_blacklisted(monkeypatch):
+    expected = "Explique le fonctionnement du site Amara.org."
+    _install_fakes(monkeypatch, [_plan(expected)])
+    assert stt.listen_for_command(max_retries=1) == expected
+
+
 def test_empty_result_retries_and_never_reaches_downstream(monkeypatch):
     fake_sd, fake_model = _install_fakes(
         monkeypatch,

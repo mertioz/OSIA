@@ -486,9 +486,14 @@ def _transcribe_local_result(
     print(f"[STT] transcribed via local (faster-whisper {size})")
     # Resample to 16kHz for Whisper
     audio_16k = resample_audio(audio, sample_rate, WHISPER_SAMPLE_RATE)
-    # Decode the captured speech without preset command examples.
+    # Decode speech rather than room noise/the readiness sound. Use Whisper's
+    # native speech filter and deterministic transcription; temperature
+    # fallback and conditioning on prior decoded text can invent stock phrases
+    # on an uncertain clip. Keep language detection with the speech model.
     segments, info = model.transcribe(
         audio_16k, beam_size=5, best_of=5, language=language,
+        task="transcribe", temperature=0.0, condition_on_previous_text=False,
+        vad_filter=True,
     )
     segment_list = list(segments)
     text = " ".join(segment.text for segment in segment_list).strip()
