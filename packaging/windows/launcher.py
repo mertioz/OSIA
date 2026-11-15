@@ -321,6 +321,24 @@ def _package_smoke() -> int:
             str(whisper_path), device="cpu", compute_type="int8", local_files_only=True,
         )
 
+        # Exercise the newly shipped voice backends in the frozen application,
+        # without opening a microphone or enabling voice activation.
+        step = "voice_wake_backend"
+        import numpy as np
+        from osia.config import get_setting
+        from osia.voice.acoustic import CHUNK_SIZE, KeywordScorer
+
+        if get_setting("wake_word_enabled", False):
+            raise RuntimeError("fresh-install wake activation must be off")
+        scorer = KeywordScorer()
+        if scorer.score(np.zeros(CHUNK_SIZE, dtype=np.int16)) >= scorer.threshold:
+            raise RuntimeError("wake engine activated on digital silence")
+        step = "voice_speech_filter"
+        from faster_whisper.vad import get_speech_timestamps
+
+        if get_speech_timestamps(np.zeros(16000, dtype=np.float32)):
+            raise RuntimeError("packaged speech filter accepted digital silence")
+
         step = "tts"
         from osia.voice.tts import _get_kokoro_pipeline
 

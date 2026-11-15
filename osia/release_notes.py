@@ -63,6 +63,41 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.268", released_on="2026-11-15", public=True,
+        changes_en=(
+            "Optional offline Hé OSIA voice activation is available and stays off on a new installation; independent Chat work does not block voice input.",
+            "A clearer wake sound confirms microphone readiness. A desktop speech switch stops spoken replies while text responses continue; pre-listening greeting controls are removed.",
+            "Wake listening closes after four seconds without speech, preserves requests spoken immediately after the wake phrase and lets a started sentence finish normally.",
+            "The wake microphone and sound request lower device latency, with a fallback to stable device defaults when needed.",
+            "Local transcription filters non-speech and uses deterministic decoding without forcing a language or blocking particular expressions.",
+            "The tucked capsule is taller, has less rounded corners and uses a thin neutral vertical grip instead of three dots.",
+            "The /web command requests a search attempt and allows a normal answer when results are unavailable or unhelpful. The chat guide explains slash commands.",
+        ),
+        changes_fr=(
+            "L’activation vocale hors ligne Hé OSIA est disponible et reste désactivée sur une installation neuve ; un autre travail Chat ne bloque pas l’entrée vocale.",
+            "Un son plus clair confirme que le micro est prêt. Un interrupteur coupe les réponses parlées sur le PC en gardant le texte ; les contrôles de salutation avant l’écoute sont retirés.",
+            "Après le réveil, l’écoute se ferme après quatre secondes sans parole, conserve les demandes prononcées immédiatement et laisse finir une phrase commencée.",
+            "Le micro de réveil et son signal demandent une latence réduite, avec retour aux réglages stables du périphérique si nécessaire.",
+            "La transcription locale filtre les sons non vocaux et utilise un décodage déterministe, sans imposer une langue ni bloquer des expressions particulières.",
+            "La capsule rangée sur le côté est plus haute, moins arrondie et affiche une fine ligne verticale neutre à la place des trois points.",
+            "La commande /web demande une tentative de recherche et permet une réponse normale si les résultats sont absents ou inutiles. Le guide explique les commandes avec /.",
+        ),
+        summary_en=(
+            "Optional offline Hé OSIA wake detection is off on first install; independent Chat work does not block voice input.",
+            "Clearer wake sound, desktop speech toggle, four-second silent-wake timeout and preservation of the start of a spoken request; pre-listening greetings removed.",
+            "Lower audio latency with a stable fallback; local transcription filters non-speech and uses deterministic decoding with automatic speech-language detection.",
+            "The tucked capsule is taller and uses a thin neutral vertical grip with less rounded corners.",
+            "/web requests a search attempt without blocking a normal answer when results are missing; slash commands are explained in the guide.",
+        ),
+        summary_fr=(
+            "Réveil vocal Hé OSIA hors ligne, désactivé à la première installation ; les autres travaux Chat ne bloquent pas l’entrée vocale.",
+            "Son de réveil plus clair, interrupteur des réponses parlées, arrêt après quatre secondes sans parole et début de demande conservé ; salutation avant l’écoute retirée.",
+            "Latence audio réduite avec repli stable ; transcription locale filtrée et déterministe, avec détection automatique de la langue parlée.",
+            "Capsule latérale plus haute, moins arrondie, avec une fine ligne verticale neutre.",
+            "/web demande une recherche sans bloquer la réponse si les résultats manquent ; les commandes / sont expliquées dans le guide.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.267", released_on="2026-11-14", public=True,
         changes_en=(
             "Click a project header to reveal or hide its conversations; the conversation list refreshes without rereading unchanged histories.",
