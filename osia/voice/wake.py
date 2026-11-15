@@ -210,6 +210,7 @@ class WakeWordDetector:
         self._last_event_generation = None
         self._handoff = None
         self._not_before = 0.0
+        self._capture_latency = "low"
         self.last_error = None
 
     @property
@@ -245,8 +246,10 @@ class WakeWordDetector:
             if not self.is_generation_current(generation) or not self._armed:
                 return False
             self._mic_idle.clear()
+        capture_opened = False
         try:
-            with factory(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=CHUNK_SIZE) as stream:
+            with factory(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=CHUNK_SIZE, latency=self._capture_latency) as stream:
+                capture_opened = True
                 print(f"[wake] microphone capture active generation={generation}", flush=True)
                 ready_logged = False
                 while self.is_generation_current(generation):
@@ -257,6 +260,11 @@ class WakeWordDetector:
                     audio = np.asarray(data, dtype=np.int16).reshape(-1)
                     if audio.size != CHUNK_SIZE:
                         raise ValueError("Incomplete wake microphone frame")
+                    if overflow and self._capture_latency == "low":
+                        # Some drivers need larger buffers. Release this exact
+                        # stream before reopening with its stable default.
+                        self._capture_latency = None
+                        return False
                     if overflow or self._is_blocked() or self._clock() < self._not_before:
                         chunks.clear()
                         ready_logged = False
@@ -284,6 +292,12 @@ class WakeWordDetector:
                                          else window.astype(np.float32) / 32768)
                     print(f"[wake] keyword accepted score={score:.4f} generation={generation}", flush=True)
                     return True
+        except Exception as exc:
+            if not capture_opened and self._capture_latency == "low":
+                self._capture_latency = None
+                print(f"[wake] low-latency input unavailable ({type(exc).__name__}); using device default", flush=True)
+                return False
+            raise
         finally:
             chunks.clear()
             self._mic_idle.set()
@@ -343,6 +357,7 @@ class WakeWordDetector:
             self._generation += 1
             self._running = self._armed = True
             self.last_error = None
+            self._capture_latency = "low"
             self._handoff = None
             self._thread = threading.Thread(target=self._listen_loop, name="osia-wake-listener", daemon=True)
             try:

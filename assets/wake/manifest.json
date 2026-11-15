@@ -2,7 +2,7 @@
   "format": "osia-french-phonetic-v1",
   "sample_rate": 16000,
   "window_samples": 32000,
-  "threshold": 0.8,
+  "threshold": 0.75,
   "phrase": "Hé OSIA",
   "pronunciation": "Hé O-ssia, unvoiced s; user confirmed 2026-11-15",
   "grammar": [

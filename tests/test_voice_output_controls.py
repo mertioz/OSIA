@@ -86,12 +86,13 @@ def test_unmuting_allows_new_owned_speech(speech):
     device.play.assert_called_once()
 
 
-def test_wake_sound_is_short_soft_and_has_smooth_edges():
+def test_wake_sound_is_clear_louder_short_and_unclipped():
     sound = feedback.wake_chime_samples()
     assert sound.dtype == np.float32
-    assert sound.ndim == 1 and len(sound) == 2760  # 115 ms at 24 kHz.
-    assert np.isfinite(sound).all() and 0 < np.max(np.abs(sound)) <= 0.12
-    assert np.allclose(sound[[0, 1199, 1560, -1]], 0, atol=1e-7)
+    assert sound.ndim == 1 and 0.12 <= len(sound) / 24000 <= 0.25
+    assert np.isfinite(sound).all() and 0.5 <= np.max(np.abs(sound)) <= 0.6
+    assert np.sqrt(np.mean(sound * sound)) > 0.1
+    assert np.allclose(sound[[0, -1]], 0, atol=1e-7)
 
 
 def test_wake_feedback_is_async_and_independent_of_muted_speech(speech, monkeypatch):
@@ -225,3 +226,59 @@ def test_desktop_mute_keeps_mobile_audio_synthesis_available(speech, monkeypatch
     assert server.synthesize_to_mp3_bytes("A reply on the phone", language="en") == b"mobile-audio"
     synthesis.assert_called_once()
     device.play.assert_not_called()
+
+
+def test_wake_sound_retries_rejected_low_latency_open_with_device_default(monkeypatch):
+    latencies, writes = [], []
+    closed = threading.Event()
+
+    class Output:
+        def __enter__(self):
+            return self
+
+        def write(self, samples):
+            writes.append(samples.copy())
+
+        def __exit__(self, *_args):
+            closed.set()
+
+    def output(**options):
+        latencies.append(options["latency"])
+        if options["latency"] == "low":
+            raise RuntimeError("driver rejected small output buffer")
+        return Output()
+
+    monkeypatch.setattr(feedback, "sd", SimpleNamespace(OutputStream=output))
+    assert feedback.play_wake_chime()
+    assert closed.wait(2)
+    assert feedback._playing.acquire(timeout=2)
+    feedback._playing.release()
+    assert latencies == ["low", None]
+    np.testing.assert_array_equal(np.concatenate(writes), feedback.wake_chime_samples())
+
+
+def test_output_failure_after_start_never_replays_a_partial_cue(monkeypatch):
+    latencies, writes = [], []
+    closed = threading.Event()
+
+    class Output:
+        def __enter__(self):
+            return self
+
+        def write(self, samples):
+            writes.append(samples)
+            raise RuntimeError("output disappeared after playback started")
+
+        def __exit__(self, *_args):
+            closed.set()
+
+    def output(**options):
+        latencies.append(options["latency"])
+        return Output()
+
+    monkeypatch.setattr(feedback, "sd", SimpleNamespace(OutputStream=output))
+    assert feedback.play_wake_chime()
+    assert closed.wait(2)
+    assert feedback._playing.acquire(timeout=2)
+    feedback._playing.release()
+    assert latencies == ["low"] and len(writes) == 1

@@ -363,3 +363,36 @@ def test_manual_recording_does_not_strip_any_word(monkeypatch):
     monkeypatch.setattr(stt, "record_audio_vad", lambda **_k: np.full(16000, 0.2, np.float32))
     monkeypatch.setattr(stt, "transcribe", lambda *_a, **_k: "Osia ouvre le navigateur")
     assert stt.listen_for_command() == "Osia ouvre le navigateur"
+
+
+@pytest.mark.parametrize("failure", ["open", "overflow"])
+def test_low_latency_falls_back_without_overlapping_microphones(failure):
+    harness = AudioHarness()
+    delivered = threading.Event()
+    latencies = []
+
+    def factory(**options):
+        latencies.append(options.get("latency"))
+        if options.get("latency") == "low" and failure == "open":
+            raise RuntimeError("driver rejected small input buffer")
+        stream = harness.stream(**options)
+        if options.get("latency") == "low":
+            read = stream.read
+
+            def overflow(size):
+                data, _ = read(size)
+                return data, True
+
+            stream.read = overflow
+        return stream
+
+    detector = wake.WakeWordDetector(lambda _: delivered.set(),
+        _scorer_factory=harness.scorer, _stream_factory=factory)
+    try:
+        assert detector.start()
+        assert delivered.wait(2)
+        assert latencies == ["low", None]
+        assert harness.maximum == 1 and harness.active == 0
+        assert detector.last_error is None
+    finally:
+        detector.stop()

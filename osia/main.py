@@ -3890,7 +3890,7 @@ def wake_mode():
                     return
                 # Deferred heavy import (faster_whisper, ~4.3s on Windows). This
                 # runs on the wake daemon thread, never on the GUI startup path.
-                from osia.voice.stt import listen_for_command
+                from osia.voice.stt import WAKE_NO_SPEECH_SECONDS, listen_for_command
                 if voice_shutdown_requested.is_set():
                     return
                 # Optional spoken greeting before listening. When enabled, OSIA
@@ -3923,6 +3923,8 @@ def wake_mode():
                             ))
 
                 voice_options = {}
+                if generation:
+                    voice_options["no_speech_timeout"] = WAKE_NO_SPEECH_SECONDS
                 if wake_audio is not None:
                     voice_options["initial_audio"] = wake_audio
                 user_text = listen_for_command(
@@ -3931,6 +3933,10 @@ def wake_mode():
                 if voice_shutdown_requested.is_set():
                     return
                 if not user_text:
+                    if generation:
+                        # No generic spoken reply to an empty acoustic wake.
+                        # The finalizer releases the recorder and rearms wake.
+                        return
                     fallback_history = (
                         _history_for_conversation(active_conv["id"])
                         if active_conv is not None else []

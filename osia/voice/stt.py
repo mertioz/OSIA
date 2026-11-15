@@ -10,6 +10,7 @@ import io
 import math
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -58,7 +59,8 @@ VAD_CHUNK_SECONDS = 0.5
 VAD_SILENCE_RMS = 0.015      # fallback if calibration fails; normally overridden
 VAD_SILENCE_SECONDS = 1.2    # silence run length that ends the recording
 VAD_MAX_SECONDS = 60.0       # hard cap on recording length
-VAD_MIN_SECONDS = 3.0        # don't end before this many seconds
+VAD_MIN_SECONDS = 3.0        # manual no-speech window
+WAKE_NO_SPEECH_SECONDS = 4.0
 
 # Ambient calibration
 VAD_CALIBRATION_SECONDS = 1.0
@@ -287,9 +289,12 @@ def record_audio_vad(
         np.asarray(initial_audio, dtype=np.float32).reshape(-1).copy()
         if initial_audio is not None else np.zeros(0, dtype=np.float32)
     )
-    # A wake handoff can contain only post-keyword silence. Wait for actual
-    # command speech, preserving the same no-speech window as manual capture.
-    state = WAITING_FOR_SPEECH
+    # Preserve a command already spoken just after the wake phrase, even if it
+    # ends before this stream opens. A silent handoff still waits for speech.
+    state = (
+        IN_SPEECH if prefix.size and float(np.sqrt(np.mean(prefix * prefix))) >= silence_rms
+        else WAITING_FOR_SPEECH
+    )
     chunks: list[np.ndarray] = [prefix] if prefix.size else []
     recorded_seconds = 0.0
     trailing_silence_seconds = 0.0
@@ -733,32 +738,51 @@ def listen_for_command(
     max_retries: int = 3,
     on_ready: Callable[[], None] | None = None,
     initial_audio: np.ndarray | None = None,
+    *,
+    no_speech_timeout: float | None = None,
 ) -> str:
     """Keep recording (via VAD) until a valid command is received.
 
     Each attempt records until the user stops talking, then transcribes. Only a
     quality-accepted result is returned; rejected results stay inside this
     sequential retry loop. `on_ready` is emitted at most once, immediately
-    before the first retained capture begins.
+    before the first retained capture begins. A wake-only no-speech timeout
+    starts when the microphone is ready, is shared across rejected attempts,
+    and never cuts speech that has already started.
     """
     ready_emitted = False
+    deadline = None
+    if no_speech_timeout is not None:
+        no_speech_timeout = float(no_speech_timeout)
+        if not math.isfinite(no_speech_timeout) or no_speech_timeout <= 0:
+            raise ValueError("The no-speech timeout must be finite and positive")
 
     def emit_ready_once() -> None:
-        nonlocal ready_emitted
+        nonlocal ready_emitted, deadline
         if ready_emitted:
             return
         ready_emitted = True
+        if no_speech_timeout is not None:
+            deadline = time.monotonic() + no_speech_timeout
         if on_ready is not None:
             on_ready()
 
     for attempt in range(1, max_retries + 1):
         print(f"👂 Listening... (attempt {attempt}/{max_retries})")
         options = {}
+        if no_speech_timeout is not None:
+            remaining = no_speech_timeout if deadline is None else deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            options["min_seconds"] = remaining
         if attempt == 1 and initial_audio is not None:
             options["initial_audio"] = initial_audio
         audio = record_audio_vad(on_ready=emit_ready_once, **options)
 
         if audio.size == 0 or float(np.max(np.abs(audio))) < 0.01:
+            if no_speech_timeout is not None:
+                print("   No command speech; returning to wake detection.")
+                return ""
             print("   ⚠️  Silent chunk, retrying...")
             continue
 

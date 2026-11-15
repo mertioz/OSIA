@@ -36,7 +36,7 @@ Ctrl+Alt+P continues to start manual recording even without the wake backend.
 Missing audio drivers or model files leave Chat and the capsule usable.
 
 Only one wake microphone worker may exist. It suspends for an accepted voice
-turn, ignores playback/active Chat work and rejects obsolete generations. The
+turn, ignores its own playback/active voice capture and rejects obsolete generations. The
 wake microphone closes before the command recorder opens. Manual activation
 pauses and awaits that same stream; stop invalidates queued activations.
 
@@ -73,6 +73,32 @@ model was therefore not declared reliable or substituted silently.
 preview is intended for an explicit user trial, not a claim that every voice,
 room or device is validated. False activations or missed words can still occur.
 Existing installer channels were not changed by this source feature.
+
+## Source tuning, 15 November 2026
+
+The wake confidence threshold is slightly relaxed from 0.80 to 0.75. The
+complete ordered phonetic phrase, competing vocabulary, model bytes and 80 ms
+analysis cadence remain unchanged. A 40 ms experiment did not improve replay
+recognition latency and was not retained.
+
+The comparison includes 36 synthetic positives (the original 12 plus 24
+attenuated/noisy variants) and the same 100 negatives including 2,106.27 seconds
+of public background audio. Both configurations detect 33/36 positives, with
+12/12 on the original corpus and no false activation in the negative corpus.
+The three missed noisy samples remain a known limitation; this is not a claim
+of a measured accuracy or recognition-time gain for every voice.
+
+Microphone capture and wake feedback request the device's lower audio latency.
+An input opening failure or input overflow falls back to the stable default,
+without overlapping microphone streams. A rejected output opening also falls
+back to its default. Driver-dependent physical latency still needs an operator
+trial.
+
+After an acoustic wake, four seconds without command speech closes listening
+and rearms detection silently. Speech already started can finish normally;
+manual capture retains its existing retry behavior. The generated wake cue is
+a brighter 180 ms bell at a higher digital level, with unclipped headroom. It
+stays independent of spoken-reply muting and never delays command capture.
 
 ## Re-run verification
 
