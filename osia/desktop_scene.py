@@ -1550,7 +1550,10 @@ def _dispatch_fresh_uia_action_bounded(
                     )
                 except Exception:
                     cancellation_enabled = False
-                method()
+                from osia.desktop_activity import native_input_activity
+
+                with native_input_activity():
+                    method()
                 if (
                     callable(journal_dispatch_returned)
                     and not journal_dispatch_returned()

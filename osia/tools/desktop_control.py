@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 from collections import namedtuple
+from osia.desktop_activity import shows_native_input
 
 # ---------------------------------------------------------------------------
 # Optional backend: pyautogui (Windows / Mac).
@@ -734,6 +735,7 @@ def prepare_click(x, y, button: str = "left", double: bool = False):
     )
 
 
+@shows_native_input
 def dispatch_prepared_click(prepared):
     """Invoke the prepared platform input callback with no readiness work."""
 
@@ -784,6 +786,7 @@ def click_at(x, y, button: str = "left", double: bool = False):
     return dispatch_prepared_click(prepared)
 
 
+@shows_native_input
 def move_to(x, y):
     """Move the cursor to absolute screen pixel ``(x, y)`` WITHOUT clicking.
 
@@ -920,6 +923,7 @@ def _type_windows_unicode(text: str) -> None:
         raise OSError(f"Windows accepted {sent} of {len(inputs)} keyboard events")
 
 
+@shows_native_input
 def type_text(text):
     """Type ``text`` into the currently focused element."""
     if text is None:
@@ -974,6 +978,7 @@ def type_text(text):
     return res
 
 
+@shows_native_input
 def press_key(key):
     """Press a single key or a ``+``-joined combo (e.g. ``"enter"``, ``"ctrl+s"``,
     ``"alt+F4"``) on the focused window."""
@@ -1029,6 +1034,7 @@ def press_key(key):
     return _run(["ydotool", "key"] + seq, ok, "press_key", env=_ydotool_env())
 
 
+@shows_native_input
 def scroll(direction: str = "down", amount=3):
     """Scroll the active window ``up``/``down``/``left``/``right`` by ``amount``
     wheel notches (default 3)."""
@@ -1507,6 +1513,7 @@ def _raise_window_win32(win32gui, win32process, hwnd) -> None:
             pass
 
 
+@shows_native_input
 def focus_app_window(window, timeout=APP_FOCUS_TIMEOUT,
                      poll=_APP_WINDOW_POLL, stable_polls=_APP_WINDOW_STABLE_POLLS):
     """Bring an already-open ``window`` ((hwnd, title, pid) from find_app_window) to

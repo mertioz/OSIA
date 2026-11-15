@@ -507,6 +507,15 @@ def main(args: list[str] | None = None) -> int:
     argv = _normalized_args(args)
     mode = argv[0] if argv else ""
 
+    from osia.control_cursor import CURSOR_HELPER_MODE
+
+    if mode == CURSOR_HELPER_MODE:
+        if len(argv) != 1:
+            return 2
+        from osia.control_cursor import run_helper
+
+        return run_helper()
+
     if mode == DOCUMENT_WORKER_MODE:
         if len(argv) != 2:
             return 2

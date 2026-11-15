@@ -1968,6 +1968,12 @@ def wake_mode():
 
     island = DynamicIsland()
     popup = MainPopup()
+    from osia.gui.desktop_feedback import DesktopControlFeedback
+
+    try:
+        desktop_feedback = DesktopControlFeedback(app)
+    except Exception as exc:
+        print(f"[OSIA] Desktop feedback unavailable ({type(exc).__name__})", flush=True)
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
     # The release-only gate follows the acceptance flags in the legal manifest.
