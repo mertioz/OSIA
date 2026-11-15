@@ -2097,6 +2097,12 @@ class ToolAttemptStore:
             if self._active_for_conversation_unlocked(conversation_id) is not None:
                 raise IllegalTransition("conversation_has_active_tool_attempt")
             self._write_atomic(self._path(attempt_id), record)
+        try:
+            from osia.desktop_activity import observe_desktop_intent
+
+            observe_desktop_intent(turn_id, tool_name)
+        except Exception:
+            pass  # presentation never changes attempt creation or dispatch
         return dict(record)
 
     def _transition(

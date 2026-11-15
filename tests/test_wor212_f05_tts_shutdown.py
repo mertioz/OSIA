@@ -41,6 +41,9 @@ class _FakeSoundDevice:
 
 @pytest.fixture(autouse=True)
 def _isolated_tts_state(monkeypatch):
+    # These cases exercise an explicitly enabled speech session. Fresh profiles
+    # are muted by default and are covered by test_tts_repair.
+    monkeypatch.setattr(tts, "desktop_speech_enabled", lambda: True)
     fake = _FakeSoundDevice()
     monkeypatch.setattr(tts, "sd", fake)
     monkeypatch.setattr(tts, "_AUDIO_OK", True)

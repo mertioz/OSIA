@@ -137,7 +137,7 @@ DEFAULT_SETTINGS = {
     "wake_word_enabled": False,
     # Physical desktop output preference; microphone input and client audio
     # projections keep their independent controls.
-    "desktop_speech_enabled": True,
+    "desktop_speech_enabled": False,
     # Scheduled tasks (Bloc 5): list of cron entries. Each entry is
     # ``{"task": <description>, "schedule": <spec>, "enabled": <bool>}``.
     # ``schedule`` is one of "every <N> minutes|hours|days" or "at HH:MM"

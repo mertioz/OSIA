@@ -7,6 +7,7 @@
   "chatgpt_account_model": null,
   "tts_provider": "local",
   "tts_voice": null,
+  "desktop_speech_enabled": false,
   "stt_provider": "local",
   "stt_fallback_provider": "local",
   "stt_local_model": "small",

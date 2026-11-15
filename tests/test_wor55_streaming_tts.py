@@ -543,10 +543,15 @@ class ProgressiveTTSTurnIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DesktopStreamingTTSTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.speech_opt_in = patch("osia.voice.tts.desktop_speech_enabled", return_value=True)
+        self.speech_opt_in.start()
+
     def tearDown(self) -> None:
         from osia.voice import tts
 
         tts.shutdown(join_timeout=1)
+        self.speech_opt_in.stop()
 
     def test_session_token_rejects_late_turn_and_shutdown_reaps_worker(self) -> None:
         from osia.voice import tts

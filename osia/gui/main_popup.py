@@ -10280,7 +10280,7 @@ class _SettingsPanel(QWidget):
         # Voice (TTS)
         self._desktop_speech_toggle.blockSignals(True)
         self._desktop_speech_toggle.setChecked(
-            settings.get("desktop_speech_enabled", True) is not False)
+            settings.get("desktop_speech_enabled", False) is True)
         self._desktop_speech_toggle.blockSignals(False)
         provider = settings.get("tts_provider", "local") or "local"
         voice = settings.get("tts_voice")

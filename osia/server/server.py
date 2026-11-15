@@ -387,38 +387,13 @@ _log_active_model()
 # ---------------------------------------------------------------------------
 def _kokoro_to_mp3_bytes(text: str, language: str | None = None) -> bytes:
     """Synthesize text with Kokoro and return mp3 bytes."""
-    from kokoro import KPipeline
-    from osia.voice.tts import (
-        detect_language,
-        KOKORO_SR,
-        KOKORO_SPEED,
-        KOKORO_VOICE_EN,
-        KOKORO_VOICE_FR,
-        local_tts_supports,
-    )
+    from osia.voice.tts import synthesize_kokoro
 
-    lang = normalize_locale(language) if language is not None else detect_language(text)
-    if not local_tts_supports(lang):
-        raise RuntimeError(
-            f"local TTS unavailable for authoritative language {lang or 'unknown'}"
-        )
-    lang_code = "f" if lang == "fr" else "a"
-    voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
-    pipeline = KPipeline(lang_code=lang_code)
-
-    segments = []
-    for _, _, audio in pipeline(text, voice=voice, speed=KOKORO_SPEED):
-        if audio is not None:
-            segments.append(audio)
-
-    if not segments:
-        raise RuntimeError("Kokoro produced no audio segments")
-
-    audio = np.concatenate(segments)
+    audio, samplerate = synthesize_kokoro(text, language)
 
     # Write WAV to in-memory buffer
     wav_buf = io.BytesIO()
-    sf.write(wav_buf, audio, KOKORO_SR, format="WAV")
+    sf.write(wav_buf, audio, samplerate, format="WAV")
     wav_buf.seek(0)
 
     # Convert WAV → MP3 via ffmpeg

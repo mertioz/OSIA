@@ -15,9 +15,11 @@ import io
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
+import unicodedata
 
 from osia.utils.diagnostics import diagnostic_print as print
 
@@ -121,6 +123,9 @@ KOKORO_SPEED = TTS_SPEED  # also imported by osia.server.server
 
 _kokoro_pipelines = {}
 _kokoro_model = None
+_kokoro_lock = threading.RLock()
+_voice_language_factory = None
+_voice_language_lock = threading.Lock()
 _stream_playback_context = threading.local()
 _playback_start_lock = threading.Lock()
 _tts_epoch_lock = threading.RLock()
@@ -133,7 +138,7 @@ _tts_accepting = True
 
 def desktop_speech_enabled() -> bool:
     """Presentation preference only; never cancel or change a Chat turn."""
-    return get_setting("desktop_speech_enabled", True) is not False
+    return get_setting("desktop_speech_enabled", False) is True
 
 
 def _session_is_current(session_id: int) -> bool:
@@ -288,33 +293,29 @@ def _play_samples_if_current(
 def _get_kokoro_pipeline(lang_code: str):
     global _kokoro_model
     from kokoro import KModel, KPipeline
-    _patch_windows_espeak_data_path()
-    if lang_code not in _kokoro_pipelines:
-        local = bundled_model_path("kokoro")
-        if local is None:
-            pipeline = KPipeline(lang_code=lang_code)
-        else:
-            if _kokoro_model is None:
+    with _kokoro_lock:
+        _patch_windows_espeak_data_path()
+        if lang_code not in _kokoro_pipelines:
+            local = bundled_model_path("kokoro")
+            if _kokoro_model is None and local is not None:
                 _kokoro_model = KModel(
                     repo_id="hexgrad/Kokoro-82M",
                     config=str(local / "config.json"),
                     model=str(local / "kokoro-v1_0.pth"),
                 ).to("cpu").eval()
-            pipeline = KPipeline(
-                lang_code=lang_code,
-                repo_id="hexgrad/Kokoro-82M",
-                model=_kokoro_model,
-                device="cpu",
-            )
-            import torch
-            for voice in (KOKORO_VOICE_EN, KOKORO_VOICE_FR):
-                voice_file = local / "voices" / f"{voice}.pt"
-                if voice_file.is_file():
-                    pipeline.voices[voice] = torch.load(
-                        voice_file, map_location="cpu", weights_only=True,
-                    )
-        _kokoro_pipelines[lang_code] = pipeline
-    return _kokoro_pipelines[lang_code]
+            options = {"model": _kokoro_model} if _kokoro_model is not None else {}
+            if local is not None:
+                options["device"] = "cpu"
+            pipeline = KPipeline(lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", **options)
+            _kokoro_model = pipeline.model
+            if local is not None:
+                import torch
+                for voice in (KOKORO_VOICE_EN, KOKORO_VOICE_FR):
+                    voice_file = local / "voices" / f"{voice}.pt"
+                    if voice_file.is_file():
+                        pipeline.voices[voice] = torch.load(voice_file, map_location="cpu", weights_only=True)
+            _kokoro_pipelines[lang_code] = pipeline
+        return _kokoro_pipelines[lang_code]
 
 
 def detect_language(text: str) -> str:
@@ -322,17 +323,61 @@ def detect_language(text: str) -> str:
     from osia.turn_context import normalize_locale
 
     try:
-        return normalize_locale(detect(text)) or ""
+        with _voice_language_lock:
+            return normalize_locale(detect(text)) or ""
     except Exception:
         return ""
 
 
 def _authoritative_tts_language(language: str | None, text: str) -> str:
-    if language is None:
-        return detect_language(text)
     from osia.turn_context import normalize_locale
 
-    return normalize_locale(language) or ""
+    if language is not None:
+        return normalize_locale(language) or ""
+    detected = detect_language(text)
+    if detected in {"en", "fr"}:
+        return detected
+    words = re.findall(r"[^\W\d_]+", text, re.UNICODE)
+    latin = all("LATIN" in unicodedata.name(char, "") for word in words for char in word)
+    # An unconstrained classifier cannot reliably identify a one/two-word reply
+    # among dozens of languages. Choose a packaged speech voice for ambiguous
+    # Latin text, rather than silently refusing to speak. Explicit locale hints
+    # and longer, identified unsupported responses retain their existing limits.
+    if not words or not latin or (detected and len(words) >= 3):
+        return detected
+    global _voice_language_factory
+    with _voice_language_lock:
+        if _voice_language_factory is None:
+            from langdetect.detector_factory import PROFILES_DIRECTORY
+
+            factory = DetectorFactory()
+            factory.seed = 0
+            factory.load_profile(PROFILES_DIRECTORY)
+            _voice_language_factory = factory
+        detector = _voice_language_factory.create()
+    detector.set_prior_map({"en": 1, "fr": 1})
+    detector.append(text)
+    return detector.detect()
+
+
+def synthesize_kokoro(text: str, language: str | None = None):
+    """Shared local engine for desktop playback and client audio, never Chat."""
+    lang = _authoritative_tts_language(language, text)
+    if lang not in {"en", "fr"}:
+        raise RuntimeError("No packaged Kokoro voice matches the speech locale")
+    voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
+    # eSpeak and the pipeline voice cache share mutable native state. Serialize
+    # synthesis only; never hold this lock while a device is playing audio.
+    with _kokoro_lock:
+        pipeline = _get_kokoro_pipeline("f" if lang == "fr" else "a")
+        segments = [np.asarray(audio, dtype=np.float32) for _, _, audio in
+                    pipeline(text, voice=voice, speed=KOKORO_SPEED) if audio is not None]
+    if not segments:
+        raise RuntimeError("Kokoro produced no audio segments")
+    samples = np.concatenate(segments)
+    if not samples.size or not np.isfinite(samples).all():
+        raise RuntimeError("Kokoro produced invalid audio")
+    return samples, KOKORO_SR
 
 
 def local_tts_supports(language: str | None) -> bool:
@@ -357,28 +402,7 @@ def speak_kokoro(
     if session_id is None or not _session_is_current(session_id):
         return False
     try:
-        lang = _authoritative_tts_language(language, text)
-        if lang not in {"en", "fr"}:
-            _debug(
-                f"kokoro: no packaged voice matches authoritative language "
-                f"{lang or 'unknown'!r}; spoken output unavailable"
-            )
-            return False
-        lang_code = "f" if lang == "fr" else "a"
-        voice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
-        pipeline = _get_kokoro_pipeline(lang_code)
-        _debug(
-            f"kokoro: synthesis start (voice={voice}, speed={KOKORO_SPEED}, "
-            f"{len(text)} chars)"
-        )
-        segments = []
-        for _, _, audio in pipeline(text, voice=voice, speed=KOKORO_SPEED):
-            if audio is not None:
-                segments.append(audio)
-        if not segments:
-            _debug("kokoro: synthesis produced NO audio segments")
-            return False
-        samples = np.concatenate(segments)
+        samples, samplerate = synthesize_kokoro(text, language)
         _debug(
             f"kokoro: synthesis done ({len(samples)} samples, "
             f"{len(samples) / KOKORO_SR:.2f}s)"
@@ -386,7 +410,7 @@ def speak_kokoro(
         _log_audio_device()
         _debug("kokoro: playback start")
         if not _play_samples_if_current(
-            samples, KOKORO_SR, session_id=session_id,
+            samples, samplerate, session_id=session_id,
         ):
             return True
         if block:
@@ -809,21 +833,7 @@ def _synthesize_to_buffer(text: str, provider: str, voice):
             return samples, GEMINI_TTS_SR
 
         # local / unknown provider → Kokoro (offline)
-        lang = detect_language(text)
-        if not local_tts_supports(lang):
-            return None
-        lang_code = "f" if lang == "fr" else "a"
-        kvoice = KOKORO_VOICE_FR if lang == "fr" else KOKORO_VOICE_EN
-        _debug(f"greeting cache: synth kokoro (voice={kvoice})")
-        pipeline = _get_kokoro_pipeline(lang_code)
-        segments = [
-            audio
-            for _, _, audio in pipeline(text, voice=kvoice, speed=KOKORO_SPEED)
-            if audio is not None
-        ]
-        if not segments:
-            return None
-        return np.concatenate(segments), KOKORO_SR
+        return synthesize_kokoro(text)
     except Exception as e:
         _debug(
             "greeting cache: synthesis to buffer failed "

@@ -55,9 +55,9 @@ def test_speech_switch_stops_audio_only_and_preserves_microphone_preference(pane
     monkeypatch.setattr(main_popup, "set_setting", lambda *args: writes.append(args))
     monkeypatch.setattr(tts, "stop", stop)
     panel.wake_word_enabled_changed.connect(wake_changes.append)
-    panel._desktop_speech_toggle.setChecked(False)
     panel._desktop_speech_toggle.setChecked(True)
-    assert writes == [("desktop_speech_enabled", False), ("desktop_speech_enabled", True)]
+    panel._desktop_speech_toggle.setChecked(False)
+    assert writes == [("desktop_speech_enabled", True), ("desktop_speech_enabled", False)]
     stop.assert_called_once_with()
     assert wake_changes == []
 

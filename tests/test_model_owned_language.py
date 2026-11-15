@@ -193,6 +193,8 @@ def test_account_history_hash_does_not_discard_user_text_after_a_marker():
 def test_local_speech_does_not_assume_english_for_an_unsupported_model_response(monkeypatch):
     from osia.voice import tts
 
+    monkeypatch.setattr(tts, "desktop_speech_enabled", lambda: True)
+    tts.start_tts_session()
     monkeypatch.setattr(tts, "detect", lambda _text: "it")
     monkeypatch.setattr(
         tts, "_get_kokoro_pipeline",

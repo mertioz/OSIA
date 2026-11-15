@@ -248,6 +248,7 @@ def record_audio_vad(
     min_seconds: float = VAD_MIN_SECONDS,
     on_ready: Callable[[], None] | None = None,
     initial_audio: np.ndarray | None = None,
+    onset_guard_seconds: float = 0.0,
 ) -> np.ndarray:
     """Record from the mic until the user stops talking, using a simple
     RMS-based Voice Activity Detection.
@@ -295,6 +296,7 @@ def record_audio_vad(
         IN_SPEECH if prefix.size and float(np.sqrt(np.mean(prefix * prefix))) >= silence_rms
         else WAITING_FOR_SPEECH
     )
+    early_sound = bool(onset_guard_seconds > 0 and state == IN_SPEECH)
     chunks: list[np.ndarray] = [prefix] if prefix.size else []
     recorded_seconds = 0.0
     trailing_silence_seconds = 0.0
@@ -315,6 +317,8 @@ def record_audio_vad(
             recorded_seconds += chunk_duration
 
             rms = float(np.sqrt(np.mean(chunk * chunk)))
+            if onset_guard_seconds > 0 and recorded_seconds - chunk_duration <= onset_guard_seconds and rms >= silence_rms:
+                early_sound = True
 
             if state == WAITING_FOR_SPEECH:
                 if rms >= silence_rms:
@@ -325,7 +329,7 @@ def record_audio_vad(
 
             if rms < silence_rms:
                 trailing_silence_seconds += chunk_duration
-                if trailing_silence_seconds >= silence_seconds:
+                if trailing_silence_seconds >= silence_seconds and (not early_sound or recorded_seconds >= min_seconds):
                     break
             else:
                 trailing_silence_seconds = 0.0
@@ -780,6 +784,10 @@ def listen_for_command(
             if remaining <= 0:
                 break
             options["min_seconds"] = remaining
+            # The wake handoff or readiness sound can look like RMS speech.
+            # Such an early transient must not close the command stream before
+            # the original four-second opportunity to start talking has elapsed.
+            options["onset_guard_seconds"] = 0.5
         if attempt == 1 and initial_audio is not None:
             options["initial_audio"] = initial_audio
         audio = record_audio_vad(on_ready=emit_ready_once, **options)

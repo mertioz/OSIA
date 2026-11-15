@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import base64
+import math
 import struct
 import sys
 import threading
+import time
 
-from PyQt6.QtCore import QObject, QPointF, Qt, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QObject, QPointF, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from osia.control_cursor import CursorClient
 from osia.desktop_activity import desktop_activity_visible
 from osia.gui.theme import get_theme_manager
+from osia.gui.motion import reduced_motion_requested
 
 
 def cursor_image(accent: QColor, *, hand: bool = False, scale: float = 1.0) -> QImage:
@@ -68,12 +71,23 @@ def cursor_file_bytes(image: QImage, hot_x: int, hot_y: int) -> bytes:
 
 
 class ControlEdge(QWidget):
-    HEIGHT = 26
+    HEIGHT = 46
 
     def __init__(self, screen, theme):
         super().__init__()
         self.screen_ref = screen
         self.theme = theme
+        self.target_active = False
+        self.reveal = 0.0
+        self._started_at = time.monotonic()
+        self._reduced_motion = reduced_motion_requested(self)
+        self._frames = QTimer(self)
+        self._frames.setInterval(33)
+        self._frames.timeout.connect(self.update)
+        self._fade = QVariantAnimation(self)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._fade.valueChanged.connect(self._set_reveal)
+        self._fade.finished.connect(self._fade_finished)
         flags = (Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                  | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
                  | Qt.WindowType.WindowTransparentForInput)
@@ -93,6 +107,43 @@ class ControlEdge(QWidget):
         geometry = self.screen_ref.geometry()
         self.setGeometry(geometry.x(), geometry.bottom() - self.HEIGHT + 1, geometry.width(), self.HEIGHT)
 
+    def _set_reveal(self, value):
+        self.reveal = float(value)
+        self.update()
+
+    def set_active(self, active):
+        active = bool(active)
+        if active == self.target_active:
+            return
+        self.target_active = active
+        current_reveal = self.reveal
+        self._fade.stop()
+        if active:
+            self.show()
+        if self._reduced_motion:
+            self._set_reveal(1.0 if active else 0.0)
+            self._fade_finished()
+            return
+        self._fade.setDuration(220 if active else 280)
+        self._fade.setCurrentTime(0)
+        self._fade.setStartValue(current_reveal)
+        self._fade.setEndValue(1.0 if active else 0.0)
+        self._set_reveal(current_reveal)
+        self._fade.start()
+        self._frames.start()
+
+    def _fade_finished(self):
+        if not self.target_active:
+            self._frames.stop()
+            self.hide()
+        elif self._reduced_motion:
+            self._frames.stop()
+
+    def closeEvent(self, event):
+        self._frames.stop()
+        self._fade.stop()
+        super().closeEvent(event)
+
     def showEvent(self, event):
         super().showEvent(event)
         if sys.platform == "win32" and QApplication.platformName() == "windows":
@@ -110,20 +161,47 @@ class ControlEdge(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self.reveal)
         accent = self.theme.palette.color("primary")
         width = self.width()
-        # Small painted strips only: no full-screen translucent backing store,
-        # shadows/effects, focus calls, input hooks or moving cursor window.
-        for y, inset, thickness, alpha in ((23, 0, 2.0, 230), (18, 0.025, 1.0, 115), (12, 0.12, 0.8, 65)):
+        phase = 0.0 if self._reduced_motion else (time.monotonic() - self._started_at) * 0.8
+        highlight_position = 0.5 + 0.34 * math.sin(phase * 0.75)
+        # Paint the neon directly in the small bottom strip. No graphics effect
+        # or moving translucent window: those can leave DWM ghosts on Windows.
+        path = QPainterPath()
+        for index in range(65):
+            x = width * index / 64
+            y = self.height() - 3.5 + 0.8 * math.sin(index / 64 * math.tau + phase)
+            if index == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        for thickness, alpha in ((22, 8), (14, 16), (8, 32), (3.5, 120), (1.2, 245)):
             gradient = QLinearGradient(0, 0, width, 0)
             transparent = QColor(accent)
             transparent.setAlpha(0)
             color = QColor(accent)
-            color.setAlpha(alpha)
-            for position, stop in ((0, transparent), (0.12, color), (0.5, accent), (0.88, color), (1, transparent)):
+            color.setAlpha(round(alpha * 0.65))
+            highlight = accent.lighter(135)
+            highlight.setAlpha(alpha)
+            for position, stop in ((0, transparent), (0.12, color), (0.5, color), (0.88, color), (1, transparent)):
                 gradient.setColorAt(position, stop)
+            gradient.setColorAt(max(0.01, highlight_position - 0.12), color)
+            gradient.setColorAt(highlight_position, highlight)
+            gradient.setColorAt(min(0.99, highlight_position + 0.12), color)
             painter.setPen(QPen(gradient, thickness))
-            painter.drawLine(QPointF(width * inset, y), QPointF(width * (1 - inset), y))
+            painter.drawPath(path)
+        for y, alpha in ((self.height() - 12, 75), (self.height() - 19, 30)):
+            color = QColor(accent)
+            color.setAlpha(alpha)
+            gradient = QLinearGradient(0, 0, width, 0)
+            clear = QColor(accent)
+            clear.setAlpha(0)
+            gradient.setColorAt(0, clear)
+            gradient.setColorAt(0.5 + 0.15 * math.sin(phase * 0.5), color)
+            gradient.setColorAt(1, clear)
+            painter.setPen(QPen(gradient, 0.8))
+            painter.drawLine(QPointF(width * 0.03, y), QPointF(width * 0.97, y))
         painter.end()
 
 
@@ -164,11 +242,11 @@ class DesktopControlFeedback(QObject):
             self._stop.wait(0.05)
 
     def _screen_added(self, screen):
-        if not self.closed and self.active and screen not in self.edges:
+        if not self.closed and self.active:
             try:
-                edge = ControlEdge(screen, self.theme)
-                self.edges[screen] = edge
-                edge.show()
+                if screen not in self.edges:
+                    self.edges[screen] = ControlEdge(screen, self.theme)
+                self.edges[screen].set_active(True)
             except (RuntimeError, OSError):
                 self._screen_removed(screen)
 
@@ -208,8 +286,8 @@ class DesktopControlFeedback(QObject):
             for screen in QApplication.screens():
                 self._screen_added(screen)
         else:
-            for screen in tuple(self.edges):
-                self._screen_removed(screen)
+            for edge in self.edges.values():
+                edge.set_active(False)
         self._update_cursor()
 
     def close(self):

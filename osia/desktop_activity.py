@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from functools import wraps
 import json
+import hashlib
 import os
 from pathlib import Path
 import threading
@@ -67,6 +68,53 @@ def shows_native_input(function):
     return observed
 
 
+DESKTOP_INTENT_TOOLS = frozenset({
+    "desktop_click", "desktop_type", "desktop_press", "desktop_scroll",
+    "activate_desktop_surface",
+})
+
+
+def _intent_path(turn_id: str) -> Path:
+    key = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()
+    return activity_directory() / f"intent-{key}.json"
+
+
+def _finished_intent_path(path: Path) -> Path:
+    return path.parent / "finished" / (path.stem + ".done")
+
+
+def observe_desktop_intent(turn_id: str, tool_name: str) -> None:
+    """A requested native action is an intention fact, not an execution permit."""
+    if not turn_id or tool_name not in DESKTOP_INTENT_TOOLS:
+        return
+    try:
+        import psutil
+
+        path = _intent_path(turn_id)
+        if _finished_intent_path(path).exists():
+            return  # stale presentation notification, never an execution veto
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        temporary.write_text(json.dumps({"pid": os.getpid(), "process_started": psutil.Process().create_time(),
+                                         "active": True, "changed_at": time.time()}), encoding="utf-8")
+        os.replace(temporary, path)
+    except Exception:
+        pass
+
+
+def finish_desktop_intent(turn_id: str) -> None:
+    """Only the matching terminal turn clears its visual phase, across processes."""
+    if turn_id:
+        try:
+            path = _intent_path(turn_id)
+            finished = _finished_intent_path(path)
+            finished.parent.mkdir(parents=True, exist_ok=True)
+            finished.touch(exist_ok=True)
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def desktop_activity_visible(*, now: float | None = None) -> bool:
     """Observe only live processes; PID reuse and abandoned files aren't activity."""
     try:
@@ -75,6 +123,8 @@ def desktop_activity_visible(*, now: float | None = None) -> bool:
         current = time.time() if now is None else now
         for path in activity_directory().glob("*.json"):
             try:
+                if path.name.startswith("intent-") and _finished_intent_path(path).exists():
+                    continue
                 if path.stat().st_size > 512:
                     continue
                 value = json.loads(path.read_text(encoding="utf-8"))

@@ -779,6 +779,13 @@ class TurnTerminalityController:
             for delay in (0.02, 0.05, 0.10, 0.20, None):
                 try:
                     os.replace(temporary, self._path)
+                    if self._state.get("terminal_state") in TERMINAL_STATES:
+                        try:
+                            from osia.desktop_activity import finish_desktop_intent
+
+                            finish_desktop_intent(self.turn_id)
+                        except Exception:
+                            pass  # optional decoration is never terminal authority
                     return
                 except PermissionError as exc:
                     # A Windows reader can briefly deny replacement of the

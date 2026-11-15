@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import threading
 
 import numpy as np
+import pytest
 
 from osia import main
 from osia.voice import stt
@@ -74,6 +75,22 @@ def test_manual_capture_keeps_its_existing_retry_behavior(monkeypatch):
     monkeypatch.setattr(stt, "transcribe", lambda *_a, **_kw: "ouvre le navigateur")
     assert stt.listen_for_command(max_retries=2) == "ouvre le navigateur"
     assert device.read_counts == [6, 4]
+
+
+@pytest.mark.parametrize("prefix_level", [0.0, 0.1])
+def test_early_wake_sound_or_handoff_cannot_cut_off_a_later_command(monkeypatch, prefix_level):
+    # Readiness sound/residual wake at 0s; the real command begins at 2s.
+    # The old RMS endpoint returned at 1.5–2s, before those words were read.
+    device = _FakeSoundDevice([[0.2, 0, 0, 0, 0.3, 0.3, 0.3, 0, 0, 0]])
+    _install_fake_audio(monkeypatch, device)
+    def transcribe(audio, **_kwargs):
+        assert np.max(audio) >= 0.3
+        return "ouvre le navigateur"
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    assert stt.listen_for_command(initial_audio=np.full(1600, prefix_level, np.float32),
+                                 no_speech_timeout=4.0) == "ouvre le navigateur"
+    assert device.stream_calls == 1 and device.read_counts == [10]
+    assert device.active_streams == 0
 
 
 def test_empty_acoustic_wake_finalizes_without_spoken_fallback(monkeypatch):

@@ -131,6 +131,97 @@ def test_prepared_click_dispatch_observes_actual_backend_without_changing_result
     assert not activity.desktop_activity_visible(now=time.time() + 5)
 
 
+def test_model_intent_survives_input_gaps_until_exact_turn_is_cancelled(activity_dir, tmp_path):
+    from osia.turn_terminality import TurnTerminalityController
+    activity.observe_desktop_intent("turn-first", "desktop_click")
+    activity.observe_desktop_intent("turn-other", "desktop_press")
+    assert activity.desktop_activity_visible(now=time.time() + 1000)
+    controller = TurnTerminalityController(turn_id="turn-first", objective="a requested action", execution_required=True, storage_dir=tmp_path/"turns")
+    controller.try_request_cancellation(effect_possible=False)
+    assert activity.desktop_activity_visible()  # another turn still owns its phase
+    activity.finish_desktop_intent("turn-other")
+    assert not activity.desktop_activity_visible()
+    assert not list(activity_dir.glob("intent-*.json"))
+
+
+def test_read_only_tools_do_not_invent_a_desktop_intention(activity_dir):
+    for tool in ("request_visual_observation", "inspect_desktop_surfaces", "read_file", "navigate"):
+        activity.observe_desktop_intent("turn-read", tool)
+    assert not activity.desktop_activity_visible()
+    assert not list(activity_dir.iterdir())
+
+
+def test_terminal_turn_cannot_be_reactivated_by_a_late_visual_notification(activity_dir):
+    activity.finish_desktop_intent("turn-finished")
+    activity.observe_desktop_intent("turn-finished", "desktop_click")
+    assert not activity.desktop_activity_visible()
+    activity.observe_desktop_intent("turn-new", "desktop_click")
+    assert activity.desktop_activity_visible()
+    activity.finish_desktop_intent("turn-new")
+
+
+def test_tool_attempt_records_intention_before_dispatch_and_terminal_final_clears_it(activity_dir, tmp_path):
+    from osia.tool_attempts import ToolAttemptStore
+    from osia.turn_terminality import TurnTerminalityController
+    store = ToolAttemptStore(tmp_path/"attempts")
+    arguments = {"target": "an observed button"}
+    attempt = store.create_attempt(conversation_id="conv-intent", turn_id="turn-intent", request_id="req-intent",
+                                   tool_call_id="call-intent", tool_name="desktop_click", provider_id="fixture", model_id="fixture",
+                                   turn_context={"language": "en", "source": "fixture"},
+                                   argument_fingerprint=store.fingerprint_arguments(arguments), side_effect="external_mutation",
+                                   idempotence="non_idempotent", retry_policy="never_after_dispatch")
+    assert attempt["status"] == "not_started"
+    assert activity.desktop_activity_visible(now=time.time()+1000)
+    controller = TurnTerminalityController(turn_id="turn-intent", objective="an answer", execution_required=False,
+                                          required_postconditions=("complete",), storage_dir=tmp_path/"turns")
+    controller.prove_postcondition("complete", {"receipt": "verified"})
+    decision = controller.evaluate()
+    assert controller.reserve_final(decision.terminal_state, reason_code=decision.reason_code, final_text="complete")
+    assert not activity.desktop_activity_visible()
+
+
+def test_neon_fades_retargets_and_stops_rendering_when_idle(monkeypatch):
+    from osia.gui import desktop_feedback as module
+    monkeypatch.setattr(module, "reduced_motion_requested", lambda *_: False)
+    theme = ThemeManager(lambda: {}, lambda *_: None)
+    edge = ControlEdge(APP.primaryScreen(), theme)
+    try:
+        edge.set_active(True)
+        assert edge.reveal == 0 and edge._frames.isActive()
+        deadline = time.monotonic() + 0.15
+        while time.monotonic() < deadline:
+            APP.processEvents(); time.sleep(0.005)
+        assert 0 < edge.reveal < 1
+        current = edge.reveal
+        edge.set_active(False)
+        assert edge.reveal == current
+        edge.set_active(True)
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            APP.processEvents(); time.sleep(0.005)
+        assert edge.reveal == 1 and edge.isVisible()
+        edge.set_active(False)
+        deadline = time.monotonic() + 0.35
+        while time.monotonic() < deadline:
+            APP.processEvents(); time.sleep(0.005)
+        assert edge.reveal == 0 and not edge.isVisible() and not edge._frames.isActive()
+    finally:
+        edge.close()
+
+
+def test_reduced_motion_has_static_neon_without_a_frame_loop(monkeypatch):
+    from osia.gui import desktop_feedback as module
+    monkeypatch.setattr(module, "reduced_motion_requested", lambda *_: True)
+    edge = ControlEdge(APP.primaryScreen(), ThemeManager(lambda: {}, lambda *_: None))
+    try:
+        edge.set_active(True)
+        assert edge.reveal == 1 and not edge._frames.isActive()
+        edge.set_active(False)
+        assert edge.reveal == 0 and not edge._frames.isActive()
+    finally:
+        edge.close()
+
+
 class FakeCursor:
     def __init__(self):
         self.calls = []
@@ -158,7 +249,7 @@ def test_feedback_is_click_through_theme_aware_and_stops_after_close():
             assert edge.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
             assert edge.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             assert edge.focusPolicy() == Qt.FocusPolicy.NoFocus
-            assert edge.height() == 26
+            assert edge.height() == ControlEdge.HEIGHT
             assert edge.geometry().bottom() == edge.screen_ref.geometry().bottom()
         old = cursor.calls[-1][1]
         other = next(key for key in PALETTES if key != theme.key)
@@ -169,7 +260,8 @@ def test_feedback_is_click_through_theme_aware_and_stops_after_close():
             import base64
             validate_cursor_bytes(base64.b64decode(cursor.calls[-1][1][name]))
         feedback.set_active(False)
-        assert not feedback.edges and cursor.calls[-1] == (False, None)
+        assert all(not edge.target_active for edge in feedback.edges.values())
+        assert cursor.calls[-1] == (False, None)
         feedback.close()
         feedback.set_active(True)  # a late queued callback cannot resurrect it
         assert cursor.closed and not feedback.edges
@@ -214,10 +306,10 @@ def test_negative_origin_screen_and_resize():
     screen = Screen()
     edge = ControlEdge(screen, theme)
     try:
-        assert edge.geometry() == QRect(-1920, 854, 1920, 26)
+        assert edge.geometry() == QRect(-1920, 834, 1920, 46)
         screen.geometry_value = QRect(100, 0, 1280, 720)
         edge.sync_geometry()
-        assert edge.geometry() == QRect(100, 694, 1280, 26)
+        assert edge.geometry() == QRect(100, 674, 1280, 46)
     finally:
         edge.close()
 
