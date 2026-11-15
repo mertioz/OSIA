@@ -2480,6 +2480,15 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
         or ""
     )
     if foreground_scene is None:
+        from osia.tools import desktop_control as dc
+
+        background_lookup_available = bool(
+            sys.platform == "win32" and requested_application
+            and dc._load_win32() is not None
+        )
+    else:
+        background_lookup_available = False
+    if foreground_scene is None and not background_lookup_available:
         return TargetSurfaceSelection(
             requested_application=requested_application,
             status="desktop_surface_unavailable",
@@ -2499,7 +2508,7 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
             ) is not None else ""
         ),
         foreground=True,
-    )
+    ) if foreground_scene is not None else None
     if not requested_application:
         return TargetSurfaceSelection(
             requested_application="",
@@ -2515,6 +2524,7 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
     foreground_matches = [
         (*_scene_application_identity(foreground_scene, item["value"]), item)
         for item in requested_candidates
+        if foreground_scene is not None
     ]
     foreground_matches = [item for item in foreground_matches if item[0] > 0]
     foreground_matches.sort(
@@ -2529,13 +2539,13 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
     foreground_rank, foreground_evidence = (
         foreground_matches[0][0], foreground_matches[0][1]
     ) if foreground_matches else (0, "")
-    foreground_is_packaged_frame = bool(
+    foreground_is_packaged_frame = bool(foreground_scene is not None and (
         _application_identity(
             foreground_scene.host_application_id
             or foreground_scene.application_id
         ) == "applicationframehost"
         or foreground_scene.packaged_application_id
-    )
+    ))
     foreground_authority = (
         foreground_matches[0][2] if foreground_matches else {}
     )
@@ -2596,12 +2606,12 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
 
     foreground_native = DESKTOP_SURFACE_REGISTRY.native_identity(
         foreground_scene.window_ref.ref_id,
-    )
+    ) if foreground_scene is not None else None
     foreground_hwnd = (
         foreground_native.native_window_id if foreground_native is not None else None
     )
-    candidates = [foreground_scene]
-    summaries = [foreground_summary]
+    candidates = [foreground_scene] if foreground_scene is not None else []
+    summaries = [foreground_summary] if foreground_summary is not None else []
     for hwnd, title, pid, class_name in dc._enum_app_windows_win32()[:80]:
         if foreground_hwnd is not None and int(hwnd) == int(foreground_hwnd):
             continue
@@ -2726,7 +2736,9 @@ def _select_desktop_target(target: str = "") -> TargetSurfaceSelection:
         )
         selection = TargetSurfaceSelection(
             requested_application=requested_application,
-            status="target_ambiguous" if conflict else "target_missing",
+            status="target_ambiguous" if (
+                conflict or any(item[0].status == "target_ambiguous" for item in unresolved)
+            ) else "target_missing",
             foreground_scene=foreground_scene,
             target_scene=None,
             candidate_count=ambiguous_count,

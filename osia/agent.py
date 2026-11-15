@@ -1335,6 +1335,10 @@ def tool_open_application(name: str) -> str:
         from osia.tools import desktop_control as _dc
     except Exception:
         _dc = None
+    if _dc is not None:
+        launch_error = _dc.application_launch_error(name)
+        if launch_error:
+            return launch_error
     if sys.platform == "win32" and _dc is not None:
         try:
             from osia.desktop_scene import focus_existing_application_window
@@ -5329,6 +5333,19 @@ def _execute_tool_with_policy(
             ExecutionOutcome.REJECTED_BEFORE_EXECUTION,
             0, False, False, contract,
         )
+
+    if tool_name == "open_application" and sys.platform == "win32":
+        try:
+            from osia.tools.desktop_control import application_launch_error
+        except ImportError:
+            launch_error = None  # preserve the optional-backend shell fallback
+        else:
+            launch_error = application_launch_error(kwargs.get("name"))
+        if launch_error:
+            return ToolExecutionRecord(
+                launch_error, True, ExecutionOutcome.CONFIRMED_FAILURE_BEFORE_EFFECT,
+                0, False, False, contract, reason_code="application_executable_missing",
+            )
 
     configured_timeout_s = _configured_tool_timeout_seconds(
         spec, tool_name, kwargs,

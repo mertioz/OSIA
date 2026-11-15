@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -1358,19 +1359,42 @@ _WIN_SHELL_CLASSES = {
 _EXE_EXTS = (".exe", ".com", ".bat", ".cmd", ".lnk", ".app")
 
 
+def _launch_executable_token(name) -> str:
+    """Read an executable token without splitting an absolute Windows path."""
+    value = str(name or "").strip()
+    if not value:
+        return ""
+    if value[0] in "\"'":
+        end = value.find(value[0], 1)
+        return value[1:end] if end > 1 else value[1:]
+    if ntpath.isabs(value):
+        match = re.match(r"^(.+?\.(?:exe|com|bat|cmd))(?:\s|$)", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return value.split()[0]
+
+
+def application_launch_error(name) -> str | None:
+    """A known missing executable is a technical failure before any effect."""
+    if sys.platform != "win32":
+        return None
+    path = _launch_executable_token(name)
+    if (ntpath.isabs(path) and ntpath.splitext(path)[1].lower() in {".exe", ".com", ".bat", ".cmd"}
+            and not os.path.isfile(path)):
+        return (
+            f"ERROR: executable does not exist: {path}. No process was started. "
+            "Use the application's name to resolve its current installed executable "
+            "instead of reusing an obsolete versioned path."
+        )
+    return None
+
+
 def _norm_app_token(name) -> str:
     """Reduce a launch string ('notepad', 'notepad.exe doc.txt', a quoted path) to
     its lowercase executable base ('notepad') for process-name matching, or '' when
     it can't be reduced. Best-effort: a wrong reduction just means no match -> the
     caller launches (safe)."""
-    s = (name or "").strip()
-    if not s:
-        return ""
-    if s[0] in "\"'":                             # leading quoted path with spaces
-        end = s.find(s[0], 1)
-        first = s[1:end] if end > 1 else s[1:]
-    else:
-        first = s.split()[0]
+    first = _launch_executable_token(name)
     base = os.path.basename(first.replace("\\", "/"))
     root, ext = os.path.splitext(base)
     if ext.lower() in _EXE_EXTS:
@@ -2107,11 +2131,39 @@ def find_app_window_multi(candidates):
         return None
     for hwnd, title, pid, _cls in _enum_app_windows_win32():       # topmost first
         try:
-            pname = psutil.Process(pid).name()
+            process = psutil.Process(pid)
+            pname = process.name()
         except Exception:
             continue
         if _proc_base(pname) in cands:
             return (hwnd, title, pid)
+        try:
+            # A renderer can own the window while the named application owns
+            # its process tree (CEF/Electron). Require both the real ancestry
+            # and a nested executable in that application's install directory.
+            # Shared shells/interpreters and unrelated sibling apps aren't
+            # application identity, even if they started the process.
+            child_executable = ntpath.normcase(process.exe())
+            generic_parents = _GENERIC_PROC_BASES | {"python", "pythonw", "node", "java", "dotnet", "electron"}
+            ancestor = process
+            for _ in range(8):
+                parent = ancestor.parent()
+                if parent is None:
+                    break
+                ancestor = parent
+                parent_name = _proc_base(parent.name())
+                if parent_name in generic_parents:
+                    break
+                if parent_name not in cands:
+                    continue
+                parent_root = ntpath.normcase(ntpath.dirname(parent.exe()))
+                if not parent_root or ntpath.dirname(parent_root) == parent_root:
+                    continue
+                if (ntpath.commonpath([child_executable, parent_root]) == parent_root
+                        and ntpath.dirname(child_executable) != parent_root):
+                    return (hwnd, title, pid)
+        except Exception:
+            continue
     return None
 
 
