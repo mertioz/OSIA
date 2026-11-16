@@ -2100,7 +2100,7 @@ class ToolAttemptStore:
         try:
             from osia.desktop_activity import observe_desktop_intent
 
-            observe_desktop_intent(turn_id, tool_name)
+            observe_desktop_intent(turn_id, tool_name, conversation_id=conversation_id)
         except Exception:
             pass  # presentation never changes attempt creation or dispatch
         return dict(record)

@@ -2,6 +2,8 @@ import os
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtTest import QSignalSpy, QTest
@@ -14,6 +16,26 @@ from osia.slash_commands import CapabilityRequirements, ModelOverride
 
 
 _APP = QApplication.instance() or QApplication([])
+
+
+@pytest.mark.parametrize("alias,command_id", [
+    ("status", "status.info"), ("help", "help.info"),
+])
+def test_information_commands_emit_their_handler_without_sending_a_turn(alias, command_id):
+    chat = _ChatPage()
+    chat.show()
+    requested = QSignalSpy(chat.informational_requested)
+    sent = QSignalSpy(chat.send_text)
+    submitted = QSignalSpy(chat.submit_directive_draft)
+    try:
+        chat._input.setPlainText("/" + alias)
+        chat._on_send()
+        assert list(requested) == [[command_id]]
+        assert not sent and not submitted
+        assert not chat._input.toPlainText()
+    finally:
+        chat.close()
+        chat.deleteLater()
 
 
 def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(monkeypatch):

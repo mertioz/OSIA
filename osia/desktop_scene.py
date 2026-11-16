@@ -1474,6 +1474,12 @@ def _dispatch_fresh_uia_action_bounded(
 ) -> dict:
     """Bound one UIA provider call while preserving its exact dispatch state."""
 
+    from osia.desktop_activity import mouse_feedback_enabled
+
+    # This COM worker has its own context. Carry only the presentation choice;
+    # the native action, its journal, cancellation and receipt stay unchanged.
+    feedback_enabled = mouse_feedback_enabled()
+
     done = threading.Event()
     cancel_before_dispatch = threading.Event()
     dispatch_gate = threading.Lock()
@@ -1552,7 +1558,7 @@ def _dispatch_fresh_uia_action_bounded(
                     cancellation_enabled = False
                 from osia.desktop_activity import native_input_activity
 
-                with native_input_activity():
+                with native_input_activity(enabled=feedback_enabled):
                     method()
                 if (
                     callable(journal_dispatch_returned)
