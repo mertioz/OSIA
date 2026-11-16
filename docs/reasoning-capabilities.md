@@ -1,38 +1,38 @@
 # Reasoning capabilities
 
-Implementation reference checked on 16 November 2026. The supported options are
-computed for an exact provider/model, rather than maintained in a second static
-documentation matrix.
+Reasoning options are resolved for the exact provider and model. Product rules
+are maintained in [AGENTS.md](../AGENTS.md) and the
+[Work Drive rules index](https://drive.google.com/file/d/1uJqAH2Ch7g5Wc3DOav4FcEaGTEiIR10r/view).
 
-## Sources of truth
+## Resolve an option
 
-- [osia/reasoning.py](../osia/reasoning.py): `get_reasoning_capability`,
-  `get_reasoning_options` and `build_reasoning_request` resolve the capability,
-  saved choice and outgoing provider fields.
-- [PC-owned model inventory](../osia/mobile_model_catalogue.py): the Desktop
-  picker and Mobile projection use the same discovered metadata.
-- [ChatGPT Account provider](../osia/chatgpt_account/provider.py): Codex
-  `model/list` supplies the account-specific IDs, effort options and defaults.
-  Its catalogue is distinct from OpenAI API discovery.
+[osia/reasoning.py](../osia/reasoning.py) owns three public entry points:
 
-`auto` leaves the provider's reasoning parameter unspecified. Other UI IDs
-(`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) are offered
-only when supported by that exact model. A catalogue entry or a configured key
-is not proof of inference entitlement.
+- `get_reasoning_capability(provider, model)` returns the model contract.
+- `get_reasoning_options(provider, model)` returns the selectable options.
+- `build_reasoning_request(provider, model, settings)` resolves the saved choice
+  and outgoing provider fields.
 
-DeepSeek's current selectable ID and five-mode mapping are documented once in
-[the DeepSeek reference](WOR-298-deepseek-flash.md). Discovery and transport
-ownership are documented in [the provider reference](WOR-355-cloud-provider-audit.md).
+`auto` leaves the reasoning parameter unspecified so the provider chooses its
+default. The other UI IDs are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max` and `ultra`; each is offered only when supported by that exact model.
+ChatGPT Account rechecks an unsupported explicit choice against `model/list`
+and returns an error if support cannot be verified or the choice remains
+incompatible. DeepSeek rejects unsupported modes. Other API adapters can fall
+back to `auto` for a legacy incompatible saved choice, with
+`mapping_state=rejected`; the stored choice is migrated to the default when
+the resolver owns the saved settings. This compatibility path is distinct
+from validating a new explicit command selection.
 
-## Verification
+## Shared metadata
 
-The relevant contracts are exercised by `tests/test_wor209_reasoning.py`,
-`tests/test_wor298_deepseek_flash.py`, `tests/test_wor245_slash_commands.py` and
-the provider-specific transport tests. A new test run has its own recorded
-result; this document does not declare a permanent all-provider green state.
+[The PC-owned model inventory](../osia/mobile_model_catalogue.py) supplies the
+Desktop picker and Mobile projection from the same discovered metadata.
+[The ChatGPT Account provider](../osia/chatgpt_account/provider.py) uses Codex
+`model/list` for the account-specific IDs, effort options and defaults. OpenAI
+API discovery is a separate catalogue.
 
-## Historical evidence
-
-The 30 July 2026 matrix contained retired DeepSeek IDs and an account inventory
-from that date. It has been removed from the current reference. Its complete
-[dated matrix and observations](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/reasoning-capabilities.md) remain in Git history.
+Catalogue visibility, configured credentials and supported option metadata are
+distinct from actual request entitlement. [Provider discovery](providers.md)
+explains availability, and [DeepSeek](deepseek.md) documents its exact five-mode
+mapping.

@@ -1,41 +1,28 @@
-# Product versions and historical identities
+# Product versions and runtime identity
 
-Current reference, consolidated on 16 November 2026.
+## Version owners
 
-## Sources
+- [osia/version.py](../osia/version.py) owns Desktop PRODUCT_VERSION, RELEASE_SEQUENCE, numeric parsing and historical display aliases.
+- [osia/release_notes.py](../osia/release_notes.py) owns the embedded Desktop release history.
+- Platform build metadata (app_metadata.json on Windows) and the release manifest identify a binary's product/display version, source commit, platform/channel and artifact metadata.
+- Android versionCode and iOS CFBundleVersion are native build identities. Mobile Settings reads its installed package rather than inventing a version from a display alias.
 
-- [osia/version.py](../osia/version.py) owns Desktop `PRODUCT_VERSION`,
-  `RELEASE_SEQUENCE` and historical display aliases.
-- [osia/release_notes.py](../osia/release_notes.py) records embedded Desktop
-  release history. A source declaration is distinct from a published artifact.
-- [The historical inventory](WOR-357-version-inventory.md) preserves dated
-  source/artifact/store observations and original hashes.
-- Current build, publication and operator-acceptance order is maintained in
-  [AGENTS.md](../AGENTS.md) and the [Drive installer rules](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view).
+The operator's explicitly requested release version takes precedence. Technical product versions use numeric components without leading zeros; presentation aliases do not rename or rewrite original artifacts. Updater comparisons use numeric product components and the established legacy epochs.
 
-## Numbering
+Desktop releaseSequence and Mobile native build identities are independent monotonic update values. Prepared candidates, store drafts, failed uploads and public releases are distinct states; a failed build does not become a new public release. Current manifests and store state supply their actual values.
 
-The operator's version instruction normally increments the last numeric public
-component for a newly published update; an explicitly requested version takes
-precedence. Technical product versions use numeric SemVer components without
-leading zeros. Display aliases are presentation, not rewritten native versions.
-Comparison uses numeric components and the updater's explicit legacy epochs.
+## Source, build and loaded process
 
-Desktop `releaseSequence`, Android `versionCode` and iOS `CFBundleVersion` are
-independent monotonic build/update identities. Mobile Settings reads the native
-installed package version. Its public product version is not inferred by
-padding an old version or by renaming historical artifacts.
+A synchronized source checkout does not update an already built EXE or code already loaded into a process. A product-version string alone does not prove that two builds contain the same fixes.
 
-The historical inventory and the release workflow distinguish source floors,
-queried store maxima, failed candidates, uploaded drafts and public releases.
-Old artifact URLs, identities and hashes retain their original meaning. Failed
-or unpublished builds do not manufacture a new public version increment.
+[osia/runtime.py](../osia/runtime.py) resolves source/frozen resources and exposes source-tree identity. The server health response identifies its PID, checkout root, executable/entry point, source mode and loaded runtime identity. Compare those observations with the intended source and the binary's embedded metadata.
 
-## Removed dated candidate instructions
+For source delivery, use the primary checkout synchronization workflow in [AGENTS.md](../AGENTS.md). For an installed application, use the commit/hash in its actual artifact metadata and the exact public release manifest. A later source-only fix requires a new built generation before that installed binary contains it.
 
-The original 23 October instruction moved Mobile from 0.9.5/build22 to the
-explicitly requested 0.9.51; Android24 and iOS25 were the final candidates, after
-iOS24 failed a packaging guard. Those observations do not prescribe today's next
-version, build floor or store maximum. [The original report](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/version-policy.md)
-preserves their exact provenance. Desktop 0.9.0 and next-Mobile 0.9.52 statements
-have been removed from the active policy.
+## Artifacts and update channels
+
+Published artifact URLs, byte sizes, hashes and installed product identities retain their original meaning. A repair or new release uses the authorized versioned publication path rather than replacing old bytes or silently changing an installed channel.
+
+[osia/updater.py](../osia/updater.py) owns Windows channel URLs, metadata/manifest validation, release ordering and installer-plan checks. Source declarations and embedded notes are not substitutes for the public manifests.
+
+Current Windows/Linux installer identity, signing, publication and acceptance procedures are maintained once in the [Drive installer rules](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view) and AGENTS.md. Platform implementation is described in [Windows distribution](windows-installer.md) and [the Linux packaging guide](../packaging/linux/README.md).

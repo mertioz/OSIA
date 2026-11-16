@@ -1,94 +1,41 @@
-# Windows installer implementation
+# Windows distribution
 
-Reference checked on 16 November 2026. Build/publication rules and acceptance
-order have one maintained home: [AGENTS.md](../AGENTS.md) and
-[Drive installer rules](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view).
-This page describes the existing implementation rather than duplicating their
-release checklist.
+## Installed layout
 
-## Package and installed identity
+The existing build chain is PyInstaller onedir followed by Inno Setup. The application is installed per user under %LOCALAPPDATA%/Programs/OSIA. Its AppId, integrations, profile preservation and uninstall behavior are implemented in [OSIA.iss](../packaging/windows/OSIA.iss).
 
-The existing chain is PyInstaller `onedir` followed by Inno Setup. One
-`OSIA.exe` with its `_internal` directory supports the GUI and internal service,
-server, wake-recovery and maintenance modes. Inno installs per user under
-`%LOCALAPPDATA%/Programs/OSIA` with the existing AppId, integration and
-uninstaller. User settings, conversations, credentials, pairing and browser
-profiles remain in the existing user-data locations outside that installation.
-Normal uninstall preserves those profiles.
+One OSIA.exe and its _internal directory contain the GUI and private service/server, wake-recovery, document/media-worker and maintenance entry points. The user does not need a separate Python, Git or Node installation to run the packaged application. User settings, conversations, credentials, pairing and browser profiles remain in their established user-data locations outside the installation. Normal uninstall preserves those profiles.
 
-[build_windows.py](../packaging/windows/build_windows.py) declares the reviewed
-tool/runtime versions, immutable download revisions, hashes, assets and notice
-inventory. The complete Codex runtime is staged under `_internal/runtimes/codex`;
-frozen discovery uses OSIA-owned runtime locations rather than developer PATH.
-The old documentation's Codex 0.144.1 pin has been removed; the executable
-`CODEX_RUNTIME_VERSION` declaration owns that value.
+[osia/runtime.py](../osia/runtime.py) resolves packaged/source resources and executable modes. [osia/config.py](../osia/config.py) owns CONFIG_DIR resolution; source and installed profiles are not selected by copying credential files into the bundle.
 
-Kokoro voices, Whisper and native MP3 dependencies are staged by this chain.
-Model hashes and dependency/license metadata are verified by its existing
-builder. The pinned resource/dependency definitions are not duplicated here.
+## Build entry point and outputs
 
-## Build entry point
+From the clean authorized source checkout and its configured build environment on Windows x64:
 
-From the clean authorized source commit on Windows x64, the Stable entry point
-is:
+    ./venv/Scripts/python.exe ./packaging/windows/build_windows.py --channel stable
 
-```powershell
-./venv/Scripts/python.exe ./packaging/windows/build_windows.py --channel stable
-```
+The builder's default channel is internal-preview, so Stable is explicit. [build_windows.py](../packaging/windows/build_windows.py) owns the actual compiler/runtime versions, immutable download revisions, SHA-256 pins, resource staging and legal inventory. [osia.spec](../packaging/windows/osia.spec) and the runtime hooks own the frozen module/data layout.
 
-The builder's default channel is internal-preview; it does not substitute for
-Stable. Generated outputs are `dist/OSIA/`, `release/windows/OSIA-Setup.exe`,
-the checksum and release manifest. The source scripts own DLL isolation,
-tracked-module collection, frozen smoke and payload integrity checks.
+The complete managed Codex distribution, including its required auxiliary executables/resources, is staged under _internal/runtimes/codex. Discovery uses OSIA-owned locations rather than assuming a developer PATH. Kokoro voices, Whisper, UI Automation resources and native MP3 dependencies are staged by the same existing chain.
 
-## Signing and verification status
+Generated outputs include dist/OSIA/, release/windows/OSIA-Setup.exe, its checksum and release manifest. app_metadata.json binds the product/display version, update ordering, platform/channel and source commit to the bundle. Use those actual files rather than a version pin copied into this guide.
 
-Authenticode signing is conditional on an accessible certificate selected by
-`OSIA_SIGN_SHA1`; the builder signs/verifies the application and installer when
-configured. It can also produce the explicitly authorized unsigned Stable beta
-under the bounded updater policy. The exact artifact's manifest and signature
-verification establish its status; the executable must not be called signed
-merely because Codex or another dependency has its own signature.
+## Installation and update behavior
 
-SmartScreen reputation is separate from those checks. Published guidance uses
-the official HTTPS download and its checksum without disabling Windows security
-protections. Existing third-party notices/source obligations are recorded in
-the package legal inventory; copied notices alone are not a legal-clearance
-claim. Commercial ChatGPT Account eligibility remains separately qualified.
+The per-user OSIA Server task supervises the server. Source setup/start entry points remain install.bat and start.bat. Direct transport and private-LAN firewall behavior are described in [webrtc-direct.md](webrtc-direct.md).
 
-The old pre-publication VM/OAuth checklist is removed. The current automated
-checks and post-publication `OPERATOR_PENDING` scenarios are defined in the
-maintained release workflow linked above.
+The installer coordinates its owned tasks/processes and writes its installed version/update sequence through the established upgrade logic. The implementation includes known legacy-sequence recovery and rejects inconsistent/newer installation states; the source and exact artifact metadata define the applicable paths.
 
-## Integration and switches
+Standard Inno command-line switches and the existing isolated-integration switch are available. For an explicitly chosen disposable installation path:
 
-The per-user OSIA Server task supervises the server. The direct transport,
-private-LAN firewall scope and relay behavior are described once in
-[webrtc-direct.md](webrtc-direct.md). Source launch/setup entry points remain
-`start.bat` and `install.bat`.
+    ./OSIA-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOINTEGRATION=1 /MERGETASKS="!firewall,!autostart" /DIR="C:/Path With Spaces/OSIA"
 
-Standard Inno switches and the existing isolated-test integration switch remain
-available. Example for an explicitly chosen disposable installation path:
+The isolated switch is a separate integration path, not proof that a normal operator installation, migration or account flow succeeded.
 
-```powershell
-./OSIA-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
-  /SP- /NOINTEGRATION=1 /MERGETASKS="!firewall,!autostart" `
-  /DIR="C:/Path With Spaces/OSIA"
-```
+## Signing and publication
 
-The installer coordinates its existing owned tasks/processes and preserves the
-profile. Its implementation and tests own upgrade/repair/rollback details; an
-old source/native probe is not equivalent to acceptance of a new binary.
+OSIA_SIGN_SHA1 selects an accessible Authenticode certificate for the builder's signing/verification path. An explicitly authorized unsigned Stable beta is supported by the bounded updater policy. Determine the actual signature state from the artifact and its manifest; a dependency's signature does not sign OSIA.
 
-## Historical proofs
+SmartScreen reputation is separate from build-integrity checks. The official HTTPS download and checksum support artifact verification without disabling Windows security protections. The package legal inventory records required notices/source obligations; commercial ChatGPT Account eligibility remains separately qualified.
 
-The [20 October portability audit](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-357-chatgpt-windows-portability.md) records the signed-out,
-empty-PATH standalone runtime probe, exact original upstream LICENSE/NOTICE
-hashes and qualifications. The [source delivery](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-357-source-delivery.md) records
-the initial version epoch and Mobile Thinking ownership corrections. Their old
-build/VM instructions are not current prerequisites.
-
-[The original installer reference](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/windows-installer.md) retains the immutable
-1.1.1 bridge and 1.1.5 rollback metadata as historical records, not current
-rollback recommendations. The [0.9.0 publication report](WOR-349-windows-0.9.0-rc.md)
-records that specific artifact's provenance and acceptance state.
+The maintained build, immutable publication, full-download verification, channel and post-publication operator-acceptance workflow is in [AGENTS.md](../AGENTS.md) and the [Drive installer rules](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view). This page supplies no additional VM/OAuth gate or release authorization. [Version policy](version-policy.md) explains source, built and loaded identities.
