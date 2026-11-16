@@ -63,6 +63,43 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.270", released_on="2026-11-16", public=True,
+        changes_en=(
+            "Chat prepares tool descriptions and conversation context with less repeated work, while preserving the complete tool inventory and independent history values.",
+            "Streaming prose appears sooner without a fixed character delay; partial internal tags and tool arguments stay hidden, and decimal numbers remain intact.",
+            "The capsule shows smoother listening waves and six animated Thinking lights in its normal, side and corner positions; idle animation stops when unnecessary.",
+            "Desktop control shows a theme-colored neon edge from a native tool request until its Chat turn finishes, including pauses between actions; Windows temporarily uses matching black cursors.",
+            "Spoken replies on this PC are off by default on a new profile. Local Kokoro synthesis is shared by PC and mobile audio and handles short French and English replies more reliably.",
+            "Wake listening preserves the command window when the wake phrase or readiness sound briefly triggers the microphone before the actual request.",
+            "Windows can find an explicitly requested background application when the foreground window is unreadable, and recognizes helper windows from verified application process families.",
+            "Application paths containing spaces retain their identity. A missing absolute executable is reported as a failure before launch, leaving the model free to resolve the current application by name.",
+        ),
+        changes_fr=(
+            "Le Chat prépare le catalogue d’outils et le contexte avec moins de travail répété, en conservant tous les outils et l’indépendance des valeurs de l’historique.",
+            "Le texte s’affiche plus tôt sans attente fixe de caractères ; les balises internes incomplètes et les arguments d’outils restent masqués, et les nombres décimaux restent intacts.",
+            "La capsule affiche des ondes d’écoute plus fluides et six lumières Thinking animées dans ses positions normale, latérale et en coin ; l’animation s’arrête au repos si elle est inutile.",
+            "Le contrôle du bureau affiche un néon assorti au thème de la demande d’un outil natif jusqu’à la fin de son tour Chat, y compris entre deux actions ; Windows utilise temporairement des curseurs noirs assortis.",
+            "Les réponses parlées sur ce PC sont désactivées par défaut sur un nouveau profil. La synthèse locale Kokoro est partagée entre PC et audio mobile et gère mieux les courtes réponses françaises et anglaises.",
+            "Après le réveil vocal, l’écoute conserve sa fenêtre de commande si le mot de réveil ou le signal sonore active brièvement le micro avant la vraie demande.",
+            "Windows retrouve une application explicitement demandée en arrière-plan même si le premier plan est illisible, et reconnaît ses fenêtres auxiliaires à partir de leur famille de processus vérifiée.",
+            "Les chemins d’applications contenant des espaces gardent leur identité. Un exécutable absolu absent est signalé avant lancement, permettant au modèle de résoudre l’application actuelle par son nom.",
+        ),
+        summary_en=(
+            "Faster local Chat preparation and streaming, with complete tool availability and unchanged conversation content.",
+            "Smoother listening and six-light Thinking animations in every capsule position, with idle work reduced.",
+            "Theme-colored neon desktop feedback follows native control intent through the turn; temporary Windows cursors restore afterwards.",
+            "Spoken PC replies default to off on new profiles; shared Kokoro synthesis and wake listening are more reliable.",
+            "Windows application discovery handles background and helper windows, paths with spaces and missing executables without false launch waits.",
+        ),
+        summary_fr=(
+            "Préparation et affichage du Chat plus rapides, avec tous les outils disponibles et le contenu des conversations conservé.",
+            "Ondes d’écoute et six lumières Thinking plus fluides dans chaque position de capsule, avec moins de travail au repos.",
+            "Le néon du bureau suit l’intention de contrôle natif jusqu’à la fin du tour ; les curseurs Windows temporaires sont ensuite restaurés.",
+            "Parole PC désactivée par défaut sur les nouveaux profils ; synthèse Kokoro partagée et écoute après réveil plus fiables.",
+            "Windows retrouve mieux les fenêtres en arrière-plan et auxiliaires, traite les chemins avec espaces et signale les exécutables absents avant lancement.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.268", released_on="2026-11-15", public=True,
         changes_en=(
             "Optional offline Hé OSIA voice activation is available and stays off on a new installation; independent Chat work does not block voice input.",
