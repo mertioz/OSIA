@@ -1,46 +1,41 @@
-# Permanent OSIA version policy — 23 October 2026
+# Product versions and historical identities
 
-Authority: operator instruction of 23 October 2026 and Linear WOR-202/WOR-352.
-Each newly published Mobile or Desktop update increments the final public
-numeric version component by one until the operator explicitly changes this.
-The requested next Mobile candidate is **0.9.51**, following historical
-**0.9.5/build22**; this explicit transition is not inferred by padding 0.9.5.
-Subsequent Mobile publications are 0.9.52, 0.9.53, and so on.
+Current reference, consolidated on 16 November 2026.
 
-Desktop Windows remains **0.9.0**; no Desktop binary publication is authorized
-in this mission. Desktop macOS development remains paused. Examples such as
-0.9.00 → 0.9.01 → 0.9.02 are display conventions: future strict SemVer/native
-metadata must use 0.9.0 → 0.9.1 → 0.9.2, with separate zero-padded display text
-only if requested. Never feed zero-padded components into strict version parsers.
-The current Desktop display is not retroactively renamed.
+## Sources
 
-Native versions and public source metadata must agree with the built product.
-Mobile Settings reads PackageInfo from the installed native package, never a
-history alias or a hardcoded replacement. iOS has no Beta footer (Apple 2.2);
-Android keeps “OSIA <installed version> — Beta”.
+- [osia/version.py](../osia/version.py) owns Desktop `PRODUCT_VERSION`,
+  `RELEASE_SEQUENCE` and historical display aliases.
+- [osia/release_notes.py](../osia/release_notes.py) records embedded Desktop
+  release history. A source declaration is distinct from a published artifact.
+- [The historical inventory](WOR-357-version-inventory.md) preserves dated
+  source/artifact/store observations and original hashes.
+- Current build, publication and operator-acceptance order is maintained in
+  [AGENTS.md](../AGENTS.md) and the [Drive installer rules](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view).
 
-Build identifiers are independent, unique, positive and monotonic. Query live
-Apple all-version builds and the complete Play bundle inventory before assigning
-a new candidate. The 23 October inspection found Apple max23 and Play max22;
-0.9.51 therefore starts at build24. Codemagic rechecks Apple's all-version
-maximum at build time and advances further if necessary. Reconcile the actual
-IPA build rather than assuming it equals the source floor.
+## Numbering
 
-Compare numeric components, never version strings. Existing Desktop
-parse_product_version rejects leading zeros and updater.compare_versions uses
-numeric tuples plus its explicit legacy epoch rules; releaseSequence remains
-the authoritative update epoch. Mobile native upgrades use versionCode and
-CFBundleVersion. Historical 1.x identifiers and display aliases must not be
-rewritten to manufacture an update order. No installed channel or migration
-policy is changed here.
+The operator's version instruction normally increments the last numeric public
+component for a newly published update; an explicitly requested version takes
+precedence. Technical product versions use numeric SemVer components without
+leading zeros. Display aliases are presentation, not rewritten native versions.
+Comparison uses numeric components and the updater's explicit legacy epochs.
 
-Never reuse a native build, overwrite an immutable release object, change an
-old URL, or describe an uploaded draft as store-public. Preserve Mobile
-0.9.5/build22 and Windows0.9.0 exactly. Store submission, physical acceptance,
-APK publication, and financial-site publication remain separate gates.
+Desktop `releaseSequence`, Android `versionCode` and iOS `CFBundleVersion` are
+independent monotonic build/update identities. Mobile Settings reads the native
+installed package version. Its public product version is not inferred by
+padding an old version or by renaming historical artifacts.
 
-Final0.9.51 native candidates: Android24 and iOS25. iOS24 failed its stale
-packaging guard and was not reused;25 passed verification and uploaded. Native
-build floors may differ by platform without changing the shared public product
-version. Failed/unpublished candidate builds do not manufacture another public
-version increment. The next separately published Mobile update is0.9.52.
+The historical inventory and the release workflow distinguish source floors,
+queried store maxima, failed candidates, uploaded drafts and public releases.
+Old artifact URLs, identities and hashes retain their original meaning. Failed
+or unpublished builds do not manufacture a new public version increment.
+
+## Removed dated candidate instructions
+
+The original 23 October instruction moved Mobile from 0.9.5/build22 to the
+explicitly requested 0.9.51; Android24 and iOS25 were the final candidates, after
+iOS24 failed a packaging guard. Those observations do not prescribe today's next
+version, build floor or store maximum. [The original report](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/version-policy.md)
+preserves their exact provenance. Desktop 0.9.0 and next-Mobile 0.9.52 statements
+have been removed from the active policy.

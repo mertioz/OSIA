@@ -1,5 +1,9 @@
 # Production direct-first transport
 
+Technical reference checked against the current configuration on 16 November 2026.
+Project rules and release order are maintained in [AGENTS.md](../AGENTS.md) and
+the [Drive installer workflow](https://drive.google.com/file/d/11nRvwHVxn0JzaZbKqE8Mzy6pEyVVBGK4/view).
+
 OSIA selects exactly one authoritative mobile application transport in this
 order:
 
@@ -136,10 +140,10 @@ Troubleshooting order:
 
 To replace the production endpoint, update `PRODUCTION_STUN_URL`, increment
 `TRANSPORT_DEFAULTS_SCHEMA_VERSION` so existing installations migrate once,
-repeat official-source/privacy review, run DNS and credential-free Binding tests
-from Windows and Android Wi-Fi/mobile data, rerun the full transport matrix, and
-ship both PC and mobile release artifacts together. Never silently substitute a
-different public provider.
+repeat the endpoint/privacy and cross-platform transport validation described
+by that change. The current coordinated build/publication procedure is maintained
+in the release workflow linked above; this reference does not grant release
+authorization or silently substitute a different public provider.
 
 The implementation is cross-platform on Windows, macOS, and Linux. Platform
 installation mechanics differ, but the authenticated ICE contract, direct-first

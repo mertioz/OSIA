@@ -1,84 +1,52 @@
-# Claude connection for the Windows candidate
+# Claude API connection
 
-Rechecked 18 October 2026. This supersedes the previous audit's statement that
-native Messages is future work. ChatGPT Account already works in the operator's
-source checkout; authenticated source acceptance is not a release prerequisite.
+Implementation reference checked on 16 November 2026. This is the single Claude
+transport/authentication reference; the earlier provider-wide audit's claim
+that native Messages was future work is no longer current.
 
-## Implemented connection
+## Implemented route
 
-OSIA uses the native `/v1/messages` API by default for Claude API. The existing
-Console key card opens the official key page and accepts a workspace ID. Keys
-continue through `key_chain.iter_keys`, including technical-failure rotation.
-Console workspace selection determines API billing. Eligible Max/Team monthly
-API credits can fund API requests when linked through Anthropic's Console;
-this does not turn a BYOK request into subscription-limit traffic.
+[osia/claude_messages.py](../osia/claude_messages.py) uses native `/v1/messages`
+by default. `anthropic_transport=compatibility` retains the OpenAI-compatible
+route. Both use the existing Console API-key configuration and optional
+workspace ID. [osia/anthropic_api.py](../osia/anthropic_api.py) constructs the
+headers; [key_chain](../osia/utils/key_chain.py) owns key rotation.
 
-Native transport supports exact model IDs, system/history context, SSE text,
-provider-returned public Thinking summaries, signatures and redacted blocks,
-native tool proposals and correlated tool results, images, usage and rate-limit
-metadata, typed API errors and the canonical stream cancellation mechanism.
-Only OSIA dispatch executes tools. No Agent SDK or second execution loop exists.
-The optional `anthropic_transport=compatibility` setting retains the previous
-OpenAI-compatible transport. Switching transport never changes billing/account.
-Messages requires a per-response `max_tokens`; the adapter supplies 16384 and
-reports `max_tokens` stop as truncation, never objective completion. No global
-turn/tool/retry ceiling is introduced. Usage/rate metadata is available on the
-PC transport; no new Mobile wire schema or quota UI is claimed.
+Native Messages supports system/history context, SSE text, native tool proposals
+and correlated results, images, usage/error metadata, signed/redacted blocks
+and provider-returned public Thinking summaries. OSIA executes tools through
+its canonical Chat runtime. Transport adaptation creates no Agent SDK loop.
 
-## Official authentication boundaries
+Messages requires a per-response `max_tokens`; the adapter currently supplies
+16384 when no value is provided. A `max_tokens` stop is truncation, not objective
+completion. This protocol field is not a global turn, tool or retry ceiling.
 
-* [Console CLI authentication](https://platform.claude.com/docs/en/cli-sdks-libraries/cli/authentication)
-  documents `ant auth login`, browser or pasted-code OAuth, workspace binding,
-  named profiles and CLI-owned token refresh/storage. It documents local CLI
-  development/scripting; it does not establish a public OAuth client
-  registration grant for OSIA. We do not reuse its client ID, credentials,
-  private store or Claude Code tokens. A CLI integration would also require a
-  reviewed redistributable Windows runtime and supported inference interface.
-* [Developer login guidance](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account)
-  directs applications built for others to Console API authentication.
-* [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
-  requires prior Anthropic approval for third-party products offering claude.ai
-  login or rate limits. This is the precise approval boundary for OSIA.
-* [Plan notice](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
-  says eligible SDK/third-party subscription usage continues. It does not grant
-  OSIA its own OAuth client or supersede the developer approval condition.
-* [API credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
-  are distinct from subscription allowance. Provider account eligibility,
-  linking, balances and actual entitlement require operator verification.
+## Authentication and billing boundary
 
-No unauthorized subscription-login button is shipped. Console OAuth for an
-OSIA-owned client and subscription access remain externally unconfirmed;
-this limitation does not block native API inference in the candidate.
+The implemented route is Console API/BYOK. Workspace selection identifies the
+API billing context; it does not turn API requests into subscription-limit
+traffic. Account eligibility and actual request access are separate from key
+presence or catalogue visibility.
 
-## Operator-ready request to Anthropic (not sent)
+The 18 October 2026 authentication review established no OSIA-owned Console OAuth
+client or approved claude.ai subscription-login route. It distinguished the
+documented CLI-managed authentication from product-owned OAuth and recorded
+that third-party product subscription access required provider approval. These
+are the audit's qualified findings, not a newly verified entitlement statement.
+The [original sources, unsent provider request and limitations](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-344-claude-authentication.md)
+remain available for a future specifically authorized investigation.
 
-Subject: OSIA desktop — approved Console OAuth and Claude subscription access
+## Historical corrections and evidence
 
-We develop OSIA (https://osia.space), a Windows desktop assistant with a Mobile
-client. The desktop owns model execution and the user's local credentials.
-We currently integrate Claude through the native Messages API with user-supplied
-Console API keys and optional workspace selection. All tool execution stays
-inside OSIA's canonical Chat engine with cancellation and factual receipts.
+The earlier WOR-343 work corrected five independent problems: retired process
+callbacks/login waits (`c4d14d6f`), exact model/account freshness (`7f2d9707`),
+Claude workspace headers (`07ce8b30`), observed logout state (`e1ed7eb9`) and
+complete Claude model pagination (`6bda58fb`). The final combined harness then
+reported 404 passes; it performed no authenticated provider inference. Its
+[complete dated audit](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-343-provider-audit.md) preserves the full SHAs and failure
+reproductions, rather than duplicating its superseded transport instructions.
 
-We request confirmation of OSIA's eligibility to offer an application-owned
-Console browser/device OAuth sign-in and, separately, claude.ai Pro/Max/Team
-subscription access. Please provide the application/partner approval process,
-OAuth client registration, permitted scopes, PKCE/redirect requirements,
-refresh/revoke rules, Windows distribution requirements, branding requirements,
-workspace-selection contract and explicit API-credit/subscription billing rules.
-
-Our integration needs a supported native inference transport with streaming,
-public Thinking summaries and tools, while retaining OSIA's existing execution
-engine. We will not impersonate Claude Code, copy another application's tokens,
-or silently switch a user from subscription allowance to paid API usage.
-Please confirm whether this architecture is supported and which approval is
-required before enabling a sign-in button in a distributed OSIA build.
-
-## Validation
-
-269 focused regressions pass, including native and compatibility HTTP fixtures,
-actual canonical temporary-file reads and native result reinjection with the
-same model, public Thinking, typed errors, account lifecycle, cancellation,
-ActionTruth, DeepSeek and PC-side Mobile projection. No real paid requests or
-authenticated Claude login were performed. Frozen/package validation is tracked
-separately in WOR-344; both tickets remain open for operator acceptance.
+WOR-344's subsequent native/compatibility harness reported 269 passes, including
+same-model tool-result reinjection, cancellation and PC-side Mobile projection.
+These are recorded historical results, not claims that every paid key, account,
+frozen application or physical Mobile session was accepted.

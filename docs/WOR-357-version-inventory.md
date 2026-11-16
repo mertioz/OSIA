@@ -1,10 +1,18 @@
-# WOR-357 — historical version inventory and migration
+# Historical version inventory — 20 October 2026
 
-Audited 2026-10-20. These are display aliases, not rewritten releases. Original version/build identifiers, timestamps, channels, SHA-256 hashes, signatures and Git identities remain immutable. A source declaration is not proof of distribution.
+This snapshot predates the [Windows 0.9.0 publication](WOR-349-windows-0.9.0-rc.md).
+Its source declarations, native build/store observations, display aliases,
+timestamps and hashes are historical records. Store maxima and prepared builds
+below are not current release assignments or acceptance results.
+
+Current version sources and publication procedure are linked from
+[version-policy.md](version-policy.md). The old next-candidate/migration
+checklist has been removed; [the original full inventory](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-357-version-inventory.md)
+retains its provenance in Git history.
 
 ## Inventory scope and limits
 
-Both repositories have zero local/remote Git tags and zero GitHub Releases. Inventory uses all reachable source history, embedded Desktop release notes, historical site release-manifest commits (read-only GitHub API), the existing local packaging manifest, and the accepted Android package record. Live download channel requests returned HTTP errors; no channel was changed. A subsequent authenticated, read-only App Store Connect browser inspection on 2026-10-20 confirmed TestFlight versions 1.1.2 (builds 16, 15) and 1.0.1 (build 3; build 2 upload failed), with highest observed iOS build 16. Upload dates as displayed: build 16 Oct 7 2026 10:53 PM; 15 Oct 7 8:25 PM; 3 Jul 24 11:58 PM; failed 2 Jul 24 10:40 PM. No timezone, artifact hash or binary Git provenance is inferred from these labels. Google Play console inventory remains unavailable; its completeness is still a release gate. No unobserved builds 6–13 or hypothetical releases are invented.
+Both repositories have zero local/remote Git tags and zero GitHub Releases. Inventory uses all reachable source history, embedded Desktop release notes, historical site release-manifest commits (read-only GitHub API), the existing local packaging manifest, and the accepted Android package record. Live download channel requests returned HTTP errors; no channel was changed. A subsequent authenticated, read-only App Store Connect browser inspection on 2026-10-20 confirmed TestFlight versions 1.1.2 (builds 16, 15) and 1.0.1 (build 3; build 2 upload failed), with highest observed iOS build 16. Upload dates as displayed: build 16 Oct 7 2026 10:53 PM; 15 Oct 7 8:25 PM; 3 Jul 24 11:58 PM; failed 2 Jul 24 10:40 PM. No timezone, artifact hash or binary Git provenance is inferred from these labels. Google Play console inventory was unavailable to the 20 October audit; that snapshot did not establish its completeness. No unobserved builds 6–13 or hypothetical releases are invented.
 
 ## Desktop identities
 
@@ -67,19 +75,4 @@ These are original site-manifest records, not new publication dates. `available=
 | windows 1.1.6 (rollback) | not recorded | 2026-10-08T07:55:52Z | `aeafacd25162f9e944e225d9a35833230d9875f83cf8c27edf87eb65b8b5e995` | `c9773da23b0ce81027480d0526e5de3ce4682a10` |
 | android 1.1.2+16 (available=False) | 2026-10-08 | 2026-10-10T15:28:45Z | `not recorded` | `7b5da92aaa03072c971606fa7d9a46ff9191676b` |
 
-The existing local Windows 1.0.6 internal-preview manifest additionally records publishedAt `2026-07-31T12:39:30Z`, SHA-256 `9fef97bc7990cddc22e2bebaf629fc52d825566139dcc5fe85ec345820887a8b`, size 1185772401, source `6953685f38ec804b4de4ccb537113ea0b4cdfbdf`. It differs from the public rollback hash; both records are preserved. The existing Windows installer rollback documentation records public 1.1.5 at `https://download.osia.space/windows/1.1.5/OSIA-Setup.exe`, size 1186101696, SHA-256 `0098631f3d19abc089a273ad7ab75ee1d6350f0a9cb64ddeec10ebf5fe4f1fcf`. These are recorded metadata, not freshly rehashed downloads. Earlier 1.0.x artifact hashes remain unverified. Do not manufacture absent hashes.
-
-## Source transition and migration contract
-
-- Desktop runtime, Qt version, Windows PE product version, Inno product version and future manifest generator derive from `osia.version.PRODUCT_VERSION = 0.9.0`. New update schema 2 carries integer `releaseSequence = 2026102001`, shared by embedded metadata, channel manifest and installer registry marker. Future releases must increment it.
-- Strict schema 1 parsing remains for historical metadata. New-schema candidates compare explicit sequences; known legacy metadata maps to the original technical sequence. New installed schema-2 clients refuse old schema-1 update manifests. Channel, URL, hash, signature, architecture and rollout checks remain in force.
-- Legacy binaries cannot be retroactively taught schema 2 or lower SemVer. Initial migration uses the separately reviewed standalone 0.9.0 installer. Do not deploy schema 2 onto the old channel as if old clients supported it. No historical installers/manifests are modified and no bridge build is fabricated.
-- Inno verifies the existing registry version against the existing PE version, same install directory/AppId and valid layout. Known 1.0.0–1.0.6 / 1.1.0–1.1.8 identities without a sequence may enter the new epoch. New installs persist sequence. Both interactive and updater launches reject backward sequence; same-sequence interactive repair remains possible. Future unknown legacy identities fail closed.
-- Historical aliases are presentation only: Qt cards/notes/notifications show aliases with original identity in card tooltips; historical note data and URLs remain intact. Mobile shows build-qualified development history and original identity in Settings.
-- No user-data path/schema/package identity, pairing store, account profile or signing key changes. No migration clears data. Real signed installer upgrade/repair/rollback with populated isolated profiles is still a binary acceptance gate.
-- Mobile pubspec is 0.9.5+19. Android uses that versionName/code and rejects overrides <=18. This exceeds all observed source/site/private codes. Google Play all-track maximum must still be inspected before publication.
-- iOS product version remains wired through FLUTTER_BUILD_NAME. The authenticated TestFlight inventory establishes maximum 16 as of 2026-10-20; 19 is safely prepared above it and Android 18, without building or uploading. It is not a completed signed iOS assignment. Both manual Codemagic workflows query `app-store-connect get-latest-build-number --platform IOS --all-versions` before selecting max(source floor, store max+1). Empty/invalid/inaccessible responses fail. Local official release helper requires the queried maximum and a greater selected build. No workflow was triggered; no iOS build/submission occurred.
-
-The Apps page also reports an updated Apple Developer Program agreement awaiting account-holder review; no acceptance was performed. Recheck the live maximum at build time and resolve that operator gate before upload. The detailed browser inventory is in Mobile `docs/WOR-357-ios-build-inventory.md`.
-
-Codemagic CLI contract: https://github.com/codemagic-ci-cd/cli-tools/blob/master/docs/app-store-connect/get-latest-build-number.md . iOS physical update/Keychain/pairing and marketing-version acceptance by the store remain unverified. All historical public site surfaces are a later publication task; this mission changes only the two primary source repositories.
+The existing local Windows 1.0.6 internal-preview manifest additionally records publishedAt `2026-07-31T12:39:30Z`, SHA-256 `9fef97bc7990cddc22e2bebaf629fc52d825566139dcc5fe85ec345820887a8b`, size 1185772401, source `6953685f38ec804b4de4ccb537113ea0b4cdfbdf`. It differs from the public rollback hash; both records are preserved. The existing Windows installer rollback documentation records public 1.1.5 at `https://download.osia.space/windows/1.1.5/OSIA-Setup.exe`, size 1186101696, SHA-256 `0098631f3d19abc089a273ad7ab75ee1d6350f0a9cb64ddeec10ebf5fe4f1fcf`. These are recorded metadata, not freshly rehashed downloads. Earlier 1.0.x artifact hashes were not verified by that audit. Earlier missing hashes were not established by that audit.

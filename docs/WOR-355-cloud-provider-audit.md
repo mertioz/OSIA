@@ -1,92 +1,59 @@
-# Cloud provider audit — 2026-10-20
+# Provider discovery and transport reference
 
-Scope: WOR-355, primary Desktop and Mobile repositories. No paid inference was
-authorized or performed. Published availability, account discovery, synthetic
-transport tests and physical acceptance are different evidence levels.
+Implementation reference checked on 16 November 2026. Product/runtime authority
+and verification workflow are defined in [AGENTS.md](../AGENTS.md); this page
+documents the implementation locations and provider-specific boundaries.
 
-## Provider findings and official sources
+## One inventory
 
-| Provider | Official contract and models | OSIA implementation / limits |
-|---|---|---|
-| OpenAI API | [Models](https://developers.openai.com/api/docs/models), [list](https://developers.openai.com/api/reference/resources/models/methods/list), [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra), [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) | Bearer API key. Add documented `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` and `gpt-5.6-sol/terra/luna`. Preserve existing GPT-5.5, GPT-5.4 and GPT-4.1 entries when discovery lists them. GPT-6.1 tools require Responses; GPT-6 Sol/Luna chat-completions tools require reasoning none. Use Responses for all new entries. Text/image input, text output, streaming/functions, 1,050,000 context. Astra/6.1 efforts low/medium/high/xhigh/max; Sol/Luna and 5.6 additionally none. |
-| ChatGPT Account | [App Server model/list](https://learn.chatgpt.com/docs/app-server#list-models-modellist) | Separate managed authentication and catalogue, unchanged native runtime. Account-specific returned IDs, modalities and effort options remain authoritative; no API-key catalogue substitutes for it. RPC pagination retained. Discovery can reflect a bundled/cache catalogue rather than all current public API releases. |
-| Anthropic | [Models](https://platform.claude.com/docs/en/models/overview), [Models API](https://platform.claude.com/docs/en/api/models/list) | Native Messages, x-api-key, anthropic-version, optional workspace header. Current documented IDs: `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`; old valid IDs remain eligible when listed. Text/image, text output, tools/streaming, 1M context. Discovery supplies image_input, thinking types, effort options and input limit. Never offer disabled thinking if provider metadata excludes it. Keep signed/redacted native blocks and public summarized thinking behavior. |
-| Gemini | [Models](https://ai.google.dev/gemini-api/docs/models), [list](https://ai.google.dev/api/models), [release notes](https://ai.google.dev/gemini-api/docs/changelog), [Argon](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon), [3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) | Add `gemini-4-argon` (GA October 13), `gemini-3.8-flash` (September). Discovery uses x-goog-api-key and nextPageToken, filters generateContent and excludes media-only services. Inference retains official OpenAI-compatible endpoint. Low/medium/high thinking; minimal is invalid on 3.8. Image input, streaming/functions, 1,048,576 context. Providers also accept audio/video/PDF natively; those modalities are not newly enabled in OSIA by this ticket. |
-| DeepSeek | [Models API](https://api-docs.deepseek.com/api/list-models/), [thinking](https://api-docs.deepseek.com/guides/thinking_mode), [API overview](https://api-docs.deepseek.com/) | Enable authenticated discovery. Sole selectable ID remains `deepseek-flash`; preserve off/low/high/max, vision, native streaming and tool/context handling already covered by WOR-298/303. Retired aliases and invented future IDs cannot reappear. |
-| GroqCloud | [Models](https://console.groq.com/docs/models), [deprecations](https://console.groq.com/docs/deprecations), [reasoning](https://console.groq.com/docs/reasoning) | Separate from Grok. Add `qwen/qwen3.8-27b`: text/image, functions/streaming, 131,072 context, none/low/medium/high. GPT-OSS 20B/120B retain low/medium/high and 131,072 context. Ordinary-tier Llama 8B/70B retired August 16; enterprise exceptions remain discoverable. Qwen 3.6 ordinary tiers retired September 14. Compound retired September 21. STT/TTS/safety/Compound entries are excluded from Chat. Enterprise MiniMax/Muse remain discoverable without assuming account access. No private reasoning is promoted into public Thinking. |
-| Mistral | [Models](https://docs.mistral.ai/models), [Models API](https://docs.mistral.ai/api/endpoint/models), [Large 4](https://docs.mistral.ai/models/mistral-large-4-0) | Enable Bearer-key discovery; completion_chat distinguishes chat from OCR/embedding/FIM. Use returned vision/function_calling/max_context_length. Add public-preview `mistral-large-4` (October 6), multimodal, tools/streaming, 1M context. Retain usable Large 3/Medium 3.5/Small 4 entries. Unknown efforts use provider default rather than fabricated settings. |
-| xAI | Already present as a legacy entry; official Responses integration and account-login research belong to WOR-356. | Not GroqCloud; same canonical execution authority. |
-| Ollama | Existing local provider, outside cloud refresh. | Local discovery/profile behavior unchanged. |
+[osia/models.py](../osia/models.py) owns cloud discovery and documented fallback
+metadata. A successful complete response replaces a provider's previous list,
+including a successful empty response. A partial/corrupt pagination response is
+not presented as a complete inventory. Failed/stale discovery does not turn an
+unverified static fallback into an available picker entry. The current cache
+duration is declared by `_DISCOVERY_TTL` in that module.
 
-All links were retrieved on 2026-10-20. Models above were documented by this
-date; no release after that date is intentionally added. Rate limits, regional
-access, credits and special model eligibility remain account/provider-specific.
-No current price is used as an execution or routing decision.
+Credential, workspace and endpoint changes invalidate discovery. Key rotation
+uses [key_chain](../osia/utils/key_chain.py) for technical failures rather than
+content errors. An existing explicit model selection is preserved; catalogue
+presence and credential presence do not establish execution entitlement.
 
-## Discovery and availability
+[osia/mobile_model_catalogue.py](../osia/mobile_model_catalogue.py) projects the
+PC-owned model identity, display name, source, availability, modalities and
+effort options. Mobile does not maintain another authoritative catalogue.
 
-Desktop owns one in-memory inventory. Successful complete discovery replaces
-that provider's list, including a successful empty list. Errors do not resurrect
-static entries. Partial/corrupt pagination is rejected. Historical static
-records remain explicit unverified fallbacks, disabled in the PC/Mobile picker.
-Snapshots expire after 15 minutes; Desktop refreshes every 10 minutes. Existing
-selected configuration is preserved; expiration does not terminate a running
-turn. Credential/workspace/fallback changes invalidate old discoveries and
-in-flight callbacks. Only technical errors rotate keys through the shared key
-chain; content errors such as 404 do not rotate.
+## Capability and transport locations
 
-Some list endpoints do not report endpoint/tool capabilities. OpenAI and xAI
-therefore intersect returned IDs with documented exact contracts; unrecognized
-IDs cannot silently become usable chat models. This is a capability limitation,
-not evidence that an unknown model is unavailable at the provider. Future
-Responses-only contracts may require another documented metadata entry. Claude,
-Mistral and Google preserve the metadata their endpoints actually expose.
+| Route | Implementation reference |
+| --- | --- |
+| OpenAI API exact contracts | [openai_model_contracts.py](../osia/openai_model_contracts.py), discovered IDs and capability intersection in models.py |
+| ChatGPT Account | [chatgpt_account/provider.py](../osia/chatgpt_account/provider.py), managed App Server catalogue and authentication, independent of the API-key catalogue |
+| Claude API | [Claude reference](WOR-344-claude-authentication.md), native Messages and optional compatibility adapter |
+| Gemini / Groq / Mistral | Provider discovery in models.py, shared [model capabilities](../osia/model_capabilities.py) and [reasoning options](reasoning-capabilities.md) |
+| DeepSeek | [Canonical model and image reference](WOR-298-deepseek-flash.md) |
+| xAI / Grok | [Grok reference](WOR-356-grok-api-audit.md), separate from GroqCloud |
+| Ollama | Local discovery in models.py; not a cloud account route |
 
-Compatibility review additionally preserves discovered GPT-4o/4o-mini,
-GPT-5/mini/nano/5.1/5.2/5.4-nano, their explicitly documented dated snapshots,
-o1/o3/o3-mini/o4-mini, Pro variants and Daybreak aliases. Each contract was
-retrieved from its official OpenAI model page on the verification date.
-`osia/openai_model_contracts.py` contains discovery-only metadata rather than
-more offline dropdown entries. Unsupported or unknown IDs remain excluded;
-account entitlement is still determined by `/models`. GPT-5.5 Pro's page does
-not advertise streaming: its request runs without SSE and the completed reply
-is projected into the existing UI stream only after completion. Its capability
-is explicitly `streaming: false`; OSIA does not claim native streaming support.
+[osia/responses_api.py](../osia/responses_api.py) translates supported Responses
+requests/events. Tools are advertised from OSIA's registry; their execution and
+factual result reinjection stay in the selected canonical route. Opaque
+provider context is retained for its exact route, while a route change uses
+factual textual history. Interrupted streams and typed errors are not success.
+Public provider summaries and private reasoning remain distinct.
 
-Mobile receives exact provider/model identity, availability and source fields,
-and renders the PC display name. It maintains no new independent model list.
-Secrets and raw provider responses are never serialized in the catalogue.
+## Historical evidence
 
-## Runtime and validation
+The 20 October 2026 audit recorded free DeepSeek, Groq and managed ChatGPT model
+discovery. Other provider requests used real SDKs with synthetic HTTP results;
+no paid inference was performed. Its old model-addition checklist is replaced
+by the executable inventory above. [The dated matrix, exact discovered IDs and
+test limits](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-355-cloud-provider-audit.md) remain available without becoming another current
+catalogue or promise of account access.
 
-ResponsesClient translates requests/stream items only. It advertises OSIA tools;
-OSIAAgent dispatches them, correlates receipts, then reinjects function outputs
-and opaque reasoning into the original route. Provider/model switches use
-textual factual history instead of another route's ciphertext. EOF/errors are
-not completion. Only summary_text events enter public Thinking; raw reasoning
-deltas are ignored. ChatGPT Account and native Claude retain their transports.
-
-Real, free discovery on this machine: DeepSeek returned `deepseek-flash`; Groq
-returned `allam-2-7b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`,
-`openai/gpt-oss-120b`. Managed ChatGPT returned GPT-6 Astra/Sol/Luna,
-GPT-5.6 Sol/Terra/Luna and Daybreak Blue, with their own effort metadata.
-GPT-6.1 Sol is documented publicly but was absent from this account catalogue;
-OSIA does not inject it into ChatGPT Account.
-
-No API keys were configured for OpenAI API, Claude, Gemini, Mistral or xAI.
-Their wire contracts are tested using the real OpenAI SDK with synthetic HTTP
-responses. Canonical tests actually read a temporary local file through OSIA and
-check native result reinjection in both streaming and nonstreaming modes.
-This establishes implementation behavior, not live inference success.
-
-Validation commands/results and synchronized commit SHAs are recorded in the
-Linear delivery comment. Historical non-DeepSeek regression tests now preserve
-their established contracts while allowing WOR-355's intentional additions.
-
-## Before WOR-357
-
-Configure missing provider API keys on Desktop and, with explicit paid-call
-authorization, validate a text/image/tool/stream/Stop turn for each provider.
-Revalidate Thinking on a new private Android test build and on iOS. Preserve
-pairing, credentials, conversations and existing updater ordering; no version,
-public build, store submission or Linux packaging is part of this delivery.
+The combined WOR-354/355/356 delivery recorded 271 Python passes, a subsequent
+35-case focused pass, 512 Flutter passes and one skipped opt-in relay diagnostic.
+Its Android fixture built but wireless ADB disconnected during installation;
+no physical acceptance was claimed. The unique Mobile Thinking-touch evidence
+is [the original Mobile report](https://github.com/mertioz/osia-mobile/blob/ff96862917efd40fa8009f59a8840ca6cbdb749e/docs/WOR-354-thinking-touch.md).
+The [complete delivery and source-commit table](https://github.com/mertioz/OSIA/blob/3c6c5beb2979de717a46ee8ccfc56235ad3eeba1/docs/WOR-354-356-delivery.md) preserve that
+history; its old “next release” instructions are not current gates.
