@@ -43,6 +43,7 @@ class PublicCommentaryStream:
         self.text = ""
         self.calls = {}
         self.tool_context = False
+        self._text_may_contain_call = False
         self.emitted = ""
         self.order = 0
         self.started = time.monotonic()
@@ -57,7 +58,12 @@ class PublicCommentaryStream:
 
     def observe(self, delta):
         text = public_assistant_text(getattr(delta, "content", None))
+        had_tool_context = self.tool_context
         self.text += text
+        # Every supported textual format starts with XML/DSML markup or a
+        # JSON object. Track new fragments instead of reparsing an ever longer
+        # plain answer at every token. Native calls are assembled independently.
+        self._text_may_contain_call |= "<" in text or "{" in text
         for call in getattr(delta, "tool_calls", None) or ():
             index = getattr(call, "index", None)
             if isinstance(index, bool) or not isinstance(index, int) or index < 0:
@@ -73,9 +79,11 @@ class PublicCommentaryStream:
                     value[key] += fragment
             # A native tool delta supplies semantics before its JSON is whole.
             self.tool_context = True
-        if not self.tool_context and text and self.parse(self.text, self.message):
+        if (not self.tool_context and text and self._text_may_contain_call
+                and self.parse(self.text, self.message)):
             self.tool_context = True
-        self._publish(complete=False)
+        if text or (self.tool_context and not had_tool_context):
+            self._publish(complete=False)
         self._diagnose("delta", len(text))
         return text
 
@@ -102,6 +110,8 @@ class PublicCommentaryStream:
 
     def _diagnose(self, boundary, chars):
         self.order += 1
+        if not _LOG.isEnabledFor(logging.DEBUG):
+            return
         # Opt-in DEBUG metadata only: no prompts, text, arguments or reasoning.
         _LOG.debug(
             "thinking_timeline provider=%s model=%s turn=%s round=%s order=%s "

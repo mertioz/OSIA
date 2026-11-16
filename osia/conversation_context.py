@@ -542,7 +542,7 @@ def _canonical_entries(messages: list, conversation_id: str) -> tuple[list[_Entr
         message = {
             key: copy.deepcopy(value)
             for key, value in raw.items()
-            if key in _WIRE_KEYS
+            if key in _WIRE_KEYS and key != "content"
         }
         message["role"] = role
         message["content"] = copy.deepcopy(content)
@@ -847,9 +847,10 @@ def build_context(
     """Return the exact bounded logical context and a sanitized receipt."""
 
     conversation = str(conversation_id or "")
-    logical_messages = [
-        copy.deepcopy(message) for message in messages
-    ] if isinstance(messages, list) else messages
+    # Only the list is edited here. _canonical_entries validates and deeply
+    # copies every wire value once; copying the full private history before
+    # that boundary only repeats the same work on every provider round.
+    logical_messages = list(messages) if isinstance(messages, list) else messages
     latest_user_content = next(
         (
             message.get("content", "")
@@ -890,7 +891,7 @@ def build_context(
     entries, duplicates_removed = _canonical_entries(
         logical_messages, conversation,
     )
-    before = [copy.deepcopy(entry.message) for entry in entries]
+    before = [entry.message for entry in entries]
     resolved_limit = int(
         context_limit
         if context_limit is not None

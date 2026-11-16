@@ -2758,11 +2758,28 @@ def effective_static_tool_specs() -> tuple[ToolSpec, ...]:
     return static_tool_inventory_specs()
 
 
+_static_prompt_cache: dict[str, str] = {}
+_static_prompt_cache_lock = threading.Lock()
+
+
 def static_tool_prompt_block(lang: str = "en") -> str:
     """Render compact canonical signatures from the authoritative registry."""
 
     del lang
     specs = effective_static_tool_specs()
+    # Resolve availability on EVERY call. Cache only the rendered text, keyed
+    # by all of its inputs, including nested schemas and conversation options.
+    # Registry rebinding or an in-place schema edit therefore takes effect
+    # immediately; no tool visibility, dispatch or private prompt is cached.
+    cache_key = json.dumps([
+        (spec.name, spec.capability, spec.input_schema, spec.result_policy.value,
+         spec.side_effect.name, spec.preconditions)
+        for spec in specs
+    ], ensure_ascii=False, separators=(",", ":"))
+    with _static_prompt_cache_lock:
+        cached = _static_prompt_cache.get(cache_key)
+    if cached is not None:
+        return cached
     schemas, definitions = _prompt_schema_bundle(specs)
     lines = [
         "## Available OSIA capabilities",
@@ -2835,7 +2852,12 @@ def static_tool_prompt_block(lang: str = "en") -> str:
                 separators=(",", ":"),
             )
         )
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    with _static_prompt_cache_lock:
+        if len(_static_prompt_cache) >= 16 and cache_key not in _static_prompt_cache:
+            del _static_prompt_cache[next(iter(_static_prompt_cache))]
+        _static_prompt_cache[cache_key] = rendered
+    return rendered
 
 
 def _prompt_schema_bundle(specs: Iterable[ToolSpec]) -> tuple[dict, dict]:

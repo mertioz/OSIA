@@ -10779,12 +10779,13 @@ class OSIAAgent:
         ("<thinking>", "</thinking>"),
     )
 
-    # Match a sentence-ending punctuation char followed by whitespace or end-of-string.
-    _SENTENCE_END_RE = re.compile(r'[.!?](?=\s|$)')
+    # Require a real separator while streaming: the end of a delta may be
+    # the middle of a decimal or abbreviation. The final tail is flushed below.
+    _SENTENCE_END_RE = re.compile(r'[.!?](?=\s)')
     # Secondary break points used for early flush — commas, semicolons,
     # colons, em/en-dashes. Lets a long lead-in clause start synthesizing
     # before the model emits the final period.
-    _EARLY_BREAK_RE = re.compile(r'[,;:—–](?=\s|$)')
+    _EARLY_BREAK_RE = re.compile(r'[,;:—–](?=\s)')
     _EARLY_FLUSH_MIN_CHARS = 40
 
     def _emit_sentences(self, speakable: str, on_sentence, flush: bool = False) -> str:
@@ -10802,8 +10803,10 @@ class OSIAAgent:
             if m:
                 end = m.end()
             elif len(speakable) >= self._EARLY_FLUSH_MIN_CHARS:
-                early = self._EARLY_BREAK_RE.search(speakable)
-                if not early or early.end() < self._EARLY_FLUSH_MIN_CHARS:
+                early = self._EARLY_BREAK_RE.search(
+                    speakable, self._EARLY_FLUSH_MIN_CHARS - 1,
+                )
+                if not early:
                     break
                 end = early.end()
             else:
@@ -10937,10 +10940,15 @@ class OSIAAgent:
                         think_idx, think_open, think_end = idx, open_tag, close_tag
 
                 if tool_idx == -1 and think_idx == -1 and dsml_idx == -1:
-                    # Hold back the last few chars in case they're the start of
-                    # a partial "<tool_call>"/"<thinking>"/DSML token split
-                    # across chunks (DSML tokens are longer, so hold more).
-                    safe = max(0, len(pending) - 24)
+                    # Retain only an unfinished tag, including whitespace in
+                    # DSML prefixes. Plain prose need not wait for 24 more
+                    # characters after an already complete sentence. Keeping
+                    # the whole partial tag also protects long split prefixes.
+                    opening = pending.rfind("<")
+                    safe = (
+                        opening if opening > pending.rfind(">")
+                        else len(pending)
+                    )
                     speakable += pending[:safe]
                     pending = pending[safe:]
                     speakable = self._emit_sentences(speakable, on_sentence)

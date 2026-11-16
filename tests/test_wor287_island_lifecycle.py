@@ -272,6 +272,8 @@ def test_actual_voice_callbacks_wait_for_playback_and_fence_old_session():
     playback_done = [False]
     released = []
     ns.update(voice_session=session, owned_tts_session=[42],
+              desktop_speech_enabled=lambda: True,
+              manual_activation_open=threading.Event(),
               wait_for_playback_complete=lambda **_: playback_done[0],
               wake_gate=SimpleNamespace(finish=lambda: released.append(True)))
     ns["voice_ui_lifecycle"].begin(session)
@@ -378,7 +380,15 @@ def test_real_qt_queued_delivery_and_animation_settle(shape, reduced_motion, mon
         lifecycle.begin("chat", "a", "thinking")
         app.processEvents()
         assert island.current_state() == "thinking"
+        # Advance elapsed time, not just timer deliveries: delayed frames must
+        # not slow the animation or turn 100 immediate calls into 3.3 seconds.
+        elapsed = [0]
+        monkeypatch.setattr(island, "_state_clock", SimpleNamespace(
+            elapsed=lambda: elapsed[0],
+            restart=lambda: elapsed.__setitem__(0, 0),
+        ))
         for _ in range(100):
+            elapsed[0] += 33
             island._tick()
         assert island.current_state() == "thinking"  # no timeout cuts real work
         if not reduced_motion:
