@@ -63,6 +63,23 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.274", released_on="2026-11-17", public=True,
+        changes_en=(
+            'Short, responsive transitions accompany conversation opening, project folding, provider navigation, page changes and settings, while controls remain immediately usable.',
+            'The /control command replaces /mousecontrol and toggles physical pointer control and new screenshots together for the conversation; keyboard and structured web tools remain available.',
+            'The /status command shows the active model, context and available account quota, or estimated API tokens and cost by model with clear limits when usage or prices are unavailable.',
+            'The chat guide explains slash commands and using @ to include a past conversation as context. Read-only /status and /help remain available while Chat is working.',
+            'Technical guides are consolidated and updated; historical validation and fix reports are kept out of the source documentation folder.',
+        ),
+        changes_fr=(
+            'Des transitions courtes et réactives accompagnent les discussions, le repliage des projets, les fournisseurs, les pages et les paramètres, avec des contrôles immédiatement utilisables.',
+            'La commande /control remplace /mousecontrol et coupe ou réactive ensemble le pointeur physique et les nouvelles captures pour la discussion ; clavier et outils web structurés restent disponibles.',
+            'La commande /status affiche le modèle actif, le contexte et le quota du compte disponible, ou les jetons et coûts API estimés par modèle avec les limites des données et tarifs inconnus.',
+            'Le guide explique les commandes / et l’ajout d’une discussion passée avec @ pour enrichir le contexte. /status et /help restent consultables pendant le travail du Chat.',
+            'Les guides techniques sont regroupés et mis à jour ; les anciens rapports de validation et de correction sont retirés du dossier de documentation source.',
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.270", released_on="2026-11-16", public=True,
         changes_en=(
             "Chat prepares tool descriptions and conversation context with less repeated work, while preserving the complete tool inventory and independent history values.",
