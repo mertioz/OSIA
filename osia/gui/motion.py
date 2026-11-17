@@ -177,6 +177,7 @@ class ContentTransition(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._frame = QPixmap()
+        self._opacity_layer = QPixmap()
         self._alpha = 0.0
         self._animation = QVariantAnimation(self)
         self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -201,6 +202,7 @@ class ContentTransition(QWidget):
         self._animation.stop()
         self._animation.setCurrentTime(0)
         self._frame = frame
+        self._opacity_layer = QPixmap()
         self._alpha = 1.0
         self.setGeometry(target.rect())
         self.raise_()
@@ -231,6 +233,7 @@ class ContentTransition(QWidget):
         self._alpha = 0.0
         self.hide()
         self._frame = QPixmap()
+        self._opacity_layer = QPixmap()
 
     def eventFilter(self, watched, event):  # noqa: N802
         if event.type() in (QEvent.Type.Hide, QEvent.Type.Resize):
@@ -238,65 +241,54 @@ class ContentTransition(QWidget):
         return False
 
     def paintEvent(self, _event) -> None:
+        if self._frame.isNull() or self._alpha <= 0:
+            return
+        alpha = max(0.0, min(1.0, self._alpha))
+        source_alpha = round(255 * alpha)
+        if alpha < 1:
+            if (
+                self._opacity_layer.size() != self._frame.size()
+                or self._opacity_layer.devicePixelRatio() != self._frame.devicePixelRatio()
+            ):
+                self._opacity_layer = QPixmap(self._frame.size())
+                self._opacity_layer.setDevicePixelRatio(self._frame.devicePixelRatio())
+            self._opacity_layer.fill(Qt.GlobalColor.transparent)
+            fade = QPainter(self._opacity_layer)
+            fade.drawPixmap(0, 0, self._frame)
+            fade.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            fade.fillRect(self.rect(), QColor(0, 0, 0, source_alpha))
+            fade.end()
+
         painter = QPainter(self)
-        # Interpolate premultiplied RGBA, including OSIA's translucent canvas.
-        # SourceOver alone would show the new text through the old frame even
-        # at alpha=1. Keep the live destination proportional to the new frame.
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, round(255 * (1 - self._alpha))))
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
-        painter.setOpacity(self._alpha)
-        painter.drawPixmap(0, 0, self._frame)
+        if alpha >= 1:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            painter.drawPixmap(0, 0, self._frame)
+        else:
+            # Scale the source on a transparent surface BEFORE adding it. Qt's
+            # Plus composition with painter opacity clamps source+destination
+            # before applying that opacity: even two identical opaque frames
+            # become translucent mid-fade, revealing a bright desktop beneath.
+            # Each premultiplied term is now weighted before the sum, keeping
+            # the background alpha constant without freezing the live controls.
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 255 - source_alpha))
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+            painter.drawPixmap(0, 0, self._opacity_layer)
         painter.end()
 
 
-class ThemeTransition(QWidget):
-    """Fade the previous frame while the live window adopts its new palette."""
+class ThemeTransition(ContentTransition):
+    """Use the same alpha-preserving fade for popup and capsule theme changes."""
 
     def __init__(self, window: QWidget) -> None:
         super().__init__(window)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._frame = QPixmap()
-        self._alpha = 1.0
-        self._animation = QVariantAnimation(self)
         self._animation.setDuration(220)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._animation.setStartValue(1.0)
-        self._animation.setEndValue(0.0)
-        self._animation.valueChanged.connect(self._set_alpha)
-        self._animation.finished.connect(self._clear)
-        self.hide()
 
     def capture(self, _key: str) -> None:
-        window = self.parentWidget()
-        if not window.isVisible() or reduced_motion_requested(window):
-            self._animation.stop()
-            self._clear()
-            return
-        # A second switch starts from the frame the user currently sees.
-        frame = window.grab()
-        self._animation.stop()
-        self._frame = frame
-        self._alpha = 1.0
-        self.setGeometry(window.rect())
-        self.raise_()
-        self.show()
+        super().capture()
 
     def start(self, _key: str) -> None:
-        if self.isVisible() and not self._frame.isNull():
-            self._animation.start()
-
-    def _set_alpha(self, value: float) -> None:
-        self._alpha = value
-        self.update()
+        super().start(220)
 
     def _clear(self) -> None:
-        self.hide()
-        self._frame = QPixmap()
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setOpacity(self._alpha)
-        painter.drawPixmap(0, 0, self._frame)
-        painter.end()
+        self.settle()

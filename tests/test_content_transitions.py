@@ -9,15 +9,62 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QVariantAnimation
+from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtTest import QSignalSpy, QTest
 from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
 
 from osia.gui import main_popup
-from osia.gui.motion import ContentTransition, MOTION, MotionController
+from osia.gui import motion as motion_module
+from osia.gui.motion import ContentTransition, MOTION, MotionController, ThemeTransition
 from osia.gui.switch import OsiaSwitch
 
 
 APP = QApplication.instance() or QApplication([])
+
+
+@pytest.mark.parametrize("transition_type", [ContentTransition, ThemeTransition])
+@pytest.mark.parametrize("background_alpha", [0, 80, 169, 255])
+@pytest.mark.parametrize("scale", [1.0, 1.25, 2.0])
+def test_crossfade_preserves_background_alpha_at_every_frame(
+    transition_type, background_alpha, scale, monkeypatch,
+):
+    """A constant translucent surface must never reveal more of the desktop.
+
+    Exercise the actual overlay painter on a known backing-store pixel. A full
+    QWidget.grab alone hid this regression by repainting the whole window.
+    """
+    root = QWidget()
+    root.resize(40, 40)
+    transition = transition_type(root)
+    transition.resize(root.size())
+    original = QImage(round(40 * scale), round(40 * scale), QImage.Format.Format_ARGB32_Premultiplied)
+    original.setDevicePixelRatio(scale)
+    original.fill(QColor(32, 24, 45, background_alpha))
+    transition._frame = QPixmap.fromImage(original)
+    try:
+        for percent in range(0, 101, 5):
+            canvas = original.copy()
+            monkeypatch.setattr(
+                motion_module, "QPainter",
+                lambda device: QPainter(canvas if device is transition else device),
+            )
+            # Leave enum references usable by the production painting code.
+            motion_module.QPainter.CompositionMode = QPainter.CompositionMode
+            transition._alpha = percent / 100
+            transition.paintEvent(None)
+            for x, y in [(20, 20), (canvas.width() - 1, canvas.height() - 1)]:
+                pixel = canvas.pixelColor(x, y)
+                assert abs(pixel.alpha() - background_alpha) <= 1, (percent, pixel.getRgb())
+                # Observe the final composited colour over a white desktop too.
+                before = original.pixelColor(x, y)
+                for old_channel, new_channel in zip(before.getRgb()[:3], pixel.getRgb()[:3]):
+                    expected = old_channel * before.alphaF() + 255 * (1 - before.alphaF())
+                    actual = new_channel * pixel.alphaF() + 255 * (1 - pixel.alphaF())
+                    assert abs(actual - expected) <= 2, (percent, before.getRgb(), pixel.getRgb())
+        transition.settle()
+        assert transition._opacity_layer.isNull()
+    finally:
+        dispose(root)
 
 
 def dispose(widget):
@@ -66,6 +113,7 @@ def test_transition_keeps_live_input_focus_geometry_and_one_bounded_frame(surfac
     transition._animation.setCurrentTime(transition._animation.duration())
     assert transition.isHidden()
     assert transition._frame.isNull()
+    assert transition._opacity_layer.isNull()
 
 
 def test_rapid_navigation_reuses_current_frame_without_animation_queue(surface):
