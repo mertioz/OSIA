@@ -45,7 +45,7 @@ async def _internal_conversation_changed(request):
     return JSONResponse(await server.internal_conversation_changed(request))
 
 
-def test_special_mode_round_trips_through_mobile_and_reconnects(tmp_path, monkeypatch):
+def test_control_round_trips_through_mobile_and_reconnects(tmp_path, monkeypatch):
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
     monkeypatch.setattr(server, "MOBILE_TOKEN", "test-token")
     monkeypatch.setattr(server, "_DURABLE_TRANSPORT", _NoDurableTransport())
@@ -64,8 +64,8 @@ def test_special_mode_round_trips_through_mobile_and_reconnects(tmp_path, monkey
 
     def change(websocket, operation_id, conversation_id, enabled):
         websocket.send_json({
-            "type": "set_conversation_special", "operation_id": operation_id,
-            "conversation_id": conversation_id, "enabled": enabled,
+            "type": "set_conversation_control", "operation_id": operation_id,
+            "conversation_id": conversation_id, "disabled": enabled,
         })
         ack = _receive_type(websocket, "conversations")
         assert ack["operation_id"] == operation_id
@@ -79,29 +79,29 @@ def test_special_mode_round_trips_through_mobile_and_reconnects(tmp_path, monkey
         ):
             authenticate(mobile, "slash-mobile")
             authenticate(peer, "slash-peer")
-            ack = change(mobile, "special_enable", first, True)
-            assert ack["special_conversation_id"] == first
-            assert ack["special_error"] == ""
+            ack = change(mobile, "control_enable", first, True)
+            assert ack["control_conversation_id"] == first
+            assert ack["control_error"] == ""
             broadcast = _receive_type(peer, "conversations")
-            assert {item["id"]: item["special_mode"] for item in broadcast["items"]} == {
+            assert {item["id"]: item["control_disabled"] for item in broadcast["items"]} == {
                 first: True, second: False,
             }
 
         with client.websocket_connect("/ws") as reconnected:
             snapshot = authenticate(reconnected, "slash-mobile")
-            assert {item["id"]: item["special_mode"] for item in snapshot["items"]} == {
+            assert {item["id"]: item["control_disabled"] for item in snapshot["items"]} == {
                 first: True, second: False,
             }
-            ack = change(reconnected, "special_restore", first, False)
-            assert {item["id"]: item["special_mode"] for item in ack["items"]} == {
+            ack = change(reconnected, "control_restore", first, False)
+            assert {item["id"]: item["control_disabled"] for item in ack["items"]} == {
                 first: False, second: False,
             }
-            ack = change(reconnected, "special_new", "", True)
-            new = ack["special_conversation_id"]
+            ack = change(reconnected, "control_new", "", True)
+            new = ack["control_conversation_id"]
             assert new and new not in (first, second)
-            assert conversations.conversation_special_mode(new)
-            replay = change(reconnected, "special_new", "", True)
-            assert replay["special_conversation_id"] == new
+            assert conversations.conversation_control_disabled(new)
+            replay = change(reconnected, "control_new", "", True)
+            assert replay["control_conversation_id"] == new
             assert len(replay["items"]) == 3
 
 

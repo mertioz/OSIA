@@ -111,10 +111,9 @@ def test_account_app_tools_have_exact_native_contracts():
         assert tools[name]["inputSchema"] == get_static_registry().get(name).input_schema
 
 
-def test_account_managed_browser_tools_stay_available_with_mouse_disabled(monkeypatch):
+def test_account_managed_browser_tools_stay_available_in_chat_scope():
     from osia.slash_commands import chat_command_scope
 
-    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
     with chat_command_scope("browser-fixture", None):
         tools = {tool["name"]: tool for tool in _canonical_native_tools()}
         assert BROWSER_FAMILY_TOOL_NAMES <= tools.keys()

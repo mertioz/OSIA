@@ -33,7 +33,7 @@ ToolAttempt/ActionTruth attach exact ownership and observed outcomes to dispatch
 
 Managed browser tools work with tab/document identity, structured page state, element references and form operations. A click on a page selector is not an OS-pointer movement. Fresh references and typed results bind the requested operation to the observed page.
 
-Native desktop inspection, capture, UIA, key input and physical pointer tools have separate contracts. A screenshot is observation, not proof of an action. /mousecontrol applies to native pointer capabilities while preserving keyboard, vision and structured web work. The [Thinking/activity guide](thinking.md) explains the independent display indicators.
+Native desktop inspection, capture, UIA, key input and physical pointer tools have separate contracts. A screenshot is observation, not proof of an action. /control toggles physical pointer control and new OSIA screenshots together for the current conversation. The persisted setting remains until toggled again; supplied images, existing image analysis, keyboard and structured web tools retain their applicable contracts. The [Thinking/activity guide](thinking.md) explains the independent display indicators.
 
 [desktop_scene.py](../osia/desktop_scene.py), [computer_use_v4_integration.py](../osia/computer_use_v4_integration.py) and [tools/desktop_control.py](../osia/tools/desktop_control.py) own the current target/surface and native boundaries. [tools/browser.py](../osia/tools/browser.py) and [browser_forms.py](../osia/tools/browser_forms.py) own managed web interaction.
 
@@ -45,13 +45,15 @@ Typing / in the chat composer opens the command palette. A command selection is 
 | --- | --- |
 | /web | Requests a relevant search attempt for the next turn; absent/unhelpful results do not prohibit a normal answer |
 | /model | Selects an exact provider/model and supported reasoning option for the next turn without rewriting global selection |
-| /status | Shows the model, conversation settings and connector status through the local information path |
+| /status | Shows model and context, plus remaining quota for an account or estimated visible-conversation tokens/cost per API model |
 | /help | Lists the commands available on the current surface |
-| /mousecontrol | Toggles native physical pointer control for the current conversation; keyboard, vision and structured web tools remain available |
+| /control | Toggles native pointer control and new screenshots off/on for the current conversation, persistently |
 | /compact | Requests compaction through the existing context path; ChatGPT Account uses Codex's native thread compaction |
 | /skill | Selects a saved skill for the next message |
 | /skillcreator | Carries an explicit skill-creation request to the existing creation tool |
 
-Modifiers require their supported message/attachment body. Model/reasoning choices are validated against the exact current model metadata. Mouse-control preference belongs to its canonical conversation and is not changed during accepted work using that preference.
+Modifiers require their supported message/attachment body. Model/reasoning choices are validated against the exact current model metadata. The control setting belongs to its canonical conversation and is not changed during accepted work using that setting. A selected @ conversation contributes context to the next message; it does not replay that conversation's actions.
+
+[chat_status.py](../osia/chat_status.py) produces the PC-owned status for both screens. Account quota is read from the provider when available. API estimates use visible saved turns and exact known pricing or cached upstream metadata; unknown prices remain unavailable. These estimates exclude unpersisted system/tool/reasoning usage, cache discounts and extra fees, and are not invoices.
 
 The palette/composer implementation is [slash_palette.py](../osia/gui/slash_palette.py) and [main_popup.py](../osia/gui/main_popup.py). PC handlers in [main.py](../osia/main.py) and [server.py](../osia/server/server.py) use the same typed definitions and canonical conversation state.

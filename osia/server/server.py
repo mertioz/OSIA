@@ -5517,7 +5517,7 @@ def _build_config_snapshot() -> dict:
         cfg["stt_local_models_available"] = []
     cfg["gmail_rest"] = _gmail_rest_config_snapshot()
     cfg["chat_slash_extensions"] = 1
-    cfg["conversation_mouse_control"] = True
+    cfg["conversation_control"] = True
     cfg["conversation_context_compaction"] = True
     cfg["slash_reasoning_model_options"] = True
     try:
@@ -8670,50 +8670,79 @@ async def websocket_endpoint(ws: WebSocket):
                 await out.send_json(snapshot)
                 continue
 
-            if msg_type == "set_conversation_special":
+            if msg_type == "set_conversation_control":
                 operation_id = msg.get("operation_id")
-                if not isinstance(operation_id, str) or not re.fullmatch(
-                    r"special_[A-Za-z0-9_-]{1,112}", operation_id,
-                ):
+                conv_id, disabled = msg.get("conversation_id"), msg.get("disabled")
+                if (not isinstance(operation_id, str)
+                        or not re.fullmatch(r"control_[A-Za-z0-9_-]{1,112}", operation_id)):
                     continue
-                conv_id = msg.get("conversation_id")
-                enabled = msg.get("enabled")
                 error = ""
                 try:
-                    if not isinstance(conv_id, str) or type(enabled) is not bool:
-                        raise ValueError("invalid_special_request")
-                    unbound = not conv_id
-                    if unbound:
-                        if not enabled:
-                            raise ValueError("invalid_special_request")
+                    if not isinstance(conv_id, str) or type(disabled) is not bool:
+                        raise ValueError("invalid_control_request")
+                    if not conv_id:
+                        if not disabled:
+                            raise ValueError("invalid_control_request")
                         conv, _ = await asyncio.to_thread(
                             conversations.resolve_request_conversation,
-                            operation_id, special_mode=True,
+                            operation_id, control_disabled=True,
                         )
                         conv_id = conv["id"]
-                        session_history = []
-                        active_conv_id = conv_id
+                        session_history, active_conv_id = [], conv_id
                     else:
                         conv = await asyncio.to_thread(
-                            conversations.set_conversation_special_mode, conv_id, enabled,
+                            conversations.set_conversation_control_disabled, conv_id, disabled,
                         )
                     await _broadcast_canonical_conversation_change(
                         conv_id, revision=conv["revision"],
                         operation_id=conv["last_operation_id"], exclude=out,
                     )
                 except (OSError, ValueError, RuntimeError) as exc:
-                    error = (
-                        str(exc) if str(exc) in {
-                            "conversation_not_found", "conversation_busy", "invalid_special_request",
-                        } else "special_storage_error"
-                    )
+                    error = str(exc) if str(exc) in {
+                        "conversation_not_found", "conversation_busy", "invalid_control_request",
+                    } else "control_storage_error"
                 snapshot = conversations.conversation_snapshot()
                 snapshot.update(
                     operation_id=operation_id,
-                    special_conversation_id="" if error else conv_id,
-                    special_error=error,
+                    control_conversation_id="" if error else conv_id,
+                    control_error=error,
                 )
                 await out.send_json(snapshot)
+                continue
+
+            if msg_type == "get_chat_status":
+                operation_id = msg.get("operation_id")
+                conv_id = msg.get("conversation_id", "")
+                if (not isinstance(operation_id, str)
+                        or not re.fullmatch(r"status_[A-Za-z0-9_-]{1,112}", operation_id)
+                        or not isinstance(conv_id, str)
+                        or (conv_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id))):
+                    continue
+
+                async def respond_chat_status(conv_id=conv_id, operation_id=operation_id):
+                    from osia.chat_status import build_chat_status
+
+                    def snapshot():
+                        conv = conversations.get_conversation(conv_id) if conv_id else None
+                        if conv_id and conv is None:
+                            return None, "conversation_not_found"
+                        route = _resolve_chat_route_binding()
+                        status = build_chat_status(
+                            conv_id, provider_id=route["provider_id"],
+                            model_id=route["model_id"], conversation=conv,
+                        )
+                        return status, ""
+
+                    try:
+                        status, error = await asyncio.to_thread(snapshot)
+                    except Exception:
+                        status, error = None, "status_unavailable"
+                    await out.send_json({
+                        "type": "chat_status", "operation_id": operation_id,
+                        "conversation_id": conv_id, "status": status, "error": error,
+                    })
+
+                _schedule_socket_response(respond_chat_status())
                 continue
 
             if msg_type == "compact_conversation_context":

@@ -38,6 +38,38 @@ def test_information_commands_emit_their_handler_without_sending_a_turn(alias, c
         chat.deleteLater()
 
 
+@pytest.mark.parametrize("tool_status", ["action_in_progress", "waiting_tool_result"])
+@pytest.mark.parametrize("alias,command_id", [("status", "status.info"), ("help", "help.info")])
+def test_readonly_information_commands_remain_local_during_active_work(tool_status, alias, command_id):
+    chat = _ChatPage()
+    chat._busy = True
+    chat._tool_status = tool_status
+    requested = QSignalSpy(chat.informational_requested)
+    sent = QSignalSpy(chat.send_text)
+    try:
+        chat._input.setPlainText("/" + alias)
+        chat._on_send()
+        assert list(requested) == [[command_id]] and not sent
+    finally:
+        chat.close()
+        chat.deleteLater()
+
+
+def test_control_action_is_never_sent_as_a_chat_turn_while_waiting():
+    chat = _ChatPage()
+    chat._busy = True
+    chat._tool_status = "waiting_tool_result"
+    requested = QSignalSpy(chat.control_requested)
+    sent = QSignalSpy(chat.send_text)
+    try:
+        chat._input.setPlainText("/control")
+        chat._on_send()
+        assert len(requested) == 1 and not sent
+    finally:
+        chat.close()
+        chat.deleteLater()
+
+
 def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(monkeypatch):
     from osia import personality
     from osia.gui import slash_palette
@@ -48,15 +80,15 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
     ])
     chat = _ChatPage()
     chat.show()
-    mouse = QSignalSpy(chat.mouse_control_requested)
+    mouse = QSignalSpy(chat.control_requested)
     typed = QSignalSpy(chat.submit_directive_draft)
     legacy = QSignalSpy(chat.send_text)
     try:
         chat._input.setPlainText("/")
-        assert {"mousecontrol", "skill", "skillcreator"} <= {
+        assert {"control", "skill", "skillcreator"} <= {
             row.get("canonical_alias") for row in chat._slash_palette._rows
         }
-        chat._input.setPlainText("/mousecontrol")
+        chat._input.setPlainText("/control")
         chat._on_send()
         assert len(mouse) == 1
         assert not typed and not legacy
@@ -121,9 +153,9 @@ def test_palette_keeps_filtering_while_snapshot_worker_waits(monkeypatch):
     try:
         chat._input.setPlainText("/")
         assert entered.wait(1)
-        for text in ("/mou", "/mous", "/mouse", "/mousecontrol"):
+        for text in ("/con", "/cont", "/contr", "/control"):
             chat._input.setPlainText(text)
-            assert chat._slash_palette._rows[0]["canonical_alias"] == "mousecontrol"
+            assert chat._slash_palette._rows[0]["canonical_alias"] == "control"
         assert loads != [threading.get_ident()]
         assert len(loads) == 1
     finally:

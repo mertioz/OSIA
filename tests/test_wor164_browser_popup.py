@@ -538,16 +538,14 @@ def test_navigation_click_fill_keyboard_tabs_and_state(owner_harness):
 
 
 @pytest.mark.parametrize("backend", ["cdp", "bidi"])
-@pytest.mark.parametrize("mouse_disabled", [False, True])
+@pytest.mark.parametrize("in_chat_scope", [False, True])
 def test_page_tools_preserve_background_focus(
-    owner_harness, monkeypatch, backend, mouse_disabled,
+    owner_harness, monkeypatch, backend, in_chat_scope,
 ):
+    from contextlib import nullcontext
     from osia.slash_commands import chat_command_scope
 
     control, owner = owner_harness
-    monkeypatch.setattr(
-        "osia.conversations.conversation_special_mode", lambda _: mouse_disabled,
-    )
     raises = []
     monkeypatch.setattr(browser, "_raise_browser_window", raises.append)
 
@@ -556,7 +554,7 @@ def test_page_tools_preserve_background_focus(
         return await owner._screenshot_b64(page)
 
     owner._op_test_capture = capture
-    with chat_command_scope("background-browser", None):
+    with (chat_command_scope("background-browser", None) if in_chat_scope else nullcontext()):
         if backend == "bidi":
             opened = owner.call("open_firefox_bidi", "https://background.test")
         else:

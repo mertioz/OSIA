@@ -10,8 +10,8 @@ from PyQt6.QtWidgets import (
 )
 
 from osia import i18n
-from osia.conversations import conversation_special_mode
 from osia.gui.motion import MOTION, MotionController
+from osia.conversations import conversation_control_disabled
 from osia.slash_commands import (
     MAX_RESULTS,
     connector_availability,
@@ -124,7 +124,7 @@ class SlashCommandPalette(QFrame):
                 else:
                     data = (
                         connector_availability(), current_web_available(provider_id),
-                        conversation_special_mode(conversation_id),
+                        conversation_control_disabled(conversation_id),
                     )
             except Exception:
                 data = () if kind == "conversations" else ((), False, False)
@@ -162,12 +162,13 @@ class SlashCommandPalette(QFrame):
                 rows = [{"name": message, "enabled": False}]
             self._show_rows(rows, "@ Discussions" if french else "@ Conversations")
             return
-        connectors, web_available, mouse_control_disabled = data or ((), False, False)
+        connectors, web_available, control_disabled = data or ((), False, False)
         self._show_rows(
             list(palette_items(
                 locale=self._locale, filter_text=query,
                 models_available=bool(self._model_rows),
-                web_available=web_available, mouse_control_disabled=mouse_control_disabled,
+                web_available=web_available,
+                control_disabled=control_disabled,
                 connectors=connectors,
             )),
             "Raccourcis" if french else "Shortcuts",

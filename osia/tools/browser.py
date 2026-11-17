@@ -1687,6 +1687,10 @@ class _AsyncBrowserOwner:
         self._publish()
 
     async def _screenshot_b64(self, page):
+        from osia.slash_commands import current_control_disabled
+
+        if current_control_disabled():
+            return None
         try:
             png = await page.screenshot(type="png", full_page=False)
             return base64.b64encode(png).decode("ascii")

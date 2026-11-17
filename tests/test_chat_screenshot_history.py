@@ -4,6 +4,7 @@ import asyncio
 import base64
 import ctypes
 import io
+import json
 import sys
 import time
 from collections import OrderedDict
@@ -108,7 +109,7 @@ def test_expired_history_does_not_block_new_user_input(visual_store):
     assert result[-1]["content"] == "Keep going."
 
 
-def test_disabled_mouse_control_preserves_current_and_historical_images(visual_store):
+def test_control_disabled_preserves_current_and_historical_images(visual_store):
     from osia.agent import OSIAAgent
     from osia.slash_commands import chat_command_scope
 
@@ -125,7 +126,10 @@ def test_disabled_mouse_control_preserves_current_and_historical_images(visual_s
             {"role": "user", "content": [{"type": "text", "text": "Continue."}, current]},
         ],
     )
-    conversations.set_conversation_special_mode(conv_id, True)
+    legacy = conversations.get_conversation(conv_id)
+    legacy["special_mode"] = True
+    conversations._path_for(conv_id).write_text(json.dumps(legacy), encoding="utf-8")
+    conversations.set_conversation_control_disabled(conv_id, True)
     with chat_command_scope(conv_id, None):
         wire = OSIAAgent._wire_messages(agent)
         assert image_inputs.image_parts(wire[0]["content"])[0]["type"] == "image_url"

@@ -30,7 +30,7 @@ from osia.slash_commands import (
 def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     entries = load_catalog()
     assert [entry["canonical_alias"] for entry in entries] == [
-        "web", "model", "status", "help", "mousecontrol", "compact", "skill", "skillcreator",
+        "web", "model", "status", "help", "control", "compact", "skill", "skillcreator",
     ]
     assert all(entry["name"]["en"] and entry["name"]["fr"] for entry in entries)
     pc = Path("assets/slash_commands/catalog.v1.json").read_bytes()
@@ -38,7 +38,7 @@ def test_static_catalog_is_bilingual_bounded_and_byte_identical():
     assert pc == mobile
 
 
-def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path, monkeypatch):
+def test_control_blocks_pointer_and_new_capture_in_one_conversation(tmp_path, monkeypatch):
     from osia import agent, conversations
     from osia.chatgpt_account.app_server_client import _canonical_native_tools
     from osia import computer_use_v4_integration as v4
@@ -48,12 +48,12 @@ def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path,
     monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path)
     first = conversations.create_conversation()["id"]
     second = conversations.create_conversation()["id"]
-    assert conversations.set_conversation_special_mode(first)["special_mode"] is True
-    assert conversations.conversation_special_mode(first)
-    assert not conversations.conversation_special_mode(second)
+    assert conversations.set_conversation_control_disabled(first)["control_disabled"] is True
+    assert conversations.conversation_control_disabled(first)
+    assert not conversations.conversation_control_disabled(second)
     assert conversations.claim_background_execution(first, "active-turn")
     with pytest.raises(ValueError, match="conversation_busy"):
-        conversations.set_conversation_special_mode(first, False)
+        conversations.set_conversation_control_disabled(first, False)
     assert conversations.release_background_execution(first, "active-turn")
 
     def unexpected_pointer():
@@ -69,7 +69,7 @@ def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path,
     monkeypatch.setattr(v4, "_loop", lambda: SimpleNamespace(execute_batch=execute_batch))
     keyboard = {"kind": "keypress", "frame_id": "frame", "key": "Enter"}
     pointer = {"kind": "click", "frame_id": "frame", "x": 10, "y": 20}
-    blocked_tools = {"computer_click", "computer_double_click", "computer_scroll", "desktop_scroll"}
+    blocked_tools = {"computer_click", "computer_double_click", "computer_scroll", "desktop_scroll", "computer_screenshot", "take_screenshot", "save_screenshot"}
 
     def action_kinds(schema):
         return schema["properties"]["actions"]["items"]["properties"]["kind"]["enum"]
@@ -84,12 +84,12 @@ def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path,
         native_tools = {spec["name"]: spec["inputSchema"] for spec in _canonical_native_tools()}
         assert not blocked_tools & (tools | native_tools.keys())
         assert {
-            "take_screenshot", "save_screenshot", "desktop_type", "desktop_press",
+            "desktop_type", "desktop_press",
             "inspect_desktop_surfaces", "get_browser_state", "scroll",
         } <= tools
         if sys.platform == "win32":
-            assert {"computer_screenshot", "computer_type", "computer_keypress", "computer_actions"} <= tools
-            assert "computer_screenshot" in native_tools
+            assert {"computer_type", "computer_keypress", "computer_actions"} <= tools
+            assert "computer_screenshot" not in native_tools
             assert action_kinds(native_tools["computer_actions"]) == ["type", "keypress"]
         assert action_kinds(get_tool_spec("computer_actions").input_schema) == ["type", "keypress"]
         result = agent._execute_tool_with_policy("desktop_scroll", {})
@@ -98,19 +98,18 @@ def test_mouse_control_blocks_only_pointer_actions_in_one_conversation(tmp_path,
         result = agent._execute_tool_with_policy("computer_actions", {"actions": [keyboard, pointer]})
         assert not result.dispatched
         direct = v4.tool_computer_actions([keyboard, pointer])
-        assert direct["receipt"]["reason_code"] == "CONVERSATION_MOUSE_CONTROL_DISABLED"
+        assert direct["receipt"]["reason_code"] == "CONVERSATION_CONTROL_DISABLED"
         assert not batches
         assert v4.tool_computer_actions([keyboard])["receipt"]["batch_executed_count"] == 1
         assert batches == [["keypress"]]
         prompt = agent.get_system_prompt("en")
-        assert "Leave the physical desktop pointer untouched" in prompt
-        assert "Use targeted window captures" in prompt
+        assert "Control disabled for this conversation" in prompt
         assert "Bring the exact target window to the foreground before using the physical mouse." in prompt
 
     with chat_command_scope(second, None):
         assert "desktop_scroll" in {spec.name for spec in effective_static_tool_specs()}
         assert "click" in action_kinds(get_tool_spec("computer_actions").input_schema)
-    assert conversations.set_conversation_special_mode(first, False)["special_mode"] is False
+    assert conversations.set_conversation_control_disabled(first, False)["control_disabled"] is False
     with chat_command_scope(first, None):
         assert "desktop_scroll" in {spec.name for spec in effective_static_tool_specs()}
 
@@ -170,7 +169,7 @@ def test_skill_creator_saves_only_new_skills_and_selects_one_for_the_turn(tmp_pa
     [
         ("/", ""),
         ("/ ", ""),
-        ("/ mousecontrol", "mousecontrol"),
+        ("/ control", "control"),
         ("   /web", "web"),
         ("/linear do it", "linear"),
         ("//web", None),
@@ -266,9 +265,8 @@ def test_safe_overlay_and_status_bound_connector_rows(monkeypatch):
     overlay = safe_availability_overlay()
     status = informational_payload("status.info")
     assert len(overlay["connectors"]) == 24
-    assert status["connector_count"] == 30
-    assert status["connector_ready_count"] == 30
-    assert len(status["connectors"]) == 8
+    assert status["command_id"] == "status.info"
+    assert not {"connectors", "connector_count", "routing_mode", "reasoning", "control_disabled"} & status.keys()
 
 
 def test_wire_contract_is_strict_canonical_and_bounded():

@@ -155,12 +155,14 @@ BROWSER_VERIFY_TOOL_NAMES = frozenset({
 DORMANT_VISUAL_V3_TOOL_NAMES = frozenset({
     "request_visual_observation", "desktop_click",
 })
-_MOUSE_CONTROL_TOOLS = frozenset({
+_CONTROL_POINTER_TOOLS = frozenset({
     "desktop_click", "desktop_scroll",
     "computer_click", "computer_double_click", "computer_scroll",
 })
-_MOUSE_ACTION_KINDS = frozenset({"click", "double_click", "scroll"})
-
+_CONTROL_SCREENSHOT_TOOLS = frozenset({
+    "take_screenshot", "save_screenshot", "computer_screenshot",
+})
+_CONTROL_POINTER_ACTION_KINDS = frozenset({"click", "double_click", "scroll"})
 _FILE_PERSISTENCE_TOOLS = frozenset({
     "read_file", "read_document", "read_document_artifact", "query_document",
     "write_file", "render_pdf", "list_files", "delete_file",
@@ -1641,7 +1643,7 @@ def get_static_registry() -> ToolRegistry:
 def get_tool_spec(name: str) -> ToolSpec | None:
     static = get_static_registry().get(name)
     if static is not None:
-        return _tool_spec_with_chat_options(static)
+        return _tool_spec_with_control_options(static)
     with _dynamic_lock:
         return _dynamic_specs.get(str(name or ""))
 
@@ -2642,47 +2644,42 @@ def static_tool_inventory_specs() -> tuple[ToolSpec, ...]:
     """
 
     return tuple(
-        _tool_spec_with_chat_options(spec) for spec in get_static_registry().values()
+        _tool_spec_with_control_options(spec) for spec in get_static_registry().values()
         if _static_tool_runtime_available(spec)
     )
 
 
-def _tool_spec_with_chat_options(spec: ToolSpec) -> ToolSpec:
-    if spec.name != "computer_actions":
-        return spec
-    from osia.slash_commands import current_chat_commands
+def _tool_spec_with_control_options(spec: ToolSpec) -> ToolSpec:
+    from osia.slash_commands import current_control_disabled
 
-    if not current_chat_commands()[0]:
+    if spec.name != "computer_actions" or not current_control_disabled():
         return spec
     schema = copy.deepcopy(spec.input_schema)
     kind = schema["properties"]["actions"]["items"]["properties"]["kind"]
-    kind["enum"] = [value for value in kind["enum"] if value not in _MOUSE_ACTION_KINDS]
+    kind["enum"] = [value for value in kind["enum"] if value not in _CONTROL_POINTER_ACTION_KINDS]
     return replace(
         spec, input_schema=schema,
-        capability="Run a bounded batch of native typing and keypress actions from a current frame",
+        capability="Run a bounded batch of native typing and keypress actions from an existing current frame",
     )
 
 
 def tool_disabled_by_chat_command(
     name: str, arguments: Mapping[str, Any] | None = None,
 ) -> bool:
-    from osia.slash_commands import current_chat_commands
+    from osia.slash_commands import current_chat_commands, current_control_disabled
 
-    mouse_control_disabled, directives = current_chat_commands()
     if name == "create_chat_skill":
-        return not directives.skill_creator
-    if not mouse_control_disabled:
+        return not current_chat_commands().skill_creator
+    if not current_control_disabled():
         return False
-    if name in _MOUSE_CONTROL_TOOLS:
+    if name in _CONTROL_POINTER_TOOLS or name in _CONTROL_SCREENSHOT_TOOLS:
         return True
-    actions = (
-        arguments.get("actions")
-        if name == "computer_actions" and isinstance(arguments, Mapping)
-        else None
-    )
+    if name == "request_visual_observation":
+        return not (isinstance(arguments, Mapping) and arguments.get("visual_frame_id"))
+    actions = arguments.get("actions") if name == "computer_actions" and isinstance(arguments, Mapping) else None
     return isinstance(actions, list) and any(
         isinstance(action, Mapping)
-        and str(action.get("kind") or "").strip().lower() in _MOUSE_ACTION_KINDS
+        and str(action.get("kind") or "").strip().lower() in _CONTROL_POINTER_ACTION_KINDS
         for action in actions
     )
 

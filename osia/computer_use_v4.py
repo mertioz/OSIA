@@ -819,6 +819,10 @@ class ComputerUseV4:
     def _capture(
         self, hwnd: int, *, expected_window_token: str = "",
     ) -> tuple[dict[str, Any], Any, str, dict]:
+        from osia.slash_commands import current_control_disabled
+
+        if current_control_disabled():
+            raise ComputerUseV4Error("CONVERSATION_CONTROL_DISABLED", "new_screenshots_disabled")
         state = dict(self._window_state(int(hwnd)) or {})
         if not state or int(state.get("hwnd") or 0) != int(hwnd):
             raise ComputerUseV4Error("WRONG_HWND", "target_window_missing")
@@ -1333,6 +1337,10 @@ class ComputerUseV4:
         verify_target: bool,
         allow_pending_batch: bool,
     ) -> dict[str, Any]:
+        from osia.slash_commands import current_control_disabled
+
+        if current_control_disabled() and action.kind in {"click", "double_click", "scroll"}:
+            return self._result("CONVERSATION_CONTROL_DISABLED", "native_pointer_disabled", action=action)
         frame = self._frames.get(action.frame_id)
         if frame is None:
             return self._result("STALE_FRAME", "frame_missing", action=action)
@@ -1584,6 +1592,16 @@ class ComputerUseV4:
         ]
         if not 1 <= len(parsed) <= _MAX_BATCH_ACTIONS:
             raise ValueError("computer_batch_must_contain_one_to_three_actions")
+        from osia.slash_commands import current_control_disabled
+
+        blocked = next((item for item in parsed if item.kind in {"click", "double_click", "scroll"}), None)
+        if current_control_disabled() and blocked is not None:
+            result = self._result("CONVERSATION_CONTROL_DISABLED", "native_pointer_disabled", action=blocked)
+            return {
+                "status": result["status"], "reason_code": result["reason_code"],
+                "results": [result], "executed_count": 0,
+                "observation_required": self._observation_required,
+            }
         anchor = parsed[0].frame_id
         if any(item.frame_id != anchor for item in parsed):
             raise ValueError("computer_batch_requires_one_frame")

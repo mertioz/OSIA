@@ -1330,7 +1330,7 @@ class _ChatPage(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
-    mouse_control_requested = pyqtSignal()
+    control_requested = pyqtSignal()
     context_compaction_requested = pyqtSignal()
     execution_cancel_requested = pyqtSignal(dict)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
@@ -1658,9 +1658,9 @@ class _ChatPage(QWidget):
         if handler == "compact_conversation_context_v1":
             self._request_context_compaction(consume_palette_prefix(self._input.text()))
             return
-        if handler == "toggle_conversation_mouse_control_v1":
+        if handler == "toggle_conversation_control_v1":
             self._input.setPlainText(consume_palette_prefix(self._input.text()))
-            self.mouse_control_requested.emit()
+            self.control_requested.emit()
             self._input.setFocus()
             return
         if handler in {
@@ -2474,6 +2474,14 @@ class _ChatPage(QWidget):
     def _on_send(self) -> None:
         if self._input.toPlainText().strip().casefold() == "/compact":
             self._request_context_compaction()
+            return
+        local = {
+            "/status": {"id": "status.info", "handler_contract": "show_safe_status_v1"},
+            "/help": {"id": "help.info", "handler_contract": "show_available_help_v1"},
+            "/control": {"id": "control.toggle", "handler_contract": "toggle_conversation_control_v1"},
+        }.get(self._input.toPlainText().strip().casefold())
+        if local is not None:
+            self._on_slash_selection(local)
             return
         waiting = bool(
             self._busy and self._tool_status in self._TOOL_WAITING_STATUSES
@@ -11569,7 +11577,7 @@ class MainPopup(QWidget):
     submit_draft = pyqtSignal(str, object)
     submit_directive_draft = pyqtSignal(str, object, object)
     informational_requested = pyqtSignal(str)
-    mouse_control_requested = pyqtSignal()
+    control_requested = pyqtSignal()
     context_compaction_requested = pyqtSignal()
     pick_file = pyqtSignal(str, str)
     new_conversation = pyqtSignal()
@@ -11726,7 +11734,7 @@ class MainPopup(QWidget):
         self._chat.informational_requested.connect(
             self.informational_requested.emit
         )
-        self._chat.mouse_control_requested.connect(self.mouse_control_requested.emit)
+        self._chat.control_requested.connect(self.control_requested.emit)
         self._chat.context_compaction_requested.connect(self.context_compaction_requested.emit)
         self._chat.execution_cancel_requested.connect(
             self._on_chat_execution_cancel_requested
@@ -12109,65 +12117,28 @@ class MainPopup(QWidget):
             message.exec()
             return
 
+        from osia.gui.chat_status_view import status_lines
+
         dialog = QDialog(self)
         dialog.setObjectName("slashStatusDialog")
-        dialog.setWindowTitle(title)
-        dialog.resize(388, 420)
+        dialog.setWindowTitle("État de la discussion" if french else "Chat status")
+        dialog.resize(388, 320)
         layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.addWidget(QLabel(title, objectName="slashStatusHeading"))
+        layout.setContentsMargins(18, 16, 18, 16)
         scroll = QScrollArea()
-        scroll.setObjectName("slashStatusScroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         content = QWidget()
-        content.setObjectName("slashStatusContent")
-        cards = QVBoxLayout(content)
-        cards.setContentsMargins(0, 0, 4, 0)
-        cards.setSpacing(8)
-
-        def add_card(label: str, rows: list[tuple[str, str]]) -> None:
-            card = QFrame(objectName="slashStatusCard")
-            inner = QVBoxLayout(card)
-            inner.setContentsMargins(12, 9, 12, 9)
-            inner.addWidget(QLabel(label, objectName="slashPaletteTitle"))
-            for key, value in rows:
-                row = QHBoxLayout()
-                label_widget = QLabel(key, objectName="slashStatusLabel")
-                label_widget.setTextFormat(Qt.TextFormat.PlainText)
-                label_widget.setWordWrap(True)
-                value_widget = QLabel(value)
-                value_widget.setTextFormat(Qt.TextFormat.PlainText)
-                value_widget.setWordWrap(True)
-                value_widget.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                row.addWidget(label_widget, 1)
-                row.addWidget(value_widget, 1)
-                inner.addLayout(row)
-            cards.addWidget(card)
-
-        level = str(payload["reasoning"])
-        key = "reasoning.default" if level == "auto" else f"reasoning.{level}"
-        translated = i18n.t(key)
-        add_card("Modèle" if french else "Model", [
-            (str(payload["provider"]), str(payload["model"])),
-            ("Raisonnement" if french else "Reasoning", level.title() if translated == key else translated),
-            ("Disponibilité" if french else "Availability",
-             ("Prêt" if french else "Ready") if payload["provider_ready"]
-             else ("Indisponible" if french else "Unavailable")),
-        ])
-        add_card("Discussion" if french else "Chat", [
-            ("Routage" if french else "Routing",
-             ("Automatique" if french else "Automatic") if payload["routing_mode"] == "automatic"
-             else ("Modèle sélectionné" if french else "Selected model")),
-            ("Contrôle de la souris" if french else "Mouse control",
-             ("Désactivé" if french else "Disabled") if payload["mouse_control_disabled"]
-             else ("Actif" if french else "Enabled")),
-        ])
-        connector_label = "Connecteurs" if french else "Connectors"
-        add_card(f"{connector_label} · {payload['connector_ready_count']}/{payload['connector_count']}", [
-            (item["name"], item["state"]) for item in payload["connectors"]
-        ] or [("Aucun connecteur" if french else "No connectors", "")])
-        cards.addStretch()
+        rows = QVBoxLayout(content)
+        rows.setContentsMargins(0, 0, 4, 0)
+        rows.setSpacing(12)
+        for line in status_lines(payload, "fr" if french else "en"):
+            label = QLabel(line)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            rows.addWidget(label)
+        rows.addStretch()
         scroll.setWidget(content)
         layout.addWidget(scroll, 1)
         close = QPushButton("Fermer" if french else "Close", objectName="slashStatusClose")

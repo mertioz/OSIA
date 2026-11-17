@@ -345,28 +345,32 @@ class SlashTurnDirectivesV1:
 
 EMPTY_DIRECTIVES = SlashTurnDirectivesV1()
 
-_CHAT_COMMAND_CONTEXT: ContextVar[tuple[bool, SlashTurnDirectivesV1]] = ContextVar(
-    "osia_chat_command_context", default=(False, EMPTY_DIRECTIVES),
+_CHAT_COMMAND_CONTEXT: ContextVar[SlashTurnDirectivesV1] = ContextVar(
+    "osia_chat_command_context", default=EMPTY_DIRECTIVES,
 )
+_CONTROL_DISABLED: ContextVar[bool] = ContextVar("osia_control_disabled", default=False)
 
 
 @contextmanager
 def chat_command_scope(conversation_id: str, directives: SlashTurnDirectivesV1 | None):
-    """Bind the conversation's mouse control setting and explicit composer choices."""
-    from osia.conversations import conversation_special_mode
+    """Bind explicit choices and this conversation's control capability setting."""
+    from osia.conversations import conversation_control_disabled
 
-    token = _CHAT_COMMAND_CONTEXT.set((
-        conversation_special_mode(conversation_id),
-        directives or EMPTY_DIRECTIVES,
-    ))
+    control_token = _CONTROL_DISABLED.set(conversation_control_disabled(conversation_id))
+    token = _CHAT_COMMAND_CONTEXT.set(directives or EMPTY_DIRECTIVES)
     try:
         yield
     finally:
         _CHAT_COMMAND_CONTEXT.reset(token)
+        _CONTROL_DISABLED.reset(control_token)
 
 
-def current_chat_commands() -> tuple[bool, SlashTurnDirectivesV1]:
+def current_chat_commands() -> SlashTurnDirectivesV1:
     return _CHAT_COMMAND_CONTEXT.get()
+
+
+def current_control_disabled() -> bool:
+    return _CONTROL_DISABLED.get()
 
 
 @dataclass(frozen=True)
@@ -648,7 +652,7 @@ def palette_items(
     filter_text: str = "",
     models_available: bool = False,
     web_available: bool = False,
-    mouse_control_disabled: bool = False,
+    control_disabled: bool = False,
     connectors: Iterable[ConnectorAvailability] = (),
 ) -> tuple[dict[str, Any], ...]:
     """Filter a prepared snapshot without disk, provider, or connector probes."""
@@ -668,11 +672,10 @@ def palette_items(
         item["description"] = str(
             raw["description"].get(language) or raw["description"].get("en") or ""
         )
-        if raw["id"] == "mouse_control.toggle" and mouse_control_disabled:
+        if raw["id"] == "control.toggle" and control_disabled:
             item["description"] = (
-                "Réactiver le contrôle de la souris dans cette discussion"
-                if language == "fr" else
-                "Restore OSIA's mouse control in this conversation"
+                "Réactiver la souris et les captures dans cette discussion"
+                if language == "fr" else "Restore mouse and screenshots in this conversation"
             )
         item["argument_hint"] = str(
             raw["argument_hint"].get(language) or raw["argument_hint"].get("en") or ""
@@ -904,28 +907,22 @@ def informational_payload(
     command_id: str,
     *,
     locale: str = "en",
-    surface: str = "PC",
     provider_id: str = "",
-    provider_label: str = "",
+    model_id: str = "",
     model_label: str = "",
-    reasoning: str = "auto",
-    provider_ready: bool | None = None,
-    routing_mode: str = "automatic",
-    transport: str = "",
+    conversation_id: str = "",
     models_available: bool = False,
-    mouse_control_disabled: bool = False,
 ) -> dict[str, Any]:
-    """Build a bounded, display-only payload; it is never a chat turn."""
+    """Build local help or the PC-owned status, without creating a Chat turn."""
     language = "fr" if str(locale).lower().startswith("fr") else "en"
-    all_connectors = connector_availability()
-    connectors = all_connectors[:8]
     if command_id == "help.info":
+        from osia.conversations import conversation_control_disabled
+
         rows = palette_items(
-            locale=language,
-            models_available=models_available,
+            locale=language, models_available=models_available,
             web_available=current_web_available(provider_id),
-            mouse_control_disabled=mouse_control_disabled,
-            connectors=all_connectors,
+            control_disabled=conversation_control_disabled(conversation_id),
+            connectors=connector_availability(),
         )
         commands = [{
             "alias": "@",
@@ -937,53 +934,15 @@ def informational_payload(
             "description": str(item.get("description") or "")[:160],
             "argument_hint": str(item.get("argument_hint") or "")[:80],
         } for item in rows if item.get("enabled") is True)
-        return {
-            "title": "Aide" if language == "fr" else "Help",
-            "commands": commands[:MAX_RESULTS],
-        }
+        return {"title": "Aide" if language == "fr" else "Help", "commands": commands[:MAX_RESULTS]}
     if command_id != "status.info":
         raise SlashDirectiveError(
             "unknown_informational_command", "Unknown informational command.",
             "Commande d’information inconnue.",
         )
-    payload = {
-        "title": "État d’OSIA" if language == "fr" else "OSIA status",
-        "surface": "Mobile" if str(surface).lower() == "mobile" else "PC",
-        "routing_mode": (
-            "exact" if str(routing_mode).lower() == "exact" else "automatic"
-        ),
-        "provider": str(provider_label or "Automatic")[:80],
-        "model": str(model_label or "Automatic")[:120],
-        "reasoning": str(reasoning or "auto")[:32],
-        "mouse_control_disabled": mouse_control_disabled,
-        "provider_ready": (
-            bool(provider_id) if provider_ready is None else bool(provider_ready)
-        ),
-        "connector_count": len(all_connectors),
-        "connector_ready_count": sum(item.usable for item in all_connectors),
-        "connectors": [
-            {
-                "name": item.display_name[:80],
-                "state": (
-                    {
-                        "connected": "connecté",
-                        "disconnected": "déconnecté",
-                        "failed": "échec",
-                        "authorization_required": "autorisation requise",
-                        "configuration_missing": "configuration manquante",
-                    }.get(item.state, "indisponible")
-                    if language == "fr" else item.state
-                ),
-                "family": (
-                    {"Mail": "Courrier", "Connector": "Connecteur"}.get(
-                        item.family, "Capacité"
-                    )
-                    if language == "fr" else item.family
-                ),
-            }
-            for item in connectors
-        ],
-    }
-    if str(surface).lower() == "mobile":
-        payload["transport"] = str(transport or "offline")[:16]
-    return payload
+    from osia.chat_status import build_chat_status
+
+    return build_chat_status(
+        conversation_id, provider_id=provider_id,
+        model_id=model_id, model_label=model_label,
+    )

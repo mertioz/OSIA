@@ -1103,8 +1103,10 @@ def resolve_conversation_reference(
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
-def create_conversation(title: str | None = None, *, special_mode: bool = False) -> dict:
+def create_conversation(title: str | None = None, *, control_disabled: bool = False) -> dict:
     """Create and persist a new conversation. Returns the full dict."""
+    if type(control_disabled) is not bool:
+        raise ValueError("invalid_control_request")
     with _store_lock():
         conv_id = uuid.uuid4().hex
         now = _now_iso()
@@ -1118,8 +1120,8 @@ def create_conversation(title: str | None = None, *, special_mode: bool = False)
             "last_operation_id": operation_id,
             "messages": [],
         }
-        if special_mode:
-            conv["special_mode"] = True
+        if control_disabled:
+            conv["control_disabled"] = True
         _write_atomic(_path_for(conv_id), conv)
         return conv
 
@@ -1128,10 +1130,12 @@ def resolve_request_conversation(
     request_id: str,
     title: str | None = None,
     *,
-    special_mode: bool = False,
+    control_disabled: bool = False,
 ) -> tuple[dict, bool]:
     """Resolve or reserve the one durable first-chat conversation for a request."""
 
+    if type(control_disabled) is not bool:
+        raise ValueError("invalid_control_request")
     stable_request_id = str(request_id or "").strip()
     if not stable_request_id:
         raise ValueError("request id is required")
@@ -1197,8 +1201,8 @@ def resolve_request_conversation(
             "messages": [],
             "_first_request_id": stable_request_id,
         }
-        if special_mode:
-            conv["special_mode"] = True
+        if control_disabled:
+            conv["control_disabled"] = True
         _write_atomic(path, conv)
         return conv, True
 
@@ -1341,7 +1345,7 @@ def _conversation_summary_unlocked(path: Path) -> dict | None:
             "message_count": len(data.get("messages") or []),
             "revision": int(data.get("revision") or 0),
             "operation_id": str(data.get("last_operation_id") or ""),
-            "special_mode": data.get("special_mode") is True,
+            "control_disabled": data.get("control_disabled") is True,
         }
         # A writer outside the canonical lock may replace a file during this
         # read. Do not cache that mixed observation for future refreshes.
@@ -2800,31 +2804,31 @@ def delete_conversation(conv_id: str) -> bool:
     return bool(delete_conversation_with_receipt(conv_id).get("success"))
 
 
-def conversation_special_mode(conv_id: str) -> bool:
-    """Read the mouse control preference from the existing conversation field."""
+def conversation_control_disabled(conv_id: str) -> bool:
+    """Read the explicit conversation setting for pointer and fresh captures."""
     if not isinstance(conv_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
         return False
     conv = get_conversation(conv_id)
-    return isinstance(conv, dict) and conv.get("special_mode") is True
+    return isinstance(conv, dict) and conv.get("control_disabled") is True
 
 
-def set_conversation_special_mode(conv_id: str, enabled: bool | None = None) -> dict:
-    """Set or toggle the PC-owned flag while no accepted turn can use it."""
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
+def set_conversation_control_disabled(conv_id: str, disabled: bool | None = None) -> dict:
+    """Set or toggle the preference between accepted turns, preserving history."""
+    if not isinstance(conv_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conv_id):
         raise ValueError("conversation_not_found")
-    if enabled is not None and type(enabled) is not bool:
-        raise ValueError("invalid_special_request")
+    if disabled is not None and type(disabled) is not bool:
+        raise ValueError("invalid_control_request")
     with _store_lock():
         conv = get_conversation(conv_id)
         if not isinstance(conv, dict) or conv.get("id") != conv_id:
             raise ValueError("conversation_not_found")
-        current = conv.get("special_mode") is True
-        desired = not current if enabled is None else enabled
+        current = conv.get("control_disabled") is True
+        desired = not current if disabled is None else disabled
         if desired == current:
             return conv
         if _has_active_canonical_chat_lease(conv) or _background_execution_lease_active(conv):
             raise ValueError("conversation_busy")
-        conv["special_mode"] = desired
+        conv["control_disabled"] = desired
         conv["revision"] = _next_revision(conv)
         conv["last_operation_id"] = f"op_{uuid.uuid4().hex}"
         _write_atomic(_path_for(conv_id), conv)

@@ -4786,43 +4786,34 @@ def wake_mode():
         ):
             popup.accept_directive_submission()
 
-    def handle_slash_mouse_control() -> None:
+    def handle_slash_control() -> None:
         nonlocal active_conv
-        language_fr = i18n.get_language() == "fr"
+        french = i18n.get_language() == "fr"
         try:
             if active_conv is None:
-                active_conv = conversations.create_conversation(special_mode=True)
+                active_conv = conversations.create_conversation(control_disabled=True)
                 popup.refresh_conversations(active_conv["id"])
                 popup.bind_unbound_draft(active_conv["id"])
             else:
-                active_conv = conversations.set_conversation_special_mode(active_conv["id"])
+                active_conv = conversations.set_conversation_control_disabled(active_conv["id"])
         except (OSError, ValueError) as error:
             if str(error) == "conversation_busy":
                 popup.show_conversation_busy_notice()
             else:
-                popup._chat.show_notice(
-                    "Impossible de modifier /mousecontrol dans cette discussion."
-                    if language_fr else "Could not change /mousecontrol in this conversation."
-                )
+                popup._chat.show_notice("Impossible de modifier le contrôle." if french else "Could not change control.")
             return
         _notify_mobile_conversation_changed(
             active_conv["id"], revision=active_conv["revision"],
             operation_id=active_conv["last_operation_id"],
         )
-        if active_conv.get("special_mode") is True:
-            notice = (
-                "Contrôle de la souris désactivé dans cette discussion."
-                if language_fr else "Mouse control disabled in this conversation."
-            )
+        disabled = active_conv.get("control_disabled") is True
+        if french:
+            notice = "Souris et captures désactivées dans cette discussion." if disabled else "Souris et captures réactivées dans cette discussion."
         else:
-            notice = (
-                "Contrôle de la souris réactivé dans cette discussion."
-                if language_fr else "Mouse control restored in this conversation."
-            )
+            notice = "Mouse and screenshots disabled in this conversation." if disabled else "Mouse and screenshots restored in this conversation."
         popup._chat.show_notice(notice)
 
     def handle_slash_information(command_id: str) -> None:
-        from osia.reasoning import resolve_reasoning_option_id
         from osia.slash_commands import informational_payload
 
         settings = load_settings() or {}
@@ -4838,31 +4829,25 @@ def wake_mode():
         epoch = selection_epoch[0]
 
         def load_status() -> None:
-            reasoning = "—"
-            if command_id == "status.info" and selected:
-                try:
-                    reasoning = resolve_reasoning_option_id(provider_id, model_id, settings)
-                except ValueError:
-                    pass
             try:
                 payload = informational_payload(
                     command_id, locale=locale, provider_id=provider_id,
-                    provider_label=selected.get("provider_display_name") or provider_id or "—",
-                    model_label=selected.get("model_display_name") or model_id or "—",
-                    reasoning=reasoning,
-                    provider_ready=bool(selected.get("available")),
-                    routing_mode="automatic" if settings.get("ai_hierarchy_enabled") else "exact",
+                    model_id=model_id,
+                    model_label=selected.get("model_display_name") or model_id,
+                    conversation_id=conv_id,
                     models_available=any(item["available"] for item in inventory),
-                    mouse_control_disabled=conversations.conversation_special_mode(conv_id),
                 )
+                payload["_conversation_id"] = conv_id
                 bridge.slash_information_ready.emit(epoch, payload)
             except RuntimeError:
-                pass  # The popup can close while the status is loading.
+                pass  # The popup can close while status is loading.
 
         threading.Thread(target=load_status, name="osia-command-status", daemon=True).start()
 
     def handle_slash_information_ready(epoch: int, payload: dict) -> None:
-        if epoch == selection_epoch[0] and popup.isVisible():
+        conv_id = str((active_conv or {}).get("id") or "")
+        if (epoch == selection_epoch[0] and popup.isVisible()
+                and payload.get("_conversation_id") == conv_id):
             popup.show_slash_information(payload)
 
     pending_compactions: set[str] = set()
@@ -5015,8 +5000,8 @@ def wake_mode():
     popup.submit_draft.connect(handle_submit_draft)
     popup.submit_directive_draft.connect(handle_submit_directive_draft)
     popup.informational_requested.connect(handle_slash_information)
+    popup.control_requested.connect(handle_slash_control)
     bridge.slash_information_ready.connect(handle_slash_information_ready)
-    popup.mouse_control_requested.connect(handle_slash_mouse_control)
     popup.context_compaction_requested.connect(handle_context_compaction)
     bridge.context_compaction_ready.connect(handle_context_compaction_ready)
     popup.new_conversation.connect(handle_new_conversation)

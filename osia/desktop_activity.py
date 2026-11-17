@@ -44,26 +44,26 @@ def _publish(active: bool) -> None:
         pass
 
 
-def mouse_feedback_enabled(*, conversation_id: str = "") -> bool:
-    """Decorate mouse-enabled chats only; keyboard/UIA execution stays independent."""
+def control_feedback_enabled(*, conversation_id: str = "") -> bool:
+    """Keep control decoration consistent with the conversation's user choice."""
     try:
-        from osia.slash_commands import current_chat_commands
+        from osia.slash_commands import current_control_disabled
 
-        if current_chat_commands()[0]:
+        if current_control_disabled():
             return False
         if conversation_id:
-            from osia.conversations import conversation_special_mode
+            from osia.conversations import conversation_control_disabled
 
-            return not conversation_special_mode(conversation_id)
+            return not conversation_control_disabled(conversation_id)
         return True
     except Exception:
-        return False  # unavailable presentation must never block native input
+        return False  # presentation failure never rejects an input action
 
 
 @contextmanager
 def native_input_activity(*, enabled: bool | None = None):
     global _depth
-    if not (mouse_feedback_enabled() if enabled is None else enabled):
+    if not (control_feedback_enabled() if enabled is None else enabled):
         yield
         return
     with _lock:
@@ -104,10 +104,7 @@ def _finished_intent_path(path: Path) -> Path:
 
 def observe_desktop_intent(turn_id: str, tool_name: str, *, conversation_id: str = "") -> None:
     """A requested native action is an intention fact, not an execution permit."""
-    if (
-        not turn_id or tool_name not in DESKTOP_INTENT_TOOLS
-        or not mouse_feedback_enabled(conversation_id=conversation_id)
-    ):
+    if not turn_id or tool_name not in DESKTOP_INTENT_TOOLS or not control_feedback_enabled(conversation_id=conversation_id):
         return
     try:
         import psutil

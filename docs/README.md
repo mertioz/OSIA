@@ -1,6 +1,6 @@
 # OSIA technical guides
 
-Updated on **16 November 2026** against the implementation and the
+Updated on **17 November 2026** against the implementation and the
 [OSIA Work Drive](https://drive.google.com/drive/folders/1dCXO0R_JyYnzQoVS59cAl9P5MTPn_kBz).
 This directory contains the maintained technical guides and their index.
 

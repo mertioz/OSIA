@@ -2905,6 +2905,66 @@
           "legacy_ids": [
             "advanced.usage-examples"
           ]
+        },
+        {
+          "slide_id": "mastery.chat-shortcuts",
+          "track_id": "master-osia",
+          "order": 46,
+          "title": {
+            "en": "Commands and past conversations",
+            "fr": "Commandes et discussions passées"
+          },
+          "subtitle": {
+            "en": "The chat composer gives quick access to commands and extra conversation context.",
+            "fr": "La zone de message donne accès aux commandes et au contexte d’autres discussions."
+          },
+          "body_blocks": [
+            {
+              "en": "Type / to open the command palette: /web, /model, /status, /help, /control, /compact, /skill and /skillcreator. Type @, search and select a past conversation to add its context to your next message.",
+              "fr": "Tapez / pour ouvrir les commandes : /web, /model, /status, /help, /control, /compact, /skill et /skillcreator. Tapez @, recherchez puis choisissez une discussion passée pour ajouter son contexte au prochain message."
+            },
+            {
+              "en": "/control disables mouse control and new screenshots in this conversation until you use it again. /status shows the model and context, plus remaining account quota or estimated API tokens and costs per model. Unavailable figures remain unavailable.",
+              "fr": "/control coupe la souris et les nouvelles captures dans cette discussion jusqu’au prochain /control. /status affiche modèle et contexte, puis quota du compte ou estimations des jetons et coûts API par modèle. Les données indisponibles restent indiquées comme telles."
+            }
+          ],
+          "callouts": [
+            {
+              "kind": "example",
+              "title": {
+                "en": "In practice",
+                "fr": "En pratique"
+              },
+              "body": {
+                "en": "Select @ and your earlier research, then ask: Continue using the context from that discussion.",
+                "fr": "Sélectionnez @ puis votre recherche précédente et demandez : Continue à partir du contexte de cette discussion."
+              }
+            },
+            {
+              "kind": "remember",
+              "title": {
+                "en": "Remember",
+                "fr": "À retenir"
+              },
+              "body": {
+                "en": "A reference adds context; it does not replay actions from the selected conversation.",
+                "fr": "Une référence ajoute du contexte ; elle ne rejoue pas les actions de la discussion sélectionnée."
+              }
+            }
+          ],
+          "visual": {
+            "kind": "native",
+            "key": "mastery.chat-shortcuts",
+            "alt": {
+              "en": "OSIA visual explaining commands and past conversations.",
+              "fr": "Visuel OSIA expliquant commandes et discussions passées."
+            }
+          },
+          "action": {
+            "type": "none",
+            "target": ""
+          },
+          "legacy_ids": []
         }
       ]
     },

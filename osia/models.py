@@ -6,6 +6,7 @@ PC-owned cloud discovery, documented capability fallbacks and local models.
 
 import re
 import copy
+import math
 import threading
 import time
 
@@ -412,6 +413,31 @@ def _supported(value):
     return value is True or (isinstance(value, dict) and value.get("supported") is True)
 
 
+def _openrouter_price_metadata(raw):
+    """Keep public USD/token list rates without changing model availability."""
+    if not isinstance(raw, dict):
+        return None
+    safe = {}
+    for field in ("prompt", "completion", "input_cache_read"):
+        value = raw.get(field)
+        if isinstance(value, bool) or value is None:
+            if field in {"prompt", "completion"}:
+                return None
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            if field in {"prompt", "completion"}:
+                return None
+            continue
+        if not math.isfinite(numeric) or numeric < 0:
+            if field in {"prompt", "completion"}:
+                return None
+            continue
+        safe[field] = numeric
+    return safe
+
+
 def _discovered_model(provider, item):
     mid = item.get("id") or item.get("name") or ""
     if not isinstance(mid, str) or not mid or any(c.isspace() for c in mid):
@@ -458,6 +484,10 @@ def _discovered_model(provider, item):
               "label": item.get("display_name") or item.get("displayName") or known.get("label") or mid,
               "tier": known.get("tier", "mid"), "source": "provider_discovery",
               "availability": "listed", "available": True, "streaming": known.get("streaming", True)}
+    if provider == "openrouter":
+        pricing = _openrouter_price_metadata(item.get("pricing"))
+        if pricing is not None:
+            result["pricing"] = pricing
     if provider == "mistral":
         result.update(vision=_supported(caps.get("vision")), tool_calls=_supported(caps.get("function_calling")))
     elif provider == "xai":

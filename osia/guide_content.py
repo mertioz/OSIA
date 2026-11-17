@@ -1496,6 +1496,34 @@ _advanced_lessons = tuple(
     for order, spec in enumerate(_ADVANCED_SPECS, start=1)
 )
 LESSONS = (*_essential_lessons, *_mastery_lessons, *_advanced_lessons)
+LESSONS = (*LESSONS, GuideLesson(
+    id="mastery.chat-shortcuts", category=CATEGORY_MASTERY, order=21,
+    subject_id="conversations-turns",
+    title={"en": "Commands and past conversations", "fr": "Commandes et discussions passées"},
+    intro={
+        "en": "The chat composer gives quick access to commands and extra conversation context.",
+        "fr": "La zone de message donne accès aux commandes et au contexte d’autres discussions.",
+    },
+    paragraphs=(
+        {
+            "en": "Type / to open the command palette: /web, /model, /status, /help, /control, /compact, /skill and /skillcreator. Type @, search and select a past conversation to add its context to your next message.",
+            "fr": "Tapez / pour ouvrir les commandes : /web, /model, /status, /help, /control, /compact, /skill et /skillcreator. Tapez @, recherchez puis choisissez une discussion passée pour ajouter son contexte au prochain message.",
+        },
+        {
+            "en": "/control disables mouse control and new screenshots in this conversation until you use it again. /status shows the model and context, plus remaining account quota or estimated API tokens and costs per model. Unavailable figures remain unavailable.",
+            "fr": "/control coupe la souris et les nouvelles captures dans cette discussion jusqu’au prochain /control. /status affiche modèle et contexte, puis quota du compte ou estimations des jetons et coûts API par modèle. Les données indisponibles restent indiquées comme telles.",
+        },
+    ),
+    example_title={"en": "In practice", "fr": "En pratique"},
+    example={
+        "en": "Select @ and your earlier research, then ask: Continue using the context from that discussion.",
+        "fr": "Sélectionnez @ puis votre recherche précédente et demandez : Continue à partir du contexte de cette discussion.",
+    },
+    remember={
+        "en": "A reference adds context; it does not replay actions from the selected conversation.",
+        "fr": "Une référence ajoute du contexte ; elle ne rejoue pas les actions de la discussion sélectionnée.",
+    },
+))
 
 
 LESSONS_BY_ID = {lesson.id: lesson for lesson in LESSONS}

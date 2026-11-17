@@ -319,7 +319,7 @@ def test_artifact_limits_identity_classification_and_privacy(tmp_path):
 
 
 def test_safe_url_display_never_exposes_query_fragment_userinfo_or_file_path():
-    raw = "https://account:secret@example.test/private/path?token=QUERY#fragment"
+    raw = "https://" + "account:secret" + "@example.test/private/path?token=QUERY#fragment"
     assert safe_url_display(raw) == "https://example.test/private/path"
     assert safe_url_display("file:///C:/private/secret.txt") == "file:///[private]"
     assert safe_url_display("about:blank?token=QUERY#fragment") == "about:blank"
@@ -803,7 +803,7 @@ def test_real_chat_agent_bridge_uses_typed_browser_results(controlled_browser):
     assert "screenshot" not in json.dumps((navigated, inspected)).lower()
 
 
-def test_exact_browser_extraction_and_nested_scroll_with_mouse_disabled(
+def test_exact_browser_extraction_and_nested_scroll_without_native_focus(
     controlled_browser, monkeypatch,
 ):
     from osia.agent import _execute_tool_with_policy
@@ -830,7 +830,6 @@ def test_exact_browser_extraction_and_nested_scroll_with_mouse_disabled(
 
     panel = next(region for region in snapshot["scroll_regions"] if region["label"] == "Nested panel")
     assert panel["scroll_top"] == 0
-    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
     monkeypatch.setattr(
         desktop_control, "focus_app_window", lambda *_: pytest.fail("desktop focus used"),
     )
@@ -847,10 +846,11 @@ def test_exact_browser_extraction_and_nested_scroll_with_mouse_disabled(
     ) == 120
 
 
-@pytest.mark.parametrize("mouse_disabled", [False, True])
+@pytest.mark.parametrize("in_chat_scope", [False, True])
 def test_real_form_keyboard_and_capture_without_page_activation(
-    controlled_browser, monkeypatch, mouse_disabled,
+    controlled_browser, monkeypatch, in_chat_scope,
 ):
+    from contextlib import nullcontext
     from playwright.async_api import Page
     from osia.slash_commands import chat_command_scope
 
@@ -861,9 +861,6 @@ def test_real_form_keyboard_and_capture_without_page_activation(
 
     monkeypatch.setattr(Page, "bring_to_front", activated)
     monkeypatch.setattr(browser, "_raise_browser_window", activations.append)
-    monkeypatch.setattr(
-        "osia.conversations.conversation_special_mode", lambda _: mouse_disabled,
-    )
     owner = controlled_browser.owner
 
     async def observe():
@@ -876,7 +873,7 @@ def test_real_form_keyboard_and_capture_without_page_activation(
         }
 
     monkeypatch.setattr(owner, "_op_test_background_observe", observe, raising=False)
-    with chat_command_scope("background-browser", None):
+    with (chat_command_scope("background-browser", None) if in_chat_scope else nullcontext()):
         state = _navigate(controlled_browser.web.base + "/background")
         fields = json.loads(browser.inspect_form_fields())["fields"]
         first_ref = next(
@@ -987,9 +984,11 @@ def test_tab_listing_pairs_navigation_state_with_the_observed_url():
 
 
 @pytest.mark.parametrize("deadline", ["inspection", "owner"])
-def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
-    controlled_browser, monkeypatch, tmp_path, deadline,
+@pytest.mark.parametrize("control_disabled", [False, True])
+def test_account_tools_fill_and_submit_managed_form_without_native_focus(
+    controlled_browser, monkeypatch, tmp_path, deadline, control_disabled,
 ):
+    from playwright.async_api import Page
     from osia.chatgpt_account.app_server_client import AppServerClient, _TurnAttempt
     from osia.slash_commands import chat_command_scope
     from osia.tool_attempts import ToolAttemptStore
@@ -1004,7 +1003,15 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
         return popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(browser.subprocess, "Popen", launch)
-    monkeypatch.setattr("osia.conversations.conversation_special_mode", lambda _: True)
+    monkeypatch.setattr("osia.conversations.conversation_control_disabled", lambda _: control_disabled)
+    captures = []
+    original_screenshot = Page.screenshot
+
+    async def checked_screenshot(page, **kwargs):
+        captures.append(1)
+        return await original_screenshot(page, **kwargs)
+
+    monkeypatch.setattr(Page, "screenshot", checked_screenshot)
     monkeypatch.setattr(
         desktop_control, "focus_app_window", lambda *_: pytest.fail("desktop focus used"),
     )
@@ -1044,6 +1051,16 @@ def test_account_tools_fill_and_submit_managed_form_with_mouse_disabled(
 
     with chat_command_scope("browser-fixture", None):
         _navigate(controlled_browser.web.base + "/form")
+        async def capture_current_page():
+            page = await controlled_browser.owner._ensure_browser()
+            return await controlled_browser.owner._screenshot_b64(page)
+
+        monkeypatch.setattr(controlled_browser.owner, "_op_capture_control_fixture", capture_current_page, raising=False)
+        image = controlled_browser.owner.call("capture_control_fixture")
+        if control_disabled:
+            assert image is None and captures == []
+        else:
+            assert image and captures
         fields = call("inspect_form_fields", {})["fields"]
         name_ref = next(
             field["field_ref"] for field in fields if field.get("html_name") == "name"

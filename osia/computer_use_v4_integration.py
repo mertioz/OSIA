@@ -374,6 +374,10 @@ def _capture_target(window: str, surface_ref: str) -> tuple[int, str]:
 
 
 def _capture_window_frame(window: str, surface_ref: str) -> ComputerFrame:
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        raise ComputerUseV4Error("CONVERSATION_CONTROL_DISABLED", "new_screenshots_disabled")
     hwnd, expected_token = _capture_target(window, surface_ref)
     if hwnd <= 0:
         raise ComputerUseV4Error("WINDOW_NOT_FOUND")
@@ -795,7 +799,7 @@ def _execute_action(tool_name: str, action: ComputerAction) -> dict[str, Any]:
     from osia.tool_contracts import tool_disabled_by_chat_command
 
     if tool_disabled_by_chat_command(tool_name):
-        return _error_result("CONVERSATION_MOUSE_CONTROL_DISABLED")
+        return _error_result("CONVERSATION_CONTROL_DISABLED")
     _before_action(tool_name, action.safe_arguments())
     try:
         return _wrap_action(_loop().execute(action))
@@ -892,7 +896,7 @@ def tool_computer_actions(actions: list[dict]) -> dict[str, Any]:
         if tool_disabled_by_chat_command("computer_actions", {
             "actions": [{"kind": item.kind} for item in parsed_actions],
         }):
-            return _error_result("CONVERSATION_MOUSE_CONTROL_DISABLED")
+            return _error_result("CONVERSATION_CONTROL_DISABLED")
         _before_action("computer_actions", {
             "action_count": len(parsed_actions),
             "actions": [item.safe_arguments() for item in parsed_actions],

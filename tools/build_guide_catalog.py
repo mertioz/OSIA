@@ -457,7 +457,7 @@ def validate_catalog(catalog: dict) -> None:
                 if not isinstance(alias, str) or not alias:
                     raise ValueError("guide_alias")
     counts = [len(track["slides"]) for track in tracks]
-    if counts != [17, 45, 43]:
+    if counts != [17, 46, 43]:
         raise ValueError(f"guide_slide_counts:{counts}")
 
 

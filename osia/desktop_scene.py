@@ -1474,12 +1474,9 @@ def _dispatch_fresh_uia_action_bounded(
 ) -> dict:
     """Bound one UIA provider call while preserving its exact dispatch state."""
 
-    from osia.desktop_activity import mouse_feedback_enabled
+    from osia.desktop_activity import control_feedback_enabled
 
-    # This COM worker has its own context. Carry only the presentation choice;
-    # the native action, its journal, cancellation and receipt stay unchanged.
-    feedback_enabled = mouse_feedback_enabled()
-
+    feedback_enabled = control_feedback_enabled()
     done = threading.Event()
     cancel_before_dispatch = threading.Event()
     dispatch_gate = threading.Lock()
@@ -3746,6 +3743,10 @@ def _capture_bounds(bounds: SurfaceBounds) -> bytes:
 
 
 def _capture_bounds_timed(bounds: SurfaceBounds) -> tuple[bytes, float, float]:
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        raise RuntimeError("CONVERSATION_CONTROL_DISABLED")
     if not bounds.valid():
         raise RuntimeError("invalid_surface_bounds")
     from PIL import Image, ImageGrab
@@ -4621,6 +4622,10 @@ def _capture_exact_window_image(
 ):
     """Capture one Win32 window without pixels from overlapping windows."""
 
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        raise RuntimeError("CONVERSATION_CONTROL_DISABLED")
     from PIL import ImageGrab
 
     candidates = (
@@ -4783,6 +4788,10 @@ def _capture_bound_visual_surface(
 ):
     """Capture the proven surface and bind its full coordinate transform."""
 
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        raise RuntimeError("CONVERSATION_CONTROL_DISABLED")
     from PIL import ImageGrab
     from osia.vision_runtime import CoordinateTransform, prepare_capture
 
@@ -5535,6 +5544,16 @@ def request_visual_observation(
     """Capture an exact frame for the active model's normal reasoning loop."""
 
     trace = VisionTrace()
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled() and not (visual_frame_id or visual_bbox):
+        return _vision_failure_result(
+            trace=trace, stage=VisionStage.CAPTURE_REQUESTED,
+            failure=VisionFailure.CAPTURE_ACCESS_DENIED,
+            reason_code="CONVERSATION_CONTROL_DISABLED",
+            text="new screenshots are disabled for this conversation; existing image input remains available.",
+            surface_ref=surface_ref,
+        )
     provider, model = effective_model_image_route()
     if not provider or not model:
         return _vision_failure_result(

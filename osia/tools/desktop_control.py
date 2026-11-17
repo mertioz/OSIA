@@ -38,6 +38,14 @@ import time
 from collections import namedtuple
 from osia.desktop_activity import shows_native_input
 
+
+def _control_disabled_error() -> str | None:
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        return "ERROR: CONVERSATION_CONTROL_DISABLED: native pointer control and new screenshots are disabled."
+    return None
+
 # ---------------------------------------------------------------------------
 # Optional backend: pyautogui (Windows / Mac).
 #
@@ -443,6 +451,8 @@ def _screenshot_with_cursor(path, env) -> bool:
     exists, spectacle first to match ``agent._capture_screen``'s order (on KDE,
     grim may produce a cursor-less frame). Mirrors that chain's robustness: drop
     any stale file first, then require rc 0 AND a non-empty file."""
+    if _control_disabled_error():
+        return False
     backends = []
     if shutil.which("spectacle"):
         backends.append((["spectacle", "-b", "-n", "-p", "-o", path], 15))  # KDE (-p pointer)
@@ -692,6 +702,9 @@ _PreparedClick = namedtuple(
 def prepare_click(x, y, button: str = "left", double: bool = False):
     """Complete fallible validation/backend loading without input dispatch."""
 
+    error = _control_disabled_error()
+    if error:
+        return error
     try:
         x = int(round(float(x)))
         y = int(round(float(y)))
@@ -740,6 +753,9 @@ def prepare_click(x, y, button: str = "left", double: bool = False):
 def dispatch_prepared_click(prepared):
     """Invoke the prepared platform input callback with no readiness work."""
 
+    error = _control_disabled_error()
+    if error:
+        return error
     if not isinstance(prepared, _PreparedClick):
         return "ERROR: click_at: invalid prepared click"
     if prepared.backend == "pyautogui":
@@ -796,6 +812,9 @@ def move_to(x, y):
     target, then the fine locate clicks the corrected position. Same backend
     resolution and calibrated Wayland positioning as :func:`click_at`; returns a
     short success string or an ``ERROR: ...`` string (never raises)."""
+    error = _control_disabled_error()
+    if error:
+        return error
     try:
         x = int(round(float(x)))
         y = int(round(float(y)))
@@ -1039,6 +1058,9 @@ def press_key(key):
 def scroll(direction: str = "down", amount=3):
     """Scroll the active window ``up``/``down``/``left``/``right`` by ``amount``
     wheel notches (default 3)."""
+    error = _control_disabled_error()
+    if error:
+        return error
     d = str(direction or "down").strip().lower()
     if d not in ("up", "down", "left", "right"):
         return f"ERROR: scroll: direction must be up/down/left/right, got {direction!r}"

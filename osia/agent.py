@@ -454,9 +454,9 @@ def get_system_prompt(
         replace_static_tool_prompt_section,
         static_tool_prompt_block,
     )
-    from osia.slash_commands import current_chat_commands
+    from osia.slash_commands import current_chat_commands, current_control_disabled
 
-    mouse_control_disabled, chat_directives = current_chat_commands()
+    chat_directives = current_chat_commands()
     surface = current_tool_surface()
     body = replace_static_tool_prompt_section(SYSTEM_PROMPT_CORE)
     if model and provider:
@@ -484,11 +484,12 @@ def get_system_prompt(
     except Exception:
         pass
 
-    if mouse_control_disabled:
+    if current_control_disabled():
         body += (
-            "\n\n[Conversation setting: mouse control disabled.] "
-            "Leave the physical desktop pointer untouched. Use targeted window captures, "
-            "image analysis, keyboard input or structured tools for this conversation."
+            "\n\n[Control disabled for this conversation.] "
+            "Physical pointer control and new screenshots are disabled for this conversation. "
+            "Keyboard input, structured browser tools and analysis of images already provided "
+            "remain available. Do not present an existing image as a fresh screenshot."
         )
     if chat_directives.capability_requirements.current_web:
         body += (
@@ -1835,6 +1836,10 @@ def _capture_screen(path: str) -> str | None:
     screen) and the desktop-click path (locate an element by pixel) so the two
     never drift apart.
     """
+    from osia.slash_commands import current_control_disabled
+
+    if current_control_disabled():
+        return "ERROR: CONVERSATION_CONTROL_DISABLED: new screenshots are disabled for this conversation."
     if sys.platform == "win32":
         try:
             from PIL import ImageGrab
@@ -3127,10 +3132,10 @@ def tool_desktop_press(key: str) -> str:
 
 def tool_desktop_scroll(direction: str = "down", amount=3) -> str:
     """Scroll the active native window up/down/left/right."""
-    from osia.tool_contracts import tool_disabled_by_chat_command
+    from osia.slash_commands import current_control_disabled
 
-    if tool_disabled_by_chat_command("desktop_scroll"):
-        return "ERROR: Mouse control is disabled for this conversation."
+    if current_control_disabled():
+        return "ERROR: CONVERSATION_CONTROL_DISABLED: pointer control is disabled for this conversation."
     from osia.tools import desktop_control as _dc
     arguments = {"direction": direction, "amount": amount}
     return _desktop_result_without_forced_observer(
