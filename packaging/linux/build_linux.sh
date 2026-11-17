@@ -25,7 +25,7 @@ trap 'rm -rf -- "$stage"' EXIT
 package="$stage/OSIA-Linux-x86_64"
 payload="$package/payload"
 mkdir -p -- "$payload/"{app,bin,integration,bootstrap}
-git -C "$repo" archive "$revision" osia assets THIRD_PARTY_NOTICES.md \
+git -C "$repo" archive "$revision" osia assets LICENSE NOTICE THIRD_PARTY_NOTICES.md \
   | tar -xf - -C "$payload/app"
 
 # The user installer fetches third-party Python libraries and browsers from

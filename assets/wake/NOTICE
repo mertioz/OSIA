@@ -3,5 +3,4 @@ Copyright Alpha Cephei Inc. and contributors.
 Licensed under Apache License 2.0. See LICENSE.vosk.
 Model source: https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip
 Model license listing: https://alphacephei.com/vosk/models
-OSIA phonetic configuration and integration: OSIA contributors, Apache-2.0.
-The OSIA name and reserved artwork retain their separate branding permissions.
+OSIA phonetic configuration and integration: OSIA contributors, MIT.

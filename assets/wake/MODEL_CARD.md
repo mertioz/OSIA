@@ -19,7 +19,7 @@ with the keyword so general speech is not forced into an activation.
 
 - Source: <https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip>
 - Upstream listing and model license: <https://alphacephei.com/vosk/models>
-- Model license: **Apache-2.0**, separate from OSIA branding permissions.
+- Vosk model license: **Apache-2.0**. OSIA's phonetic configuration and integration use **MIT**.
 - 68,483,807 bytes of model data, plus the native Vosk library already declared
   in requirements. This is a compact French speech engine, not the retired
   pickle classifier. The downloaded model is not relabeled as OSIA-authored.

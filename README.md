@@ -25,20 +25,13 @@ speak your request. Ctrl+Alt+P always starts manual listening. Acoustic listenin
 is off by default, and microphone audio is not saved. Command transcription
 uses your configured STT provider. See [model, training and acceptance details](assets/wake/MODEL_CARD.md).
 
-## License and brand
+## License
 
-OSIA-authored code is open source under **Apache License 2.0**. Commercial reuse,
-modification and integration are permitted. Read LICENSE and LICENSING.md,
-including the separate licenses of dependencies such as PyQt.
+Original OSIA code, documentation, logo and visual assets use the
+[MIT License](LICENSE), which permits commercial reuse. See [LICENSING.md](LICENSING.md)
+and [third-party notices](THIRD_PARTY_NOTICES.md) for dependency terms.
 
-The OSIA name and original visual identity have separate permissions.
-A commercial offering using the reserved name/artwork as its own branding
-requires prior written permission: contact@osia.space. You may commercialize
-the code under your own branding with reserved artwork replaced.
-See TRADEMARKS.md and the exact inventory in BRAND_ASSETS.json.
-
-En français : le code peut être réutilisé dans des produits commerciaux.
-La vente d'une offre reprenant le nom ou les visuels réservés d'OSIA demande
-un accord écrit préalable. L'utilisation interne en entreprise reste autorisée.
+En français, la licence MIT autorise la réutilisation commerciale du code et
+des visuels originaux d’OSIA.
 
 Report vulnerabilities privately as described in SECURITY.md.

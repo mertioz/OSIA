@@ -24,6 +24,8 @@ datas = [
     (str(STAGE / "models"), "models"),
     (str(STAGE / "runtimes"), "runtimes"),
     (str(STAGE / "legal"), "legal"),
+    (str(ROOT / "LICENSE"), "legal"),
+    (str(ROOT / "NOTICE"), "legal"),
     (str(GENERATED / "app_metadata.json"), "."),
     (str(ROOT / "packaging" / "windows" / "THIRD_PARTY_NOTICES.md"), "."),
 ]
