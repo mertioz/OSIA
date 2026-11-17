@@ -7,6 +7,9 @@ from PyQt6.QtWidgets import QAbstractButton, QApplication, QComboBox
 class ButtonCursorPolicy(QObject):
     """Keep controls consistent without overriding the system-wide cursor."""
 
+    _CONTROL_TYPES = (QAbstractButton, QComboBox)
+    _CURSOR_EVENTS = (QEvent.Type.Polish, QEvent.Type.Show, QEvent.Type.EnabledChange)
+
     def __init__(self, root):
         super().__init__(root)
         self._root = root
@@ -30,9 +33,9 @@ class ButtonCursorPolicy(QObject):
 
     def eventFilter(self, watched, event):  # noqa: N802 (Qt method name)
         if (
-            event.type() in (QEvent.Type.Polish, QEvent.Type.Show, QEvent.Type.EnabledChange)
-            and isinstance(watched, (QAbstractButton, QComboBox))
+            isinstance(watched, self._CONTROL_TYPES)
             and self._root_alive
+            and event.type() in self._CURSOR_EVENTS
             and self._root.isAncestorOf(watched)
         ):
             self._apply(watched)

@@ -26,6 +26,7 @@ import shlex
 import sys
 import threading
 import webbrowser
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -543,8 +544,10 @@ class _Bubble(QFrame):
 class _PointerStyledButton(QPushButton):
     """Draw hover across the whole button, including child labels."""
 
+    _HOVER_EVENTS = (QEvent.Type.Enter, QEvent.Type.Leave)
+
     def event(self, event) -> bool:
-        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
+        if event.type() in self._HOVER_EVENTS:
             self.update()
         return super().event(event)
 
@@ -3061,6 +3064,7 @@ class _ConversationsPanel(QWidget):
         self._active_id: str | None = None
         self._rendered_active_id: str | None = None
         self._last_signature = None
+        self._rendered_projection = None
         self._last_snapshot: dict | None = None
         self._row_widgets: dict[str, _ConvRow] = {}
         self._folder_widgets: dict[str, _FolderRow] = {}
@@ -3149,7 +3153,7 @@ class _ConversationsPanel(QWidget):
         more_label = i18n.t("conversations.more_actions")
         self._more_btn.setToolTip(more_label)
         self._more_btn.setAccessibleName(more_label)
-        self.refresh()
+        self.refresh(force=True)
 
     def show_notice(self, message: str) -> None:
         self._delete_notice.setText(message)
@@ -3264,7 +3268,7 @@ class _ConversationsPanel(QWidget):
             tuple(
                 (
                     item.get("id"), item.get("title"), item.get("updated_at"),
-                    item.get("folder_id"),
+                    item.get("folder_id"), item.get("message_count"),
                 )
                 for item in snapshot.get("items") or []
             ),
@@ -3436,7 +3440,7 @@ class _ConversationsPanel(QWidget):
                 row.setFocus(Qt.FocusReason.OtherFocusReason)
         self._scroll.verticalScrollBar().setValue(scroll_value)
 
-    def refresh(self, *, snapshot: dict | None = None) -> None:
+    def refresh(self, *, snapshot: dict | None = None, force: bool = False) -> None:
         snapshot = snapshot or conversations.conversation_snapshot()
         if (
             self._last_snapshot is not None
@@ -3444,6 +3448,32 @@ class _ConversationsPanel(QWidget):
             < int(self._last_snapshot.get("snapshot_revision") or 0)
         ):
             snapshot = self._last_snapshot
+        # Navigation and canonical polling often deliver the same projection.
+        # Keep existing rows, focus, scroll and any running project animation
+        # when nothing rendered has changed. Optimistic rollback and localized
+        # timestamps participate too; a store revision alone is not sufficient.
+        projection = (
+            self._snapshot_signature(snapshot),
+            frozenset(self._optimistic_hidden_ids),
+            tuple(
+                (key, self._snapshot_signature({"items": [item]}))
+                for key, item in self._optimistic_restore_items.items()
+            ),
+            tuple(self._optimistic_restore_order.items()),
+            i18n.get_language(), timefmt.use_12h(),
+        )
+        if (
+            not force and projection == self._rendered_projection
+            and self._active_id == self._rendered_active_id
+        ):
+            # Retain fresh canonical metadata even when it has no visible
+            # effect. This cache only avoids widget work, not state projection.
+            self._last_snapshot = {
+                "items": [dict(item) for item in snapshot.get("items") or []],
+                "folders": [dict(item) for item in snapshot.get("folders") or []],
+                "snapshot_revision": snapshot.get("snapshot_revision", 0),
+            }
+            return
         animation_starts = {}
         for folder in snapshot.get("folders") or []:
             folder_id = str(folder.get("id") or "")
@@ -3510,6 +3540,7 @@ class _ConversationsPanel(QWidget):
             self._rendered_active_id = self._active_id
             self._scroll_value_to_restore = None
             self._folder_focus_to_restore = None
+            self._rendered_projection = projection
             return
         insert_at = 0
 
@@ -3584,6 +3615,7 @@ class _ConversationsPanel(QWidget):
             register_conversation(row)
             insert_at += 1
         self._rendered_active_id = self._active_id
+        self._rendered_projection = projection
         if self._scroll_value_to_restore is not None:
             # Let the scroll area settle its resized content and range first.
             self._scroll_restore_timer.start(0)
@@ -3946,6 +3978,7 @@ class _ModelPanel(QWidget):
         self._remote: list = []
         self._account_status: dict | None = None
         self._inventory: list[dict] = []
+        self._rendered_reasoning = None
         self._view: str | None = None   # None = provider grid, else provider key
 
         outer = QVBoxLayout(self)
@@ -4024,6 +4057,11 @@ class _ModelPanel(QWidget):
         ))
 
     def set_current(self, model_id: str | None, provider: str | None = None) -> None:
+        if (
+            model_id == self._current_model and provider == self._current_provider
+            and self._rendered_reasoning == get_reasoning_settings()
+        ):
+            return
         self._current_model = model_id
         self._current_provider = provider
         self.refresh()
@@ -4038,9 +4076,17 @@ class _ModelPanel(QWidget):
 
     def set_inventory(self, inventory: list[dict]) -> None:
         """Consume the MainPopup-owned normalized cached inventory."""
-        self._inventory = [
+        incoming = [
             dict(entry) for entry in inventory if isinstance(entry, dict)
         ]
+        if (
+            incoming == self._inventory
+            and self._rendered_reasoning == get_reasoning_settings()
+        ):
+            return
+        # Detach nested capability/options data from its producer so a later
+        # in-place catalog update cannot silently invalidate this comparison.
+        self._inventory = deepcopy(incoming)
         self.refresh()
 
     def showEvent(self, event):
@@ -4112,6 +4158,7 @@ class _ModelPanel(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
+        reasoning = get_reasoning_settings()
         while self._host_layout.count() > 1:
             item = self._host_layout.takeAt(0)
             w = item.widget()
@@ -4126,6 +4173,7 @@ class _ModelPanel(QWidget):
             self._build_grid()
         else:
             self._build_model_list(self._view)
+        self._rendered_reasoning = reasoning
 
     # ── Level 1: provider grid ──────────────────────────────────────────────
 
