@@ -105,8 +105,8 @@ def test_transition_keeps_live_input_focus_geometry_and_one_bounded_frame(surfac
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     assert len(clicked) == 1
     assert button.text() == "After"
-    for milliseconds in (30, 70, 120):
-        transition._animation.setCurrentTime(milliseconds)
+    for fraction in (0.15, 0.4, 0.7):
+        transition._animation.setCurrentTime(round(transition._animation.duration() * fraction))
         assert button.geometry() == geometry
         assert root.graphicsEffect() is None
         assert 0 < transition._alpha < 1

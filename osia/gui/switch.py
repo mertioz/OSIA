@@ -15,7 +15,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import QCheckBox, QWidget
 
-from osia.gui.motion import reduced_motion_requested
+from osia.gui.motion import MOTION, reduced_motion_requested
 from osia.gui.theme import ThemeManager, get_theme_manager
 
 
@@ -44,7 +44,7 @@ class OsiaSwitch(QCheckBox):
     CONTROL_HEIGHT = TRACK_HEIGHT + 6
     THUMB_DIAMETER = 16
     TEXT_GAP = 8
-    ANIMATION_MS = 140
+    ANIMATION_MS = MOTION.state_ms
 
     def __init__(
         self,

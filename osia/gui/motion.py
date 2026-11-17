@@ -19,12 +19,13 @@ from PyQt6.QtWidgets import (
 
 @dataclass(frozen=True)
 class MotionTokens:
-    micro_ms: int = 110
-    state_ms: int = 140
-    appearance_ms: int = 180
-    page_ms: int = 190
-    navigation_ms: int = 180
-    collapse_ms: int = 140
+    micro_ms: int = 70
+    state_ms: int = 100
+    appearance_ms: int = 120
+    page_ms: int = 110
+    navigation_ms: int = 110
+    collapse_ms: int = 90
+    theme_ms: int = 150
 
 
 MOTION = MotionTokens()
@@ -282,13 +283,13 @@ class ThemeTransition(ContentTransition):
 
     def __init__(self, window: QWidget) -> None:
         super().__init__(window)
-        self._animation.setDuration(220)
+        self._animation.setDuration(MOTION.theme_ms)
 
     def capture(self, _key: str) -> None:
         super().capture()
 
     def start(self, _key: str) -> None:
-        super().start(220)
+        super().start(MOTION.theme_ms)
 
     def _clear(self) -> None:
         self.settle()
