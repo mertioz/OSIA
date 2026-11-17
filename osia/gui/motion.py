@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable
 
-from PyQt6.QtCore import QEasingCurve, QObject, Qt, QVariantAnimation
-from PyQt6.QtGui import QPainter, QPixmap
+from PyQt6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QRect, Qt, QVariantAnimation
+from PyQt6.QtGui import QColor, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QGraphicsOpacityEffect,
@@ -23,6 +23,8 @@ class MotionTokens:
     state_ms: int = 140
     appearance_ms: int = 180
     page_ms: int = 190
+    navigation_ms: int = 180
+    collapse_ms: int = 140
 
 
 MOTION = MotionTokens()
@@ -114,10 +116,12 @@ class MotionController(QObject):
             self._states[key] = (widget, effect, animation)
         else:
             _, effect, animation = state
+            start = effect.opacity()
             animation.stop()
-            effect.setOpacity(start)
+        animation.setCurrentTime(0)
         animation.setStartValue(start)
         animation.setEndValue(end)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         animation.setDuration(max(0, int(duration_ms)))
         animation.start()
 
@@ -157,6 +161,93 @@ class MotionController(QObject):
     def settle(self) -> None:
         for key in tuple(self._states):
             self._finish(key, force_opacity=1.0)
+
+
+class ContentTransition(QWidget):
+    """Crossfade one visible content area; its live controls stay in place.
+
+    Capture once before a user navigation, then start after the synchronous
+    content change. Only a bounded viewport-sized pixmap is painted per frame,
+    never the full scrollable history. No input, focus or state is deferred.
+    """
+
+    def __init__(self, target: QWidget) -> None:
+        super().__init__(target)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._frame = QPixmap()
+        self._alpha = 0.0
+        self._animation = QVariantAnimation(self)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.valueChanged.connect(self._set_alpha)
+        self._animation.finished.connect(self.settle)
+        target.installEventFilter(self)
+        self.hide()
+
+    def capture(self) -> None:
+        target = self.parentWidget()
+        if (
+            not target.isVisible() or target.size().isEmpty()
+            or reduced_motion_requested(target)
+        ):
+            self.settle()
+            return
+        # Include the current overlay on a rapid second navigation, so the next
+        # fade starts from what is actually visible rather than an old endpoint.
+        # QWidget.grab only renders OSIA's own client area, not the desktop.
+        window = target.window()
+        frame = window.grab(QRect(target.mapTo(window, QPoint()), target.size()))
+        self._animation.stop()
+        self._animation.setCurrentTime(0)
+        self._frame = frame
+        self._alpha = 1.0
+        self.setGeometry(target.rect())
+        self.raise_()
+        self.show()
+
+    def start(self, duration_ms: int = MOTION.navigation_ms) -> None:
+        target = self.parentWidget()
+        if (
+            self._frame.isNull() or not target.isVisible()
+            or reduced_motion_requested(target)
+        ):
+            self.settle()
+            return
+        self.raise_()
+        self._animation.stop()
+        self._animation.setCurrentTime(0)
+        self._animation.setStartValue(1.0)
+        self._animation.setEndValue(0.0)
+        self._animation.setDuration(max(0, int(duration_ms)))
+        self._animation.start()
+
+    def _set_alpha(self, value: float) -> None:
+        self._alpha = float(value)
+        self.update()
+
+    def settle(self) -> None:
+        self._animation.stop()
+        self._alpha = 0.0
+        self.hide()
+        self._frame = QPixmap()
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if event.type() in (QEvent.Type.Hide, QEvent.Type.Resize):
+            self.settle()
+        return False
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        # Interpolate premultiplied RGBA, including OSIA's translucent canvas.
+        # SourceOver alone would show the new text through the old frame even
+        # at alpha=1. Keep the live destination proportional to the new frame.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, round(255 * (1 - self._alpha))))
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        painter.setOpacity(self._alpha)
+        painter.drawPixmap(0, 0, self._frame)
+        painter.end()
 
 
 class ThemeTransition(QWidget):

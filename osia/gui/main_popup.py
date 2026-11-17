@@ -83,7 +83,8 @@ from osia import i18n
 from osia import timefmt
 from osia.perf import perf_timer
 from osia.gui.motion import (
-    MOTION, MotionController, ThemeTransition, reduced_motion_requested,
+    MOTION, ContentTransition, MotionController, ThemeTransition,
+    reduced_motion_requested,
 )
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
@@ -3000,8 +3001,7 @@ class _FolderContents(QWidget):
         clip.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         clip.addWidget(self._rows_host, 0, Qt.AlignmentFlag.AlignTop)
         self._animation = QPropertyAnimation(self, b"maximumHeight", self)
-        self._animation.setDuration(MOTION.page_ms)
-        self._animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._animation.finished.connect(self._finish_animation)
 
     def reveal_from(self, height: int | None) -> None:
@@ -3016,7 +3016,18 @@ class _FolderContents(QWidget):
             return
         # Clip the full-size rows instead of squeezing their text and buttons.
         self._rows_host.setFixedHeight(content_height)
+        height = max(0, min(height, content_height))
+        self._animation.stop()
+        if height == end:
+            self._finish_animation()
+            return
         self.setMaximumHeight(height)
+        self._animation.setCurrentTime(0)
+        duration = MOTION.collapse_ms if self._collapsed else MOTION.navigation_ms
+        # A quick reversal travels only the remaining distance, without a new
+        # slow start or a queue of animations after repeated project clicks.
+        distance = abs(end - height) / max(1, content_height)
+        self._animation.setDuration(max(MOTION.micro_ms, round(duration * distance)))
         self._animation.setStartValue(height)
         self._animation.setEndValue(end)
         self._animation.start()
@@ -3028,6 +3039,11 @@ class _FolderContents(QWidget):
             self._rows_host.setMinimumHeight(0)
             self._rows_host.setMaximumHeight(16777215)
             self.setMaximumHeight(16777215)
+
+    def hideEvent(self, event) -> None:
+        self._animation.stop()
+        self._finish_animation()
+        super().hideEvent(event)
 
 
 class _ConversationsPanel(QWidget):
@@ -3993,6 +4009,7 @@ class _ModelPanel(QWidget):
         self._account_refresh_timer = QTimer(self)
         self._account_refresh_timer.setInterval(5000)
         self._account_refresh_timer.timeout.connect(self._request_visible_refreshes)
+        self._content_transition = ContentTransition(self)
 
     def _retranslate(self) -> None:
         self._back_btn.setText("←  " + i18n.t("models.back"))
@@ -4065,10 +4082,17 @@ class _ModelPanel(QWidget):
     # ── Navigation ─────────────────────────────────────────────────────────
 
     def _show_grid(self) -> None:
+        if self._view is None:
+            return
+        self._content_transition.capture()
         self._view = None
         self.refresh()
+        self._content_transition.start()
 
     def _show_provider(self, provider: str) -> None:
+        if self._view == provider:
+            return
+        self._content_transition.capture()
         if provider == "openrouter" and self._view != provider:
             blocked = self._model_search.blockSignals(True)
             self._model_search.clear()
@@ -4076,6 +4100,7 @@ class _ModelPanel(QWidget):
             self._openrouter_limit = self._OPENROUTER_PAGE_SIZE
         self._view = provider
         self.refresh()
+        self._content_transition.start()
 
     def _filter_openrouter_models(self, _query: str) -> None:
         self._openrouter_limit = self._OPENROUTER_PAGE_SIZE
@@ -5369,6 +5394,7 @@ class _SettingsPanel(QWidget):
         self._settings_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOn
         )
+        self._detail_transition = ContentTransition(self._settings_scroll.viewport())
 
         self._settings_stack = _SettingsDetailStack()
         self._settings_stack.setObjectName("settingsStack")
@@ -5494,14 +5520,13 @@ class _SettingsPanel(QWidget):
     def _on_settings_category_changed(self, row: int) -> None:
         if row < 0:
             return
+        self._detail_transition.capture()
         self._settings_category_title.setText(self._settings_nav.item(row).text())
         self._settings_stack.setCurrentIndex(row)
         self._schedule_settings_detail_extent()
         # WOR-198: reset only the independently owned right detail pane.
         self._settings_scroll.verticalScrollBar().setValue(0)
-        page = self._settings_stack.currentWidget()
-        if page is not None:
-            self._motion.fade_in(page, MOTION.page_ms)
+        self._detail_transition.start()
         try:
             key = self._settings_pages[row][0]
         except Exception:
@@ -10241,12 +10266,18 @@ class _SettingsPanel(QWidget):
 
     def _on_ai_provider_changed(self, _idx: int) -> None:
         provider = self._ai_provider_combo.currentData()
+        changed = provider != getattr(self, "_displayed_ai_provider", None)
+        if changed:
+            self._detail_transition.capture()
         self._chatgpt_card.setVisible(provider == "chatgpt_account")
         for p, card in self._provider_cards.items():
             card.setVisible(p == provider)
         if provider in LOCAL_PROVIDERS:
             self._local_provider_name.setText(PROVIDERS[provider]["name"])
         self._ollama_row.setVisible(provider in LOCAL_PROVIDERS)
+        self._displayed_ai_provider = provider
+        if changed:
+            self._detail_transition.start()
 
 
     # ── State load / save ─────────────────────────────────────────────────
@@ -11406,14 +11437,14 @@ class _NavButton(QPushButton):
 
     def _animate_highlight(self, duration_ms: int) -> None:
         target = QPointF(self._hover_target, float(self.isChecked()))
+        start = QPointF(self._hover_progress, self._selection_progress)
         self._hover_anim.stop()
         if reduced_motion_requested(self) or not self.isVisible():
             self._update_highlight(target)
             return
         self._hover_anim.setDuration(duration_ms)
-        self._hover_anim.setStartValue(
-            QPointF(self._hover_progress, self._selection_progress),
-        )
+        self._hover_anim.setCurrentTime(0)
+        self._hover_anim.setStartValue(start)
         self._hover_anim.setEndValue(target)
         self._hover_anim.start()
 
@@ -11872,6 +11903,7 @@ class MainPopup(QWidget):
         outer.addLayout(nav)
 
         self._theme_transition = ThemeTransition(self)
+        self._page_transition = ContentTransition(self._stack)
         self._theme.theme_changing.connect(self._theme_transition.capture)
         self._theme.theme_changed.connect(self._on_theme_changed)
         self._theme.theme_changed.connect(self._theme_transition.start)
@@ -11890,7 +11922,7 @@ class MainPopup(QWidget):
     ) -> None:
         """Open one Settings category without the active-nav toggle behavior."""
 
-        self._stack.setCurrentIndex(self.PAGE_SETTINGS)
+        self._switch_page(self.PAGE_SETTINGS)
         button = self._nav_buttons.get(self.PAGE_SETTINGS)
         if button is not None:
             button.setChecked(True)
@@ -12078,10 +12110,7 @@ class MainPopup(QWidget):
     # ── Public API ────────────────────────────────────────────────────────
 
     def show_chat(self) -> None:
-        changed = self._stack.currentIndex() != self.PAGE_CHAT
-        self._stack.setCurrentIndex(self.PAGE_CHAT)
-        if changed:
-            self._motion.fade_in(self._chat, MOTION.page_ms)
+        self._switch_page(self.PAGE_CHAT)
         for b in self._nav_buttons.values():
             b.setChecked(False)
         self._apply_current_busy()
@@ -12630,19 +12659,25 @@ class MainPopup(QWidget):
             self._chat.set_tool_status(self._tool_status_by_turn.get(key, ""))
         self._apply_current_activity()
 
+    def _switch_page(self, page_idx: int) -> None:
+        if self._stack.currentIndex() == page_idx:
+            return
+        self._motion.settle()
+        # Keep the existing instantaneous window resize: moving controls during
+        # a width tween used to swallow Settings clicks (WOR-48).
+        self._animate_width(
+            POPUP_W_WIDE if page_idx == self.PAGE_SETTINGS else POPUP_W
+        )
+        self.layout().activate()
+        self._page_transition.capture()
+        self._stack.setCurrentIndex(page_idx)
+        self._page_transition.start()
+
     def _on_nav_clicked(self, page_idx: int) -> None:
         with perf_timer(f"nav -> page {page_idx}"):
             if self._stack.currentIndex() == page_idx:
                 return
-            self._stack.setCurrentIndex(page_idx)
-            page = self._stack.currentWidget()
-            if page is not None:
-                self._motion.fade_in(page, MOTION.page_ms)
-            # WOR-48 P3: settings hosts the master-detail layout and needs the
-            # WIDE window; every other page uses the COMPACT width.
-            self._animate_width(
-                POPUP_W_WIDE if page_idx == self.PAGE_SETTINGS else POPUP_W
-            )
+            self._switch_page(page_idx)
             if page_idx == self.PAGE_CONVS:
                 self._convs.refresh()
             elif page_idx == self.PAGE_OSIA:

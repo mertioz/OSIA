@@ -44,7 +44,7 @@ class OsiaSwitch(QCheckBox):
     CONTROL_HEIGHT = TRACK_HEIGHT + 6
     THUMB_DIAMETER = 16
     TEXT_GAP = 8
-    ANIMATION_MS = 220
+    ANIMATION_MS = 140
 
     def __init__(
         self,
@@ -69,7 +69,7 @@ class OsiaSwitch(QCheckBox):
         self._target_position = self._thumb_position
         self._animation = QVariantAnimation(self)
         self._animation.setDuration(self.ANIMATION_MS)
-        self._animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._animation.valueChanged.connect(self._set_thumb_position)
         self._animation.finished.connect(self._settle_animation)
         self._theme.theme_changed.connect(self._on_theme_changed)
@@ -162,7 +162,9 @@ class OsiaSwitch(QCheckBox):
         if self.active_animation_count and self._animation.endValue() == target:
             return
         self._animation.stop()
-        self._animation.setStartValue(self._thumb_position)
+        start = self._thumb_position
+        self._animation.setCurrentTime(0)
+        self._animation.setStartValue(start)
         self._animation.setEndValue(target)
         self._animation.start()
 
