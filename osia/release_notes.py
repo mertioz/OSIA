@@ -63,6 +63,21 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.275", released_on="2026-11-17", public=True,
+        changes_en=(
+            'Page, provider and theme transitions preserve background transparency throughout the animation, removing the brief bright flash while keeping controls immediately usable.',
+            'Unchanged conversation lists and model controls are reused when navigating. Renames, message counts, project changes, availability and reasoning preferences still refresh normally.',
+            'Navigation, settings and project opening use shorter 110 ms transitions; project closing takes up to 90 ms, with faster switches and popup appearance.',
+            'Rapid clicks retain focus, scroll and ongoing project motion. Reduced-motion preferences, the window dimensions and the existing control behavior are preserved.',
+        ),
+        changes_fr=(
+            'Les transitions de pages, fournisseurs et thèmes conservent la transparence du fond pendant toute l’animation, sans flash clair et avec des contrôles immédiatement utilisables.',
+            'Les listes de discussions et contrôles de modèles inchangés sont réutilisés pendant la navigation. Renommages, compteurs, projets, disponibilités et réglages de raisonnement restent actualisés.',
+            'Navigation, paramètres et ouverture des projets passent à 110 ms ; le repliage prend au plus 90 ms, avec des interrupteurs et une apparition du menu plus rapides.',
+            'Les clics rapprochés préservent le focus, le défilement et le mouvement du projet. Mouvements réduits, dimensions de fenêtre et comportement des contrôles sont conservés.',
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.274", released_on="2026-11-17", public=True,
         changes_en=(
             'Short, responsive transitions accompany conversation opening, project folding, provider navigation, page changes and settings, while controls remain immediately usable.',
