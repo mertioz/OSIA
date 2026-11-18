@@ -91,6 +91,7 @@ from osia.gui.motion import (
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
+from osia.gui.window_corners import use_painted_window_corners
 from osia.gui.cursors import ButtonCursorPolicy
 from osia.gui.thinking_orbs import ThinkingOrbs
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
@@ -12101,27 +12102,7 @@ class MainPopup(QWidget):
         super().showEvent(event)
         if sys.platform == "win32" and QApplication.platformName() == "windows":
             # Qt can set the DWM corner preference while showing the HWND.
-            QTimer.singleShot(0, self, self._use_painted_window_corners)
-
-    def _use_painted_window_corners(self) -> None:
-        hwnd = self.effectiveWinId() if self.isVisible() else None
-        if not hwnd:
-            return
-
-        import ctypes
-        from ctypes import wintypes
-
-        # The card inside this transparent window already paints its own
-        # rounded corners. DWM rounding draws a second frame in the margin.
-        corner_preference = 33  # DWMWA_WINDOW_CORNER_PREFERENCE
-        do_not_round = ctypes.c_int(1)  # DWMWCP_DONOTROUND
-        try:
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                wintypes.HWND(int(hwnd)), corner_preference,
-                ctypes.byref(do_not_round), ctypes.sizeof(do_not_round),
-            )
-        except (AttributeError, OSError):
-            pass  # The corner preference is only available on newer Windows.
+            QTimer.singleShot(0, self, lambda: use_painted_window_corners(self))
 
     def toggle(self) -> None:
         if self.isVisible() and not self._hiding:

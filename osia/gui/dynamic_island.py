@@ -34,6 +34,7 @@ from PySide6.QtWidgets import QApplication, QWidget
 from osia.gui.motion import MOTION, reduced_motion_requested
 from osia.gui.quick import load_quick_view
 from osia.gui.theme import get_theme_manager
+from osia.gui.window_corners import use_painted_window_corners
 
 
 # Visual constants
@@ -132,7 +133,7 @@ class DynamicIsland(QWidget):
         # Already-topmost windows are never raised over another application's UI.
         self._stacking_deferred = QTimer(self)
         self._stacking_deferred.setSingleShot(True)
-        self._stacking_deferred.timeout.connect(self._ensure_topmost)
+        self._stacking_deferred.timeout.connect(self._restore_native_window_style)
         self._stacking_timer = QTimer(self)
         self._stacking_timer.setInterval(2000)
         self._stacking_timer.timeout.connect(self._ensure_topmost)
@@ -431,6 +432,10 @@ class DynamicIsland(QWidget):
         ):
             self._stacking_deferred.start(0)
         return result
+
+    def _restore_native_window_style(self) -> None:
+        use_painted_window_corners(self)
+        self._ensure_topmost()
 
     def _ensure_topmost(self) -> None:
         if (

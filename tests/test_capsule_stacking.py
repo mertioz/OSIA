@@ -55,11 +55,13 @@ def test_capsule_rechecks_after_show_and_handle_change_but_never_reshows_when_di
     monkeypatch.setattr(dynamic_island, "sys", SimpleNamespace(platform="win32"))
     monkeypatch.setattr(QApplication, "platformName", lambda: "windows")
     calls = []
+    corners = []
     monkeypatch.setattr(dynamic_island, "_restore_windows_topmost", calls.append)
+    monkeypatch.setattr(dynamic_island, "use_painted_window_corners", corners.append)
     island = dynamic_island.DynamicIsland()
     try:
         app.processEvents()
-        assert calls
+        assert calls and corners == [island]
         island._shape = shape
         island._dock_side = "left"
         island._apply_shape_geometry(animate=False)
@@ -67,19 +69,23 @@ def test_capsule_rechecks_after_show_and_handle_change_but_never_reshows_when_di
         QApplication.sendEvent(island, QEvent(QEvent.Type.WinIdChange))
         app.processEvents()
         assert len(calls) >= 2
+        assert len(corners) >= 2
         assert island.geometry() == geometry
         assert island._stacking_timer.isActive()
         island.set_capsule_visible(False)
         assert not island._stacking_timer.isActive()
         count = len(calls)
+        corner_count = len(corners)
         island._ensure_topmost()
         QApplication.sendEvent(island, QEvent(QEvent.Type.WinIdChange))
         app.processEvents()
         assert len(calls) == count
+        assert len(corners) == corner_count
         assert not island.isVisible()
         island.set_capsule_visible(True)
         app.processEvents()
         assert len(calls) > count
+        assert len(corners) > corner_count
         assert island.size() == geometry.size()
         assert island._shape == shape
         geometry = island.geometry()
