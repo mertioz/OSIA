@@ -63,6 +63,17 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.276", released_on="2026-11-18", public=True,
+        changes_en=(
+            'OSIA Desktop adopts the MIT License for its original code, documentation, logo and visuals.',
+            'The Windows and Linux packages include the MIT license and retain the third-party notices.',
+        ),
+        changes_fr=(
+            'OSIA Desktop adopte la licence MIT pour son code, sa documentation, son logo et ses visuels originaux.',
+            'Les paquets Windows et Linux incluent la licence MIT et conservent les mentions des composants tiers.',
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.275", released_on="2026-11-17", public=True,
         changes_en=(
             'Page, provider and theme transitions preserve background transparency throughout the animation, removing the brief bright flash while keeping controls immediately usable.',
