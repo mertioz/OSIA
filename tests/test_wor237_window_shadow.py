@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtGui import QImage
+from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import QApplication
 
 from osia.gui import main_popup
@@ -106,6 +107,32 @@ class ExternalWindowShadowTests(unittest.TestCase):
         )
         self._assert_shadow_policy()
 
+
+    def test_context_meter_shares_the_composer_backing_store(self):
+        # A Quick child has its own compositing layer and punches through the
+        # translucent composer on the native Windows renderer.
+        self.assertNotIsInstance(self.popup._chat._context_meter, QQuickWidget)
+
+    def test_dwm_uses_the_painted_card_corners_on_windows(self):
+        if sys.platform != "win32" or self.app.platformName() != "windows":
+            self.skipTest("Requires the native Windows compositor")
+
+        import ctypes
+        from ctypes import wintypes
+
+        for width in (main_popup.POPUP_W, main_popup.POPUP_W_WIDE, main_popup.POPUP_W):
+            self.popup.hide()
+            self.popup._animate_width(width)
+            self.popup.show()
+            self.app.processEvents()
+            preference = ctypes.c_int()
+            result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(int(self.popup.winId())), 33,
+                ctypes.byref(preference), ctypes.sizeof(preference),
+            )
+            if result != 0:
+                self.skipTest("DWM corner preferences unavailable")
+            self.assertEqual(preference.value, 1)
 
 if __name__ == "__main__":
     unittest.main()

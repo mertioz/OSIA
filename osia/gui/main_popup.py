@@ -43,7 +43,6 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocument, QTextOption, QImage, QBrush, QLinearGradient,
     QDesktopServices,
 )
-from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
@@ -89,7 +88,6 @@ from osia.gui.motion import (
     MOTION, ContentTransition, MotionController, ThemeTransition,
     reduced_motion_requested,
 )
-from osia.gui.quick import load_quick_view
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
@@ -620,7 +618,7 @@ class _ComposerButton(_PointerStyledButton):
         painter.end()
 
 
-class _ContextMeter(QQuickWidget):
+class _ContextMeter(QWidget):
     """Small gray ring for the selected conversation's model context."""
 
     def __init__(self):
@@ -628,13 +626,6 @@ class _ContextMeter(QQuickWidget):
         self.setFixedSize(18, 18)
         self._usage = {}
         self._fraction = 0.0
-        self._theme = get_theme_manager()
-        palette = self._theme.palette
-        load_quick_view(self, "ContextMeter.qml", {
-            "trackColor": palette.color("text", 60),
-            "usageColor": palette.color("text", 175),
-        })
-        self._theme.theme_changed.connect(self._on_theme_changed)
         self.set_usage({})
 
     def set_usage(self, usage: dict) -> None:
@@ -660,13 +651,23 @@ class _ContextMeter(QQuickWidget):
         self.setToolTip(label)
         if usage != self._usage:
             self._usage = dict(usage)
-            self.rootObject().setProperty("fraction", self._fraction)
+            self.update()
 
-    def _on_theme_changed(self, _key: str) -> None:
-        palette = self._theme.palette
-        root = self.rootObject()
-        root.setProperty("trackColor", palette.color("text", 60))
-        root.setProperty("usageColor", palette.color("text", 175))
+    def paintEvent(self, _event) -> None:
+        # Paint onto the same backing store as the translucent composer.
+        # A Quick child is composited separately and cuts a hole through it.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = get_theme_manager().palette
+        ring = QRectF(2.5, 2.5, 13, 13)
+        painter.setPen(QPen(palette.color("text", 60), 1.5))
+        painter.drawEllipse(ring)
+        if self._fraction:
+            pen = QPen(palette.color("text", 175), 1.5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(ring, 90 * 16, -round(360 * 16 * self._fraction))
+        painter.end()
 
 
 class _ComposerInput(QTextEdit):
@@ -12095,6 +12096,32 @@ class MainPopup(QWidget):
             self._width_anim.stop()
             if isinstance(end, QRect):
                 self.setGeometry(end)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if sys.platform == "win32" and QApplication.platformName() == "windows":
+            # Qt can set the DWM corner preference while showing the HWND.
+            QTimer.singleShot(0, self, self._use_painted_window_corners)
+
+    def _use_painted_window_corners(self) -> None:
+        hwnd = self.effectiveWinId() if self.isVisible() else None
+        if not hwnd:
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        # The card inside this transparent window already paints its own
+        # rounded corners. DWM rounding draws a second frame in the margin.
+        corner_preference = 33  # DWMWA_WINDOW_CORNER_PREFERENCE
+        do_not_round = ctypes.c_int(1)  # DWMWCP_DONOTROUND
+        try:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(int(hwnd)), corner_preference,
+                ctypes.byref(do_not_round), ctypes.sizeof(do_not_round),
+            )
+        except (AttributeError, OSError):
+            pass  # The corner preference is only available on newer Windows.
 
     def toggle(self) -> None:
         if self.isVisible() and not self._hiding:
