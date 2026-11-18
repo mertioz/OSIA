@@ -40,7 +40,7 @@ if [ ! -f "$root/cpu-torch-ready" ]; then
     --report "$reports/torch-install.json" 'torch==2.12.0+cpu'
   touch "$root/cpu-torch-ready"
 fi
-runtime_spec="$(sha256sum "$source/requirements.txt" | cut -d ' ' -f 1):playwright-1.60.0:pyside-6.11.0"
+runtime_spec="$(sha256sum "$source/requirements.txt" | cut -d ' ' -f 1):playwright-1.60.0"
 if [ -f "$root/runtime-ready" ] && [ "$(cat "$root/runtime-ready")" != "$runtime_spec" ]; then
   printf 'Runtime dependency cache is stale; use a fresh WORK_DIR to retain complete dependency reports.\n' >&2
   exit 1
@@ -48,9 +48,9 @@ fi
 if [ ! -f "$root/runtime-ready" ]; then
   # Vosk supplies local French wake detection. Retired openWakeWord/sklearn
   # are not used; tflite-runtime has no CPython 3.12 Linux wheel.
-  sed -E '/^openwakeword[>=]/d; /^scikit-learn==/d; /^PyQt6[>=]/d' "$source/requirements.txt" >"$root/requirements-linux.txt"
+  sed -E '/^openwakeword[>=]/d; /^scikit-learn==/d' "$source/requirements.txt" >"$root/requirements-linux.txt"
   "$python" -m pip install --report "$reports/runtime-install.json" \
-    -r "$root/requirements-linux.txt" 'playwright==1.60.0' 'PySide6-Essentials==6.11.0'
+    -r "$root/requirements-linux.txt" 'playwright==1.60.0'
   "$python" -m pip check
   "$python" -m pip freeze >"$reports/linux-resolved-requirements.txt"
   printf '%s\n' "$runtime_spec" >"$root/runtime-ready"

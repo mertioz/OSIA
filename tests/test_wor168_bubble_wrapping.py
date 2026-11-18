@@ -13,9 +13,9 @@ os.environ["HOME"] = _TEMP_HOME.name
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["OSIA_REDUCED_MOTION"] = "1"
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QPoint
-from PyQt6.QtGui import QTextCursor, QTextOption
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint
+from PySide6.QtGui import QTextCursor, QTextOption
+from PySide6.QtWidgets import QApplication
 
 from osia.gui.main_popup import (
     _BUBBLE_MAX_WIDTH,

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-OSIA GUI Overlay — floating always-on-top window using PyQt6.
+OSIA GUI Overlay — floating always-on-top window using PySide6.
 Dark glassmorphism style, positioned right side of screen.
 Contains: model selector, chat input, response area, status indicator.
 """
 
 import threading
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit,
     QSizePolicy,
 )
-from PyQt6.QtCore import (
-    Qt, QRect, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
+from PySide6.QtCore import (
+    Qt, QRect, Signal, QObject, QTimer, QPropertyAnimation, QEasingCurve,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
 )
 from osia.utils.subprocess_policy import run_background_probe
@@ -41,10 +41,10 @@ class OSIAOverlay(QWidget):
     """Floating glassmorphism overlay for OSIA."""
 
     # Signals for inter-thread communication
-    status_changed = pyqtSignal(str)  # 'idle', 'listening', 'thinking'
-    response_ready = pyqtSignal(str)  # response text
-    model_changed = pyqtSignal(str)   # new model name
-    send_message = pyqtSignal(str)    # user chat message
+    status_changed = Signal(str)  # 'idle', 'listening', 'thinking'
+    response_ready = Signal(str)  # response text
+    model_changed = Signal(str)   # new model name
+    send_message = Signal(str)    # user chat message
 
     def __init__(self):
         super().__init__()

@@ -10,8 +10,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtGui import QColor
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QColor
 
 
 THEME_SETTING_KEY = "ui_theme"
@@ -221,8 +221,8 @@ def themed_stylesheet(template: str, palette: ThemePalette) -> str:
 class ThemeManager(QObject):
     """Own the active palette and persist its local PC preference."""
 
-    theme_changing = pyqtSignal(str)
-    theme_changed = pyqtSignal(str)
+    theme_changing = Signal(str)
+    theme_changed = Signal(str)
 
     def __init__(
         self,

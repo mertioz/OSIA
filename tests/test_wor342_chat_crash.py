@@ -6,7 +6,7 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 
 from osia.gui.main_popup import _ChatPage, _ChatThinkingTrace
 from osia.utils.diagnostics import diagnostic_print

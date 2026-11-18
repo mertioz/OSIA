@@ -33,13 +33,23 @@ binaries = []
 
 # Build the committed product, without importing operator experiments that may
 # coexist in the primary checkout. Git is a build dependency, never a runtime one.
-tracked_python = subprocess.check_output(
-    ["git", "ls-files", "-z", "--", "osia"], cwd=ROOT,
+tracked_files = subprocess.check_output(
+    ["git", "ls-files", "-z", "--", "osia", "packaging/licenses/qt"], cwd=ROOT,
 ).decode("utf-8").split("\0")
 product_modules = {
     name.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
-    for name in tracked_python if name.endswith(".py")
+    for name in tracked_files if name.endswith(".py")
 }
+datas += [
+    (str(ROOT / name), str(Path(name).parent))
+    for name in tracked_files
+    if name.startswith("osia/gui/qml/") and not name.endswith(".py")
+]
+datas += [
+    (str(ROOT / name), "legal/licenses/qt")
+    for name in tracked_files
+    if name.startswith("packaging/licenses/qt/")
+]
 hiddenimports = collect_submodules(
     "osia",
     filter=lambda name: name in product_modules and not any(
@@ -112,6 +122,9 @@ a = Analysis(
         "llvmlite",
         "numba",
         "notebook",
+        "PyQt5",
+        "PyQt6",
+        "PySide2",
         "pytest",
         "tkinter",
     ],

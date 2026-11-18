@@ -1,7 +1,7 @@
 """Local pointer cursors for OSIA controls, including dynamically rebuilt pages."""
 
-from PyQt6.QtCore import QEvent, QObject, Qt
-from PyQt6.QtWidgets import QAbstractButton, QApplication, QComboBox
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtWidgets import QAbstractButton, QApplication, QComboBox
 
 
 class ButtonCursorPolicy(QObject):

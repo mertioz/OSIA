@@ -124,7 +124,7 @@ def test_installer_guards_both_interactive_and_update_mode_and_keeps_identity():
 def test_qt_history_uses_alias_and_keeps_original_in_details(monkeypatch):
     import os
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
     from osia.gui.update_ui import _ReleaseCard
     from osia.version import display_historical_text
     app = QApplication.instance() or QApplication([])

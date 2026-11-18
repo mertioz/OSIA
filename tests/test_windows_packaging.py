@@ -55,7 +55,7 @@ def test_frozen_qt_runtime_hook_registers_bundled_dll_directory(
         "osia_qt_dll_runtime_hook_test",
         "packaging/windows/qt_dll_runtime_hook.py",
     )
-    qt_bin = tmp_path / "PyQt6" / "Qt6" / "bin"
+    qt_bin = tmp_path / "PySide6"
     qt_bin.mkdir(parents=True)
     monkeypatch.setattr(hook.sys, "platform", "win32")
     monkeypatch.setattr(hook.sys, "frozen", True, raising=False)
@@ -96,6 +96,7 @@ def test_pyinstaller_environment_excludes_codex_host_native_dependencies(
     )
     path_entries = [project_python, host_native, packaged_host_native, system]
     monkeypatch.setenv("PATH", os.pathsep.join(map(str, path_entries)))
+    monkeypatch.setenv("QT_API", "pyqt6")
 
     environment = build._pyinstaller_environment()
 
@@ -103,6 +104,7 @@ def test_pyinstaller_environment_excludes_codex_host_native_dependencies(
         str(project_python),
         str(system),
     ]
+    assert environment["QT_API"] == "pyside6"
 
 
 def test_external_data_filter_preserves_licenses_and_excludes_generated_cache():

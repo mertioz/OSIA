@@ -142,6 +142,42 @@ def _timezone_smoke() -> None:
         raise RuntimeError("packaged IANA timezone data is invalid")
 
 
+def _quick_smoke() -> None:
+    from PySide6.QtCore import QCoreApplication, Qt, QUrl
+    from PySide6.QtQml import QQmlComponent, QQmlEngine
+    from PySide6.QtQuick import QQuickItem
+    from PySide6.QtQuickWidgets import QQuickWidget
+    import osia.gui
+
+    qml_root = Path(osia.gui.__file__).resolve().parent / "qml"
+    sources = sorted(qml_root.rglob("*.qml"))
+    if not sources:
+        raise RuntimeError("packaged Qt Quick views are missing")
+
+    engine = QQmlEngine()
+    for source in sources:
+        component = QQmlComponent(engine, QUrl.fromLocalFile(str(source)))
+        if not component.isReady():
+            raise RuntimeError(f"cannot load packaged Qt Quick view: {source.name}")
+
+    component = QQmlComponent(engine)
+    component.setData(
+        b"import QtQuick\nimport QtQuick.Shapes\nItem { width: 12; height: 12; Shape {} }",
+        QUrl(),
+    )
+    item = component.create()
+    if not isinstance(item, QQuickItem):
+        raise RuntimeError("Qt Quick could not instantiate a scene")
+    widget = QQuickWidget(engine, None)
+    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    widget.setContent(QUrl(), component, item)
+    widget.show()
+    QCoreApplication.processEvents()
+    if widget.status() != QQuickWidget.Status.Ready or widget.grabFramebuffer().isNull():
+        raise RuntimeError("Qt Quick could not render the packaged scene")
+    widget.close()
+
+
 def _package_smoke() -> int:
     """Offline dependency/model probe used by build and install validation."""
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -179,8 +215,8 @@ def _package_smoke() -> int:
         import uiautomation
         import win32com.client  # noqa: F401
         from uiautomation.uiautomation import _DllClient
-        from PyQt6.QtGui import QPixmap
-        from PyQt6.QtWidgets import QApplication, QLabel
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QApplication, QLabel
         from faster_whisper import WhisperModel
         from playwright._impl._driver import compute_driver_executable
         from osia.chatgpt_account.app_server_client import AppServerClient
@@ -220,6 +256,9 @@ def _package_smoke() -> int:
             raise RuntimeError("Qt platform plugin did not initialize")
         if QPixmap(LOGO_PATH).isNull():
             raise RuntimeError("Qt could not load the packaged logo")
+
+        step = "qt_quick"
+        _quick_smoke()
 
         step = "release_notes"
         if release_for_version(metadata.version) is None:

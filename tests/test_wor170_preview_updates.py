@@ -306,7 +306,7 @@ def test_bilingual_confirmation_is_complete_and_permanent_help_is_calm():
 
 def test_ui_confirmation_cancel_enable_and_persistence(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QMessageBox
     from osia.gui import update_ui
 
     app = QApplication.instance() or QApplication([])
@@ -362,7 +362,7 @@ def test_controller_disable_preview_manual_check_reports_no_newer_stable(
     monkeypatch, tmp_path
 ):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
     from osia.gui import update_ui
 
     app = QApplication.instance() or QApplication([])

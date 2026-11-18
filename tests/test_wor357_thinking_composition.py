@@ -2,7 +2,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 from osia.execution_trace import ExecutionTraceLedger
 from osia.gui.main_popup import _ChatPage, _ChatThinkingTrace, _Bubble
 from test_wor340_thinking import payload

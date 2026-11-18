@@ -5,8 +5,8 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 from osia import i18n
 from osia.agent import _public_progress_from_tool_response, strip_reasoning_blocks

@@ -602,7 +602,7 @@ class ProtectedPipelineRegressionTests(unittest.TestCase):
 class GuiContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from PyQt6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
 
     def _build_panel(self, *, connect_handler=None):
@@ -680,8 +680,8 @@ class GuiContractTests(unittest.TestCase):
         panel.deleteLater()
 
     def test_compact_states_and_information_tooltip(self):
-        from PyQt6.QtCore import QEvent
-        from PyQt6.QtGui import QFocusEvent
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QFocusEvent
         from osia.gui import main_popup
         panel, _save_setting, _settings = self._build_panel()
         self._select(panel, "chatgpt_account")

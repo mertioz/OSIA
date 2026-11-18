@@ -7,7 +7,7 @@ from osia import i18n, legal
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtWidgets import QApplication, QPushButton
+    from PySide6.QtWidgets import QApplication, QPushButton
 except ImportError:
     QApplication = None
 
@@ -20,13 +20,13 @@ class LegalLinkTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if QApplication is None:
-            raise unittest.SkipTest("PyQt6 is not installed in this test environment")
+            raise unittest.SkipTest("PySide6 is not installed in this test environment")
         cls.application = QApplication.instance() or QApplication([])
 
     def test_settings_buttons_open_official_pages_in_the_current_language(self):
         with (
-            patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher"),
-            patch.object(_SettingsPanel, "_load_state"),
+            patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher", lambda self: None),
+            patch.object(_SettingsPanel, "_load_state", lambda self: None),
         ):
             panel = _SettingsPanel()
         try:

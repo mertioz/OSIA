@@ -16,9 +16,9 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["OSIA_REDUCED_MOTION"] = "1"
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia.attachments import MAX_ATTACHMENT_BYTES
 from osia.desktop_attachments import (
@@ -72,7 +72,7 @@ def test_selecting_one_file_stages_without_send(tmp_path):
         drafts = QSignalSpy(popup.submit_draft)
         legacy_picks = QSignalSpy(popup.pick_file)
         _stage_in_chat(popup, [_write(tmp_path / "one.txt")])
-        assert len(sends) == len(drafts) == len(legacy_picks) == 0
+        assert sends.count() == drafts.count() == legacy_picks.count() == 0
         assert len(popup._chat.pending_attachments()) == 1
         assert popup._chat._attachment_layout.count() == 1
     finally:
@@ -119,10 +119,10 @@ def test_text_and_multiple_attachments_emit_one_atomic_draft(tmp_path):
         )
         popup._chat._input.setText("one request")
         QTest.mouseClick(popup._chat._send_btn, Qt.MouseButton.LeftButton)
-        assert len(draft_spy) == 1
-        assert len(text_spy) == 0
-        assert draft_spy[0][0] == "one request"
-        assert [item.display_name for item in draft_spy[0][1]] == [
+        assert draft_spy.count() == 1
+        assert text_spy.count() == 0
+        assert draft_spy.at(0)[0] == "one request"
+        assert [item.display_name for item in draft_spy.at(0)[1]] == [
             "one.txt", "two.txt",
         ]
         # The UI is cleared only by the host's explicit acceptance callback.
@@ -139,14 +139,14 @@ def test_attachments_only_send_and_acceptance_clear_once(tmp_path):
         _stage_in_chat(popup, [_write(tmp_path / "only.txt")])
         assert popup._chat._send_btn.isEnabled()
         QTest.mouseClick(popup._chat._send_btn, Qt.MouseButton.LeftButton)
-        ids = tuple(item.draft_id for item in draft_spy[0][1])
-        assert draft_spy[0][0] == ""
+        ids = tuple(item.draft_id for item in draft_spy.at(0)[1])
+        assert draft_spy.at(0)[0] == ""
         assert popup.accept_draft_submission(ids)
         assert not popup._chat.pending_attachments()
         assert popup._chat._input.text() == ""
         assert not popup.accept_draft_submission(ids)
         QTest.mouseClick(popup._chat._send_btn, Qt.MouseButton.LeftButton)
-        assert len(draft_spy) == 1
+        assert draft_spy.count() == 1
     finally:
         _close(popup)
 
@@ -370,7 +370,7 @@ def test_close_reopen_and_fresh_process_widget_never_send_implicitly(tmp_path):
     _QT_APP.processEvents()
     popup._show_animated()
     _QT_APP.processEvents()
-    assert len(sends) == 0
+    assert sends.count() == 0
     assert len(popup._chat.pending_attachments()) == 1
     _close(popup)
 
@@ -449,8 +449,8 @@ def test_enter_sends_once_and_shift_enter_inserts_newline(tmp_path):
         QTest.keyClicks(popup._chat._input, "line two")
         assert popup._chat._input.text() == "line one\nline two"
         QTest.keyClick(popup._chat._input, Qt.Key.Key_Return)
-        assert len(sends) == 1
-        assert sends[0][0] == "line one\nline two"
+        assert sends.count() == 1
+        assert sends.at(0)[0] == "line one\nline two"
     finally:
         _close(popup)
 

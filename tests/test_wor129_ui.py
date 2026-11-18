@@ -15,8 +15,8 @@ os.environ["HOME"] = _TEMP_HOME.name
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["OSIA_REDUCED_MOTION"] = "0"
 
-from PyQt6 import sip
-from PyQt6.QtCore import (
+from shiboken6 import Shiboken
+from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
     QPoint,
@@ -25,9 +25,9 @@ from PyQt6.QtCore import (
     Qt,
     QVariantAnimation,
 )
-from PyQt6.QtGui import QColor
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtGui import QColor
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from osia.gui.dynamic_island import (
     CIRCLE_SIZE,
@@ -170,7 +170,7 @@ class ThemeTests(unittest.TestCase):
         changes = QSignalSpy(manager.theme_changed)
         self.assertTrue(manager.set_theme("rose"))
         self.assertFalse(manager.set_theme("rose"))
-        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes.count(), 1)
         self.assertEqual(store[THEME_SETTING_KEY], "rose")
         restored = ThemeManager(load, save)
         self.assertEqual(restored.key, "rose")
@@ -194,14 +194,14 @@ class StreamingControllerTests(unittest.TestCase):
         self.assertEqual(controller.target_text, text)
         self.assertEqual(len(controller.findChildren(QTimer)), 1)
         controller._on_tick()
-        partial = seen[-1][0]
+        partial = seen.at(seen.count() - 1)[0]
         self.assertGreater(len(partial), 0)
         self.assertLess(len(partial), len(text))
         final = text + " final exact tail"
         controller.finalize(final)
         self.assertTrue(controller.active)
         _finish_reveal(controller)
-        self.assertEqual(seen[-1][0], final)
+        self.assertEqual(seen.at(seen.count() - 1)[0], final)
         self.assertEqual(controller.displayed_text, final)
         self.assertFalse(controller.timer_active)
         self.assertFalse(controller.active)
@@ -214,7 +214,7 @@ class StreamingControllerTests(unittest.TestCase):
         controller.append_chunk("alpha")
         controller.append_chunk("beta")
         controller.cancel(flush=True)
-        self.assertEqual(seen[-1][0], "alphabeta")
+        self.assertEqual(seen.at(seen.count() - 1)[0], "alphabeta")
         self.assertFalse(controller.timer_active)
         self.assertFalse(controller.active)
 
@@ -222,7 +222,7 @@ class StreamingControllerTests(unittest.TestCase):
         controller.append_chunk("partial")
         controller.error("Error: stopped safely")
         _finish_reveal(controller)
-        self.assertEqual(seen[-1][0], "Error: stopped safely")
+        self.assertEqual(seen.at(seen.count() - 1)[0], "Error: stopped safely")
         self.assertFalse(controller.timer_active)
 
     def test_reduced_motion_reveals_immediately_without_a_running_timer(self):
@@ -231,7 +231,7 @@ class StreamingControllerTests(unittest.TestCase):
         )
         seen = QSignalSpy(controller.text_changed)
         controller.append_chunk("immediate")
-        self.assertEqual(seen[-1][0], "immediate")
+        self.assertEqual(seen.at(seen.count() - 1)[0], "immediate")
         self.assertFalse(controller.timer_active)
 
 
@@ -548,7 +548,7 @@ class QtUiLifecycleTests(unittest.TestCase):
         host.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
-        self.assertTrue(sip.isdeleted(timer))
+        self.assertFalse(Shiboken.isValid(timer))
 
     def test_user_actions_and_signals_still_fire_exactly_once(self):
         chat = _ChatPage()
@@ -560,12 +560,12 @@ class QtUiLifecycleTests(unittest.TestCase):
             chat._send_btn,
             Qt.MouseButton.LeftButton,
         )
-        self.assertEqual(len(sends), 1)
-        self.assertEqual(sends[0][0], "one action")
+        self.assertEqual(sends.count(), 1)
+        self.assertEqual(sends.at(0)[0], "one action")
 
         new_conversations = QSignalSpy(self.popup.new_conversation)
         self.popup._on_new_conv()
-        self.assertEqual(len(new_conversations), 1)
+        self.assertEqual(new_conversations.count(), 1)
         chat.close()
         chat.deleteLater()
 

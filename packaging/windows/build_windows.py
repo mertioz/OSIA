@@ -101,7 +101,7 @@ def _run(args: list[str], **kwargs) -> None:
 
 
 def _pyinstaller_environment() -> dict[str, str]:
-    """Keep Codex-host native runtimes out of the packaged dependency search."""
+    """Isolate the packaged dependency search and select the product Qt binding."""
 
     environment = os.environ.copy()
     path_entries = []
@@ -113,6 +113,7 @@ def _pyinstaller_environment() -> dict[str, str]:
             continue
         path_entries.append(entry)
     environment["PATH"] = os.pathsep.join(path_entries)
+    environment["QT_API"] = "pyside6"
     return environment
 
 
@@ -372,6 +373,9 @@ def _stage_legal() -> list[dict]:
         key=lambda item: (item.metadata.get("Name") or "").lower(),
     ):
         name = dist.metadata.get("Name") or "unknown"
+        qt_name = name.casefold()
+        if qt_name.startswith(("pyqt5", "pyqt6")) or qt_name in {"pyside2", "shiboken2"}:
+            continue
         entry = {
             "name": name,
             "version": dist.version,

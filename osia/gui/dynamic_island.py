@@ -23,17 +23,16 @@ press + move drags the capsule instead.
 import math
 import sys
 
-from PyQt6.QtCore import (
-    Qt, QTimer, QRect, QRectF, QPointF, QEvent, QElapsedTimer, pyqtSignal, QPropertyAnimation,
-    QEasingCurve, QVariantAnimation,
+from PySide6.QtCore import (
+    Qt, QTimer, QRect, QRectF, QEvent, QElapsedTimer, Signal, Slot,
+    QPropertyAnimation, QEasingCurve, QVariantAnimation,
 )
-from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QLinearGradient, QPainter,
-    QPainterPath, QPen,
-)
-from PyQt6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QPainterPath
+from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
-from osia.gui.motion import MOTION, ThemeTransition, reduced_motion_requested
+from osia.gui.motion import MOTION, reduced_motion_requested
+from osia.gui.quick import load_quick_view
 from osia.gui.theme import get_theme_manager
 
 
@@ -123,7 +122,7 @@ def _restore_windows_topmost(hwnd: int) -> bool:
 class DynamicIsland(QWidget):
     """Top-center floating capsule with state-driven animations."""
 
-    clicked = pyqtSignal()
+    clicked = Signal()
 
     def __init__(self):
         super().__init__()
@@ -139,11 +138,7 @@ class DynamicIsland(QWidget):
         self._stacking_timer.timeout.connect(self._ensure_topmost)
 
         self._theme = get_theme_manager()
-        self._theme_transition = ThemeTransition(self)
-        self._theme.theme_changing.connect(self._theme_transition.capture)
         self._theme.theme_changed.connect(self._on_theme_changed)
-        self._theme.theme_changed.connect(self._theme_transition.start)
-        self._refresh_theme_colors()
 
         flags = (
             Qt.WindowType.FramelessWindowHint
@@ -159,7 +154,7 @@ class DynamicIsland(QWidget):
         # only and meaningless on Windows, where FramelessWindowHint |
         # WindowStaysOnTopHint | Tool already give the right behaviour — so skip
         # it on win32 (WOR-11).
-        if sys.platform != "win32":
+        if sys.platform.startswith("linux") and QApplication.platformName() == "xcb":
             flags |= Qt.WindowType.X11BypassWindowManagerHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -229,6 +224,20 @@ class DynamicIsland(QWidget):
         self._timer.setInterval(33)  # ~30 FPS, plenty for the small island
         self._timer.timeout.connect(self._tick)
 
+        self._quick_view = QQuickWidget(self)
+        self._quick_view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        load_quick_view(self._quick_view, "Capsule.qml", {
+            "launchWidth": LAUNCH_W,
+            "launchHeight": LAUNCH_H,
+            "dockedRadius": DOCK_CORNER_RADIUS,
+            "circleActiveScale": CIRCLE_ACTIVE_SCALE,
+            "thinkingPeriod": THINK_CYCLE_MS,
+            "reducedMotion": reduced_motion_requested(self),
+        })
+        self._visual = self._quick_view.rootObject()
+        self._quick_view.setGeometry(self.rect())
+        self._refresh_theme_colors()
+
         self.setWindowOpacity(IDLE_OPACITY)
         self._restore_position()
         self.show()
@@ -239,8 +248,7 @@ class DynamicIsland(QWidget):
         if handle is not None:
             handle.setFlag(Qt.WindowType.FramelessWindowHint, True)
         if reduced_motion_requested(self):
-            self._launch_t = 1.0
-            self.update()
+            self._on_launch_value(1.0)
         else:
             self._launch_anim.start()
 
@@ -278,7 +286,8 @@ class DynamicIsland(QWidget):
                 self._apply_shape_geometry(animate=True, slid_out=True)
 
         self._sync_animation_timer()
-        self.update()
+        self._sync_visual_state()
+        self._sync_visual_frame()
 
     def current_state(self) -> str:
         return self._state
@@ -293,16 +302,36 @@ class DynamicIsland(QWidget):
 
     # ── Internals ─────────────────────────────────────────────────────────
 
-    def _refresh_theme_colors(self) -> None:
+    def _refresh_theme_colors(self, duration_ms: int = 0) -> None:
+        self._visual.setProperty("themeDuration", duration_ms)
         palette = self._theme.palette
-        self._background_color = palette.color("background")
-        self._primary_color = palette.color("primary")
-        self._primary_color_31 = palette.color("primary", 31)
-        self._text_color_200 = palette.color("text", 200)
+        for name in ("background", "primary", "secondary", "text"):
+            self._visual.setProperty(f"{name}Color", palette.color(name))
+        rail = palette.color("muted_text", 200)
+        rail.setHsl(0, 0, rail.lightness(), rail.alpha())
+        self._visual.setProperty("railColor", rail)
 
+    @Slot(str)
     def _on_theme_changed(self, _key: str) -> None:
-        self._refresh_theme_colors()
-        self.update()
+        duration = MOTION.theme_ms if self.isVisible() and not reduced_motion_requested(self) else 0
+        self._refresh_theme_colors(duration)
+
+    def _sync_visual_state(self) -> None:
+        self._visual.setProperty("activity", self._state)
+        self._visual.setProperty("capsuleShape", self._shape)
+        self._visual.setProperty("dockSide", self._dock_side or "")
+        self._visual.setProperty("dockExposed", self._docked_slid_out)
+        self._visual.setProperty("reducedMotion", reduced_motion_requested(self))
+
+    def _sync_visual_frame(self) -> None:
+        self._visual.setProperty("elapsedMs", self._anim_ms)
+        self._visual.setProperty("speechPhase", self._phase)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        view = getattr(self, "_quick_view", None)
+        if view is not None:
+            view.setGeometry(self.rect())
 
     def _position_at_top(self) -> None:
         screen = self.screen() or QApplication.primaryScreen()
@@ -431,11 +460,11 @@ class DynamicIsland(QWidget):
         # monotonic time keeps motion smooth without catch-up work or drift.
         self._anim_ms = self._state_clock.elapsed()
         self._phase = (self._anim_ms * 0.10 / 33) % math.tau
-        self.update()
+        self._sync_visual_frame()
 
     def _on_launch_value(self, value) -> None:
         self._launch_t = float(value)
-        self.update()
+        self._visual.setProperty("launchProgress", self._launch_t)
 
     # ── Click / drag handling ─────────────────────────────────────────────
     # A press inside the capsule starts a potential click OR drag; the two
@@ -475,7 +504,6 @@ class DynamicIsland(QWidget):
                 return
             self._dragging = True
             self.move(global_pos - self._drag_offset)
-            self.update()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -559,12 +587,11 @@ class DynamicIsland(QWidget):
             self._morph_anim.start()
         else:
             self._commit_geometry(target)
-        self.update()
+        self._sync_visual_state()
 
     def _on_morph_value(self, rect: QRect) -> None:
         """Per-frame morph step — commit the interpolated geometry."""
         self._commit_geometry(rect)
-        self.update()
 
     def _commit_geometry(self, rect: QRect) -> None:
         """Apply ``rect`` to the window, forcing it past WM clamping so a docked
@@ -652,302 +679,6 @@ class DynamicIsland(QWidget):
         path = QPainterPath()
         path.addRoundedRect(rect, radius, radius)
         return path
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Background capsule
-        path = self._capsule_path()
-        painter.setPen(QPen(self._primary_color_31, 1))
-        painter.fillPath(path, self._background_color)
-        painter.drawPath(path)
-
-        # Content overlay.
-        if self._shape == SHAPE_DOCKED:
-            if self._docked_slid_out:
-                self._paint_docked_active(painter)
-            else:
-                self._paint_docked_ear(painter)
-        # Clip the corner capsule's content to the disc.
-        elif self._shape == SHAPE_CIRCLE:
-            painter.save()
-            painter.setClipPath(path)
-            if self._state in ("idle", "thinking"):
-                self._paint_state(painter)
-            else:
-                # Scale the pill-sized active animation down around the disc
-                # centre so it fits the circle instead of being clipped.
-                cx, cy = self.width() / 2, self.height() / 2
-                painter.translate(cx, cy)
-                painter.scale(CIRCLE_ACTIVE_SCALE, CIRCLE_ACTIVE_SCALE)
-                painter.translate(-cx, -cy)
-                self._paint_state(painter)
-            painter.restore()
-        else:
-            self._paint_state(painter)
-
-        painter.end()
-
-    def _paint_state(self, p: QPainter) -> None:
-        """Dispatch to the active animation-state painter (idle/…/speaking)."""
-        if self._state == "idle":
-            self._paint_idle(p)
-        elif self._state == "listening":
-            self._paint_listening(p)
-        elif self._state == "thinking":
-            self._paint_thinking(p)
-        elif self._state == "speaking":
-            self._paint_speaking(p)
-
-    def _paint_docked_ear(self, p: QPainter) -> None:
-        """A thin neutral rail centred in the visible half of the side handle.
-
-        Docked left → the right half is on screen; docked right → the left half
-        is, so centre the grip in that exposed half rather than the full widget.
-        """
-        rect = self._capsule_rect()
-        if self._dock_side == "right":
-            gx = rect.left() + rect.width() * 0.25
-        else:
-            gx = rect.right() - rect.width() * 0.25
-        color = self._theme.palette.color("muted_text", 200)
-        color.setHsl(0, 0, color.lightness(), color.alpha())
-        pen = QPen(color, 1.0)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        padding = min(10.0, rect.height() / 4)
-        p.drawLine(QPointF(gx, rect.top() + padding),
-                   QPointF(gx, rect.bottom() - padding))
-
-    def _paint_docked_active(self, p: QPainter) -> None:
-        """Sweep light up and down a vertical rail in the side capsule."""
-        if self._state == "listening":
-            self._paint_docked_listening(p)
-            return
-        if self._state == "thinking":
-            self._paint_thinking_lights(p, vertical=True)
-            return
-        rect = self._capsule_rect()
-        centre = rect.center()
-        height = min(36.0, rect.height() * 0.66)
-        rail = QRectF(centre.x() - 2.0, centre.y() - height / 2, 4.0, height)
-        path = QPainterPath()
-        path.addRoundedRect(rail, 2.0, 2.0)
-        palette = self._theme.palette
-        p.fillPath(path, palette.color("primary", 45))
-
-        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
-        y = centre.y() + height * 0.28 * math.sin(math.tau * progress)
-        span = height * 0.27
-        sweep = QLinearGradient(0, y - span, 0, y + span)
-        sweep.setColorAt(0.0, palette.color("primary", 0))
-        sweep.setColorAt(0.30, palette.color("secondary", 190))
-        sweep.setColorAt(0.62, palette.color("text", 240))
-        sweep.setColorAt(1.0, palette.color("primary", 0))
-        p.fillPath(path, QBrush(sweep))
-
-    def _paint_docked_listening(self, p: QPainter) -> None:
-        """Wake ripples fit the narrow handle without changing its geometry."""
-        centre = self._capsule_rect().center()
-        palette = self._theme.palette
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        for index in range(3):
-            progress = (self._anim_ms / 1800 + index / 3) % 1.0
-            alpha = round(130 * math.sin(math.pi * progress) ** 2)
-            width = 12 + 12 * progress
-            height = 30 + 42 * progress
-            p.setPen(QPen(palette.color("primary", alpha), 1.3))
-            p.drawRoundedRect(QRectF(
-                centre.x() - width / 2, centre.y() - height / 2,
-                width, height,
-            ), width / 2, width / 2)
-        p.save()
-        p.translate(centre)
-        p.scale(0.72, 0.72)
-        self._paint_microphone(p, 0.0, 0.0)
-        p.restore()
-
-    def _paint_idle(self, p: QPainter) -> None:
-        """Center the idle wordmark and fade it in at the end of launch."""
-        fade = min(1.0, max(0.0, (self._launch_t - 0.7) / 0.3))
-        if fade <= 0.0:
-            return
-
-        compact = self._shape == SHAPE_CIRCLE
-        font = QFont()
-        font.setFamilies(["Segoe UI", "Helvetica Neue", "Noto Sans", "sans-serif"])
-        font.setPixelSize(30 if compact else 12)
-        font.setBold(True)
-        if not compact:
-            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
-
-        p.save()
-        p.setOpacity(fade)
-        p.setFont(font)
-        p.setPen(self._text_color_200)
-        p.drawText(
-            self._capsule_rect(), Qt.AlignmentFlag.AlignCenter, "O" if compact else "OSIA",
-        )
-        p.restore()
-
-    def _paint_listening(self, p: QPainter) -> None:
-        """Centred mic glyph wrapped in 3 concentric pulse rings.
-
-        The three rings ripple outward in sequence (each a third of a period
-        behind the last), fading as they expand — so the capsule reads as a
-        radar-style "listening" pulse around a single centred microphone.
-        """
-        cx = self.width() / 2
-        cy = self.height() / 2
-
-        # Fade in AND out at the loop boundary so the next ring never pops in.
-        # A slight initial bloom acknowledges wake detection immediately.
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        for i in range(3):
-            t = (self._anim_ms / 1800 + i / 3.0) % 1.0
-            ring_r = 13 + 11 * t
-            ring_alpha = round(145 * math.sin(math.pi * t) ** 2)
-            if ring_alpha <= 0:
-                continue
-            p.setPen(QPen(QColor(
-                self._primary_color.red(),
-                self._primary_color.green(),
-                self._primary_color.blue(),
-                ring_alpha,
-            ), 1.6))
-            p.drawEllipse(QPointF(cx, cy), ring_r, ring_r)
-
-        p.save()
-        if not reduced_motion_requested(self):
-            bloom = 1.0 + 0.10 * math.sin(math.pi * min(1.0, self._anim_ms / 420))
-            p.translate(cx, cy)
-            p.scale(bloom, bloom)
-            p.translate(-cx, -cy)
-        self._paint_microphone(p, cx, cy)
-        p.restore()
-
-    def _paint_microphone(self, p: QPainter, cx: float, cy: float) -> None:
-        # Organic, hand-drawn microphone — a calligraphic sketch rather than a
-        # crisp UI glyph. Everything is stroke-only with round caps so the
-        # bezier curves read like a single flowing pen line.
-        pen = QPen(self._primary_color, 1.5)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-
-        # Mic head — a slightly asymmetric rounded capsule. The start/end points
-        # don't quite meet at the top, leaving a small calligraphic gap.
-        head = QPainterPath()
-        head.moveTo(cx + 0.6, cy - 10)
-        head.cubicTo(cx + 5.2, cy - 9.2, cx + 5.6, cy - 3.5, cx + 4.4, cy - 0.2)
-        head.cubicTo(cx + 3.4, cy + 2.6, cx - 3.6, cy + 2.8, cx - 4.6, cy - 0.4)
-        head.cubicTo(cx - 5.6, cy - 3.8, cx - 5.0, cy - 9.0, cx - 0.6, cy - 10)
-        p.drawPath(head)
-
-        # Stand — a flowing arc that cradles the mic from below.
-        stand = QPainterPath()
-        stand.moveTo(cx - 7.6, cy - 1.5)
-        stand.cubicTo(cx - 7.2, cy + 5.5, cx + 7.2, cy + 5.5, cx + 7.6, cy - 1.5)
-        p.drawPath(stand)
-
-        # Neck — a gently wavering stem dropping from the cradle.
-        stem = QPainterPath()
-        stem.moveTo(cx + 0.2, cy + 5.3)
-        stem.cubicTo(cx + 0.5, cy + 7.4, cx - 0.5, cy + 8.6, cx + 0.2, cy + 10.4)
-        p.drawPath(stem)
-
-        # Base — a small upturned flourish for the foot.
-        base = QPainterPath()
-        base.moveTo(cx - 3.4, cy + 9.8)
-        base.cubicTo(cx - 1.4, cy + 11.4, cx + 1.4, cy + 11.4, cx + 3.4, cy + 9.8)
-        p.drawPath(base)
-
-    def _paint_thinking(self, p: QPainter) -> None:
-        """Flow six lights along the pill or around the corner mark."""
-        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
-        if self._shape == SHAPE_CIRCLE:
-            self._paint_thinking_orbit(p, progress)
-            return
-
-        self._paint_thinking_lights(p)
-
-    def _paint_thinking_lights(self, p: QPainter, *, vertical: bool = False) -> None:
-        """Six soft lights pass a wave through the existing capsule."""
-        rect = self._capsule_rect()
-        center = rect.center()
-        progress = (self._anim_ms % THINK_CYCLE_MS) / THINK_CYCLE_MS
-        extent = (min(54.0, rect.height() * 0.66) if vertical
-                  else min(80.0, rect.width() * 0.68))
-        p.save()
-        p.translate(center)
-        if vertical:
-            p.rotate(90)
-        palette = self._theme.palette
-        p.setPen(Qt.PenStyle.NoPen)
-        for index in range(6):
-            wave = math.sin(math.tau * progress - index * math.tau / 6)
-            pulse = (wave + 1.0) / 2
-            radius = (1.9 if vertical else 2.2) + 1.25 * pulse
-            point = QPointF(-extent / 2 + index * extent / 5, -2.8 * wave)
-            p.setBrush(palette.color("primary", round(12 + 20 * pulse)))
-            p.drawEllipse(point, radius + 2.5, radius + 2.5)
-            p.setBrush(palette.color("primary", round(85 + 160 * pulse)))
-            p.drawEllipse(point, radius, radius)
-            p.setBrush(palette.color("text", round(150 * pulse)))
-            p.drawEllipse(point, radius * 0.4, radius * 0.4)
-        p.restore()
-
-    def _paint_thinking_orbit(self, p: QPainter, progress: float) -> None:
-        rect = self._capsule_rect()
-        center = rect.center()
-        radius = min(rect.width(), rect.height()) * 0.33
-        palette = self._theme.palette
-        p.setPen(Qt.PenStyle.NoPen)
-        for index in range(6):
-            angle = math.tau * (progress + index / 6) - math.pi / 2
-            pulse = (1 + math.cos(math.tau * progress - index * math.tau / 6)) / 2
-            light_radius = 1.8 + 1.1 * pulse
-            point = QPointF(center.x() + radius * math.cos(angle),
-                            center.y() + radius * math.sin(angle))
-            p.setBrush(palette.color("primary", round(14 + 18 * pulse)))
-            p.drawEllipse(point, light_radius + 2.0, light_radius + 2.0)
-            p.setBrush(palette.color("primary", round(95 + 150 * pulse)))
-            p.drawEllipse(point, light_radius, light_radius)
-            p.setBrush(palette.color("text", round(150 * pulse)))
-            p.drawEllipse(point, light_radius * 0.4, light_radius * 0.4)
-
-        font = QFont()
-        font.setFamilies(["Segoe UI", "Helvetica Neue", "Noto Sans", "sans-serif"])
-        font.setPixelSize(max(1, min(18, round(radius))))
-        font.setBold(True)
-        p.setFont(font)
-        p.setPen(self._text_color_200)
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "O")
-
-    def _paint_speaking(self, p: QPainter) -> None:
-        """Symmetric waveform of bars bouncing at independent frequencies."""
-        cy = self.height() / 2
-        n = 9
-        gap = 5
-        bar_w = 3
-        total_w = n * bar_w + (n - 1) * gap
-        start_x = (self.width() - total_w) / 2
-
-        p.setPen(Qt.PenStyle.NoPen)
-        for i in range(n):
-            # Distance from the centre — central bars swing wider.
-            dist = abs(i - (n - 1) / 2)
-            amp = max(2, 14 - dist * 2.4)
-            phase = self._phase * 2.6 + i * 0.7
-            h = amp * (0.4 + 0.6 * abs(math.sin(phase)))
-            x = start_x + i * (bar_w + gap)
-            rect = QRectF(x, cy - h, bar_w, h * 2)
-            color = QColor(self._primary_color)
-            color.setAlpha(220)
-            p.setBrush(color)
-            p.drawRoundedRect(rect, 1.5, 1.5)
 
 
 # ── Self-test ───────────────────────────────────────────────────────────────

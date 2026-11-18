@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable
 
-from PyQt6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QRect, Qt, QVariantAnimation
-from PyQt6.QtGui import QColor, QPainter, QPixmap
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QEvent, QEasingCurve, QObject, QPoint, QRect, Qt, QVariantAnimation
+from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtWidgets import (
     QApplication,
     QGraphicsOpacityEffect,
     QWidget,

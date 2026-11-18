@@ -13,9 +13,9 @@ os.environ["USERPROFILE"] = _TEMP_HOME.name
 os.environ["HOME"] = _TEMP_HOME.name
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtGui import QImage, QPainter
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QApplication
 
 from osia.gui import main_popup
 
@@ -42,9 +42,7 @@ class ExternalWindowShadowTests(unittest.TestCase):
             QImage.Format.Format_ARGB32_Premultiplied,
         )
         image.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(image)
-        self.popup.render(painter)
-        painter.end()
+        self.popup.render(image)
         return image
 
     def _assert_shadow_policy(self) -> None:

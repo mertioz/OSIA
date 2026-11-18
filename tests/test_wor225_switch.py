@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import sip
-from PyQt6.QtCore import (
+from shiboken6 import Shiboken
+from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
     QObject,
@@ -18,10 +18,10 @@ from PyQt6.QtCore import (
     QRectF,
     QTimer,
     Qt,
-    pyqtSignal,
+    Signal,
 )
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox, QWidget
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QWidget
 
 from osia.gui.main_popup import _OsiaPanel, _SettingsPanel
 from osia.gui.switch import OsiaSwitch
@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _FakeUpdateController(QObject):
-    state_changed = pyqtSignal(dict)
+    state_changed = Signal(dict)
 
     def __init__(self) -> None:
         super().__init__()
@@ -117,8 +117,8 @@ class TestCanonicalSwitch:
         changed = QSignalSpy(switch.stateChanged)
         QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
         assert switch.isChecked() is True
-        assert len(toggled) == 1
-        assert len(changed) == 1
+        assert toggled.count() == 1
+        assert changed.count() == 1
         assert switch.thumb_position == 1.0
 
     def test_text_and_track_share_one_comfortable_click_target(self):
@@ -137,7 +137,7 @@ class TestCanonicalSwitch:
             pos=QPoint(switch.width() - 2, switch.height() // 2),
         )
         assert switch.isChecked() is True
-        assert len(toggled) == 1
+        assert toggled.count() == 1
 
     def test_space_uses_the_native_checkbox_keyboard_contract(self):
         switch = self._switch(reduced_motion=lambda: True)
@@ -147,7 +147,7 @@ class TestCanonicalSwitch:
         toggled = QSignalSpy(switch.toggled)
         QTest.keyClick(switch, Qt.Key.Key_Space)
         assert switch.isChecked() is True
-        assert len(toggled) == 1
+        assert toggled.count() == 1
         assert switch.hasFocus()
 
     def test_programmatic_updates_have_no_feedback_loop_and_blocked_updates_paint(self):
@@ -174,7 +174,7 @@ class TestCanonicalSwitch:
         for _index in range(25):
             QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
             assert switch.active_animation_count <= 1
-        assert len(toggled) == 25
+        assert toggled.count() == 25
         assert switch.isChecked() is True
         assert len(switch.findChildren(QTimer)) == 0
         QTest.qWait(switch.ANIMATION_MS + 40)
@@ -208,7 +208,7 @@ class TestCanonicalSwitch:
         QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
         QTest.keyClick(switch, Qt.Key.Key_Space)
         assert switch.isChecked() is False
-        assert len(toggled) == 0
+        assert toggled.count() == 0
         assert switch.thumb_position == 0.0
 
     def test_live_theme_and_light_palette_repaint_the_same_component(self):
@@ -285,7 +285,7 @@ class TestCanonicalSwitch:
         host.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
-        assert sip.isdeleted(animation)
+        assert not Shiboken.isValid(animation)
 
     def test_checked_state_and_accessibility_metadata_remain_native_qt_properties(self):
         switch = self._switch(reduced_motion=lambda: True)
@@ -302,10 +302,14 @@ class TestCanonicalSwitch:
 
 
 class TestSensitiveIntegrationContracts:
+    @classmethod
+    def setup_class(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def test_unavailable_wake_is_disabled_and_voice_controls_stay_available(self):
         with (
-            patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher"),
-            patch.object(_SettingsPanel, "_load_state"),
+            patch.object(_SettingsPanel, "_configure_chatgpt_file_watcher", lambda self: None),
+            patch.object(_SettingsPanel, "_load_state", lambda self: None),
             patch("osia.voice.wake.verifier_available", return_value=False),
             patch("osia.gui.main_popup.set_setting") as save,
         ):

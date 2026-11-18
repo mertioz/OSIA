@@ -7,9 +7,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia.gui import main_popup
 
@@ -206,5 +206,5 @@ def test_project_settings_click_does_not_toggle_the_project(panel, monkeypatch):
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     APP.processEvents()
     assert opened == ["stage"]
-    assert not requests
+    assert requests.count() == 0
     assert panel._folder_widgets["stage"]._collapsed

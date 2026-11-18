@@ -141,7 +141,7 @@ def test_windowed_launcher_routes_helper_without_gui_start(monkeypatch):
 def test_real_windows_cursor_resource_load_and_backup_without_display(tmp_path):
     from osia.control_cursor import WindowsCursorAPI
     from osia.gui.desktop_feedback import cursor_file_bytes, cursor_image
-    from PyQt6.QtGui import QColor
+    from PySide6.QtGui import QColor
 
     api = WindowsCursorAPI()
     for name, identity in CURSOR_IDS.items():

@@ -26,7 +26,7 @@ Design (audited)
   ``setModal(True)`` and a ``showEvent`` that centres on the parent window.
   OSIA is permanently full-access: no permission or confirmation prompt gates
   setup.
-* Imports PyQt6 + ``osia.i18n`` (+ stdlib ``webbrowser``), and lazily imports
+* Imports PySide6 + ``osia.i18n`` (+ stdlib ``webbrowser``), and lazily imports
   ``google_oauth`` only to display the stable Mobile redirect. No GUI module is
   pulled back in, so the dependency remains acyclic.
 
@@ -41,8 +41,8 @@ from __future__ import annotations
 
 import webbrowser
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,

@@ -14,10 +14,10 @@ os.environ["HOME"] = _TEMP_HOME.name
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["OSIA_REDUCED_MOTION"] = "0"
 
-from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QVariantAnimation
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
+from shiboken6 import Shiboken
+from PySide6.QtCore import QCoreApplication, QEvent, Qt, QTimer, QVariantAnimation
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from osia.gui.main_popup import (
     MainPopup,
@@ -104,7 +104,7 @@ class DesktopUxV2Tests(unittest.TestCase):
 
                 self.assertEqual(self.popup._stack.currentIndex(), page_idx)
                 self.assertTrue(button.isChecked())
-                self.assertEqual(len(page_changes), 0)
+                self.assertEqual(page_changes.count(), 0)
                 show_chat.assert_not_called()
 
     def test_repeated_active_settings_click_preserves_nested_category(self):
@@ -128,7 +128,7 @@ class DesktopUxV2Tests(unittest.TestCase):
             self.popup._stack.currentIndex(), self.popup.PAGE_SETTINGS,
         )
         self.assertEqual(settings_nav.currentRow(), nested_row)
-        self.assertEqual(len(page_changes), 0)
+        self.assertEqual(page_changes.count(), 0)
         show_chat.assert_not_called()
 
     def test_switching_sections_retains_active_conversation_and_chat(self):
@@ -220,18 +220,19 @@ class DesktopUxV2Tests(unittest.TestCase):
             return_value=("Renamed conversation", True),
         ):
             QTest.mouseClick(rename, Qt.MouseButton.LeftButton)
-        with patch("osia.gui.main_popup.QMenu.exec"):
+        with patch("osia.gui.main_popup.QMenu") as menu:
             QTest.mouseClick(move, Qt.MouseButton.LeftButton)
+        menu.return_value.exec.assert_called_once()
         QTest.mouseClick(delete, Qt.MouseButton.LeftButton)
 
-        self.assertEqual(len(opened), 0)
-        self.assertEqual(len(renamed), 1)
+        self.assertEqual(opened.count(), 0)
+        self.assertEqual(renamed.count(), 1)
         self.assertEqual(
-            list(renamed[0]),
+            list(renamed.at(0)),
             ["conversation-actions", "Renamed conversation"],
         )
-        self.assertEqual(len(deleted), 1)
-        self.assertEqual(deleted[0][0], "conversation-actions")
+        self.assertEqual(deleted.count(), 1)
+        self.assertEqual(deleted.at(0)[0], "conversation-actions")
         for button in (rename, move, delete):
             self.assertGreater(button.width(), 30)
             self.assertEqual(button.width(), button.height())
@@ -241,7 +242,7 @@ class DesktopUxV2Tests(unittest.TestCase):
         QTest.mouseClick(title, Qt.MouseButton.LeftButton)
         row.setFocus()
         QTest.keyClick(row, Qt.Key.Key_Return)
-        self.assertEqual(list(opened), [["conversation-actions"]] * 2)
+        self.assertEqual([opened.at(i) for i in range(opened.count())], [["conversation-actions"]] * 2)
         row.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
@@ -310,9 +311,9 @@ class DesktopUxV2Tests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
 
-        self.assertTrue(sip.isdeleted(page))
+        self.assertFalse(Shiboken.isValid(page))
         self.assertEqual(motion.active_animation_count, 0)
-        self.assertTrue(sip.isdeleted(animation))
+        self.assertFalse(Shiboken.isValid(animation))
         motion.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()

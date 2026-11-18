@@ -8,10 +8,10 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QVariantAnimation
-from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QVariantAnimation
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from osia.gui import main_popup
 from osia.gui import motion as motion_module
@@ -103,7 +103,7 @@ def test_transition_keeps_live_input_focus_geometry_and_one_bounded_frame(surfac
     assert APP.focusWidget() is focused
     clicked = QSignalSpy(button.clicked)
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-    assert len(clicked) == 1
+    assert clicked.count() == 1
     assert button.text() == "After"
     for fraction in (0.15, 0.4, 0.7):
         transition._animation.setCurrentTime(round(transition._animation.duration() * fraction))
@@ -234,7 +234,7 @@ def test_chat_open_is_immediate_during_page_crossfade(popup):
     click_nav(popup, popup.PAGE_CONVS)
     opened = QSignalSpy(popup.open_conversation)
     QTest.mouseClick(popup._convs._row_widgets["sample"], Qt.MouseButton.LeftButton)
-    assert len(opened) == 1
+    assert opened.count() == 1
     assert popup._stack.currentWidget() is popup._chat
     assert [b.text() for b in popup._chat.findChildren(main_popup._Bubble)] == ["Saved message"]
     assert popup._page_transition.isVisible()
@@ -293,16 +293,17 @@ def test_provider_navigation_and_back_animate_without_changing_selected_model(po
     panel.set_current("example", "openai")
     changed = QSignalSpy(panel.model_changed)
     click_nav(popup, popup.PAGE_MODELS)
-    card = panel.findChild(main_popup._ProviderGridCard)
+    card = next(card for card in panel.findChildren(main_popup._ProviderGridCard)
+                if card.isVisible() and card._provider == "openai")
     QTest.mouseClick(card, Qt.MouseButton.LeftButton)
     assert panel._view == "openai"
     assert panel._content_transition.isVisible()
-    assert not changed
+    assert changed.count() == 0
     QTest.mouseClick(panel._back_btn, Qt.MouseButton.LeftButton)
     assert panel._view is None
     assert panel._content_transition.isVisible()
     assert panel._current_model == "example"
-    assert not changed
+    assert changed.count() == 0
 
 
 def test_provider_settings_crossfade_keeps_new_configuration_interactive(popup):
@@ -328,13 +329,13 @@ def test_switch_updates_immediately_and_reverses_from_current_position(surface):
     seen = QSignalSpy(switch.toggled)
     QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
     assert switch.isChecked()
-    assert len(seen) == 1
+    assert seen.count() == 1
     switch._animation.setCurrentTime(45)
     before = switch.thumb_position
     assert 0 < before < 1
     QTest.mouseClick(switch, Qt.MouseButton.LeftButton)
     assert not switch.isChecked()
-    assert len(seen) == 2
+    assert seen.count() == 2
     assert switch.thumb_position == pytest.approx(before)
     switch._animation.setCurrentTime(switch.ANIMATION_MS)
     assert switch.thumb_position == 0

@@ -44,8 +44,8 @@ def test_windows_repair_preserves_focus_geometry_and_owner_and_does_not_reraise_
 def test_capsule_rechecks_after_show_and_handle_change_but_never_reshows_when_disabled(monkeypatch, shape):
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtCore import QEvent
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
     from osia.gui import dynamic_island
 
     app = QApplication.instance() or QApplication([])

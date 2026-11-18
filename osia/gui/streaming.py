@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PyQt6.QtCore import QObject, QTextBoundaryFinder, QTimer, pyqtSignal
+from PySide6.QtCore import QObject, QTextBoundaryFinder, QTimer, Signal
 
 from osia.gui.motion import reduced_motion_requested
 
@@ -12,8 +12,8 @@ from osia.gui.motion import reduced_motion_requested
 class DesktopTextStreamController(QObject):
     """Keep a canonical target and reveal one ordered prefix with one timer."""
 
-    text_changed = pyqtSignal(str)
-    completed = pyqtSignal()
+    text_changed = Signal(str)
+    completed = Signal()
 
     TICK_MS = 16
     CHARS_PER_SECOND = 200

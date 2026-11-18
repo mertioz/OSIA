@@ -5,9 +5,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from osia.gui import main_popup as ui
 
@@ -188,7 +188,7 @@ def test_unchanged_catalog_preserves_search_pagination_rows_and_selection(models
     assert models._current_model == "example-1"
     assert scroll.value() == position
     assert APP.focusWidget() is focused
-    assert not chosen
+    assert chosen.count() == 0
     models.set_current("example-10", "openrouter")
     active = [models._host_layout.itemAt(i).widget() for i in range(models._host_layout.count() - 1)]
     assert [row._mid for row in active if isinstance(row, ui._ModelRow) and row.property("active")] == ["example-10"]

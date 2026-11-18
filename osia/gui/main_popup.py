@@ -33,17 +33,18 @@ from pathlib import Path
 
 import qrcode
 
-from PyQt6.QtCore import (
-    Qt, QEvent, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
+from PySide6.QtCore import (
+    Qt, QEvent, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
     QParallelAnimationGroup, QUrl,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
     QTextCursor, QTextDocument, QTextOption, QImage, QBrush, QLinearGradient,
     QDesktopServices,
 )
-from PyQt6.QtWidgets import (
+from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
     QSizePolicy, QFileDialog, QComboBox,
@@ -51,6 +52,7 @@ from PyQt6.QtWidgets import (
     QToolTip, QMessageBox, QTextBrowser, QBoxLayout, QListView, QListWidgetItem,
     QStyle, QStyleOptionButton, QStylePainter, QStyledItemDelegate,
 )
+from shiboken6 import isValid
 
 from osia import conversations
 from osia import personality
@@ -87,6 +89,7 @@ from osia.gui.motion import (
     MOTION, ContentTransition, MotionController, ThemeTransition,
     reduced_motion_requested,
 )
+from osia.gui.quick import load_quick_view
 from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
@@ -112,15 +115,6 @@ from osia.slash_commands import (
     conversation_mention,
     escaped_literal_text,
 )
-
-# sip lets us detect widgets whose C++ side has already been destroyed
-# (accessing them raises RuntimeError otherwise). It ships with PyQt6 but
-# guard the import so a missing module never breaks the GUI.
-try:
-    from PyQt6 import sip
-except ImportError:
-    sip = None
-
 
 # ── Visual constants ────────────────────────────────────────────────────────
 
@@ -226,20 +220,13 @@ def _format_time(ts: str | None) -> str:
         return ts
 
 
-def _is_deleted(widget) -> bool:
+def _is_deleted(widget: QWidget | None) -> bool:
     """True when *widget*'s underlying C++ object has been destroyed.
 
     Qt can delete child widgets from the C++ side (e.g. while a layout is
     cleared); the Python wrapper then raises RuntimeError on any access.
     """
-    if widget is None:
-        return True
-    if sip is not None:
-        try:
-            return sip.isdeleted(widget)
-        except TypeError:
-            pass
-    return False
+    return widget is None or not isValid(widget)
 
 
 def _display_text(content) -> str:
@@ -345,7 +332,7 @@ _BUBBLE_MAX_WIDTH = 360
 class _MessageText(QTextBrowser):
     """Selectable message text with native anywhere fallback wrapping."""
 
-    metrics_changed = pyqtSignal()
+    metrics_changed = Signal()
 
     def __init__(
         self, text: str, *, markdown: bool = False, streaming: bool = False,
@@ -633,7 +620,7 @@ class _ComposerButton(_PointerStyledButton):
         painter.end()
 
 
-class _ContextMeter(QWidget):
+class _ContextMeter(QQuickWidget):
     """Small gray ring for the selected conversation's model context."""
 
     def __init__(self):
@@ -641,6 +628,13 @@ class _ContextMeter(QWidget):
         self.setFixedSize(18, 18)
         self._usage = {}
         self._fraction = 0.0
+        self._theme = get_theme_manager()
+        palette = self._theme.palette
+        load_quick_view(self, "ContextMeter.qml", {
+            "trackColor": palette.color("text", 60),
+            "usageColor": palette.color("text", 175),
+        })
+        self._theme.theme_changed.connect(self._on_theme_changed)
         self.set_usage({})
 
     def set_usage(self, usage: dict) -> None:
@@ -666,27 +660,19 @@ class _ContextMeter(QWidget):
         self.setToolTip(label)
         if usage != self._usage:
             self._usage = dict(usage)
-            self.update()
+            self.rootObject().setProperty("fraction", self._fraction)
 
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        palette = get_theme_manager().palette
-        ring = QRectF(2.5, 2.5, 13, 13)
-        painter.setPen(QPen(palette.color("text", 60), 1.5))
-        painter.drawEllipse(ring)
-        if self._fraction:
-            pen = QPen(palette.color("text", 175), 1.5)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            painter.drawArc(ring, 90 * 16, -round(360 * 16 * self._fraction))
-        painter.end()
+    def _on_theme_changed(self, _key: str) -> None:
+        palette = self._theme.palette
+        root = self.rootObject()
+        root.setProperty("trackColor", palette.color("text", 60))
+        root.setProperty("usageColor", palette.color("text", 175))
 
 
 class _ComposerInput(QTextEdit):
     """Compact multiline editor: Enter submits, Shift+Enter inserts a newline."""
 
-    send_requested = pyqtSignal()
+    send_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -726,7 +712,7 @@ class _ComposerInput(QTextEdit):
 class _AttachmentChip(QFrame):
     """Path-free, removable presentation for one pending draft item."""
 
-    remove_requested = pyqtSignal(str)
+    remove_requested = Signal(str)
 
     def __init__(self, attachment: DraftAttachment) -> None:
         super().__init__()
@@ -800,7 +786,7 @@ class _AttachmentChip(QFrame):
 class _DirectiveChip(QFrame):
     """Removable display-only chip for one structured turn modifier."""
 
-    remove_requested = pyqtSignal(str)
+    remove_requested = Signal(str)
 
     def __init__(self, identity: str, label: str) -> None:
         super().__init__()
@@ -853,7 +839,7 @@ def _thinking_display_text(text: str) -> str:
 class _ChatThinkingTrace(QFrame):
     """Compact, real-only public trace bound to one exact Chat run."""
 
-    cancel_requested = pyqtSignal(dict)
+    cancel_requested = Signal(dict)
     _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,256}$")
     _DETAIL_MAX_HEIGHT = 180
 
@@ -1330,15 +1316,15 @@ class _ComposerDraft:
 class _ChatPage(QWidget):
     """Scrollable message list + text input row at the bottom."""
 
-    send_text = pyqtSignal(str)
-    submit_draft = pyqtSignal(str, object)
-    submit_directive_draft = pyqtSignal(str, object, object)
-    informational_requested = pyqtSignal(str)
-    control_requested = pyqtSignal()
-    context_compaction_requested = pyqtSignal()
-    execution_cancel_requested = pyqtSignal(dict)
+    send_text = Signal(str)
+    submit_draft = Signal(str, object)
+    submit_directive_draft = Signal(str, object, object)
+    informational_requested = Signal(str)
+    control_requested = Signal()
+    context_compaction_requested = Signal()
+    execution_cancel_requested = Signal(dict)
     # Kept as a compatibility signal. Selecting a file no longer emits it.
-    pick_file = pyqtSignal(str, str)
+    pick_file = Signal(str, str)
     _BUSY_TEXT = "OSIA is still working in this conversation."
     _FINAL_REPLY_FADE_MS = 260
     _TOOL_WAITING_STATUSES = frozenset({
@@ -2657,10 +2643,10 @@ class _ConversationAction(QPushButton):
 class _ConvRow(_PointerStyledButton):
     """One row in the conversations list."""
 
-    open_clicked = pyqtSignal(str)
-    rename_clicked = pyqtSignal(str, str)   # (conv_id, new_title)
-    delete_clicked = pyqtSignal(str)
-    move_clicked = pyqtSignal(str, object)
+    open_clicked = Signal(str)
+    rename_clicked = Signal(str, str)   # (conv_id, new_title)
+    delete_clicked = Signal(str)
+    move_clicked = Signal(str, object)
 
     def __init__(
         self,
@@ -2827,12 +2813,12 @@ class _FolderIcon(QWidget):
 class _FolderRow(_PointerStyledButton):
     """Visually distinct canonical folder header and its compact settings."""
 
-    collapsed_changed = pyqtSignal(str, bool)
-    new_conversation_clicked = pyqtSignal(str)
-    rename_clicked = pyqtSignal(str, str)
-    context_policy_changed = pyqtSignal(str, bool)
-    reorder_clicked = pyqtSignal(str, int)
-    delete_clicked = pyqtSignal(str, int)
+    collapsed_changed = Signal(str, bool)
+    new_conversation_clicked = Signal(str)
+    rename_clicked = Signal(str, str)
+    context_policy_changed = Signal(str, bool)
+    reorder_clicked = Signal(str, int)
+    delete_clicked = Signal(str, int)
 
     def __init__(self, folder: dict, count: int, index: int, total: int):
         super().__init__()
@@ -3052,12 +3038,12 @@ class _FolderContents(QWidget):
 class _ConversationsPanel(QWidget):
     """List of past conversations + 'new chat' action."""
 
-    new_conversation = pyqtSignal()
-    open_conversation = pyqtSignal(str)
-    rename_conversation = pyqtSignal(str, str)
-    delete_conversation = pyqtSignal(str)
-    folder_mutation_requested = pyqtSignal(dict)
-    bulk_delete_ungrouped_requested = pyqtSignal(int)
+    new_conversation = Signal()
+    open_conversation = Signal(str)
+    rename_conversation = Signal(str, str)
+    delete_conversation = Signal(str)
+    folder_mutation_requested = Signal(dict)
+    bulk_delete_ungrouped_requested = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -3626,7 +3612,7 @@ class _ConversationsPanel(QWidget):
 class _ModelRow(QFrame):
     """One model entry — provider tag, label, select button."""
 
-    selected = pyqtSignal(str)
+    selected = Signal(str)
 
     def __init__(
         self, model: dict, is_active: bool,
@@ -3903,7 +3889,7 @@ class _ProviderGridCard(QFrame):
     exposes. Clicking it drills into that provider's model list.
     """
 
-    clicked = pyqtSignal(str)   # provider key
+    clicked = Signal(str)   # provider key
 
     def __init__(self, provider: str, color: str, model_count: int):
         super().__init__()
@@ -3961,9 +3947,9 @@ class _ModelPanel(QWidget):
     to the provider grid.
     """
 
-    model_changed = pyqtSignal(str, str)
-    account_refresh_requested = pyqtSignal()
-    local_models_refresh_requested = pyqtSignal()
+    model_changed = Signal(str, str)
+    account_refresh_requested = Signal()
+    local_models_refresh_requested = Signal()
 
     PROVIDER_ORDER = (
         "chatgpt_account", "anthropic", "openai", "deepseek", "google",
@@ -4091,7 +4077,7 @@ class _ModelPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(50, self._request_visible_refreshes)
+        QTimer.singleShot(50, self, self._request_visible_refreshes)
         self._account_refresh_timer.start()
 
     def _request_visible_refreshes(self) -> None:
@@ -4376,7 +4362,7 @@ class _ProviderCard(QFrame):
     key only — there is no OAuth.
     """
 
-    saved = pyqtSignal(str)            # provider
+    saved = Signal(str)            # provider
 
     def __init__(self, provider: str):
         super().__init__()
@@ -4520,7 +4506,7 @@ class _ProviderCard(QFrame):
             self._save_btn.style().unpolish(self._save_btn)
             self._save_btn.style().polish(self._save_btn)
 
-        QTimer.singleShot(1500, restore)
+        QTimer.singleShot(1500, self, restore)
 
 
 class _TokenDialog(QDialog):
@@ -4585,7 +4571,7 @@ class _TokenDialog(QDialog):
         QApplication.clipboard().setText(self._field.text())
         self._copy_btn.setText(i18n.t("settings.copied"))
         QTimer.singleShot(
-            1500, lambda: self._copy_btn.setText(i18n.t("settings.copy"))
+            1500, self, lambda: self._copy_btn.setText(i18n.t("settings.copy"))
         )
 
     def showEvent(self, event):
@@ -5237,27 +5223,27 @@ class _SettingsPanel(QWidget):
     services.
     """
 
-    api_keys_saved = pyqtSignal(dict)
+    api_keys_saved = Signal(dict)
     # Emitted when the "Show the floating capsule" toggle changes (WOR-22).
     # The host (osia.main.wake_mode) connects it to the capsule's visibility.
-    capsule_visibility_changed = pyqtSignal(bool)
+    capsule_visibility_changed = Signal(bool)
     # Emitted when the "Enable wake word" toggle changes. The host
     # (osia.main.wake_mode) connects it to the wake-word detector start/stop.
-    wake_word_enabled_changed = pyqtSignal(bool)
+    wake_word_enabled_changed = Signal(bool)
     # Carries startup-service probe results [(unit, state, enabled), ...] from
     # the background probe thread back onto the GUI thread (WOR perf fix — the
     # probe does slow tasklist/socket calls that must not block the UI).
-    _startup_status_ready = pyqtSignal(list)
-    _startup_change_finished = pyqtSignal(str, bool, bool)
+    _startup_status_ready = Signal(list)
+    _startup_change_finished = Signal(str, bool, bool)
     # Carries token-safe native Gmail REST status from a background probe.
-    _gmail_rest_status_ready = pyqtSignal(dict)
+    _gmail_rest_status_ready = Signal(dict)
     # Managed ChatGPT account operations always run off the GUI thread.
-    _chatgpt_status_ready = pyqtSignal(dict)
-    _chatgpt_login_ready = pyqtSignal(dict)
-    chatgpt_status_changed = pyqtSignal(dict)
-    local_models_refresh_requested = pyqtSignal()
-    getting_started_requested = pyqtSignal()
-    _shutdown_finished = pyqtSignal(bool)
+    _chatgpt_status_ready = Signal(dict)
+    _chatgpt_login_ready = Signal(dict)
+    chatgpt_status_changed = Signal(dict)
+    local_models_refresh_requested = Signal()
+    getting_started_requested = Signal()
+    _shutdown_finished = Signal(bool)
 
     # Order AI provider cards appear in Section 1 (Ollama is keyless and shown
     # last as an info-only row).
@@ -5589,7 +5575,7 @@ class _SettingsPanel(QWidget):
         ):
             return
         self._settings_extent_refresh_scheduled = True
-        QTimer.singleShot(0, self._sync_settings_detail_extent)
+        QTimer.singleShot(0, self, self._sync_settings_detail_extent)
 
     def _sync_settings_detail_extent(self) -> None:
         if not hasattr(self, "_settings_stack"):
@@ -6051,6 +6037,7 @@ class _SettingsPanel(QWidget):
             daemon=True,
         ).start()
 
+    @Slot(bool)
     def _on_shutdown_finished(self, stopped: bool) -> None:
         if not self._shutdown_pending:
             return
@@ -8883,6 +8870,7 @@ class _SettingsPanel(QWidget):
             target=_bg, name="osia-gmail-rest-status", daemon=True
         ).start()
 
+    @Slot(dict)
     def _apply_gmail_rest_status(self, status: dict) -> None:
         self._gmail_rest_probe_busy = False
         if not isinstance(status, dict):
@@ -10083,10 +10071,12 @@ class _SettingsPanel(QWidget):
         except Exception:
             pass
 
+    @Slot(str)
     def _on_chatgpt_auth_storage_changed(self, _path: str) -> None:
         self._configure_chatgpt_file_watcher()
         self._probe_chatgpt_account(force=True)
 
+    @Slot(dict)
     def _apply_chatgpt_status(self, status: dict) -> None:
         status = dict(status or {})
         logout_failed = bool(status.pop("_osiaLogoutFailed", False))
@@ -10105,7 +10095,7 @@ class _SettingsPanel(QWidget):
                 and not self._chatgpt_action_busy
             ):
                 self._chatgpt_refresh_pending = False
-                QTimer.singleShot(0, lambda: self._probe_chatgpt_account(force=True))
+                QTimer.singleShot(0, self, lambda: self._probe_chatgpt_account(force=True))
             return
 
         if request_kind == "probe":
@@ -10191,7 +10181,7 @@ class _SettingsPanel(QWidget):
         generation = self._chatgpt_request_generation
         self._set_chatgpt_ui_state("connecting")
         if self._chatgpt_retry_view_state is not None:
-            QTimer.singleShot(0, self._restore_chatgpt_retry_view)
+            QTimer.singleShot(0, self, self._restore_chatgpt_retry_view)
 
         def worker():
             try:
@@ -10242,6 +10232,7 @@ class _SettingsPanel(QWidget):
             target=worker, name="osia-chatgpt-login", daemon=True
         ).start()
 
+    @Slot(dict)
     def _apply_chatgpt_login_action(self, action: dict) -> None:
         if (
             action.get("_osiaRequestGeneration") == self._chatgpt_request_generation
@@ -10970,6 +10961,7 @@ class _SettingsPanel(QWidget):
         except RuntimeError:
             self._apply_startup_change(unit, checked, False)
 
+    @Slot(str, bool, bool)
     def _apply_startup_change(self, unit: str, checked: bool, ok: bool) -> None:
         self._startup_changes.discard(unit)
         for row_unit, _dot, toggle in self._startup_rows:
@@ -11027,13 +11019,14 @@ class _SettingsPanel(QWidget):
         except RuntimeError:
             self._startup_probe_busy = False
 
+    @Slot(list)
     def _apply_startup_status(self, results: list) -> None:
         """Apply background startup-status probe results on the GUI thread."""
         self._startup_probe_busy = False
         if self._startup_refresh_pending:
             self._startup_refresh_pending = False
             QTimer.singleShot(
-                0, lambda: self._refresh_startup_status(force=True)
+                0, self, lambda: self._refresh_startup_status(force=True)
             )
         if self._startup_probe_stale:
             self._startup_probe_stale = False
@@ -11071,7 +11064,7 @@ class _SettingsPanel(QWidget):
             return
         self._state_refresh_scheduled = True
         # Let Qt paint the already-cached page before rebuilding stale controls.
-        QTimer.singleShot(50, self._refresh_scheduled_state)
+        QTimer.singleShot(50, self, self._refresh_scheduled_state)
 
     def _refresh_scheduled_state(self) -> None:
         self._state_refresh_scheduled = False
@@ -11088,7 +11081,7 @@ class _SettingsPanel(QWidget):
         # Queue the thread starts behind the show event.  The probes themselves
         # remain off-thread; a zero-delay callback also prevents an unrelated
         # delayed probe from racing a Retry/login action shortly afterwards.
-        QTimer.singleShot(0, self._refresh_visible_probes)
+        QTimer.singleShot(0, self, self._refresh_visible_probes)
         self._startup_timer.start()
         self._mcp_timer.start()
 
@@ -11236,14 +11229,14 @@ class _OsiaPanel(QWidget):
 
         def restore(b=btn):
             # The button may have been destroyed by a re-render in the meantime.
-            if sip is not None and sip.isdeleted(b):
+            if _is_deleted(b):
                 return
             b.setProperty("saved", False)
             b.setText(i18n.t("provider.save"))
             b.style().unpolish(b)
             b.style().polish(b)
 
-        QTimer.singleShot(1500, restore)
+        QTimer.singleShot(1500, btn, restore)
 
     # ── Skills section ─────────────────────────────────────────────────────
 
@@ -11652,31 +11645,31 @@ class _CentralStack(QStackedWidget):
 class MainPopup(QWidget):
     """Floating glass panel anchored just below the Dynamic Island."""
 
-    send_text = pyqtSignal(str)
-    submit_draft = pyqtSignal(str, object)
-    submit_directive_draft = pyqtSignal(str, object, object)
-    informational_requested = pyqtSignal(str)
-    control_requested = pyqtSignal()
-    context_compaction_requested = pyqtSignal()
-    pick_file = pyqtSignal(str, str)
-    new_conversation = pyqtSignal()
-    open_conversation = pyqtSignal(str)
-    rename_conversation = pyqtSignal(str, str)
-    delete_conversation = pyqtSignal(str)
-    folder_mutation_requested = pyqtSignal(dict)
-    bulk_delete_ungrouped_requested = pyqtSignal(int)
-    model_changed = pyqtSignal(str, str)
-    api_keys_saved = pyqtSignal(dict)
-    chatgpt_status_changed = pyqtSignal(dict)
+    send_text = Signal(str)
+    submit_draft = Signal(str, object)
+    submit_directive_draft = Signal(str, object, object)
+    informational_requested = Signal(str)
+    control_requested = Signal()
+    context_compaction_requested = Signal()
+    pick_file = Signal(str, str)
+    new_conversation = Signal()
+    open_conversation = Signal(str)
+    rename_conversation = Signal(str, str)
+    delete_conversation = Signal(str)
+    folder_mutation_requested = Signal(dict)
+    bulk_delete_ungrouped_requested = Signal(int)
+    model_changed = Signal(str, str)
+    api_keys_saved = Signal(dict)
+    chatgpt_status_changed = Signal(dict)
     # Re-emitted from the settings panel: the floating-capsule visibility toggle
     # (WOR-22). The host wires it to the Dynamic Island's set_capsule_visible.
-    capsule_visibility_changed = pyqtSignal(bool)
+    capsule_visibility_changed = Signal(bool)
     # Compatibility signal retained for older hosts; the disabled settings row
     # can only emit False in this release.
-    wake_word_enabled_changed = pyqtSignal(bool)
-    chat_execution_cancel_requested = pyqtSignal(dict)
-    _local_models_ready = pyqtSignal(list)
-    _remote_catalogue_ready = pyqtSignal(list)
+    wake_word_enabled_changed = Signal(bool)
+    chat_execution_cancel_requested = Signal(dict)
+    _local_models_ready = Signal(list)
+    _remote_catalogue_ready = Signal(list)
 
     # Index of the chat page in the QStackedWidget.
     PAGE_CHAT = 0
@@ -11958,7 +11951,7 @@ class MainPopup(QWidget):
         self._apply_style()
         self._button_cursor_policy = ButtonCursorPolicy(self)
         self._stack.setCurrentIndex(self.PAGE_CHAT)
-        QTimer.singleShot(0, self._request_local_models_refresh)
+        QTimer.singleShot(0, self, self._request_local_models_refresh)
 
     # ── Window placement ──────────────────────────────────────────────────
 
@@ -12632,6 +12625,7 @@ class MainPopup(QWidget):
                 conversation_id=self._chat._draft_context or "",
             )
 
+    @Slot(list)
     def set_remote_models(self, remote: list) -> None:
         self._model_remote_models = [
             dict(item) for item in remote or [] if isinstance(item, dict)
@@ -12683,6 +12677,7 @@ class MainPopup(QWidget):
     def _publish_local_models(self, models: list) -> None:
         self._local_models_ready.emit(list(models))
 
+    @Slot(list)
     def _apply_local_models(self, _models: list) -> None:
         self._settings._apply_local_models_snapshot()
         self._refresh_model_inventory()

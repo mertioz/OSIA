@@ -1,9 +1,10 @@
 """The microphone opt-in is visible, reversible, and unavailable assets are safe."""
 from types import SimpleNamespace
 
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 import pytest
 
+from osia.config import DEFAULT_SETTINGS
 from osia.gui import main_popup
 from osia.voice import wake
 
@@ -20,6 +21,7 @@ class DormantThread:
 def panel(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(main_popup, "threading", SimpleNamespace(Thread=DormantThread))
+    monkeypatch.setattr(main_popup, "load_settings", lambda: dict(DEFAULT_SETTINGS))
     monkeypatch.setattr(wake, "verifier_available", lambda: True)
     widget = main_popup._SettingsPanel()
     yield widget

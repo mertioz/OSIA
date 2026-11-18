@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from osia.chatgpt_account.app_server_client import AppServerError
 from osia.chatgpt_account.provider import AccountProviderError

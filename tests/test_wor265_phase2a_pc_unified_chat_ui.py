@@ -8,9 +8,9 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import Qt
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QFrame
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QFrame
 
 from osia import i18n
 from osia.execution_trace import ExecutionTraceLedger
@@ -335,6 +335,7 @@ def test_committed_stop_closes_thinking_and_late_trace_cannot_reopen(
     binding = ledger.binding_dict()
     popup.refresh_conversations(binding["conversation_id"])
     popup.set_messages([])
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     popup._active_conversation_id = binding["conversation_id"]
     requested = []
     capture_request = requested.append

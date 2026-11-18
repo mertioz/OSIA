@@ -18,5 +18,5 @@ Contribute only material you have the right to provide under the MIT License or
 under a separately identified license for third-party material.
 
 For packaged Desktop builds, consult the third-party notices for the exact
-distribution. PyQt6 on Windows uses GPLv3 or a separate commercial license.
-Qt for Python on Linux and bundled runtimes and models have their own terms.
+distribution. Qt for Python (PySide6) and its Qt libraries have their own
+license terms, as do the other bundled runtimes and models.

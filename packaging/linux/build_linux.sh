@@ -27,6 +27,9 @@ payload="$package/payload"
 mkdir -p -- "$payload/"{app,bin,integration,bootstrap}
 git -C "$repo" archive "$revision" osia assets LICENSE NOTICE THIRD_PARTY_NOTICES.md \
   | tar -xf - -C "$payload/app"
+mkdir -p -- "$payload/app/licenses/qt"
+git -C "$repo" archive "$revision:packaging/licenses/qt" \
+  | tar -xf - -C "$payload/app/licenses/qt"
 
 # The user installer fetches third-party Python libraries and browsers from
 # their publishers. The portable interpreter and Codex are verified inputs.

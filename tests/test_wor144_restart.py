@@ -7,7 +7,7 @@ import types
 from pathlib import Path
 
 import pytest
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from osia import relaunch
 from osia.gui import main_popup
@@ -97,19 +97,19 @@ def test_restart_confirmation_prepares_once_and_disables_duplicates(
         "prepare_relaunch",
         lambda: prepared.append(True),
     )
-    monkeypatch.setattr(
-        main_popup,
-        "QApplication",
-        types.SimpleNamespace(instance=lambda: fake_app),
-    )
-    monkeypatch.setattr(
-        main_popup,
-        "QTimer",
-        types.SimpleNamespace(singleShot=lambda _delay, callback: callback()),
-    )
-
-    settings_panel._on_restart_clicked()
-    settings_panel._on_restart_clicked()
+    with monkeypatch.context() as exit_ui:
+        exit_ui.setattr(
+            main_popup,
+            "QApplication",
+            types.SimpleNamespace(instance=lambda: fake_app),
+        )
+        exit_ui.setattr(
+            main_popup,
+            "QTimer",
+            types.SimpleNamespace(singleShot=lambda _delay, callback: callback()),
+        )
+        settings_panel._on_restart_clicked()
+        settings_panel._on_restart_clicked()
 
     assert questions == [True]
     assert prepared == [True]

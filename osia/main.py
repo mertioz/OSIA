@@ -1844,9 +1844,9 @@ def voice_mode():
 
 def wake_mode():
     """Desktop voice mode with opt-in local wake and Ctrl+Alt+P activation."""
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtCore import QObject, pyqtSignal, Qt, QTimer
-    from PyQt6.QtGui import QGuiApplication, QIcon
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QObject, Signal, Qt, QTimer
+    from PySide6.QtGui import QGuiApplication, QIcon
 
     from osia.perf import perf_mark
     perf_mark("wake_mode: enter")
@@ -1889,37 +1889,37 @@ def wake_mode():
     perf_mark("wake_mode: heavy imports done")
 
     class Bridge(QObject):
-        wake_detected = pyqtSignal(int)
-        remote_models_signal = pyqtSignal(list)
+        wake_detected = Signal(int)
+        remote_models_signal = Signal(list)
         # Update the chat with a (role, text) pair from a worker thread.
-        chat_message = pyqtSignal(str, str)
+        chat_message = Signal(str, str)
         # Update the chat only if the popup is still viewing this conversation.
-        chat_message_for_conversation = pyqtSignal(str, str, str)
+        chat_message_for_conversation = Signal(str, str, str)
         # Presentation-only desktop assistant streaming. Sentence chunks extend
         # one bounded typewriter target; final/error frames flush it exactly.
-        assistant_stream_chunk = pyqtSignal(dict, str)
-        assistant_stream_final = pyqtSignal(dict, str)
-        assistant_stream_error = pyqtSignal(dict, str)
-        chat_turn_started = pyqtSignal(dict)
-        chat_cancel_finished = pyqtSignal(dict, object, bool, bool)
-        execution_trace = pyqtSignal(dict)
+        assistant_stream_chunk = Signal(dict, str)
+        assistant_stream_final = Signal(dict, str)
+        assistant_stream_error = Signal(dict, str)
+        chat_turn_started = Signal(dict)
+        chat_cancel_finished = Signal(dict, object, bool, bool)
+        execution_trace = Signal(dict)
         # Request GUI reprojection without carrying a possibly stale state.
-        island_state = pyqtSignal()
+        island_state = Signal()
         # Per-conversation desktop busy state for the popup input controls.
-        conversation_busy_changed = pyqtSignal(str, bool)
-        tool_attempt_status = pyqtSignal(dict, str)
+        conversation_busy_changed = Signal(str, bool)
+        tool_attempt_status = Signal(dict, str)
         # Refresh the conversations panel (new active id) from a worker thread.
-        conversations_changed = pyqtSignal(str)
+        conversations_changed = Signal(str)
         # Canonical conversation deletion completes off the GUI thread.
-        conversation_delete_finished = pyqtSignal(dict)
-        slash_information_ready = pyqtSignal(int, dict)
-        context_compaction_ready = pyqtSignal(int, str, dict)
+        conversation_delete_finished = Signal(dict)
+        slash_information_ready = Signal(int, dict)
+        context_compaction_ready = Signal(int, str, dict)
         # Reset chat (agent + GUI) from a worker thread â€” "nouveau chat" voice
         # command (WOR-10). Runs on the GUI thread so Qt calls are safe.
-        new_chat = pyqtSignal()
+        new_chat = Signal()
         # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
-        toggle_popup = pyqtSignal()
+        toggle_popup = Signal()
         # Sanitized durable execution state projected into its originating Chat.
 
     bridge = Bridge()

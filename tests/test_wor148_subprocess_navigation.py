@@ -9,8 +9,8 @@ import types
 from datetime import datetime
 
 import pytest
-from PyQt6.QtCore import QEvent, QObject, QThread
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QObject, QThread
+from PySide6.QtWidgets import QApplication
 
 from osia import models
 from osia.gui import main_popup

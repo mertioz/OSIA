@@ -1,0 +1,19 @@
+Qt for Python and Qt 6.11.0
+
+OSIA uses PySide6 Essentials and Shiboken6 6.11.0 from The Qt Company
+and contributors. The Python packages identify LGPL-3.0-only,
+GPL-2.0-only and GPL-3.0-only as open-source options. The Qt libraries
+and plugins retain their upstream module and third-party terms.
+
+The attached texts are from the upstream 6.11.0 licence directories.
+The Qt GPL exception applies where specified by the upstream component.
+
+Qt for Python source and licence directory
+https://code.qt.io/cgit/pyside/pyside-setup.git/tree/LICENSES?h=v6.11.0
+
+Qt 6.11.0 source archive
+https://download.qt.io/archive/qt/6.11/6.11.0/single/
+
+Qt licensing and third-party notices
+https://doc.qt.io/qt-6/licensing.html
+https://doc.qt.io/qtforpython-6/licenses.html

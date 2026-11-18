@@ -316,8 +316,8 @@ def test_corrupt_or_foreign_snapshot_does_not_mix_chats(chats):
 
 def test_desktop_progress_and_completion_are_chat_notices_not_model_bubbles(chats, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtCore import QCoreApplication, QEvent
-    from PyQt6.QtWidgets import QApplication, QLabel
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication, QLabel
     from osia import i18n
     from osia.gui.main_popup import _ChatPage
     app = QApplication.instance() or QApplication([])

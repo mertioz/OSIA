@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PyQt6.QtCore import (
+from PySide6.QtCore import (
     QEvent,
     QEasingCurve,
     QRectF,
@@ -12,8 +12,8 @@ from PyQt6.QtCore import (
     Qt,
     QVariantAnimation,
 )
-from PyQt6.QtGui import QColor, QPainter, QPen
-from PyQt6.QtWidgets import QCheckBox, QWidget
+from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtWidgets import QCheckBox, QWidget
 
 from osia.gui.motion import MOTION, reduced_motion_requested
 from osia.gui.theme import ThemeManager, get_theme_manager

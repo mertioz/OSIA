@@ -6,10 +6,10 @@ import types
 from unittest.mock import patch
 
 import pytest
-from PyQt6.QtCore import QAbstractAnimation, QPoint, QPointF, Qt
-from PyQt6.QtGui import QWheelEvent
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QAbstractItemView, QWidget
+from PySide6.QtCore import QAbstractAnimation, QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QWidget
 
 from osia import updater
 from osia.gui import main_popup
@@ -154,12 +154,13 @@ def test_hierarchy_reorder_recovers_from_failed_save_and_keeps_live_rows(
     buttons["down"].click()
     animation = panel._hier_motion["heavy"]
     assert animation.state() == QAbstractAnimation.State.Running
+    settled = QSignalSpy(animation.finished)
     buttons["down"].click()  # A second click while the same row is still sliding.
     assert panel._hier_rows["heavy"] == [second, third, first]
     assert not buttons["down"].isEnabled()
     assert not panel._hier_save_notice.isVisible()
     assert saved[-1] == ("ai_hierarchy", {"heavy": [values[1], values[2], values[0]], "medium": []})
-    QTest.qWait(260)
+    assert settled.count() or settled.wait(1200)
     assert animation.state() == QAbstractAnimation.State.Stopped
     rows = [combo.parentWidget().y() for combo in panel._hier_rows["heavy"]]
     assert rows == sorted(set(rows))

@@ -13,9 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import psutil
 import pytest
-from PyQt6.QtCore import QCoreApplication, QRect, Qt
-from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QRect, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication
 
 from osia import desktop_activity as activity
 from osia.gui.desktop_feedback import ControlEdge, DesktopControlFeedback, cursor_file_bytes, cursor_image

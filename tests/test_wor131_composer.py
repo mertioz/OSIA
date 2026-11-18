@@ -16,10 +16,10 @@ os.environ["HOME"] = _TEMP_HOME.name
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["OSIA_REDUCED_MOTION"] = "1"
 
-from PyQt6.QtCore import QCoreApplication, QEvent, QRectF, Qt
-from PyQt6.QtGui import QColor
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QEvent, QRectF, Qt
+from PySide6.QtGui import QColor
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication
 
 from osia.gui.main_popup import (
     COMPOSER_BUTTON_RADIUS,
@@ -110,8 +110,8 @@ class ComposerTests(unittest.TestCase):
         sends = QSignalSpy(self.popup.send_text)
         self.chat._input.setText("  hello once  ")
         QTest.mouseClick(self.chat._send_btn, Qt.MouseButton.LeftButton)
-        self.assertEqual(len(sends), 1)
-        self.assertEqual(sends[0][0], "hello once")
+        self.assertEqual(sends.count(), 1)
+        self.assertEqual(sends.at(0)[0], "hello once")
         self.assertEqual(self.chat._input.text(), "")
         self.assertFalse(self.chat._send_btn.isEnabled())
 
@@ -123,7 +123,7 @@ class ComposerTests(unittest.TestCase):
         self.chat._input.setText("   \t")
         QTest.keyClick(self.chat._input, Qt.Key.Key_Return)
         self.assertFalse(self.chat._send_btn.isEnabled())
-        self.assertEqual(len(sends), 0)
+        self.assertEqual(sends.count(), 0)
 
     def test_click_and_enter_remain_exactly_once_after_state_changes(self):
         sends = QSignalSpy(self.popup.send_text)
@@ -133,8 +133,8 @@ class ComposerTests(unittest.TestCase):
         self.chat._input.clear()
         self.chat._input.setText("enter")
         QTest.keyClick(self.chat._input, Qt.Key.Key_Return)
-        self.assertEqual(len(sends), 2)
-        self.assertEqual([entry[0] for entry in sends], ["click", "enter"])
+        self.assertEqual(sends.count(), 2)
+        self.assertEqual([sends.at(i)[0] for i in range(sends.count())], ["click", "enter"])
 
     def test_file_pick_stages_once_without_emitting_legacy_send_signal(self):
         picks = QSignalSpy(self.popup.pick_file)
@@ -145,7 +145,7 @@ class ComposerTests(unittest.TestCase):
             return_value=([str(source)], ""),
         ):
             QTest.mouseClick(self.chat._file_btn, Qt.MouseButton.LeftButton)
-        self.assertEqual(len(picks), 0)
+        self.assertEqual(picks.count(), 0)
         self.assertEqual(len(self.chat.pending_attachments()), 1)
         self.assertTrue(self.chat._send_btn.isEnabled())
         self.assertTrue(self.chat._attachment_scroll.isVisible())

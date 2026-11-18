@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QFont, QGuiApplication, QKeySequence, QPainter, QRadialGradient
-from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QFont, QGuiApplication, QKeySequence, QPainter, QRadialGradient
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from osia import i18n
 from osia.gui.theme import get_theme_manager
@@ -106,7 +106,7 @@ class _SettingsIllustration(QWidget):
 class GuideSlideshowDialog(QDialog):
     """Show one illustration and a short explanation per step."""
 
-    handled = pyqtSignal(str)
+    handled = Signal(str)
     SLIDE_COUNT = len(_SLIDES["en"])
 
     def __init__(

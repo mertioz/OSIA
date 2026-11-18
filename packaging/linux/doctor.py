@@ -7,7 +7,8 @@ from osia.version import PRODUCT_VERSION
 
 failures = []
 for name in ("fastapi", "aiortc", "av", "cryptography", "mcp", "PIL.Image",
-             "PySide6.QtGui", "playwright.async_api", "onnxruntime", "faster_whisper", "torch"):
+             "PySide6.QtGui", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
+             "playwright.async_api", "onnxruntime", "faster_whisper", "torch"):
     try:
         import_module(name)
     except (ImportError, OSError) as error:

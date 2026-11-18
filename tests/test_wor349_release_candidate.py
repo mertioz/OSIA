@@ -13,7 +13,7 @@ from test_windows_packaging import _load_launcher
 @pytest.mark.parametrize("language", ["en", "fr"])
 def test_frozen_release_gate_and_bilingual_beta_history(channel, language):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     metadata = updater.AppMetadata(
         product="OSIA", version=PRODUCT_VERSION, channel=channel,

@@ -5,9 +5,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from osia import i18n
 from osia.execution_trace import ExecutionTraceLedger
@@ -208,13 +208,13 @@ def test_queued_receipt_mutates_widgets_on_gui_thread(app):
     trace.record_public_reasoning_summary("Queued public text.")
 
     class Receiver(_ChatThinkingTrace):
-        @pyqtSlot(dict)
+        @Slot(dict)
         def receive(self, value):
             self.received_on_gui = QThread.currentThread() == app.thread()
             self.apply_trace(value)
 
     class Worker(QThread):
-        receipt = pyqtSignal(dict)
+        receipt = Signal(dict)
         def run(self):
             self.receipt.emit(payload(trace))
 

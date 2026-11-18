@@ -90,10 +90,10 @@ def main() -> int:
             "DEMO-TOKEN-NOT-A-SECRET", encoding="utf-8"
         )
 
-        from PyQt6.QtCore import QPoint
-        from PyQt6.QtGui import QFont
-        from PyQt6.QtTest import QTest
-        from PyQt6.QtWidgets import QApplication
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QFont
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
         from osia import i18n
         from osia.gui import main_popup
         from osia.gui.update_ui import UpdateController

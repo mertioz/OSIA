@@ -350,8 +350,8 @@ def test_canonical_trace_projection_uses_current_turn_ownership():
 def test_real_qt_queued_delivery_and_animation_settle(shape, reduced_motion, monkeypatch):
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtCore import QObject, Qt, Signal, Slot
+    from PySide6.QtWidgets import QApplication
     from osia.gui import dynamic_island
 
     app = QApplication.instance() or QApplication([])
@@ -364,13 +364,13 @@ def test_real_qt_queued_delivery_and_animation_settle(shape, reduced_motion, mon
     island._apply_shape_geometry(animate=False)
 
     class Bridge(QObject):
-        changed = pyqtSignal()
+        changed = Signal()
 
     bridge = Bridge()
     lifecycle = IslandLifecycle(bridge.changed.emit)
 
     class Receiver(QObject):
-        @pyqtSlot()
+        @Slot()
         def project(self):
             island.set_state(lifecycle.current_state())
 

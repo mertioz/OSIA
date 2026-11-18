@@ -89,7 +89,7 @@ def test_tool_output_markup_is_reinjected_as_data_not_an_assistant_call():
 
 
 def test_grok_card_stores_only_xai_key_and_explains_account_limit(monkeypatch):
-    from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+    from PySide6.QtWidgets import QApplication, QLabel, QPushButton
     from osia.gui import main_popup
     app = QApplication.instance() or QApplication([])
     writes = []

@@ -2,18 +2,19 @@
 from __future__ import annotations
 
 import base64
-import math
 import struct
 import sys
 import threading
 import time
 
-from PyQt6.QtCore import QEasingCurve, QObject, QPointF, Qt, QTimer, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QApplication, QWidget
+from PySide6.QtCore import QEasingCurve, QObject, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtQuickWidgets import QQuickWidget
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from osia.control_cursor import CursorClient
 from osia.desktop_activity import desktop_activity_visible
+from osia.gui.quick import load_quick_view
 from osia.gui.theme import get_theme_manager
 from osia.gui.motion import reduced_motion_requested
 
@@ -57,7 +58,7 @@ def cursor_image(accent: QColor, *, hand: bool = False, scale: float = 1.0) -> Q
 def cursor_file_bytes(image: QImage, hot_x: int, hot_y: int) -> bytes:
     image = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
     width, height = image.width(), image.height()
-    rows = bytes(image.constBits().asstring(image.sizeInBytes()))
+    rows = bytes(image.constBits())
     bitmap = b"".join(rows[y * image.bytesPerLine():y * image.bytesPerLine() + width * 4]
                       for y in reversed(range(height)))
     mask_stride = ((width + 31) // 32) * 4
@@ -83,7 +84,7 @@ class ControlEdge(QWidget):
         self._reduced_motion = reduced_motion_requested(self)
         self._frames = QTimer(self)
         self._frames.setInterval(33)
-        self._frames.timeout.connect(self.update)
+        self._frames.timeout.connect(self._update_phase)
         self._fade = QVariantAnimation(self)
         self._fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
         self._fade.valueChanged.connect(self._set_reveal)
@@ -100,6 +101,14 @@ class ControlEdge(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        visual = QQuickWidget(self)
+        load_quick_view(visual, "ControlEdge.qml", {
+            "accent": theme.palette.color("primary"),
+        })
+        self._visual = visual.rootObject()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(visual)
         self.sync_geometry()
         screen.geometryChanged.connect(self.sync_geometry)
 
@@ -109,7 +118,13 @@ class ControlEdge(QWidget):
 
     def _set_reveal(self, value):
         self.reveal = float(value)
-        self.update()
+        self._visual.setProperty("reveal", self.reveal)
+
+    def _update_phase(self):
+        self._visual.setProperty("phase", (time.monotonic() - self._started_at) * 0.8)
+
+    def update_theme(self):
+        self._visual.setProperty("accent", self.theme.palette.color("primary"))
 
     def set_active(self, active):
         active = bool(active)
@@ -158,55 +173,9 @@ class ControlEdge(QWidget):
             except Exception:
                 pass
 
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setOpacity(self.reveal)
-        accent = self.theme.palette.color("primary")
-        width = self.width()
-        phase = 0.0 if self._reduced_motion else (time.monotonic() - self._started_at) * 0.8
-        highlight_position = 0.5 + 0.34 * math.sin(phase * 0.75)
-        # Paint the neon directly in the small bottom strip. No graphics effect
-        # or moving translucent window: those can leave DWM ghosts on Windows.
-        path = QPainterPath()
-        for index in range(65):
-            x = width * index / 64
-            y = self.height() - 3.5 + 0.8 * math.sin(index / 64 * math.tau + phase)
-            if index == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-        for thickness, alpha in ((22, 8), (14, 16), (8, 32), (3.5, 120), (1.2, 245)):
-            gradient = QLinearGradient(0, 0, width, 0)
-            transparent = QColor(accent)
-            transparent.setAlpha(0)
-            color = QColor(accent)
-            color.setAlpha(round(alpha * 0.65))
-            highlight = accent.lighter(135)
-            highlight.setAlpha(alpha)
-            for position, stop in ((0, transparent), (0.12, color), (0.5, color), (0.88, color), (1, transparent)):
-                gradient.setColorAt(position, stop)
-            gradient.setColorAt(max(0.01, highlight_position - 0.12), color)
-            gradient.setColorAt(highlight_position, highlight)
-            gradient.setColorAt(min(0.99, highlight_position + 0.12), color)
-            painter.setPen(QPen(gradient, thickness))
-            painter.drawPath(path)
-        for y, alpha in ((self.height() - 12, 75), (self.height() - 19, 30)):
-            color = QColor(accent)
-            color.setAlpha(alpha)
-            gradient = QLinearGradient(0, 0, width, 0)
-            clear = QColor(accent)
-            clear.setAlpha(0)
-            gradient.setColorAt(0, clear)
-            gradient.setColorAt(0.5 + 0.15 * math.sin(phase * 0.5), color)
-            gradient.setColorAt(1, clear)
-            painter.setPen(QPen(gradient, 0.8))
-            painter.drawLine(QPointF(width * 0.03, y), QPointF(width * 0.97, y))
-        painter.end()
-
 
 class DesktopControlFeedback(QObject):
-    activity_changed = pyqtSignal(bool)
+    activity_changed = Signal(bool)
 
     def __init__(self, parent=None, *, theme=None, activity_reader=desktop_activity_visible, cursor_client=None):
         super().__init__(parent)
@@ -268,7 +237,7 @@ class DesktopControlFeedback(QObject):
         if self.closed:
             return
         for edge in self.edges.values():
-            edge.update()
+            edge.update_theme()
         if self.active:
             self._update_cursor()
 

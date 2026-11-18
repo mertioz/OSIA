@@ -6,10 +6,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtCore import QEvent, Qt
-from PyQt6.QtGui import QKeyEvent
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtWidgets import QApplication
 
 from osia.gui.main_popup import _ChatPage
 from osia.slash_commands import CapabilityRequirements, ModelOverride
@@ -30,8 +30,8 @@ def test_information_commands_emit_their_handler_without_sending_a_turn(alias, c
     try:
         chat._input.setPlainText("/" + alias)
         chat._on_send()
-        assert list(requested) == [[command_id]]
-        assert not sent and not submitted
+        assert [requested.at(i) for i in range(requested.count())] == [[command_id]]
+        assert sent.count() == 0 and submitted.count() == 0
         assert not chat._input.toPlainText()
     finally:
         chat.close()
@@ -49,7 +49,7 @@ def test_readonly_information_commands_remain_local_during_active_work(tool_stat
     try:
         chat._input.setPlainText("/" + alias)
         chat._on_send()
-        assert list(requested) == [[command_id]] and not sent
+        assert [requested.at(i) for i in range(requested.count())] == [[command_id]] and sent.count() == 0
     finally:
         chat.close()
         chat.deleteLater()
@@ -64,7 +64,7 @@ def test_control_action_is_never_sent_as_a_chat_turn_while_waiting():
     try:
         chat._input.setPlainText("/control")
         chat._on_send()
-        assert len(requested) == 1 and not sent
+        assert requested.count() == 1 and sent.count() == 0
     finally:
         chat.close()
         chat.deleteLater()
@@ -90,8 +90,8 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
         }
         chat._input.setPlainText("/control")
         chat._on_send()
-        assert len(mouse) == 1
-        assert not typed and not legacy
+        assert mouse.count() == 1
+        assert typed.count() == 0 and legacy.count() == 0
 
         chat._input.setPlainText("/skill")
         chat._on_send()
@@ -99,15 +99,15 @@ def test_new_commands_use_the_desktop_palette_without_sending_literal_slashes(mo
         chat._slash_palette._list.itemClicked.emit(chat._slash_palette._list.item(0))
         chat._input.setPlainText("Summarize this.")
         chat._on_send()
-        assert typed[0][2]["skill_name"] == "brief.md"
+        assert typed.at(0)[2]["skill_name"] == "brief.md"
         assert chat.accept_directive_submission()
 
         chat._input.setPlainText("/skillcreator Write a meeting skill.")
         chat._on_send()
         assert chat._input.toPlainText() == "Write a meeting skill."
         chat._on_send()
-        assert typed[1][2]["skill_creator"] is True
-        assert not legacy
+        assert typed.at(1)[2]["skill_creator"] is True
+        assert legacy.count() == 0
     finally:
         chat.close()
         chat.deleteLater()
@@ -123,11 +123,11 @@ def test_context_meter_and_compact_command_keep_the_composer_local():
         assert "4 / 8" in chat._context_meter.toolTip()
         chat._input.setPlainText("/compact")
         chat._on_send()
-        assert len(requested) == 1 and not sent
+        assert requested.count() == 1 and sent.count() == 0
         assert not chat._input.toPlainText()
         chat._input.setPlainText("//compact")
         chat._on_send()
-        assert sent[0][0] == "/compact"
+        assert sent.at(0)[0] == "/compact"
     finally:
         chat.close()
         chat.deleteLater()
@@ -241,10 +241,10 @@ def test_modifier_selection_creates_chip_and_enter_emits_typed_draft_only():
     assert chat._directive_host.isVisible() is False  # parent is not shown
     assert chat._directive_layout.count() == 1
     chat._on_send()
-    assert len(typed) == 1
-    assert len(legacy) == 0
-    assert typed[0][0] == "latest release"
-    assert typed[0][2]["capability_requirements"] == {"current_web": True}
+    assert typed.count() == 1
+    assert legacy.count() == 0
+    assert typed.at(0)[0] == "latest release"
+    assert typed.at(0)[2]["capability_requirements"] == {"current_web": True}
     # Draft stays intact until the host confirms persistence/dispatch.
     assert chat._input.toPlainText() == "latest release"
     assert chat.accept_directive_submission(())
@@ -264,10 +264,10 @@ def test_informational_selection_is_immediate_and_never_emits_chat_turn():
         "canonical_alias": "help",
         "handler_contract": "show_available_help_v1",
     })
-    assert len(info) == 1
-    assert info[0][0] == "help.info"
-    assert len(typed) == 0
-    assert len(legacy) == 0
+    assert info.count() == 1
+    assert info.at(0)[0] == "help.info"
+    assert typed.count() == 0
+    assert legacy.count() == 0
     chat.deleteLater()
 
 
@@ -316,7 +316,7 @@ def test_informational_command_must_be_used_alone():
         "canonical_alias": "status",
         "handler_contract": "show_safe_status_v1",
     })
-    assert len(info) == 0
+    assert info.count() == 0
     assert chat._input.toPlainText() == "/status trailing"
     chat.deleteLater()
 
@@ -349,7 +349,7 @@ def test_desktop_palette_enter_selects_escape_closes_and_tab_traverses():
         QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier
     )
     assert palette.handle_key(enter) is True
-    assert len(selected) == 1
+    assert selected.count() == 1
     palette._show_rows([row], "Commands")
     escape = QKeyEvent(
         QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier

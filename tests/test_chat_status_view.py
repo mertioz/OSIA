@@ -40,8 +40,8 @@ def test_api_view_labels_estimates_and_never_turns_unknown_prices_into_zero():
 
 
 def test_status_dialog_is_plain_text_without_old_cards(monkeypatch):
-    from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QWidget
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QDialog, QLabel, QWidget
     from osia.gui.main_popup import MainPopup
 
     app = QApplication.instance() or QApplication([])

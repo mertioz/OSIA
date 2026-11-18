@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QElapsedTimer, QPointF, Qt, QTimer
-from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import QPushButton, QStyle, QStyleOptionFocusRect, QWidget
+from PySide6.QtCore import QElapsedTimer, QPointF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter
+from PySide6.QtWidgets import QPushButton, QStyle, QStyleOptionFocusRect, QWidget
 
 from osia.gui.motion import reduced_motion_requested
 from osia.gui.theme import get_theme_manager
@@ -91,7 +91,7 @@ class ThinkingOrbs(QPushButton):
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
-        QTimer.singleShot(0, self._sync_animation)
+        QTimer.singleShot(0, self, self._sync_animation)
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._timer.stop()

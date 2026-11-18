@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import QEvent, Qt, pyqtSignal
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QEvent, Qt, Signal, Slot
+from PySide6.QtWidgets import (
     QApplication, QFrame, QLabel, QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout,
 )
 
@@ -24,10 +24,10 @@ from osia.slash_commands import (
 
 
 class SlashCommandPalette(QFrame):
-    item_selected = pyqtSignal(object)
-    inventory_requested = pyqtSignal()
-    dismissed = pyqtSignal()
-    _snapshot_ready = pyqtSignal(object, object)
+    item_selected = Signal(object)
+    inventory_requested = Signal()
+    dismissed = Signal()
+    _snapshot_ready = Signal(object, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -135,6 +135,7 @@ class SlashCommandPalette(QFrame):
 
         threading.Thread(target=load, name=f"osia-palette-{kind}", daemon=True).start()
 
+    @Slot(object, object)
     def _on_snapshot_ready(self, key: tuple[str, str, str], data: object) -> None:
         kind = key[0]
         self._loading.discard(kind)

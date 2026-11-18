@@ -140,7 +140,7 @@ def test_real_canonical_read_tool_receipt_continues_same_claude_model(monkeypatc
 
 
 def test_claude_api_card_exposes_workspace_and_billing_without_account_login(monkeypatch):
-    from PyQt6.QtWidgets import QApplication, QLabel
+    from PySide6.QtWidgets import QApplication, QLabel
     from osia.gui import main_popup
 
     app = QApplication.instance() or QApplication([])

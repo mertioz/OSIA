@@ -12,9 +12,9 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QCoreApplication
-from PyQt6.QtTest import QSignalSpy
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication
+from PySide6.QtTest import QSignalSpy
+from PySide6.QtWidgets import QApplication
 
 from osia import conversations, scheduled_tasks
 from osia.agent import (
@@ -225,7 +225,7 @@ class DesktopFinalizationTests(unittest.TestCase):
         controller.finalize(canonical)
         _finish_reveal(controller)
 
-        self.assertEqual(seen[-1][0], canonical)
+        self.assertEqual(seen.at(seen.count() - 1)[0], canonical)
         self.assertEqual(controller.target_text, canonical)
         self.assertEqual(controller.displayed_text, canonical)
         self.assertEqual(controller.displayed_text.count("Fin canonique exacte."), 1)

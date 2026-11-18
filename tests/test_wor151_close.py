@@ -8,7 +8,7 @@ import types
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication
 
 from osia.gui import main_popup
 from osia.runtime import SERVER_MODE
@@ -78,15 +78,15 @@ def test_confirm_stops_only_owned_server_then_quits_successfully(
     monkeypatch.setattr(
         main_popup, "stop_service", lambda unit: calls.append(("stop", unit)) or True,
     )
-    monkeypatch.setattr(
-        main_popup, "QApplication", types.SimpleNamespace(instance=lambda: fake_app),
-    )
-    monkeypatch.setattr(
-        main_popup, "QTimer",
-        types.SimpleNamespace(singleShot=lambda _delay, callback: callback()),
-    )
-
-    panel._on_close_osia_clicked()
+    with monkeypatch.context() as exit_ui:
+        exit_ui.setattr(
+            main_popup, "QApplication", types.SimpleNamespace(instance=lambda: fake_app),
+        )
+        exit_ui.setattr(
+            main_popup, "QTimer",
+            types.SimpleNamespace(singleShot=lambda _delay, callback: callback()),
+        )
+        panel._on_close_osia_clicked()
 
     assert calls == [
         ("stop", "osia-server.service"),

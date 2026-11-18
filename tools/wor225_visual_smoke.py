@@ -9,9 +9,9 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QT_VERSION_STR, Qt
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QEvent, Qt, qVersion
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
@@ -228,7 +228,7 @@ def main() -> int:
         evidence.extend(_capture_settings(args.output, prefix))
     manifest = {
         "mode": prefix,
-        "qtVersion": QT_VERSION_STR,
+        "qtVersion": qVersion(),
         "files": evidence,
     }
     (args.output / f"{prefix}-manifest.json").write_text(

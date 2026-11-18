@@ -12,9 +12,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PIL import Image
-from PyQt6.QtCore import Qt
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia import i18n, onboarding
 from osia.guide_content import (
@@ -295,7 +295,7 @@ def test_settings_guide_preserves_first_install_handling(tmp_path, finish):
         else:
             dialog.close()
         outcome = "completed" if finish else "closed"
-        assert [list(item) for item in handled] == [[outcome]]
+        assert [handled.at(i) for i in range(handled.count())] == [[outcome]]
         assert onboarding.onboarding_state(marker)["outcome"] == outcome
         assert not onboarding.claim_automatic_onboarding(marker)
     finally:
@@ -444,7 +444,7 @@ def test_manual_settings_action_reopens_home_without_writing_configuration(monke
     spy = QSignalSpy(panel.getting_started_requested)
     monkeypatch.setattr(main_popup, "set_setting", lambda *args: writes.append(args))
     QTest.mouseClick(panel._guide_btn, Qt.MouseButton.LeftButton)
-    assert len(spy) == 1
+    assert spy.count() == 1
     assert writes == []
     popup_source = (ROOT / "osia" / "gui" / "main_popup.py").read_text("utf-8")
     assert "self._settings.getting_started_requested.connect(" in popup_source

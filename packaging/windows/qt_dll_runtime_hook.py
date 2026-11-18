@@ -1,4 +1,4 @@
-"""Register bundled Qt DLLs before PyInstaller imports its PyQt6 runtime hook."""
+"""Register the bundled PySide6 DLLs before its PyInstaller runtime hook."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def register_frozen_qt_dll_directory():
     frozen_root = str(getattr(sys, "_MEIPASS", "") or "")
     if not frozen_root:
         return None
-    qt_bin = Path(frozen_root) / "PyQt6" / "Qt6" / "bin"
+    qt_bin = Path(frozen_root) / "PySide6"
     if not qt_bin.is_dir():
         return None
     qt_bin_path = str(qt_bin)

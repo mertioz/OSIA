@@ -2,8 +2,9 @@
 
 OSIA Linux is a beta package for a desktop session on Linux x86-64 or an OSIA
 server launched from the terminal. It uses the shared OSIA Desktop runtime,
-Qt for Python on Linux, and a portable Python 3.12 interpreter. The installer
-downloads Python dependencies from the publishers using the bundled hashes
+Qt for Python (PySide6 with Qt Quick/QML), and a portable Python 3.12
+interpreter. The installer downloads Python dependencies from the publishers
+using the bundled hashes
 and installs Chromium and Firefox from Playwright. Allow at least 6 GB of
 free space for installation. The desktop launcher requires an X11 session or
 a working XWayland display. Access to native controls depends on the display
@@ -45,6 +46,9 @@ directly, run `~/.local/bin/osia --server`. Browser and desktop tools need a
 display session when the server runs on a remote machine. Local AI models
 are installed separately. The complete Codex runtime for ChatGPT Account is
 included. Connect an account through OSIA and review the provider's terms.
+
+The Qt licence texts and upstream source links are included in
+`payload/app/licenses/qt/`.
 
 ## Updates
 

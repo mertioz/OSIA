@@ -9,10 +9,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, Qt
-from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from shiboken6 import Shiboken
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from osia import main
 from osia.gui.main_popup import MainPopup, _ChatPage, _ConversationsPanel
@@ -114,18 +114,18 @@ def test_rapid_single_and_duplicate_deletes_do_not_rebuild_or_leave_live_rows():
             panel.set_optimistic_hidden({conv_id}, True)  # duplicate click
             if index == 0:
                 stale_button.click()
-                assert len(emitted) == 0
+                assert emitted.count() == 0
             panel.set_optimistic_hidden({conv_id}, False, revision=index + 2)
             if index + 1 in (1, 5, 12):
                 assert len(panel._row_widgets) == 12 - (index + 1)
         assert refresh.call_count == 0
 
-    assert len(emitted) == 0
+    assert emitted.count() == 0
     assert not first.isVisible()
     assert panel._row_widgets == {}
     assert panel.findChild(QLabel, "panelEmpty").parent() is panel._host
     _drain()
-    assert sip.isdeleted(first)
+    assert not Shiboken.isValid(first)
     panel.close()
     panel.deleteLater()
     _drain()
@@ -219,8 +219,8 @@ def test_folder_count_updates_with_immediate_row_removal():
 
 def test_last_delete_keeps_empty_state_inside_existing_chat_window():
     with (
-        patch("osia.gui.main_popup._SettingsPanel._probe_chatgpt_account"),
-        patch("osia.gui.main_popup._SettingsPanel._refresh_startup_status"),
+        patch("osia.gui.main_popup._SettingsPanel._probe_chatgpt_account", lambda self, **kw: None),
+        patch("osia.gui.main_popup._SettingsPanel._refresh_startup_status", lambda self, **kw: None),
         patch(
             "osia.gui.main_popup.conversations.conversation_snapshot",
             return_value=_snapshot(1),
@@ -239,7 +239,7 @@ def test_last_delete_keeps_empty_state_inside_existing_chat_window():
         button = row.findChild(QPushButton, "convActionDel")
         clicked = QSignalSpy(popup.delete_conversation)
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-        assert len(clicked) == 1
+        assert clicked.count() == 1
         popup.set_optimistic_conversation_deletions({"conv-0"}, True)
         popup.refresh_conversations(None)
         popup.set_messages([])

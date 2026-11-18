@@ -11,7 +11,7 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0          # ASGI server; [standard] pulls websockets for /ws
 
 # ── Desktop GUI ─────────────────────────────────────────────────────────────
-PyQt6>=6.6.0
+PySide6-Essentials==6.11.0        # Qt Widgets, Qt Quick/QML, and Shiboken
 
 # ── Speech-to-text ──────────────────────────────────────────────────────────
 faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)

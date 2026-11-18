@@ -497,7 +497,7 @@ def test_updater_is_disabled_in_source_mode(monkeypatch):
 
 def test_update_widgets_render_all_key_states(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
     from osia.gui import update_ui
 
     app = QApplication.instance() or QApplication([])
@@ -521,7 +521,7 @@ def test_update_widgets_render_all_key_states(monkeypatch, tmp_path):
 
 def test_unsigned_stable_diagnostic_disclosure_and_consent(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QMessageBox
     from osia import i18n
     from osia.gui import update_ui
 
@@ -587,7 +587,7 @@ def test_unsigned_stable_diagnostic_disclosure_and_consent(monkeypatch, tmp_path
 
 def test_update_check_is_off_gui_thread_and_manual_offline_is_visible(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication
     from osia.gui import update_ui
 
     app = QApplication.instance() or QApplication([])

@@ -4,6 +4,12 @@ OSIA is distributed with third-party open-source libraries and model assets.
 The build creates `legal/DEPENDENCIES.json` and copies the license/notice files
 available in each installed Python distribution into `legal/licenses/`.
 
+## Qt for Python
+
+The desktop uses PySide6 Essentials and Shiboken6 with Qt Widgets and Qt Quick.
+The bundled Qt licence texts and corresponding upstream source links are in
+`legal/licenses/qt/`.
+
 ## Bundled ChatGPT Account runtime
 
 OpenAI Codex 0.144.1 is included as a standalone native Windows package, not

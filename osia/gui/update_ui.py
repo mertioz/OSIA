@@ -9,7 +9,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
-from PyQt6.QtCore import (
+from PySide6.QtCore import (
     QEasingCurve,
     QPointF,
     QRectF,
@@ -17,10 +17,11 @@ from PyQt6.QtCore import (
     Qt,
     QTimer,
     QVariantAnimation,
-    pyqtSignal,
+    Signal,
+    Slot,
 )
-from PyQt6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import (
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
@@ -178,11 +179,11 @@ def _release_colors(accent: str, dark: bool) -> tuple[QColor, QColor]:
 class UpdateController(QObject):
     """Schedule updater work without ever blocking Qt's event loop."""
 
-    state_changed = pyqtSignal(dict)
-    _check_finished = pyqtSignal(object, bool, object, bool)
-    _operation_snapshot = pyqtSignal(object)
-    _download_finished = pyqtSignal(object, object)
-    _launch_finished = pyqtSignal(object)
+    state_changed = Signal(dict)
+    _check_finished = Signal(object, bool, object, bool)
+    _operation_snapshot = Signal(object)
+    _download_finished = Signal(object, object)
+    _launch_finished = Signal(object)
 
     def __init__(
         self,
@@ -327,6 +328,7 @@ class UpdateController(QObject):
         threading.Thread(target=worker, name="osia-update-check", daemon=True).start()
         return True
 
+    @Slot(object, bool, object, bool)
     def _on_check_finished(
         self,
         result,
@@ -445,7 +447,7 @@ class UpdateController(QObject):
             return False
         self._confirmation_parent = parent
         if self.installer is not None and self.installer.is_file():
-            QTimer.singleShot(0, self._confirm_and_launch)
+            QTimer.singleShot(0, self, self._confirm_and_launch)
             return True
         manifest = self.manifest
 
@@ -465,6 +467,7 @@ class UpdateController(QObject):
         threading.Thread(target=worker, name="osia-update-download", daemon=True).start()
         return True
 
+    @Slot(object)
     def _on_operation_snapshot(self, snapshot: UpdaterSnapshot) -> None:
         if not isinstance(snapshot, UpdaterSnapshot):
             return
@@ -489,6 +492,7 @@ class UpdateController(QObject):
             )
         self._publish(**changes)
 
+    @Slot(object, object)
     def _on_download_finished(self, path, error) -> None:
         if error is not None:
             code = safe_error_code(error)
@@ -543,6 +547,7 @@ class UpdateController(QObject):
 
         threading.Thread(target=worker, name="osia-update-launch", daemon=True).start()
 
+    @Slot(object)
     def _on_launch_finished(self, error) -> None:
         if error is not None:
             if self.operation.snapshot.phase != "failed":
@@ -555,9 +560,9 @@ class UpdateController(QObject):
 
 
 class UpdateBanner(QFrame):
-    view_requested = pyqtSignal()
-    install_requested = pyqtSignal()
-    dismiss_requested = pyqtSignal()
+    view_requested = Signal()
+    install_requested = Signal()
+    dismiss_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -796,7 +801,7 @@ class _ReleaseCard(QFrame):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._resize_notes)
+        QTimer.singleShot(0, self, self._resize_notes)
 
     def _resize_notes(self) -> None:
         width = max(1, self.notes_scroll.viewport().width() - 4)
@@ -838,7 +843,7 @@ class _ReleaseCard(QFrame):
             shown = notes or (i18n.t("updates.notes_unavailable"),)
             text = "\n".join(f"• {note}" for note in shown)
         self.notes.setText(display_historical_text(text))
-        QTimer.singleShot(0, self._resize_notes)
+        QTimer.singleShot(0, self, self._resize_notes)
 
 
 class _ReleaseProgressBar(QProgressBar):

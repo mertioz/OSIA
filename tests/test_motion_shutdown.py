@@ -6,9 +6,9 @@ import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent
-from PyQt6.QtWidgets import QApplication, QWidget
+from shiboken6 import Shiboken
+from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtWidgets import QApplication, QWidget
 
 from osia.gui.motion import MotionController
 
@@ -43,7 +43,7 @@ def test_settle_cleans_the_effect_even_if_its_animation_is_already_destroyed():
     APP.processEvents()
     motion.fade_in(child, duration_ms=10000)
     animation = motion._states[id(child)][2]
-    sip.delete(animation)
+    Shiboken.delete(animation)
     try:
         motion.settle()
         assert motion.active_animation_count == 0
