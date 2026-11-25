@@ -12,6 +12,15 @@ The mobile app projects that state and supplies user controls.
 - Official downloads and documentation: https://osia.space
 - Support: https://osia.space/support
 
+### Run OSIA on Windows
+
+1. Open [GitHub Releases](https://github.com/mertioz/OSIA/releases/latest) and download the **OSIA-Windows-…-x64.zip** file under **Assets**.
+2. Right-click the ZIP, choose **Extract All**, and select a folder.
+3. Open the extracted `OSIA` folder and run `OSIA.exe`. Keep `_internal` beside it.
+
+The Windows download page includes the ZIP checksum, shortcut instructions and
+the optional installer. [English guide](https://osia.space/download/windows#installation) · [Guide français](https://osia.space/fr/download/windows#installation)
+
 For Windows source setup, use install.bat, start.bat and requirements.txt.
 For the existing Linux package workflow, see packaging/linux/README.md.
 User configuration, provider credentials and runtime data are local and are not
