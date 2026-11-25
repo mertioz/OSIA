@@ -14,12 +14,17 @@ The mobile app projects that state and supplies user controls.
 
 ### Run OSIA on Windows
 
-1. Open [GitHub Releases](https://github.com/mertioz/OSIA/releases/latest) and download the **OSIA-Windows-…-x64.zip** file under **Assets**.
+1. Open [GitHub Releases](https://github.com/mertioz/OSIA/releases/latest) and download the **OSIA.zip** file under **Assets**.
 2. Right-click the ZIP, choose **Extract All**, and select a folder.
 3. Open the extracted `OSIA` folder and run `OSIA.exe`. Keep `_internal` beside it.
 
 The Windows download page includes the ZIP checksum, shortcut instructions and
 the optional installer. [English guide](https://osia.space/download/windows#installation) · [Guide français](https://osia.space/fr/download/windows#installation)
+
+### Run OSIA on Linux or macOS
+
+- **Linux x86-64**. Download `OSIA.tar.xz`, verify its SHA-256 and OpenPGP signature, extract it with `tar -xf OSIA.tar.xz`, and run `./OSIA/OSIA`. [Linux download and verification](https://osia.space/download/linux)
+- **Mac with Apple Silicon, macOS 15 or later**. Download `OSIA.tar.gz`, open the archive in Finder, and move `OSIA.app` to Applications. The beta has an ad hoc signature. Apple has not notarized it and Gatekeeper may block it. [Mac download](https://osia.space/download#mac-title)
 
 For Windows source setup, use install.bat, start.bat and requirements.txt.
 For the existing Linux package workflow, see packaging/linux/README.md.
