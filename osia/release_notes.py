@@ -63,6 +63,19 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.277", released_on="2026-11-25", public=True,
+        changes_en=(
+            "A startup window appears while OSIA loads. Desktop imports and session recovery now overlap.",
+            "Settings → Permissions opens your system’s local-network settings so you can revisit an earlier decision.",
+            "OSIA uses PySide6 and Qt Quick, with the original chat transparency and capsule outline. Windows displays the application name as OSIA.",
+        ),
+        changes_fr=(
+            "Une fenêtre apparaît pendant le démarrage. OSIA charge l’interface pendant la récupération de la session.",
+            "Paramètres → Autorisation permet de revoir l’accès au réseau local dans les réglages du système.",
+            "OSIA utilise PySide6 et Qt Quick, avec la transparence d’origine du chat et de la capsule. Windows affiche le nom OSIA.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.276", released_on="2026-11-18", public=True,
         changes_en=(
             'OSIA Desktop adopts the MIT License for its original code, documentation, logo and visuals.',

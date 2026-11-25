@@ -17,7 +17,8 @@ PySide6-Essentials==6.11.0        # Qt Widgets, Qt Quick/QML, and Shiboken
 faster-whisper>=1.0.0              # on-device Whisper (CTranslate2 backend)
 
 # ── Wake word ───────────────────────────────────────────────────────────────
-vosk==0.3.45                     # offline French phonetic wake phrase; no API key
+vosk==0.3.45; sys_platform != "darwin"
+vosk==0.3.44; sys_platform == "darwin"  # upstream universal2 wheel
 openwakeword>=0.6.0
 scikit-learn==1.8.0               # required by openwakeword's top-level verifier import
 

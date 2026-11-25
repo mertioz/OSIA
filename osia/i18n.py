@@ -45,6 +45,14 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "startup.loading": {"en": "Starting OSIA…", "fr": "Démarrage d’OSIA…", "de": "OSIA startet…", "es": "Iniciando OSIA…", "ja": "OSIA を起動中…", "zh": "正在启动 OSIA…"},
+    "settings.cat.permissions": {"en": "Permissions", "fr": "Autorisation", "de": "Berechtigungen", "es": "Permisos", "ja": "権限", "zh": "权限"},
+    "permissions.network": {"en": "Local network", "fr": "Réseau local", "de": "Lokales Netzwerk", "es": "Red local", "ja": "ローカルネットワーク", "zh": "本地网络"},
+    "permissions.review": {"en": "Review network permission", "fr": "Modifier l’autorisation réseau", "de": "Netzwerkberechtigung ändern", "es": "Revisar permiso de red", "ja": "ネットワーク権限を確認", "zh": "检查网络权限"},
+    "permissions.windows": {"en": "Choose Change settings, then allow OSIA on your private network. If OSIA is missing, choose Allow another app and select your OSIA.exe.", "fr": "Choisissez Modifier les paramètres, puis autorisez OSIA sur le réseau privé. Si OSIA est absent, choisissez Autoriser une autre application et sélectionnez votre OSIA.exe."},
+    "permissions.mac": {"en": "In Privacy & Security → Local Network, enable OSIA to connect your phone over the local network.", "fr": "Dans Confidentialité et sécurité → Réseau local, activez OSIA pour connecter votre téléphone sur le réseau local."},
+    "permissions.linux": {"en": "For direct phone access, allow incoming TCP port 8766 from your private subnet in your firewall settings.", "fr": "Pour connecter votre téléphone en réseau local, autorisez le port TCP entrant 8766 depuis votre sous-réseau privé dans les réglages du pare-feu."},
+    "permissions.unavailable": {"en": "Open your system’s network permissions or firewall settings to review access.", "fr": "Ouvrez les autorisations réseau ou le pare-feu de votre système pour modifier cet accès."},
     "grok_api.account_notice": {
         "en": "Connect with an xAI API key. API billing is separate from Grok subscriptions. Grok account login in OSIA is unavailable pending an official method and authorization.",
         "fr": "Connexion par clé API xAI. La facturation API est distincte des abonnements Grok. La connexion au compte Grok dans OSIA reste indisponible, dans l’attente d’une méthode officielle et d’une autorisation.",

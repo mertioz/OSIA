@@ -12,4 +12,7 @@ with sync_playwright() as playwright:
         executable = Path(browser.executable_path).resolve(strict=True)
         if root not in executable.parents or not os.access(executable, os.X_OK):
             raise SystemExit(f"Invalid packaged browser: {browser.name}")
-        (binaries / browser.name).symlink_to(os.path.relpath(executable, binaries))
+        link = binaries / browser.name
+        if link.is_symlink() and link.resolve() == executable:
+            continue
+        link.symlink_to(os.path.relpath(executable, binaries))

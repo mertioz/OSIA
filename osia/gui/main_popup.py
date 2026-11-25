@@ -92,6 +92,7 @@ from osia.gui.switch import OsiaSwitch
 from osia.gui.streaming import DesktopTextStreamController
 from osia.gui.theme import PALETTES, get_theme_manager, themed_stylesheet
 from osia.gui.window_corners import use_painted_window_corners
+from osia.gui.network_permissions import NetworkPermissions
 from osia.gui.cursors import ButtonCursorPolicy
 from osia.gui.thinking_orbs import ThinkingOrbs
 from osia.gui.update_ui import UpdateBanner, UpdateController, UpdateSettingsSection
@@ -5454,6 +5455,7 @@ class _SettingsPanel(QWidget):
         sec_heartbeat = self._build_heartbeat_section()     # Heartbeat
         sec_apikeys   = self._build_apikeys_section()       # API Key Fallback
         sec_mobile    = self._build_mobile_section()        # Mobile Connection
+        self._network_permissions = NetworkPermissions()
         sec_startup   = self._build_startup_section()       # Autostart services
         sec_memory    = self._build_memory_section()        # Local Memory
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
@@ -5473,6 +5475,7 @@ class _SettingsPanel(QWidget):
             ("settings.cat.memory",   [sec_memory]),
             ("settings.cat.mcp",      [sec_mcp]),
             ("settings.cat.mobile",   [sec_mobile, sec_startup]),
+            ("settings.cat.permissions", [self._network_permissions]),
             ("settings.cat.advanced", [sec_cron, sec_heartbeat]),
             *(([("settings.cat.updates", [sec_updates])]) if sec_updates is not None else []),
             ("settings.cat.legal",    [sec_legal]),
@@ -10732,6 +10735,7 @@ class _SettingsPanel(QWidget):
     # ── Re-translation ────────────────────────────────────────────────────
 
     def _retranslate_sections(self) -> None:
+        self._network_permissions.retranslate()
         self._settings_title.setText(i18n.t("settings.title"))
         self._theme_title.setText(i18n.t("theme.section"))
         self._theme_sub.setText(i18n.t("theme.section_sub"))

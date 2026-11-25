@@ -16,6 +16,7 @@ from osia.runtime import (
     application_dir,
     application_executable,
     is_frozen,
+    portable_desktop_executable,
 )
 from osia.utils.subprocess_policy import ProcessMode, process_kwargs
 
@@ -51,6 +52,9 @@ def desktop_command(*, frozen: bool | None = None) -> list[str]:
     frozen = is_frozen() if frozen is None else bool(frozen)
     if frozen:
         return [str(application_executable()), "--wake"]
+    portable = portable_desktop_executable()
+    if portable is not None:
+        return [str(portable), "--wake"]
     return [str(application_executable()), "-m", "osia.main", "--wake"]
 
 

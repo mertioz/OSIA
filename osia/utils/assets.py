@@ -11,7 +11,7 @@ import os
 import platform
 import sys
 
-from osia.runtime import application_executable, is_frozen, resource_root
+from osia.runtime import application_executable, is_frozen, portable_desktop_executable, resource_root
 
 # <root>/osia/utils/assets.py → <root>
 PROJECT_ROOT = str(resource_root())
@@ -47,7 +47,7 @@ def ensure_desktop_entry() -> str | None:
     the written path, or ``None`` on any failure — this must never raise,
     the app has to start regardless.
     """
-    if platform.system() != "Linux":
+    if platform.system() != "Linux" or portable_desktop_executable() is not None:
         return None
     try:
         apps_dir = os.path.join(

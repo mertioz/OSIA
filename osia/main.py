@@ -76,12 +76,6 @@ import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from osia.agent import (
-    OSIAAgent,
-    DEFAULT_LANG,
-    get_system_prompt,
-    _sanitize_persisted_history_message,
-)
 from osia import conversations
 from osia.tools import verify_tools
 
@@ -1258,6 +1252,8 @@ def _persist_agent_delta(
     Return True only when the canonical assistant delta was durably committed.
     Callers must not project a terminal answer or clear its busy state on False.
     """
+    from osia.agent import _sanitize_persisted_history_message
+
     if not conv_id:
         return False
     try:
@@ -1643,6 +1639,8 @@ def _shutdown_voice_runtime(
 
 def text_mode():
     """Interactive text-based chat with OSIA."""
+    from osia.agent import DEFAULT_LANG, OSIAAgent
+    from osia.config import load_settings
     agent = OSIAAgent()
     settings = load_settings()
     selected_model = settings.get("selected_model")
@@ -1728,7 +1726,7 @@ def voice_mode():
     from osia.turn_context import localized_text, resolve_turn_context
     from osia.voice.stt import listen
     from osia.voice.tts import speak
-    from osia.agent import clean_response
+    from osia.agent import DEFAULT_LANG, OSIAAgent, clean_response
 
     # No conversation is auto-created â€” one is created lazily when the
     # first spoken command arrives.
@@ -1842,16 +1840,18 @@ def voice_mode():
         print("[TTS] main.voice_mode: speak() returned", flush=True)
 
 
-def wake_mode():
+def wake_mode(startup=None, maintenance=None):
     """Desktop voice mode with opt-in local wake and Ctrl+Alt+P activation."""
-    from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QObject, Signal, Qt, QTimer
-    from PySide6.QtGui import QGuiApplication, QIcon
+    from PySide6.QtCore import QEventLoop
+    from osia.gui.startup import show_startup
+
+    app, indicator = startup if startup is not None else show_startup()
 
     from osia.perf import perf_mark
     perf_mark("wake_mode: enter")
 
-    from osia.utils.assets import ICON_PATH, ensure_desktop_entry
+    from osia.utils.assets import ensure_desktop_entry
     from osia.gui.dynamic_island import DynamicIsland
     from osia.gui.main_popup import MainPopup
     from osia.voice.wake import VoiceSessionLifecycle, WakeAcceptanceGate, WakeWordDetector
@@ -1871,7 +1871,7 @@ def wake_mode():
         stop as tts_stop,
         wait_for_playback_complete,
     )
-    from osia.agent import clean_response, strip_tool_artifacts
+    from osia.agent import DEFAULT_LANG, OSIAAgent, clean_response, strip_tool_artifacts
     from osia import i18n
     from osia.turn_context import (
         localized_text,
@@ -1924,41 +1924,12 @@ def wake_mode():
 
     bridge = Bridge()
 
-    # Identify the app to the windowing system *before* any window is
-    # created, so the taskbar/dock shows "OSIA" + the logo instead of
-    # "python"/"osia_desktop" and a generic icon.
-    #   â€¢ applicationName / displayName  â†’ the window title + dock label
-    #   â€¢ desktopFileName ("osia")       â†’ Wayland/XCB map the window to
-    #     ~/.local/share/applications/osia.desktop for its taskbar icon
-    #   â€¢ setWindowIcon (absolute path)  â†’ the icon every window inherits,
-    #     resolved from the project root so it works from any CWD. Uses the
-    #     tightly-cropped ICON_PATH (not the padded logo) so the taskbar/dock
-    #     shows the swirl at a proper visible size.
     ensure_desktop_entry()
-    QGuiApplication.setDesktopFileName("osia")
-
-    # HiDPI: crisp logo/icon rendering on Windows fractional-scaling displays
-    # (125%/150%/175%). Qt6 always enables high-DPI scaling and DPI-aware pixmaps
-    # (the old Qt.AA_EnableHighDpiScaling / AA_UseHighDpiPixmaps attributes are
-    # no-ops) and already defaults to PassThrough rounding, so the actual fix is
-    # the per-pixmap setDevicePixelRatio scaling in main_popup.py /
-    # dynamic_island.py (which renders the logo at native resolution). We pin
-    # PassThrough explicitly to document the fractional-scale rounding those
-    # DPR-tagged pixmaps assume â€” it equals the Qt6 default, so it is a no-op on
-    # every platform today (integer-scale Linux/Mac included) and changes no
-    # behaviour. Must run before the QApplication is constructed. (WOR-11.)
-    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("OSIA")
-    from osia.version import current_product_version, display_version
-    app.setApplicationVersion(current_product_version())
-    app.setApplicationDisplayName(
-        f"OSIA Desktop {display_version(app.applicationVersion())} — Public Beta"
-    )
-    app.setWindowIcon(QIcon(ICON_PATH))
+    # Finish durable recovery before starting services or accepting input.
+    if maintenance is not None:
+        while maintenance.is_alive():
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            maintenance.join(0.05)
 
     # WOR-11 (Windows): bring up the mobile server alongside the GUI. On Linux a
     # systemd unit owns it; on Windows main.py does, so it also starts on the
@@ -5360,8 +5331,38 @@ def wake_mode():
     QTimer.singleShot(0, _restore_incomplete_desktop_chat_turns)
     QTimer.singleShot(0, _sync_wake_setting)
 
+    indicator.hide()
+    indicator.deleteLater()
     perf_mark("wake_mode: entering app.exec() (GUI now interactive)")
     sys.exit(app.exec())
+
+
+def _prepare_desktop_state() -> None:
+    try:
+        from osia.image_inputs import (
+            cleanup_media_store,
+            cleanup_owned_temp_images,
+        )
+
+        cleanup_media_store()
+        cleanup_owned_temp_images()
+    except Exception:
+        pass
+
+    try:
+        from osia.tool_attempts import recover_orphaned_tool_attempts
+
+        recovered_attempts = recover_orphaned_tool_attempts()
+        if recovered_attempts:
+            print(
+                f"[OSIA] reconciled {len(recovered_attempts)} orphaned "
+                "tool attempt(s) without replay"
+            )
+    except Exception as e:
+        print(
+            "[OSIA] tool-attempt startup recovery skipped: "
+            f"{type(e).__name__}"
+        )
 
 
 def main():
@@ -5377,20 +5378,14 @@ def main():
             print(f"[OSIA] desktop singleton unavailable: {exc}")
             return 1
 
+    startup = None
+    if wake_entry:
+        from osia.gui.startup import show_startup
+        startup = show_startup()
+
     try:
         from osia.relaunch import clear_stale_restart_state
         clear_stale_restart_state()
-    except Exception:
-        pass
-
-    try:
-        from osia.image_inputs import (
-            cleanup_media_store,
-            cleanup_owned_temp_images,
-        )
-
-        cleanup_media_store()
-        cleanup_owned_temp_images()
     except Exception:
         pass
 
@@ -5410,20 +5405,12 @@ def main():
     except Exception as e:
         print(f"[CONFIG] ensure_config_files skipped: {e}")
 
-    try:
-        from osia.tool_attempts import recover_orphaned_tool_attempts
-
-        recovered_attempts = recover_orphaned_tool_attempts()
-        if recovered_attempts:
-            print(
-                f"[OSIA] reconciled {len(recovered_attempts)} orphaned "
-                "tool attempt(s) without replay"
-            )
-    except Exception as e:
-        print(
-            "[OSIA] tool-attempt startup recovery skipped: "
-            f"{type(e).__name__}"
-        )
+    maintenance = None
+    if wake_entry:
+        maintenance = threading.Thread(target=_prepare_desktop_state, name="osia-startup-maintenance")
+        maintenance.start()
+    else:
+        _prepare_desktop_state()
 
     # One-time tool health check: logs which tool categories (bash, file
     # read, browser) are usable so missing dependencies show up at startup
@@ -5441,11 +5428,8 @@ def main():
         text_mode()
     elif "--voice" in sys.argv:
         voice_mode()
-    elif "--wake" in sys.argv:
-        wake_mode()
     else:
-        # Default: wake mode with GUI
-        wake_mode()
+        wake_mode(startup, maintenance)
 
 
 if __name__ == "__main__":

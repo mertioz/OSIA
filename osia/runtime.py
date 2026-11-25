@@ -89,6 +89,20 @@ def application_executable() -> Path:
     return Path(sys.executable).resolve()
 
 
+def portable_desktop_executable() -> Path | None:
+    """Resolve the launcher only inside an OSIA portable Unix package."""
+    if is_frozen() or sys.platform == "win32":
+        return None
+    app = resource_root()
+    root = app.parent
+    if app.name != "app" or not application_executable().is_relative_to(root / "python"):
+        return None
+    launcher = root.parent / "MacOS" / "OSIA" if sys.platform == "darwin" else root / "OSIA"
+    if (root / "portable.py").is_file() and launcher.is_file():
+        return launcher
+    return None
+
+
 def application_dir() -> Path:
     """Installed application directory, or the repository root in source."""
     if is_frozen():
@@ -105,6 +119,12 @@ def critical_install_paths() -> tuple[Path, ...]:
             root = executable.parent
             if executable.name.casefold() == "osia.exe" and resources == root / "_internal":
                 return root, executable, resources
+        elif sys.platform == "darwin":
+            launcher = portable_desktop_executable()
+            if launcher is not None and launcher.parent.name == "MacOS":
+                bundle = launcher.parent.parent.parent
+                if bundle.suffix == ".app":
+                    return bundle, launcher, resources, executable
         elif sys.platform.startswith("linux") and not is_frozen():
             root = resources.parent
             if resources.name != "app" or not executable.is_relative_to(root / "python"):
