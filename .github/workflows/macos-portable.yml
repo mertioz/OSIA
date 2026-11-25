@@ -1,6 +1,11 @@
 name: Build macOS portable
 on:
   workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Desktop source commit to build (defaults to this workflow revision)
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
@@ -10,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ inputs.source_commit || github.sha }}
           persist-credentials: false
       - name: Prepare native runtime
         run: bash packaging/portable/prepare_macos.sh "$RUNNER_TEMP/osia-runtime"
@@ -24,7 +30,7 @@ jobs:
           codesign --verify --strict "$app"
           "$app/Contents/MacOS/OSIA" --doctor
           python3 packaging/portable/smoke.py "$app/Contents/MacOS/OSIA"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b640449e92b4886f43607fa02
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: OSIA-macos-arm64
           path: ${{ runner.temp }}/portable-output/
