@@ -82,7 +82,7 @@ from osia.utils.systemd_manager import (
 )
 from osia.utils.assets import autostart_enabled, set_autostart
 from osia import i18n
-from osia import timefmt
+from osia import timefmt, windows_store
 from osia.perf import perf_timer
 from osia.gui.motion import (
     MOTION, ContentTransition, MotionController, ThemeTransition,
@@ -5461,10 +5461,11 @@ class _SettingsPanel(QWidget):
         sec_mcp       = self._build_mcp_section()           # MCP / Connectors (WOR-44)
         sec_legal     = self._build_legal_section()         # Legal versions + links
         sec_donation  = self._build_donation_section()
-        sec_updates   = (
-            UpdateSettingsSection(update_controller)
-            if update_controller is not None else None
-        )
+        if windows_store.is_store_install():
+            from osia.gui.store_settings import StoreSettingsSection
+            sec_updates = StoreSettingsSection()
+        else:
+            sec_updates = UpdateSettingsSection(update_controller) if update_controller is not None else None
 
         # Each category maps to its own Settings page.
         self._settings_pages = [

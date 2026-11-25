@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from osia.config import CONFIG_DIR
+from osia import windows_store
 from osia.runtime import (
     SERVER_MODE,
     SERVICE_MODE,
@@ -159,7 +160,7 @@ def _kernel32():
 
 
 def _win_shutdown_event_name(kind: str) -> str:
-    return f"Local\\OSIA.SupervisorShutdown.{kind}"
+    return windows_store.supervisor_shutdown_event(kind)
 
 
 def _win_lifecycle_mutex_name(kind: str) -> str:
@@ -288,6 +289,8 @@ def _win_process_snapshot():
 
 def _win_is_supervisor(info: dict, kind: str) -> bool:
     cmdline = [str(arg) for arg in (info.get("cmdline") or [])]
+    if windows_store.is_store_install() and (not cmdline or Path(cmdline[0]) != _APP_EXE):
+        return False
     return bool(
         _win_cmdline_has_path(" ".join(cmdline), _RUN_SERVICE)
         and kind in {arg.lower() for arg in cmdline}
@@ -1012,7 +1015,7 @@ def _win_coordinated_restart(kind: str) -> bool:
         # non-signaled event and cannot inherit stale shutdown state.
         shutdown.close()
         shutdown = None
-        if not _win_task_registered(task) and not _win_register_task(kind):
+        if not windows_store.is_store_install() and not _win_task_registered(task) and not _win_register_task(kind):
             print("[win-service] restart failed category=task-registration")
             return False
         if not _win_run_task(task):
@@ -1134,7 +1137,9 @@ def _win_current_user() -> str:
 # ── Scheduled-task lifecycle (Windows) ──────────────────────────────────────
 
 def _win_task_registered(task: str) -> bool:
-    """True if the Scheduled Task exists (locale-independent: exit code only)."""
+    """True if the per-user login task is enabled."""
+    if windows_store.is_store_install():
+        return task == _TASK_NAME["server"] and windows_store.startup_task(windows_store.SERVER_STARTUP)
     try:
         return _schtasks(["/query", "/TN", task]).returncode == 0
     except Exception:
@@ -1150,7 +1155,7 @@ def _win_task_running(task: str) -> bool:
     failing open. Called only on infrequent paths (install / GUI toggle /
     startup self-heal), never the periodic status refresh.
     """
-    if not task:
+    if not task or windows_store.is_store_install():
         return False
     try:
         r = _ps(
@@ -1166,7 +1171,7 @@ def _win_task_running(task: str) -> bool:
 
 def _win_task_running_for_barrier(task: str) -> bool:
     """Task state probe that fails closed when Task Scheduler cannot be queried."""
-    if not _win_task_registered(task):
+    if windows_store.is_store_install() or not _win_task_registered(task):
         return False
     script = (
         "$ErrorActionPreference='Stop';"
@@ -1199,6 +1204,8 @@ def _win_register_task(kind: str) -> bool:
     task = _TASK_NAME.get(kind)
     if not task or kind != "server":
         return False
+    if windows_store.is_store_install():
+        return windows_store.startup_task(windows_store.SERVER_STARTUP, True)
     # Drop any pre-rename task with the old display name so an upgrade never
     # leaves an orphan that also fires AtLogOn (best-effort; no-op if absent).
     for legacy in _LEGACY_TASK_NAMES.get(kind, ()):
@@ -1300,6 +1307,8 @@ def _win_register_wake_recovery_task() -> bool:
 
 
 def _win_run_task(task: str) -> bool:
+    if windows_store.is_store_install():
+        return task == _TASK_NAME["server"] and windows_store.start_server()
     try:
         return _schtasks(["/run", "/TN", task]).returncode == 0
     except Exception:
@@ -1309,6 +1318,8 @@ def _win_run_task(task: str) -> bool:
 def _win_end_task(task: str) -> bool:
     """Request Task Scheduler to end its launched program; descendants are
     handled separately by OSIA's explicit ownership barrier."""
+    if windows_store.is_store_install():
+        return False  # The packaged supervisor is stopped by its own shutdown event.
     try:
         result = _schtasks(["/end", "/TN", task])
     except Exception:
@@ -1473,14 +1484,19 @@ def _win_enable(name: str) -> bool:
         return False
     if kind == "tunnel":
         return False
+    store = windows_store.is_store_install()
+    if store and not windows_store.startup_task(windows_store.SERVER_STARTUP, True):
+        return False
     if is_frozen() and kind == "server":
         try:
             _SERVER_DISABLED_MARKER.unlink(missing_ok=True)
         except OSError:
             return False
-    ok = _win_register_task(kind)
+    ok = store or _win_register_task(kind)
     if _win_should_start(kind):
-        _win_run_task(_TASK_NAME[kind])
+        started = _win_run_task(_TASK_NAME[kind])
+        if store and not started:
+            return False
     return ok
 
 
@@ -1490,6 +1506,9 @@ def _win_disable(name: str) -> bool:
     if kind not in ("server", "tunnel"):
         print(f"[win-service] unknown unit: {name}")
         return False
+    store = windows_store.is_store_install()
+    if store and (kind != "server" or not windows_store.startup_task(windows_store.SERVER_STARTUP, False)):
+        return False
     if is_frozen() and kind == "server":
         try:
             _SERVER_DISABLED_MARKER.parent.mkdir(parents=True, exist_ok=True)
@@ -1497,6 +1516,8 @@ def _win_disable(name: str) -> bool:
         except OSError:
             return False
     task = _TASK_NAME[kind]
+    if store:
+        return _win_coordinated_stop(kind)
     _win_end_task(task)      # stop the supervisor + its child (task job object)
     _win_delete_task(task)   # so it won't relaunch at the next login
     _win_kill_leftovers(kind)  # reap anything the job object didn't
@@ -1514,6 +1535,8 @@ def install_windows_services() -> bool:
 
     Returns True only if all Windows tasks registered successfully.
     """
+    if windows_store.is_store_install():
+        return True
     if not _IS_WINDOWS:
         return True
     # Migration-only cleanup: target the old OSIA task names and the exact
@@ -1537,6 +1560,8 @@ def install_windows_services() -> bool:
 
 def remove_windows_services() -> bool:
     """Stop and unregister OSIA's Windows tasks without deleting user data."""
+    if windows_store.is_store_install():
+        return True
     if not _IS_WINDOWS:
         return True
     ok = True
@@ -1572,7 +1597,7 @@ def ensure_service_running(name: str) -> bool:
     if is_frozen():
         if kind == "server" and _SERVER_DISABLED_MARKER.exists():
             return True
-        if not _win_task_registered(task) and not _win_register_task(kind):
+        if not windows_store.is_store_install() and not _win_task_registered(task) and not _win_register_task(kind):
             return False
         if _win_should_start(kind) and not _win_run_task(task):
             return False

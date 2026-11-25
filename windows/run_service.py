@@ -48,6 +48,7 @@ _SOURCE_ROOT = Path(__file__).resolve().parent.parent
 if (_SOURCE_ROOT / "osia").is_dir() and str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
+from osia import windows_store
 from osia.runtime import (
     SERVER_MODE,
     application_dir,
@@ -149,7 +150,7 @@ class _JobExtendedLimitInformation(ctypes.Structure):
 
 
 def _shutdown_event_name(kind: str) -> str:
-    return f"Local\\OSIA.SupervisorShutdown.{kind}"
+    return windows_store.supervisor_shutdown_event(kind)
 
 
 def _lifecycle_mutex_name(kind: str) -> str:

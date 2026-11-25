@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 desktop rescap">
+  <Identity Name="GreatInvention.OSIA" Publisher="CN=FA4E5D6A-6188-48A3-B369-2B6989768B29"
+    Version="1.9.277.0" ProcessorArchitecture="x64"/>
+  <Properties>
+    <DisplayName>OSIA</DisplayName>
+    <PublisherDisplayName>Mertioz</PublisherDisplayName>
+    <Logo>StoreAssets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/>
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-US"/>
+    <Resource Language="fr-FR"/>
+  </Resources>
+  <Applications>
+    <Application Id="OSIA" Executable="app\OSIA.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="OSIA" Description="OSIA Desktop AI Assistant"
+        Square150x150Logo="StoreAssets\Square150.png" Square44x44Logo="StoreAssets\Square44.png" BackgroundColor="transparent"/>
+      <Extensions>
+        <desktop:Extension Category="windows.startupTask" Executable="app\OSIA.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="OsiaDesktopStartup" Enabled="false" DisplayName="OSIA"/>
+        </desktop:Extension>
+        <desktop:Extension Category="windows.startupTask" Executable="app\OSIA.exe" EntryPoint="Windows.FullTrustApplication" uap10:Parameters="--osia-service server">
+          <desktop:StartupTask TaskId="OsiaServerStartup" Enabled="false" DisplayName="OSIA Mobile Server"/>
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <Capability Name="internetClient"/>
+    <Capability Name="privateNetworkClientServer"/>
+    <rescap:Capability Name="runFullTrust"/>
+    <DeviceCapability Name="microphone"/>
+  </Capabilities>
+</Package>

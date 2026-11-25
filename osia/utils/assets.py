@@ -11,6 +11,7 @@ import os
 import platform
 import sys
 
+from osia import windows_store
 from osia.runtime import application_executable, is_frozen, portable_desktop_executable, resource_root
 
 # <root>/osia/utils/assets.py → <root>
@@ -165,6 +166,8 @@ def autostart_enabled() -> bool:
     (Linux) or the HKCU Run value existing (Windows) — so the settings toggle
     always mirrors the actual configuration. Mac reports disabled (no impl).
     """
+    if windows_store.is_store_install():
+        return windows_store.startup_task(windows_store.GUI_STARTUP)
     system = platform.system()
     if system == "Linux":
         return os.path.exists(_autostart_desktop_path())
@@ -196,6 +199,8 @@ def set_autostart(enabled: bool) -> bool:
     """
     system = platform.system()
     if system == "Windows":
+        if windows_store.is_store_install():
+            return windows_store.startup_task(windows_store.GUI_STARTUP, enabled)
         return _set_autostart_windows(enabled)
     if system != "Linux":
         if system == "Darwin":

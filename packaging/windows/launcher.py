@@ -609,7 +609,8 @@ def main(args: list[str] | None = None) -> int:
         return 0 if result.get("removed") or result.get("state") in {
             "not_registered", "not_applicable",
         } else 1
-    if is_frozen() and sys.platform == "win32":
+    from osia.windows_store import is_store_install
+    if is_frozen() and sys.platform == "win32" and not is_store_install():
         try:
             from osia.legacy_browser_cleanup import (
                 remove_legacy_browser_registration,

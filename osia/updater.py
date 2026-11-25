@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 from osia.config import CONFIG_DIR
 from osia.runtime import is_frozen, resource_path
+from osia.windows_store import is_store_install
 from osia.version import (
     PRODUCT_VERSION, FIRST_RELEASE_SEQUENCE, HISTORICAL_DISPLAY_VERSIONS,
     parse_product_version, legacy_release_sequence,
@@ -591,7 +592,7 @@ def load_app_metadata(path: Path | None = None) -> AppMetadata:
 
 
 def updater_enabled(metadata: AppMetadata | None = None) -> bool:
-    if sys.platform != "win32" or not is_frozen():
+    if sys.platform != "win32" or not is_frozen() or is_store_install():
         return False
     try:
         current = metadata or load_app_metadata()
@@ -1551,6 +1552,8 @@ def launch_update_installer(
     operation: UpdaterStateMachine | None = None,
 ):
     try:
+        if is_store_install():
+            raise UpdaterError("store_managed_updates")
         plan = prepare_installer_plan(manifest, path)
     except UpdaterError as exc:
         if operation is not None:

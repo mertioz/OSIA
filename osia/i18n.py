@@ -45,6 +45,8 @@ DEFAULT_LANG = "en"
 # English entry, then to the key itself. Use ``{name}``-style placeholders
 # and pass them as kwargs to :func:`t`.
 TRANSLATIONS: dict[str, dict[str, str]] = {
+    "store.updates": {"en": "Get updates in Microsoft Store", "fr": "Mises à jour dans le Microsoft Store", "de": "Updates im Microsoft Store", "es": "Actualizaciones en Microsoft Store", "ja": "Microsoft Store で更新", "zh": "在 Microsoft Store 中更新"},
+    "store.report": {"en": "Report inappropriate AI content", "fr": "Signaler un contenu inapproprié généré par l’IA", "de": "Unangemessenen KI-Inhalt melden", "es": "Denunciar contenido de IA inapropiado", "ja": "不適切な AI コンテンツを報告", "zh": "举报不当的 AI 内容"},
     "startup.loading": {"en": "Starting OSIA…", "fr": "Démarrage d’OSIA…", "de": "OSIA startet…", "es": "Iniciando OSIA…", "ja": "OSIA を起動中…", "zh": "正在启动 OSIA…"},
     "settings.cat.permissions": {"en": "Permissions", "fr": "Autorisation", "de": "Berechtigungen", "es": "Permisos", "ja": "権限", "zh": "权限"},
     "permissions.network": {"en": "Local network", "fr": "Réseau local", "de": "Lokales Netzwerk", "es": "Red local", "ja": "ローカルネットワーク", "zh": "本地网络"},
