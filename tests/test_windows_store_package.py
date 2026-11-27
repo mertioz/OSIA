@@ -42,5 +42,7 @@ def test_store_manifest_matches_the_public_product():
           "d": "http://schemas.microsoft.com/appx/manifest/desktop/windows10"}
     assert manifest.find("p:Identity", ns).get("Name") == windows_store.PACKAGE_FAMILY.split("_")[0]
     tasks = manifest.findall(".//d:StartupTask", ns)
-    assert {t.get("TaskId") for t in tasks} == {windows_store.GUI_STARTUP, windows_store.SERVER_STARTUP}
-    assert all(t.get("Enabled") == "false" for t in tasks)
+    assert {t.get("TaskId"): t.get("Enabled") for t in tasks} == {
+        windows_store.GUI_STARTUP: "true",
+        windows_store.SERVER_STARTUP: "false",
+    }

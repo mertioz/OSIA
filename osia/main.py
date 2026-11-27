@@ -5337,7 +5337,10 @@ def wake_mode(startup=None, maintenance=None):
     sys.exit(app.exec())
 
 
-def _prepare_desktop_state() -> None:
+def _prepare_desktop_state(*, desktop_ui: bool = False) -> None:
+    if desktop_ui:
+        from osia.utils.assets import initialize_autostart
+        initialize_autostart()
     try:
         from osia.image_inputs import (
             cleanup_media_store,
@@ -5407,7 +5410,8 @@ def main():
 
     maintenance = None
     if wake_entry:
-        maintenance = threading.Thread(target=_prepare_desktop_state, name="osia-startup-maintenance")
+        maintenance = threading.Thread(target=_prepare_desktop_state, kwargs={"desktop_ui": True},
+                                       name="osia-startup-maintenance")
         maintenance.start()
     else:
         _prepare_desktop_state()

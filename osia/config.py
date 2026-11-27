@@ -686,6 +686,10 @@ def save_settings(settings: dict) -> None:
         _write_settings(settings)
 
 
+def desktop_autostart_pending_file() -> Path:
+    return Path(SETTINGS_FILE).with_name("desktop-autostart.pending")
+
+
 def _write_settings(settings: dict) -> None:
     global _settings_cache_signature, _settings_cache_data
     from osia.deepseek import migrate_settings
@@ -718,6 +722,17 @@ def _write_settings(settings: dict) -> None:
                 os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
             except Exception:
                 pass
+        # The server can create the first settings file before the GUI runs.
+        # A separate one-shot marker cannot be rearmed by a stale settings
+        # snapshot. Create it inside the same interprocess transaction.
+        if not os.path.exists(SETTINGS_FILE):
+            try:
+                with desktop_autostart_pending_file().open("xb"):
+                    pass
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                print(f"[CONFIG] login setup marker unavailable: {type(exc).__name__}")
         for delay in (0.02, 0.05, 0.10, None):
             try:
                 os.replace(tmp, SETTINGS_FILE)

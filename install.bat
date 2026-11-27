@@ -106,16 +106,9 @@ echo [6/7] Enregistrement du service en arriere-plan ^(serveur mobile^)...
 set "PYTHONPATH="
 
 REM --- 7. GUI autostart at login (per-user HKCU Run key) ---------------------
-REM Launch the OSIA interface automatically at login, after the server task.
-REM Per-user (HKCU) so it needs no admin. The value is kept identical to
-REM osia.utils.assets._windows_autostart_command() - the single source of truth
-REM the Settings toggle "Lancer OSIA au demarrage" reads via autostart_enabled()
-REM and writes via set_autostart() - so install.bat seeds it and the GUI toggle
-REM can later add/remove it without drift.
-echo [7/7] Activation du lancement d'OSIA au demarrage...
-set "VENV_PYW=%VENV_DIR%\Scripts\pythonw.exe"
-set "MAIN_PY=%PROJECT_DIR%osia\main.py"
-reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "OSIA" /t REG_SZ /d "\"%VENV_PYW%\" \"%MAIN_PY%\" --wake" /f >nul
+REM Only a new profile receives the default. Reinstalling preserves the user's choice.
+echo [7/7] Configuration du lancement d'OSIA au demarrage...
+"%VENV_PY%" -c "from osia.config import ensure_config_files; from osia.utils.assets import initialize_autostart; ensure_config_files(create_token=False); raise SystemExit(0 if initialize_autostart() else 1)"
 if errorlevel 1 (
     echo [ATTENTION] Lancement au demarrage non active - vous pourrez l'activer depuis Parametres ^> Demarrage.
 )

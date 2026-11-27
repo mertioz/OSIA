@@ -25,7 +25,7 @@
         Square150x150Logo="StoreAssets\Square150.png" Square44x44Logo="StoreAssets\Square44.png" BackgroundColor="transparent"/>
       <Extensions>
         <desktop:Extension Category="windows.startupTask" Executable="app\OSIA.exe" EntryPoint="Windows.FullTrustApplication">
-          <desktop:StartupTask TaskId="OsiaDesktopStartup" Enabled="false" DisplayName="OSIA"/>
+          <desktop:StartupTask TaskId="OsiaDesktopStartup" Enabled="true" DisplayName="OSIA"/>
         </desktop:Extension>
         <desktop:Extension Category="windows.startupTask" Executable="app\OSIA.exe" EntryPoint="Windows.FullTrustApplication" uap10:Parameters="--osia-service server">
           <desktop:StartupTask TaskId="OsiaServerStartup" Enabled="false" DisplayName="OSIA Mobile Server"/>

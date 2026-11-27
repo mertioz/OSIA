@@ -310,10 +310,11 @@ def test_three_categories_and_all_stable_ids_are_unique():
         CATEGORY_ADVANCED,
     ]
     ids = [lesson.id for lesson in LESSONS]
-    assert len(ids) == len(set(ids)) == 66
+    assert len(ids) == len(set(ids)) == 67
+    assert "mastery.chat-shortcuts" in ids
     assert set(ids) == set(LESSONS_BY_ID)
     assert len(lessons_for_category(CATEGORY_ESSENTIAL)) == 8
-    assert len(lessons_for_category(CATEGORY_MASTERY)) == 20
+    assert len(lessons_for_category(CATEGORY_MASTERY)) == 21
     assert len(lessons_for_category(CATEGORY_ADVANCED)) == 38
     for category in CATEGORIES:
         orders = [lesson.order for lesson in lessons_for_category(category.id)]
@@ -363,9 +364,9 @@ def test_menu_lesson_matches_the_actual_settings_page_registry():
 def test_mastery_content_covers_only_audited_runtime_capabilities():
     copy = _english_copy(lessons_for_category(CATEGORY_MASTERY)).lower()
     for phrase in (
-        "private-lan wss",
-        "webrtc/p2p",
-        "end-to-end encrypted relay",
+        "private lan first",
+        "direct webrtc connection",
+        "phone stays offline",
         "tts",
         "stt",
         "provider and api hierarchy",

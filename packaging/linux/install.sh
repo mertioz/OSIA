@@ -107,6 +107,16 @@ if [ ! -L "$launcher" ]; then
   ln -s -- "$current/bin/osia" "$launcher"
 fi
 mv -Tf -- "$switch/current" "$current"
+if [ "$first_install" = true ]; then
+  "$release/python/bin/python3.12" -I -B - "$release/app" <<'PY' || printf '%s\n' 'Desktop login setup will be retried on launch.' >&2
+import sys
+sys.path.insert(0, sys.argv[1])
+from osia.config import ensure_config_files
+from osia.utils.assets import initialize_autostart
+ensure_config_files(create_token=False)
+sys.exit(0 if initialize_autostart() else 1)
+PY
+fi
 if command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload 2>/dev/null; then
   if [ "$first_install" = true ]; then
     systemctl --user enable osia-server.service || printf '%s\n' 'Enable the OSIA user service from Settings.' >&2

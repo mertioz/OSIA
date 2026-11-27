@@ -9,7 +9,13 @@ systemd unit, or a desktop launcher.
 
 import os
 import platform
+import plistlib
+import subprocess
 import sys
+import tempfile
+from configparser import ConfigParser, Error as ConfigError
+from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 from osia import windows_store
 from osia.runtime import application_executable, is_frozen, portable_desktop_executable, resource_root
@@ -97,18 +103,65 @@ def ensure_desktop_entry() -> str | None:
 #   • Linux:   a ``~/.config/autostart/osia.desktop`` file (XDG autostart spec)
 #   • Windows: an ``OSIA`` value under the per-user Run key
 #              ``HKCU\Software\Microsoft\Windows\CurrentVersion\Run``
-#   • Mac:     not yet implemented (reports disabled)
+#   • macOS:   the app bundle's native login item, or a user LaunchAgent for source runs
 
 # Windows per-user "run at login" registry location.
 _WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _WIN_RUN_VALUE = "OSIA"
 
 
-def _autostart_desktop_path() -> str:
-    """Path to the XDG autostart entry that launches OSIA at login (Linux)."""
-    return os.path.join(
-        os.path.expanduser("~"), ".config", "autostart", "osia.desktop"
-    )
+def _autostart_desktop_path() -> Path:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", ""))
+    if not config_home.is_absolute():
+        config_home = Path.home() / ".config"
+    return config_home / "autostart" / "osia.desktop"
+
+
+def _unix_startup_arguments() -> list[str]:
+    portable = portable_desktop_executable()
+    if portable is not None:
+        return [str(portable)]
+    project = Path(PROJECT_ROOT)
+    release = project.parent
+    if project.name == "app" and application_executable().is_relative_to(release / "python"):
+        launcher = release / "bin" / "osia"
+        if launcher.is_file():
+            stable = Path.home() / ".local" / "bin" / "osia"
+            if stable.is_file() and stable.samefile(launcher):
+                launcher = stable
+            return [str(launcher)]
+    python = project / "venv" / "bin" / "python"
+    return [str(python) if python.is_file() else (sys.executable or "python3"),
+            str(project / "osia" / "main.py"), "--wake"]
+
+
+def _xdg_argument(value: str) -> str:
+    # The desktop-entry string escapes are decoded before Exec argument quoting.
+    escaped = "".join("\\" + c if c in '\\"$`' else c for c in value)
+    escaped = (escaped.replace("\\", "\\\\").replace("%", "%%")
+               .replace("\n", r"\n").replace("\r", r"\r").replace("\t", r"\t"))
+    return '"' + escaped + '"'
+
+
+def _write_login_file(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _source_launch_agent() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / "space.osia.desktop.source.plist"
+
+
+def _mac_login_item(launcher: Path, action: str) -> int:
+    result = subprocess.run([str(launcher), "--osia-login-item", action],
+                            timeout=5, check=False, stdin=subprocess.DEVNULL)
+    return result.returncode
 
 
 def _windows_autostart_command() -> str:
@@ -159,88 +212,126 @@ def _set_autostart_windows(enabled: bool) -> bool:
         return False
 
 
-def autostart_enabled() -> bool:
-    """Return True when OSIA is configured to launch at login.
+def _windows_run_registered() -> bool:
+    import winreg
 
-    The state is derived from reality — the XDG autostart entry existing
-    (Linux) or the HKCU Run value existing (Windows) — so the settings toggle
-    always mirrors the actual configuration. Mac reports disabled (no impl).
-    """
-    if windows_store.is_store_install():
-        return windows_store.startup_task(windows_store.GUI_STARTUP)
-    system = platform.system()
-    if system == "Linux":
-        return os.path.exists(_autostart_desktop_path())
-    if system == "Windows":
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
-                winreg.QueryValueEx(key, _WIN_RUN_VALUE)
-            return True
-        except FileNotFoundError:
-            return False
-        except Exception:
-            return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+            winreg.QueryValueEx(key, _WIN_RUN_VALUE)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def autostart_enabled() -> bool:
+    """Read the current user's login setting from the native backend."""
+    try:
+        if windows_store.is_store_install():
+            return windows_store.startup_task(windows_store.GUI_STARTUP)
+        system = platform.system()
+        if system == "Windows":
+            return _windows_run_registered()
+        if system == "Darwin":
+            launcher = portable_desktop_executable()
+            if launcher is not None:
+                return _mac_login_item(launcher, "state") == 0
+            with _source_launch_agent().open("rb") as handle:
+                entry = plistlib.load(handle)
+            return isinstance(entry, dict) and entry.get("RunAtLoad") is True and not entry.get("Disabled", False)
+        if system == "Linux":
+            parser = ConfigParser(interpolation=None, strict=False)
+            with _autostart_desktop_path().open(encoding="utf-8") as handle:
+                parser.read_file(handle)
+            entry = parser["Desktop Entry"]
+            return (bool(entry.get("Exec")) and not entry.getboolean("Hidden", False)
+                    and entry.getboolean("X-GNOME-Autostart-enabled", True))
+    except (ImportError, OSError, ValueError, KeyError, ConfigError, ExpatError, plistlib.InvalidFileException,
+            subprocess.TimeoutExpired):
+        pass
     return False
 
 
-def set_autostart(enabled: bool) -> bool:
-    """Enable or disable launching OSIA (wake mode) at login.
-
-    Linux: write / remove ``~/.config/autostart/osia.desktop`` launching
-    ``osia/main.py --wake`` through the project venv with ``QT_QPA_PLATFORM=xcb``
-    forced (the GUI always runs under XCB).
-
-    Windows: add / remove the ``OSIA`` value under the HKCU Run key, launching
-    ``osia/main.py --wake`` via the venv ``pythonw.exe`` (WOR-11).
-
-    Mac: logs that autostart is not yet implemented and returns False so the
-    caller can revert the toggle. Returns True on success; never raises.
-    """
+def _configure_autostart(enabled: bool, *, initial: bool = False) -> bool:
+    if windows_store.is_store_install():
+        # Windows applies the manifest default and owns user/policy overrides.
+        return initial or windows_store.startup_task(windows_store.GUI_STARTUP, enabled)
     system = platform.system()
     if system == "Windows":
-        if windows_store.is_store_install():
-            return windows_store.startup_task(windows_store.GUI_STARTUP, enabled)
+        if initial:
+            # Inno records the operator's actual choice, including /NOINTEGRATION.
+            if is_frozen() and any(p.with_suffix(".exe").is_file()
+                                   for p in application_executable().parent.glob("unins[0-9][0-9][0-9].dat")):
+                return True
+            if _windows_run_registered():
+                return True
         return _set_autostart_windows(enabled)
-    if system != "Linux":
-        if system == "Darwin":
-            print("[autostart] not yet implemented on Mac")
-        else:
-            print(f"[autostart] not yet implemented on {system}")
+    if system == "Darwin":
+        launcher = portable_desktop_executable()
+        if launcher is not None:
+            action = "default" if initial else "enable" if enabled else "disable"
+            code = _mac_login_item(launcher, action)
+            # macOS can hold a registered item for approval in System Settings.
+            return code == 0 or (initial and code == 3)
+        path = _source_launch_agent()
+    elif system == "Linux":
+        path = _autostart_desktop_path()
+    else:
+        return False
+    if not enabled:
+        path.unlink(missing_ok=True)
+        return True
+    if initial and os.path.lexists(path):
+        # A Hidden=true XDG entry, for example, is a deliberate user choice.
+        return True
+    arguments = _unix_startup_arguments()
+    if system == "Darwin":
+        content = plistlib.dumps({"Label": "space.osia.desktop.source",
+                                  "ProgramArguments": arguments, "RunAtLoad": True,
+                                  "LimitLoadToSessionType": "Aqua"})
+    else:
+        command = " ".join(_xdg_argument(arg) for arg in arguments)
+        content = ("[Desktop Entry]\nType=Application\nName=OSIA\n"
+                   f"Exec=env QT_QPA_PLATFORM=xcb {command}\n"
+                   "Terminal=false\nStartupWMClass=osia\nX-GNOME-Autostart-enabled=true\n").encode()
+    _write_login_file(path, content)
+    return True
+
+
+def initialize_autostart() -> bool:
+    """Apply the login default once, on the first desktop launch of a new profile."""
+    from osia import config
+
+    try:
+        pending = config.desktop_autostart_pending_file()
+        if not pending.is_file() or not Path(config.SETTINGS_FILE).is_file():
+            return True
+        with config.settings_transaction():
+            if not pending.is_file():
+                return True
+            if not _configure_autostart(True, initial=True):
+                return False
+            pending.unlink(missing_ok=True)
+        return True
+    except (ImportError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"[autostart] login setup deferred: {type(exc).__name__}")
         return False
 
-    path = _autostart_desktop_path()
+
+def set_autostart(enabled: bool) -> bool:
+    """Apply a user's explicit choice, also cancelling any pending default."""
+    from osia import config
+
     try:
-        if enabled:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            # Prefer the project venv interpreter so the autostart launch uses
-            # the same Python/deps as a manual launch; fall back to whatever is
-            # running this process.
-            py = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
-            if not os.path.exists(py):
-                py = sys.executable or "python3"
-            main_py = os.path.join(PROJECT_ROOT, "osia", "main.py")
-            # .desktop Exec= does not run a shell, so the QT_QPA_PLATFORM
-            # environment variable is set via `env` (a bare `VAR=val cmd`
-            # prefix would be parsed as a binary name, not an assignment).
-            content = (
-                "[Desktop Entry]\n"
-                "Type=Application\n"
-                "Name=OSIA\n"
-                "Comment=OSIA — Local AI Voice Assistant\n"
-                f"Exec=env QT_QPA_PLATFORM=xcb {py} {main_py} --wake\n"
-                f"Icon={ICON_PATH}\n"
-                "Terminal=false\n"
-                "Categories=Utility;\n"
-                "StartupWMClass=osia\n"
-                "X-GNOME-Autostart-enabled=true\n"
-            )
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        else:
-            if os.path.exists(path):
-                os.remove(path)
-        return True
-    except Exception as e:
-        print(f"[autostart] failed to {'enable' if enabled else 'disable'}: {e}")
+        pending = config.desktop_autostart_pending_file()
+        if pending.is_file() or not Path(config.SETTINGS_FILE).exists():
+            with config.settings_transaction():
+                if not Path(config.SETTINGS_FILE).exists():
+                    config.ensure_config_files(create_token=False)
+                pending.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[autostart] could not record manual choice: {type(exc).__name__}")
+    try:
+        return _configure_autostart(enabled)
+    except (ImportError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"[autostart] login setting update failed: {type(exc).__name__}")
         return False

@@ -24,12 +24,12 @@ jobs:
           "$RUNNER_TEMP/osia-runtime/bundle/python/bin/python3.12" -I -B packaging/portable/build_unix.py "$RUNNER_TEMP/osia-runtime/bundle" "$RUNNER_TEMP/portable-output"
       - name: Extract and launch on macOS
         run: |
-          mkdir "$RUNNER_TEMP/OSIA portable test"
-          tar -xzf "$RUNNER_TEMP/portable-output/OSIA.tar.gz" -C "$RUNNER_TEMP/OSIA portable test"
-          app="$RUNNER_TEMP/OSIA portable test/OSIA.app"
+          mkdir -p "$HOME/Applications/OSIA portable test"
+          tar -xzf "$RUNNER_TEMP/portable-output/OSIA.tar.gz" -C "$HOME/Applications/OSIA portable test"
+          app="$HOME/Applications/OSIA portable test/OSIA.app"
           codesign --verify --strict "$app"
           "$app/Contents/MacOS/OSIA" --doctor
-          python3 packaging/portable/smoke.py "$app/Contents/MacOS/OSIA"
+          python3 packaging/portable/smoke.py "$app/Contents/MacOS/OSIA" --check-login
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: OSIA-macos-arm64

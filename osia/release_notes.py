@@ -65,11 +65,13 @@ _RELEASES = (
     ReleaseEntry(
         version="0.9.279", released_on="2026-11-27", public=True,
         changes_en=(
+            "New desktop installations start OSIA at sign-in by default. You can turn this off in Settings.",
             "Paired phones receive known models while OSIA checks local runtimes and providers in the background.",
             "Mobile connections use the private LAN first, then direct WebRTC. The public Worker provides encrypted signaling.",
         ),
         changes_fr=(
             "Le téléphone associé reçoit les modèles connus pendant qu’OSIA vérifie les moteurs locaux et les fournisseurs en arrière-plan.",
+            "Les nouvelles installations de bureau lancent OSIA à l’ouverture de session par défaut. Cette option peut être désactivée dans les paramètres.",
             "Le mobile se connecte par le réseau local privé, puis par WebRTC direct. Le Worker public assure la signalisation chiffrée.",
         ),
     ),
