@@ -63,6 +63,17 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.278", released_on="2026-11-27", public=True,
+        changes_en=(
+            "ChatGPT Account stays available after reopening OSIA with newer Codex runtimes.",
+            "OSIA checks for a compatible local Codex configuration and creates its own when needed.",
+        ),
+        changes_fr=(
+            "Le compte ChatGPT reste disponible après la réouverture d’OSIA avec les versions récentes de Codex.",
+            "OSIA recherche une configuration Codex locale compatible et crée la sienne si nécessaire.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.277", released_on="2026-11-25", public=True,
         changes_en=(
             "A startup window appears while OSIA loads. Desktop imports and session recovery now overlap.",

@@ -213,6 +213,9 @@ def _verify_runtime(executable: Path, version: str, scratch: Path, stop: threadi
             )
         finally:
             client.shutdown()
+        # Codex can populate its own home during the first launch. Check what
+        # the next production launch would see before making this version active.
+        client._validate_home_isolation()
     return True
 
 

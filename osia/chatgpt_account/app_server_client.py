@@ -91,6 +91,13 @@ web_search = false
 inherit = "none"
 """
 
+_MAX_CODEX_CONFIG_CHARS = 64 * 1024
+_BUILTIN_CODEX_SKILLS = frozenset({
+    ".codex-system-skills.marker", "create-statusline", "imagegen",
+    "openai-docs", "plugin-creator", "review-agent", "skill-creator",
+    "skill-installer",
+})
+
 _SAFE_ITEM_TYPES = frozenset({
     "agentMessage", "userMessage", "reasoning", "plan",
     "contextCompaction", "webSearch", "imageView",
@@ -598,6 +605,75 @@ def _runtime_base_dir() -> Path:
     return root / "OSIA" / "Codex"
 
 
+def _personal_codex_configs() -> tuple[Path, ...]:
+    """Codex's configured home and the default home of the current user."""
+    override = os.environ.get("CODEX_HOME")
+    if not override and sys.platform == "win32":
+        # A Start menu or Store launch can inherit an older environment.
+        import winreg
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                value, _ = winreg.QueryValueEx(key, "CODEX_HOME")
+                if isinstance(value, str):
+                    override = winreg.ExpandEnvironmentStrings(value)
+        except OSError:
+            pass
+    paths = [Path.home() / ".codex" / "config.toml"]
+    if override:
+        configured = Path(os.path.expanduser(override))
+        if configured.is_absolute():
+            paths.insert(0, configured / "config.toml")
+    return tuple(dict.fromkeys(paths))
+
+
+def _read_codex_config(path: Path) -> str:
+    with path.open(encoding="utf-8") as config:
+        content = config.read(_MAX_CODEX_CONFIG_CHARS + 1)
+    if len(content) > _MAX_CODEX_CONFIG_CHARS:
+        raise ValueError("Codex configuration is too large")
+    return content
+
+
+def _compatible_codex_config(content: str) -> str | None:
+    """Keep the same isolated policy, including when migrating older OSIA files."""
+    content = content.removeprefix("\ufeff")
+    known_configs = (_SAFE_CONFIG, _LEGACY_SAFE_CONFIG, _NO_ENV_SAFE_CONFIG)
+    if content in known_configs:
+        return _SAFE_CONFIG
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10 can still use the canonical files above.
+        return None
+    try:
+        parsed = json.dumps(tomllib.loads(content), sort_keys=True)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if parsed == json.dumps(tomllib.loads(_SAFE_CONFIG), sort_keys=True):
+        return content
+    for config in known_configs[1:]:
+        if parsed == json.dumps(tomllib.loads(config), sort_keys=True):
+            return _SAFE_CONFIG
+    return None
+
+
+def _write_codex_config(path: Path, content: str, *, replace: bool = False) -> None:
+    """Publish a complete config, with exclusive creation on first launch."""
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+            file.write(content)
+        if replace:
+            temporary.replace(path)
+        elif os.name == "nt":
+            temporary.rename(path)
+        else:
+            os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 _DATA_IMAGE_PATTERN = re.compile(
     r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)",
     re.IGNORECASE,
@@ -888,26 +964,26 @@ class AppServerClient:
         )
         raise RuntimeUnavailableError(message, category=category)
 
-    def _ensure_layout(self) -> None:
-        for path in (self.home_dir, self.workspace_dir, self.temp_dir):
-            path.mkdir(parents=True, exist_ok=True)
-            if path.is_symlink():
-                raise RuntimeUnavailableError(
-                    "ERROR: OSIA's isolated Codex directories cannot be symbolic links.",
-                    category="isolation_failed",
-                )
-
+    def _validate_home_isolation(self) -> None:
         forbidden = (
             "plugins", "hooks", "rules", "profiles", "AGENTS.md",
             ".codex", ".codex-plugin",
         )
         for name in forbidden:
-            if (self.home_dir / name).exists():
+            path = self.home_dir / name
+            if path.exists() or path.is_symlink():
                 raise RuntimeUnavailableError(
                     "ERROR: the isolated Codex configuration is not clean; ChatGPT account support was disabled.",
                     category="isolation_failed",
                 )
         skills = self.home_dir / "skills"
+        system_skills = skills / ".system"
+        for path in (skills, system_skills):
+            if path.resolve() != self.home_dir.resolve() / path.relative_to(self.home_dir):
+                raise RuntimeUnavailableError(
+                    "ERROR: OSIA's isolated Codex skills cannot be symbolic links.",
+                    category="isolation_failed",
+                )
         if skills.exists():
             custom = [p for p in skills.iterdir() if p.name != ".system"]
             if custom:
@@ -915,41 +991,72 @@ class AppServerClient:
                     "ERROR: custom Codex skills were found in OSIA's isolated runtime.",
                     category="isolation_failed",
                 )
-            system_skills = skills / ".system"
             if system_skills.exists():
-                allowed_system = {
-                    ".codex-system-skills.marker", "imagegen", "openai-docs",
-                    "plugin-creator", "review-agent", "skill-creator",
-                    "skill-installer",
-                }
-                unexpected = [
-                    path for path in system_skills.iterdir()
-                    if path.name not in allowed_system
-                ]
-                if unexpected:
+                if any(
+                    path.name not in _BUILTIN_CODEX_SKILLS or path.is_symlink()
+                    for path in system_skills.iterdir()
+                ):
                     raise RuntimeUnavailableError(
                         "ERROR: unexpected skills were found in OSIA's isolated Codex runtime.",
                         category="isolation_failed",
                     )
 
-        config = self.home_dir / "config.toml"
-        if config.exists():
-            try:
-                current_config = config.read_text(encoding="utf-8")
-                if current_config in {_LEGACY_SAFE_CONFIG, _NO_ENV_SAFE_CONFIG}:
-                    config.write_text(_SAFE_CONFIG, encoding="utf-8", newline="\n")
-                elif current_config != _SAFE_CONFIG:
-                    raise RuntimeUnavailableError(
-                        "ERROR: OSIA's isolated Codex configuration was modified.",
-                        category="isolation_failed",
+    def _initial_config(self) -> str:
+        # Scratch clients used by build and update probes have their own trust root.
+        if self.base_dir == _runtime_base_dir():
+            for candidate in _personal_codex_configs():
+                try:
+                    content = (
+                        _compatible_codex_config(_read_codex_config(candidate))
+                        if candidate.is_file() else None
                     )
-            except OSError as exc:
+                except (OSError, ValueError):
+                    continue
+                if content is not None:
+                    return content
+        return _SAFE_CONFIG
+
+    def _ensure_codex_config(self) -> None:
+        config = self.home_dir / "config.toml"
+        if config.is_symlink() or (config.exists() and not config.is_file()):
+            raise RuntimeUnavailableError(
+                "ERROR: OSIA's isolated Codex configuration must be a regular file.",
+                category="isolation_failed",
+            )
+        try:
+            try:
+                current = _read_codex_config(config)
+            except FileNotFoundError:
+                try:
+                    _write_codex_config(config, self._initial_config())
+                except FileExistsError:
+                    current = _read_codex_config(config)
+                else:
+                    return
+            supported = _compatible_codex_config(current)
+            if supported is None:
                 raise RuntimeUnavailableError(
-                    "ERROR: OSIA could not verify its isolated Codex configuration.",
+                    "ERROR: OSIA's isolated Codex configuration was modified.",
                     category="isolation_failed",
-                ) from exc
-        else:
-            config.write_text(_SAFE_CONFIG, encoding="utf-8", newline="\n")
+                )
+            if supported != current:
+                _write_codex_config(config, supported, replace=True)
+        except (OSError, ValueError) as exc:
+            raise RuntimeUnavailableError(
+                "ERROR: OSIA could not prepare its isolated Codex configuration.",
+                category="isolation_failed",
+            ) from exc
+
+    def _ensure_layout(self) -> None:
+        for path in (self.home_dir, self.workspace_dir, self.temp_dir):
+            if path.resolve() != self.base_dir.resolve() / path.name:
+                raise RuntimeUnavailableError(
+                    "ERROR: OSIA's isolated Codex directories cannot be symbolic links.",
+                    category="isolation_failed",
+                )
+            path.mkdir(parents=True, exist_ok=True)
+        self._validate_home_isolation()
+        self._ensure_codex_config()
         from osia.image_inputs import (
             cleanup_media_store,
             cleanup_owned_temp_images,
