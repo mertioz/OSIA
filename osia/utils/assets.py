@@ -10,7 +10,6 @@ systemd unit, or a desktop launcher.
 import os
 import platform
 import plistlib
-import subprocess
 import sys
 import tempfile
 from configparser import ConfigParser, Error as ConfigError
@@ -103,7 +102,7 @@ def ensure_desktop_entry() -> str | None:
 #   • Linux:   a ``~/.config/autostart/osia.desktop`` file (XDG autostart spec)
 #   • Windows: an ``OSIA`` value under the per-user Run key
 #              ``HKCU\Software\Microsoft\Windows\CurrentVersion\Run``
-#   • macOS:   the app bundle's native login item, or a user LaunchAgent for source runs
+#   • macOS:   a per-user launchd agent limited to the graphical login session
 
 # Windows per-user "run at login" registry location.
 _WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -154,14 +153,8 @@ def _write_login_file(path: Path, content: bytes) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _source_launch_agent() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / "space.osia.desktop.source.plist"
-
-
-def _mac_login_item(launcher: Path, action: str) -> int:
-    result = subprocess.run([str(launcher), "--osia-login-item", action],
-                            timeout=5, check=False, stdin=subprocess.DEVNULL)
-    return result.returncode
+def _mac_launch_agent() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / "space.osia.desktop.login.plist"
 
 
 def _windows_autostart_command() -> str:
@@ -232,10 +225,7 @@ def autostart_enabled() -> bool:
         if system == "Windows":
             return _windows_run_registered()
         if system == "Darwin":
-            launcher = portable_desktop_executable()
-            if launcher is not None:
-                return _mac_login_item(launcher, "state") == 0
-            with _source_launch_agent().open("rb") as handle:
+            with _mac_launch_agent().open("rb") as handle:
                 entry = plistlib.load(handle)
             return isinstance(entry, dict) and entry.get("RunAtLoad") is True and not entry.get("Disabled", False)
         if system == "Linux":
@@ -245,8 +235,7 @@ def autostart_enabled() -> bool:
             entry = parser["Desktop Entry"]
             return (bool(entry.get("Exec")) and not entry.getboolean("Hidden", False)
                     and entry.getboolean("X-GNOME-Autostart-enabled", True))
-    except (ImportError, OSError, ValueError, KeyError, ConfigError, ExpatError, plistlib.InvalidFileException,
-            subprocess.TimeoutExpired):
+    except (ImportError, OSError, ValueError, KeyError, ConfigError, ExpatError, plistlib.InvalidFileException):
         pass
     return False
 
@@ -266,13 +255,7 @@ def _configure_autostart(enabled: bool, *, initial: bool = False) -> bool:
                 return True
         return _set_autostart_windows(enabled)
     if system == "Darwin":
-        launcher = portable_desktop_executable()
-        if launcher is not None:
-            action = "default" if initial else "enable" if enabled else "disable"
-            code = _mac_login_item(launcher, action)
-            # macOS can hold a registered item for approval in System Settings.
-            return code == 0 or (initial and code == 3)
-        path = _source_launch_agent()
+        path = _mac_launch_agent()
     elif system == "Linux":
         path = _autostart_desktop_path()
     else:
@@ -285,9 +268,12 @@ def _configure_autostart(enabled: bool, *, initial: bool = False) -> bool:
         return True
     arguments = _unix_startup_arguments()
     if system == "Darwin":
-        content = plistlib.dumps({"Label": "space.osia.desktop.source",
-                                  "ProgramArguments": arguments, "RunAtLoad": True,
-                                  "LimitLoadToSessionType": "Aqua"})
+        if "AppTranslocation" in Path(arguments[0]).parts:
+            # Gatekeeper's temporary path disappears. Retry at the next normal launch.
+            return False
+        content = plistlib.dumps({"Label": path.stem, "ProgramArguments": arguments,
+                                  "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
+                                  "AssociatedBundleIdentifiers": ["space.osia.desktop"]})
     else:
         command = " ".join(_xdg_argument(arg) for arg in arguments)
         content = ("[Desktop Entry]\nType=Application\nName=OSIA\n"
@@ -312,7 +298,7 @@ def initialize_autostart() -> bool:
                 return False
             pending.unlink(missing_ok=True)
         return True
-    except (ImportError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except (ImportError, OSError, ValueError) as exc:
         print(f"[autostart] login setup deferred: {type(exc).__name__}")
         return False
 
@@ -332,6 +318,6 @@ def set_autostart(enabled: bool) -> bool:
         print(f"[autostart] could not record manual choice: {type(exc).__name__}")
     try:
         return _configure_autostart(enabled)
-    except (ImportError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except (ImportError, OSError, ValueError) as exc:
         print(f"[autostart] login setting update failed: {type(exc).__name__}")
         return False

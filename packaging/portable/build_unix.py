@@ -66,10 +66,7 @@ def build(runtime: Path, output: Path) -> None:
         shutil.copy2(REPO / "packaging/linux/doctor.py", root / "doctor.py")
         entry = package / "Contents/MacOS/OSIA" if mac else package / "OSIA"
         entry.parent.mkdir(parents=True, exist_ok=True)
-        mac_flags = ["-x", "objective-c", "-fobjc-arc", "-mmacosx-version-min=15.0", "-framework", "Foundation",
-                     "-framework", "ServiceManagement"] if mac else []
-        subprocess.run(["cc", "-O2", "-Wall", "-Werror", *mac_flags,
-                        str(HERE / "launcher.c"), "-o", str(entry)], check=True)
+        subprocess.run(["cc", "-O2", "-Wall", "-Werror", str(HERE / "launcher.c"), "-o", str(entry)], check=True)
         import runpy
         version = runpy.run_path(str(app / "osia/version.py"))
         metadata = {"version": version["PRODUCT_VERSION"], "releaseSequence": version["RELEASE_SEQUENCE"],

@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 import plistlib
 import sys
-from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -128,27 +127,30 @@ def test_retry_after_failure_but_never_after_explicit_disable(profile, monkeypat
     assert json.loads(Path(config.SETTINGS_FILE).read_bytes())["time_format"] == "24h"
 
 
-def test_macos_native_item_pending_approval_is_not_requested_again(profile, monkeypatch):
+def test_bundled_mac_uses_permanent_launcher_and_honors_external_opt_out(profile, monkeypatch):
     monkeypatch.setattr(assets.platform, "system", lambda: "Darwin")
+    plist = profile / "Library/LaunchAgents/space.osia.desktop.login.plist"
+    monkeypatch.setattr(assets, "_mac_launch_agent", lambda: plist)
     launcher = profile / "OSIA.app/Contents/MacOS/OSIA"
-    monkeypatch.setattr(assets, "portable_desktop_executable", lambda: launcher)
-    actions = []
-    def run(arguments, **kwargs):
-        assert arguments[:2] == [str(launcher), "--osia-login-item"]
-        actions.append(arguments[2])
-        return SimpleNamespace(returncode=3 if arguments[2] == "default" else 0)
-    monkeypatch.setattr(assets.subprocess, "run", run)
+    monkeypatch.setattr(assets, "portable_desktop_executable", lambda: profile / "AppTranslocation" / "OSIA")
     config.ensure_config_files(create_token=False)
-    assert assets.initialize_autostart() and assets.initialize_autostart()
-    assert assets.autostart_enabled()
-    assert assets.set_autostart(False) and assets.initialize_autostart()
-    assert actions == ["default", "state", "disable"]
+    assert not assets.initialize_autostart()
+    assert not plist.exists() and config.desktop_autostart_pending_file().exists()
+    monkeypatch.setattr(assets, "portable_desktop_executable", lambda: launcher)
+    assert assets.initialize_autostart() and assets.autostart_enabled()
+    entry = plistlib.loads(plist.read_bytes())
+    assert entry["ProgramArguments"] == [str(launcher)]
+    assert entry["AssociatedBundleIdentifiers"] == ["space.osia.desktop"]
+    entry["Disabled"] = True
+    plist.write_bytes(plistlib.dumps(entry))
+    assert assets.initialize_autostart() and not assets.autostart_enabled()
+    assert assets.set_autostart(False) and not plist.exists()
 
 
 def test_unbundled_mac_login_plist_uses_arguments_and_respects_removal(profile, monkeypatch):
     monkeypatch.setattr(assets.platform, "system", lambda: "Darwin")
-    plist = profile / "Library/LaunchAgents/space.osia.desktop.source.plist"
-    monkeypatch.setattr(assets, "_source_launch_agent", lambda: plist)
+    plist = profile / "Library/LaunchAgents/space.osia.desktop.login.plist"
+    monkeypatch.setattr(assets, "_mac_launch_agent", lambda: plist)
     monkeypatch.setattr(assets, "PROJECT_ROOT", str(profile / "OSIA Source"))
     config.ensure_config_files(create_token=False)
     assert assets.initialize_autostart() and assets.autostart_enabled()
