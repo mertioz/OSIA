@@ -7517,6 +7517,7 @@ async def websocket_endpoint(ws: WebSocket):
     heartbeat_task: asyncio.Task | None = None
     remote_catalogue_refresh_pending = False
     socket_response_tasks: set[asyncio.Task] = set()
+    models_read_task: asyncio.Task | None = None
     chatgpt_login_generation: int | None = None
     account_state_lock = asyncio.Lock()
     catalogue_change_task: asyncio.Task | None = None
@@ -7528,44 +7529,89 @@ async def websocket_endpoint(ws: WebSocket):
     canonical_config_keys: set[str] = set()
 
     async def _send_model_catalogue(
-        *, refresh_local: bool = True, refresh_account: bool = True
-    ) -> None:
+        *, refresh_local: bool = True, refresh_account: bool = True,
+        cached_only: bool = False, refreshing: bool = False, previous: dict | None = None,
+    ) -> dict | None:
         """Send one safe PC-authoritative catalogue without blocking the loop."""
         def read_catalogue():
             from osia.mobile_model_catalogue import build_catalogue
 
             return build_catalogue(
-                refresh_local=refresh_local, refresh_account=refresh_account,
+                refresh_local=refresh_local, refresh_account=refresh_account, cached_only=cached_only,
             )
 
         catalogue = await asyncio.to_thread(read_catalogue)
-        await out.send_json({
+        if refreshing and not catalogue["models"]:
+            # Older phones treat an empty frame as a final, empty inventory.
+            return previous
+        frame = {
             "type": "models_list",
             "catalogue": {
                 "version": catalogue["version"],
                 "providers": catalogue["providers"],
+                "refreshing": refreshing,
             },
             # Backward-compatible flat view for existing mobile consumers.
             "models": catalogue["models"],
             "current": catalogue["current"],
             "current_provider": catalogue["currentProvider"],
             "account": catalogue["account"],
-        })
+        }
+        if frame != previous:
+            await out.send_json(frame)
+        return frame
 
     async def _respond_models() -> None:
+        from osia.mobile_model_catalogue import account_snapshot, request_remote_refresh
+        from osia.models import get_local_models
+
+        tasks = []
         try:
-            await _send_model_catalogue()
-            _request_remote_catalogue_refresh()
+            last = await _send_model_catalogue(cached_only=True, refreshing=True)
+            remote_done = loop.create_future()
+
+            def remote_ready():
+                if not remote_done.done():
+                    remote_done.set_result(None)
+
+            def discover_remote():
+                request_remote_refresh(lambda: loop.call_soon_threadsafe(remote_ready))
+
+            async def remote():
+                await asyncio.to_thread(discover_remote)
+                await remote_done
+
+            tasks = [
+                asyncio.create_task(asyncio.to_thread(get_local_models)),
+                asyncio.create_task(asyncio.to_thread(
+                    account_snapshot, refresh_models=True, include_usage=False,
+                )),
+                asyncio.create_task(remote()),
+            ]
+            remaining = set(tasks)
+            while remaining:
+                finished, remaining = await asyncio.wait(remaining, return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    if task.exception() is not None:
+                        print(f"[OSIA Server] model discovery failed: {type(task.exception()).__name__}")
+                last = await _send_model_catalogue(
+                    cached_only=True, refreshing=bool(remaining), previous=last,
+                )
         except Exception as e:
             print(f"[OSIA Server] get_models failed: {e}")
             await out.send_json({
                 "type": "models_list",
-                "catalogue": {"version": 1, "providers": []},
+                "catalogue": {"version": 1, "providers": [], "error": True},
                 "models": [],
                 "current": None,
                 "current_provider": None,
                 "account": {},
             })
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _respond_account(*, refresh_models: bool = True) -> None:
         async with account_state_lock:
@@ -7592,7 +7638,7 @@ async def websocket_endpoint(ws: WebSocket):
                 "type": "chatgpt_account_state", "account": state
             })
 
-    def _schedule_socket_response(coroutine) -> None:
+    def _schedule_socket_response(coroutine) -> asyncio.Task:
         # Provider I/O must not block the receive loop for this connection.
         task = asyncio.create_task(coroutine)
         socket_response_tasks.add(task)
@@ -7603,6 +7649,7 @@ async def websocket_endpoint(ws: WebSocket):
                 print("[OSIA Server] response task failed after client closure")
 
         task.add_done_callback(finished)
+        return task
 
     def _canonical_config_changed(key: str) -> None:
         """Push the safe PC-owned snapshot after any canonical setting change."""
@@ -9250,7 +9297,12 @@ async def websocket_endpoint(ws: WebSocket):
 
             # --- Models ---
             if msg_type == "get_models":
-                _schedule_socket_response(_respond_models())
+                if models_read_task is None or models_read_task.done():
+                    models_read_task = _schedule_socket_response(_respond_models())
+                else:
+                    # Each request can be from a newly opened picker. Share
+                    # discovery, but give the new reader its current inventory.
+                    _schedule_socket_response(_send_model_catalogue(cached_only=True, refreshing=True))
                 continue
 
             if msg_type == "set_model":

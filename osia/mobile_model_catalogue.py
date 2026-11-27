@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from collections.abc import Callable
 
 from osia.config import (
@@ -19,6 +20,7 @@ from osia.models import (
     PROVIDERS,
     discover_models_async,
     get_all_models,
+    get_all_models_cached,
     invalidate_local_models_cache,
 )
 from osia.reasoning import (
@@ -66,6 +68,8 @@ _login_generation = 0
 _login_connecting = False
 _login_ephemeral: dict[str, str] = {}
 _login_error = ""
+_account_cache_lock = threading.Lock()
+_last_account_status = None
 
 
 def _safe_error(value) -> str:
@@ -138,19 +142,49 @@ def _safe_model(raw: dict, provider: str | None = None) -> dict | None:
     }
 
 
-def _account_status_with_usage(*, refresh_models: bool) -> dict:
+def _account_revision(provider):
+    """Match runtime generation and on-disk identity, including a sibling process's logout."""
+    client = getattr(provider, "client", None)
+    try:
+        return client.account_generation, client._read_auth_storage_revision()
+    except (AttributeError, OSError):
+        return None
+
+
+def _account_status_with_usage(
+    *, refresh_models: bool, include_usage: bool = True, cached_only: bool = False,
+) -> dict:
+    global _last_account_status
+    if cached_only:
+        with _account_cache_lock:
+            if _last_account_status is not None:
+                owner, revision, status = _last_account_status
+                if revision == _account_revision(owner):
+                    return deepcopy(status)
+        return {}
     try:
         from osia.chatgpt_account.provider import get_account_provider
 
         provider = get_account_provider()
+        revision = _account_revision(provider)
         status = provider.status(refresh_models=refresh_models)
-        if status.get("connected"):
+        if revision is not None and revision != _account_revision(provider):
+            # A sibling process may have completed sign-in during account/read.
+            revision = _account_revision(provider)
+            status = provider.status(refresh_models=refresh_models)
+        if status.get("connected") and include_usage:
             try:
                 usage = provider.rate_limits()
                 status = dict(status)
                 status["quotaWindows"] = quota_windows(usage)
             except Exception:
                 pass
+        with _account_cache_lock:
+            if revision is not None and revision == _account_revision(provider):
+                if (not include_usage and status.get("connected") and _last_account_status
+                        and _last_account_status[:2] == (provider, revision)):
+                    status = {**status, "quotaWindows": _last_account_status[2].get("quotaWindows", [])}
+                _last_account_status = (provider, revision, deepcopy(status))
         return status
     except Exception:
         return {
@@ -163,9 +197,13 @@ def _account_status_with_usage(*, refresh_models: bool) -> dict:
 
 
 def account_snapshot(
-    *, refresh_models: bool = True, login_generation: int | None = None
+    *, refresh_models: bool = True, login_generation: int | None = None,
+    include_usage: bool = True, cached_only: bool = False,
 ) -> dict:
-    status = _account_status_with_usage(refresh_models=refresh_models)
+    status = _account_status_with_usage(refresh_models=refresh_models,
+                                        include_usage=include_usage, cached_only=cached_only)
+    if cached_only and not status:
+        return {}
     account = status.get("account") if isinstance(status.get("account"), dict) else {}
     models = []
     seen = set()
@@ -463,13 +501,15 @@ def build_model_inventory(
 
 
 
-def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True) -> dict:
+def build_catalogue(*, refresh_local: bool = True, refresh_account: bool = True,
+                    cached_only: bool = False) -> dict:
     """Build the deterministic safe catalogue from current PC-owned state."""
-    if refresh_local:
+    if refresh_local and not cached_only:
         invalidate_local_models_cache()
     keys = load_api_keys()
-    raw_models = get_all_models(api_keys=keys, remote_models=cached_remote_models())
-    account = account_snapshot(refresh_models=refresh_account)
+    model_reader = get_all_models_cached if cached_only else get_all_models
+    raw_models = model_reader(api_keys=keys, remote_models=cached_remote_models())
+    account = account_snapshot(refresh_models=refresh_account, cached_only=cached_only)
     inventory = build_model_inventory(
         raw_models,
         configured_api_providers(keys),

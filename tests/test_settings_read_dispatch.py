@@ -27,7 +27,9 @@ def test_config_overtakes_pending_provider_read_without_losing_reply(tmp_path, m
     monkeypatch.setattr(server, "_WS_CLIENTS", set())
     monkeypatch.setattr(server, "_build_config_snapshot", lambda: {"time_format": "12h"})
     monkeypatch.setattr(server, "_pending_cron_notifications", lambda: [])
-    monkeypatch.setattr(mobile_model_catalogue, "request_remote_refresh", lambda callback: None)
+    monkeypatch.setattr(mobile_model_catalogue, "request_remote_refresh", lambda callback: callback())
+    monkeypatch.setattr("osia.models.get_local_models", lambda: [])
+    monkeypatch.setattr(mobile_model_catalogue, "account_snapshot", lambda **kwargs: {})
 
     def slow_read(**kwargs):
         started.set()
@@ -62,6 +64,82 @@ def test_config_overtakes_pending_provider_read_without_losing_reply(tmp_path, m
     finally:
         release.set()
         timer.cancel()
+
+
+def test_first_models_and_config_arrive_while_account_is_still_loading(tmp_path, monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    slow_reads = []
+    monkeypatch.setattr(server, "MOBILE_TOKEN", "test-only")
+    monkeypatch.setattr(server, "_DURABLE_TRANSPORT", DurableTransportStore(tmp_path / "transport"))
+    monkeypatch.setattr(conversations, "CONVERSATIONS_DIR", tmp_path / "conversations")
+    monkeypatch.setattr(server, "_WS_CLIENTS", set())
+    monkeypatch.setattr(server, "_build_config_snapshot", lambda: {"time_format": "24h"})
+    monkeypatch.setattr(server, "_pending_cron_notifications", lambda: [])
+    monkeypatch.setattr(mobile_model_catalogue, "request_remote_refresh", lambda callback: callback())
+    monkeypatch.setattr("osia.models.get_local_models", lambda: [])
+    def account_read(**kwargs):
+        slow_reads.append(kwargs)
+        started.set()
+        assert release.wait(5)
+    def catalogue(**kwargs):
+        assert kwargs["cached_only"]
+        model = {"id": "fixture", "providerId": "local"}
+        return {"version": 1, "providers": [], "models": [model], "current": "fixture",
+                "currentProvider": "local", "account": {}}
+    monkeypatch.setattr(mobile_model_catalogue, "account_snapshot", account_read)
+    monkeypatch.setattr(mobile_model_catalogue, "build_catalogue", catalogue)
+    app = Starlette(routes=[WebSocketRoute("/ws", server.websocket_endpoint)])
+    with TestClient(app, client=("127.0.0.1", 54321)) as client:
+        with client.websocket_connect("/ws") as socket:
+            socket.send_json({"type": "auth", "token": "test-only", "event_cursors": {}})
+            while socket.receive_json().get("type") != "conversations":
+                pass
+            try:
+                socket.send_json({"type": "get_models"})
+                assert started.wait(3)
+                socket.send_json({"type": "get_models"})
+                socket.send_json({"type": "get_config"})
+                first = set()
+                while first != {"config", "models_list"}:
+                    frame = socket.receive_json()
+                    if frame["type"] == "models_list":
+                        assert frame["catalogue"]["refreshing"] and frame["models"][0]["id"] == "fixture"
+                    if frame["type"] in {"config", "models_list"}:
+                        first.add(frame["type"])
+            finally:
+                release.set()
+            while True:
+                frame = socket.receive_json()
+                if frame["type"] == "models_list" and not frame["catalogue"]["refreshing"]:
+                    break
+            assert slow_reads == [{"refresh_models": True, "include_usage": False}]
+
+
+def test_cached_inventory_skips_live_probes_and_invalidates_external_account_changes(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    revision = [1]
+    client = SimpleNamespace(account_generation=1, _read_auth_storage_revision=lambda: revision[0])
+    account = SimpleNamespace(client=client, status=Mock(return_value={
+        "runtimeAvailable": True, "available": True, "connected": True,
+        "account": {"email": "fixture@example.test"}, "models": [{"id": "fixture-account"}],
+        "selectedModel": "fixture-account",
+    }), rate_limits=Mock(side_effect=AssertionError("quota on catalogue path")))
+    monkeypatch.setattr(provider, "get_account_provider", lambda: account)
+    monkeypatch.setattr(mobile_model_catalogue, "_last_account_status", None)
+    monkeypatch.setattr(mobile_model_catalogue, "get_all_models",
+                        Mock(side_effect=AssertionError("live local discovery")))
+    monkeypatch.setattr(mobile_model_catalogue, "get_all_models_cached", lambda **kwargs: [])
+    monkeypatch.setattr(mobile_model_catalogue, "configured_api_providers", lambda keys: set())
+    monkeypatch.setattr(mobile_model_catalogue, "load_api_keys", lambda: {})
+    assert mobile_model_catalogue.build_catalogue(cached_only=True)["account"] == {}
+    mobile_model_catalogue.account_snapshot(include_usage=False)
+    assert mobile_model_catalogue.build_catalogue(cached_only=True)["account"]["connected"]
+    revision[0] += 1
+    assert mobile_model_catalogue.build_catalogue(cached_only=True)["account"] == {}
+    account.status.assert_called_once()
+    account.rate_limits.assert_not_called()
 
 
 def test_device_sign_in_survives_mobile_reconnect_and_logout(tmp_path, monkeypatch):

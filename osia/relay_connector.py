@@ -34,6 +34,7 @@ from osia.transport_coordinator import (
     application_transport_coordination_enabled,
 )
 from osia.webrtc_signaling import (
+    SIGNAL_EVENT_TYPES,
     WebRtcSignalingError,
     capability_frame as webrtc_capability_frame,
     load_webrtc_ice_servers,
@@ -241,6 +242,7 @@ class RelayBridge:
         self.pair_id, self.secret = relay_pair_credentials(token)
         self.seq = 0
         self._terminal_error_code = ""
+        self._relay_application_enabled = True
         self.allow_plaintext = _relay_allow_plaintext(relay_url)
         self._transport_coordination_enabled = (
             application_transport_coordination_enabled()
@@ -767,7 +769,7 @@ class RelayBridge:
             return
         if self.e2e_pc_ready_sent:
             return
-        if self._transport_coordination_enabled:
+        if self._transport_coordination_enabled or not self._relay_application_enabled:
             # Remain E2E-authenticated but application-idle until mobile has
             # completed its LAN-first attempt and explicitly commits to relay.
             await self._send_relay(
@@ -818,6 +820,8 @@ class RelayBridge:
         self.e2e_pc_ready_sent = True
 
     async def _handle_transport_commit(self, relay_ws, frame: dict) -> None:
+        if not self._relay_application_enabled:
+            return
         if (
             set(frame) != {"type", "transport", "attempt_id"}
             or frame.get("type") != TYPE_TRANSPORT_COMMIT
@@ -866,6 +870,8 @@ class RelayBridge:
         )
 
     async def _connect_local(self, relay_ws, *, start_reader: bool = True) -> None:
+        if not self._relay_application_enabled:
+            return
         if self._local_ws is not None:
             return
         import websockets
@@ -986,6 +992,10 @@ class RelayBridge:
         allow_chunking: bool,
     ) -> bool:
         """Encrypt and send one app frame while ``_relay_send_lock`` is held."""
+        if not self._relay_application_enabled:
+            if (_safe_frame_type(frame) not in {"lan_provisioning", "webrtc_capabilities"}
+                    and str(frame.get("event_type") or "") not in SIGNAL_EVENT_TYPES):
+                return False
         keys = self.e2e_keys
         if keys is None:
             return False
@@ -1004,7 +1014,7 @@ class RelayBridge:
         )
         msg = {
             "v": PROTOCOL_VERSION,
-            "type": TYPE_E2E_FRAME,
+            "type": TYPE_E2E_FRAME if self._relay_application_enabled else "E2E_SIGNAL",
             "role": "pc",
             "pair_id": self.pair_id,
             "seq": frame_seq,
@@ -1066,7 +1076,7 @@ class RelayBridge:
             outer_seq = frame_seq if chunk_index == 0 else self._next_seq()
             chunk_msg = {
                 "v": PROTOCOL_VERSION,
-                "type": TYPE_E2E_CHUNK,
+                "type": TYPE_E2E_CHUNK if self._relay_application_enabled else "E2E_SIGNAL_CHUNK",
                 "role": "pc",
                 "pair_id": self.pair_id,
                 "seq": outer_seq,
@@ -1221,7 +1231,7 @@ class RelayBridge:
         if _safe_frame_type(frame) == "relay_chunk_error":
             self._handle_chunk_error_frame(frame)
             return
-        if self._transport_coordination_enabled:
+        if self._transport_coordination_enabled or not self._relay_application_enabled:
             try:
                 if await self._webrtc_manager.handle_signal(frame):
                     return
@@ -1229,6 +1239,8 @@ class RelayBridge:
                 print(f"[OSIA WebRTC] signaling failed: {type(exc).__name__}")
                 await relay_ws.close()
                 return
+        if not self._relay_application_enabled:
+            return
         if (
             self._transport_coordination_enabled
             and _safe_frame_type(frame) == TYPE_TRANSPORT_COMMIT
@@ -1639,6 +1651,7 @@ class RelayBridge:
                 print("[OSIA Relay] incompatible relay protocol; update required")
                 await relay_ws.close()
                 return
+            self._relay_application_enabled = payload.get("application_relay_enabled", True) is True
             print("[OSIA Relay] relay pair confirmed")
             self._oauth_authoritative = True
             oauth_relay_coordinator.mark_authoritative(self)

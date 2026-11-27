@@ -2339,8 +2339,8 @@
             "fr": "L’association établit la confiance"
           },
           "subtitle": {
-            "en": "Pairing creates trust; transports are simply the different roads the phone can use to reach the same OSIA server on your PC. The token is the shared pairing secret. From it, PC and phone derive proofs and fresh encryption keys.",
-            "fr": "L’association crée la confiance ; les transports sont simplement les différentes routes permettant au téléphone d’atteindre le même serveur OSIA sur votre PC. Le jeton est le secret d’association partagé. Le PC et le téléphone en dérivent des preuves et de nouvelles clés de chiffrement."
+            "en": "Pairing creates trust; transports are simply the different roads the phone can use to reach the same OSIA server on your PC. The token is the shared pairing secret. From it, PC and phone derive proofs and fresh encryption keys. The public Worker forwards encrypted connection details.",
+            "fr": "L’association crée la confiance ; les transports sont simplement les différentes routes permettant au téléphone d’atteindre le même serveur OSIA sur votre PC. Le jeton est le secret d’association partagé. Le PC et le téléphone en dérivent des preuves et de nouvelles clés de chiffrement. Le Worker public transmet les informations de connexion chiffrées."
           },
           "body_blocks": [],
           "callouts": [],
@@ -2369,8 +2369,8 @@
             "fr": "Transport direct d’abord"
           },
           "subtitle": {
-            "en": "The public relay routes encrypted data and does not receive the raw token. Connection order is direct-first: (1) try an already provisioned private-LAN WSS connection; (2) open the end-to-end encrypted relay in standby; (3) retry newly provisioned LAN; (4) try data-only WebRTC/P2P with encrypted signaling through the relay; (5) explicitly commit the encrypted relay fallback.",
-            "fr": "Le relais public achemine des données chiffrées sans recevoir le jeton brut. L’ordre privilégie le direct : (1) essayer une connexion WSS déjà configurée sur le réseau local privé ; (2) ouvrir le relais chiffré de bout en bout en attente ; (3) réessayer le réseau local nouvellement configuré ; (4) essayer WebRTC/P2P pour les données, avec signalisation chiffrée par le relais ; (5) activer explicitement le relais chiffré en secours."
+            "en": "The pairing token stays on the devices. The phone tries your private LAN first, then a direct WebRTC connection. The OSIA Worker helps the devices pair and exchange encrypted connection details.",
+            "fr": "Le jeton reste sur les appareils. Le téléphone essaie d’abord le réseau local privé, puis une connexion WebRTC directe. Le Worker OSIA aide les appareils à s’associer et à échanger les informations de connexion chiffrées."
           },
           "body_blocks": [],
           "callouts": [],
@@ -2399,8 +2399,8 @@
             "fr": "Un seul transport engagé"
           },
           "subtitle": {
-            "en": "Only one road may carry application traffic at a time. After sleep or a network change, reconnect attempts are coalesced. OSIA does not switch roads during an active request because replaying part of a response could duplicate work.",
-            "fr": "Une seule route transporte les données de l’application à la fois. Après une veille ou un changement de réseau, les reconnexions sont regroupées. OSIA ne change pas de route pendant une demande active afin d’éviter de dupliquer une partie du travail."
+            "en": "If neither direct connection succeeds, the phone stays offline. Only one road may carry application traffic at a time. After sleep or a network change, reconnect attempts are coalesced.",
+            "fr": "Si aucune connexion directe n’aboutit, le téléphone reste hors ligne. Une seule route transporte les données de l’application à la fois. Après une veille ou un changement de réseau, les reconnexions sont regroupées."
           },
           "body_blocks": [],
           "callouts": [
@@ -2411,8 +2411,8 @@
                 "fr": "Exemple concret"
               },
               "body": {
-                "en": "At home, the phone may connect over the authenticated private LAN. Away from home, WebRTC may establish a direct path; if it cannot, the end-to-end encrypted relay carries the conversation. The OSIA task still runs on the PC.",
-                "fr": "À la maison, le téléphone peut utiliser le réseau local privé authentifié. À distance, WebRTC peut créer une route directe ; sinon, le relais chiffré de bout en bout transporte la conversation. La tâche OSIA s’exécute toujours sur le PC."
+                "en": "At home the phone can connect over the private LAN. Away from home it needs a working WebRTC connection to reach the PC.",
+                "fr": "À la maison, le téléphone peut se connecter sur le réseau local privé. À distance, il lui faut une connexion WebRTC fonctionnelle pour atteindre le PC."
               }
             }
           ],
@@ -2441,8 +2441,8 @@
             "fr": "Ce que signifie hors ligne"
           },
           "subtitle": {
-            "en": "The older direct host/rendezvous WebSocket route is a gated legacy fallback and is disabled by default. If the PC is off, asleep without a working server, disconnected, or unable to reach any usable transport, the phone cannot run OSIA tasks.",
-            "fr": "L’ancienne route WebSocket directe par hôte/rendez-vous est un secours historique conditionnel, désactivé par défaut. Si le PC est éteint, en veille sans serveur actif, déconnecté ou sans transport utilisable, le téléphone ne peut pas exécuter de tâches OSIA."
+            "en": "OSIA does not switch roads during an active request because replaying part of a response could duplicate work. The older direct host/rendezvous WebSocket route is a gated legacy fallback and is disabled by default. If the PC is off, asleep without a working server, disconnected, or unable to reach any usable transport, the phone cannot run OSIA tasks.",
+            "fr": "OSIA ne change pas de route pendant une demande active afin d’éviter de dupliquer une partie du travail. L’ancienne route WebSocket directe par hôte/rendez-vous est un secours historique conditionnel, désactivé par défaut. Si le PC est éteint, en veille sans serveur actif, déconnecté ou sans transport utilisable, le téléphone ne peut pas exécuter de tâches OSIA."
           },
           "body_blocks": [],
           "callouts": [
@@ -2453,8 +2453,8 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "LAN → relay standby → provisioned LAN retry → WebRTC → committed relay. One authenticated application transport owns the bridge at a time.",
-                "fr": "LAN → relais en attente → nouvel essai LAN → WebRTC → relais activé. Un seul transport authentifié contrôle la connexion à la fois."
+                "en": "Try LAN first, then WebRTC. One authenticated connection carries application data.",
+                "fr": "Le téléphone essaie le LAN, puis WebRTC. Une seule connexion authentifiée transporte les données."
               }
             }
           ],
@@ -3387,8 +3387,8 @@
           },
           "body_blocks": [
             {
-              "en": "Selection tries a provisioned private-LAN WSS path, opens the E2E relay in signaling standby, retries newly provisioned LAN, attempts data-only WebRTC/P2P, then explicitly commits the encrypted relay. The coordinator and OS-level lease prevent two bridges from delivering one turn.",
-              "fr": "La sélection essaie le WSS du LAN privé, ouvre le relais E2E en attente de signalisation, retente le LAN nouvellement fourni, essaie WebRTC/P2P pour les données, puis valide explicitement le relais chiffré. Le coordinateur et le verrou système empêchent deux ponts de livrer un tour."
+              "en": "The phone tries authenticated WSS on the private LAN, including a newly paired LAN, then a direct WebRTC data channel. The coordinator assigns application traffic to one connection.",
+              "fr": "Le téléphone essaie une connexion WSS authentifiée sur le réseau local privé, y compris après une nouvelle association, puis un canal de données WebRTC direct. Le coordinateur confie les échanges à une seule connexion."
             }
           ],
           "callouts": [
@@ -3410,8 +3410,8 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "Relay standby is signaling infrastructure until its application commit succeeds.",
-                "fr": "Le relais en attente ne porte que la signalisation jusqu’à validation applicative."
+                "en": "The public Worker carries connection signaling. Application relay is disabled.",
+                "fr": "Le Worker public assure la signalisation. Le relais des données applicatives est désactivé."
               }
             }
           ],
@@ -3499,8 +3499,8 @@
           },
           "body_blocks": [
             {
-              "en": "The PC creates a fresh offer; mobile answers; bounded SDP and ICE candidates travel only inside relay E2E frames. A single ordered DataChannel then performs another pairing-authenticated E2E handshake before application commit. Failed ICE, authentication, timeout or bridge availability closes that attempt and permits relay fallback.",
-              "fr": "Le PC crée une offre neuve ; le mobile répond ; SDP et candidats ICE bornés voyagent uniquement dans les trames E2E du relais. Un DataChannel ordonné réalise un nouvel échange E2E authentifié avant validation. Échec ICE, authentification, délai ou pont ferme la tentative et permet le relais."
+              "en": "The PC sends an offer and the phone answers over encrypted signaling. Once ICE finds a route, the peers authenticate their ordered data channel before sending application data. If negotiation fails, the attempt closes.",
+              "fr": "Le PC envoie une offre et le téléphone répond via la signalisation chiffrée. Dès qu’ICE trouve une route, les appareils authentifient leur canal de données ordonné. Si la négociation échoue, la tentative se termine."
             }
           ],
           "callouts": [
@@ -3555,8 +3555,8 @@
           },
           "body_blocks": [
             {
-              "en": "OSIA persists only validated credential-free STUN URLs and currently defaults to Cloudflare STUN. Optional TURN records require credentials from protected runtime environment configuration and are never stored in ordinary settings. TURN is therefore supported as protected configuration, not configured by default; OSIA’s own E2E relay remains the normal fallback.",
-              "fr": "OSIA ne persiste que des URL STUN validées sans identifiants et utilise par défaut le STUN Cloudflare. Les entrées TURN facultatives exigent des identifiants fournis par l’environnement protégé et ne sont jamais stockées dans les réglages. TURN est donc possible mais absent par défaut ; le relais E2E OSIA reste le repli normal."
+              "en": "OSIA defaults to Cloudflare STUN. Private TURN credentials, if configured by an operator, come from the protected runtime environment. The public OSIA application relay is disabled.",
+              "fr": "OSIA utilise le STUN de Cloudflare par défaut. Les éventuels identifiants TURN privés proviennent de l’environnement protégé configuré par l’opérateur. Le relais applicatif public d’OSIA est désactivé."
             }
           ],
           "callouts": [
@@ -3602,17 +3602,17 @@
           "track_id": "osia-advanced",
           "order": 12,
           "title": {
-            "en": "OSIA relay fallback",
-            "fr": "Relais de secours OSIA"
+            "en": "OSIA signaling",
+            "fr": "Signalisation OSIA"
           },
           "subtitle": {
-            "en": "The public relay becomes the application transport only after direct paths fail and an encrypted commit succeeds.",
-            "fr": "Le relais public devient le transport applicatif seulement après l’échec des chemins directs et une validation chiffrée."
+            "en": "The public Worker provides encrypted signaling so the paired devices can establish their direct connection.",
+            "fr": "Le Worker public assure la signalisation chiffrée qui permet aux deux appareils associés d’établir leur connexion directe."
           },
           "body_blocks": [
             {
-              "en": "A Durable Object routes PC and mobile roles for one pair, enforces monotonic sequences, generations, frame and chunk limits, priorities and backpressure, and hibernates idle sockets. Application frames must be E2E envelopes; plaintext is rejected. Duplicate readiness and commits are idempotent, while stale sessions are superseded.",
-              "fr": "Un Durable Object route les rôles PC/mobile d’une paire, impose séquences monotones, générations, limites de trames/fragments, priorités et pression, puis hiberne les sockets inactifs. Les trames applicatives doivent être E2E ; le clair est refusé. Les doublons sont idempotents et les sessions anciennes remplacées."
+              "en": "A Durable Object connects the paired PC and mobile signaling sockets. It checks session identity, sequence numbers, message sizes and traffic budgets and can hibernate idle sockets.",
+              "fr": "Un Durable Object relie les sockets de signalisation du PC et du mobile associés. Il vérifie l’identité de session, la séquence, la taille des messages et les volumes autorisés. Les sockets inactifs peuvent hiberner."
             }
           ],
           "callouts": [
@@ -3634,8 +3634,8 @@
                 "fr": "À retenir"
               },
               "body": {
-                "en": "The relay can route ciphertext and metadata but cannot decrypt application content.",
-                "fr": "Le relais route chiffré et métadonnées sans pouvoir déchiffrer le contenu."
+                "en": "Chat and files travel on the active LAN or WebRTC connection.",
+                "fr": "Les discussions et les fichiers transitent par la connexion LAN ou WebRTC active."
               }
             }
           ],
@@ -3643,8 +3643,8 @@
             "kind": "native",
             "key": "advanced.relay",
             "alt": {
-              "en": "OSIA visual explaining osia relay fallback.",
-              "fr": "Visuel OSIA expliquant relais de secours osia."
+              "en": "OSIA visual explaining osia signaling.",
+              "fr": "Visuel OSIA expliquant signalisation osia."
             }
           },
           "action": {
@@ -5069,8 +5069,8 @@
           },
           "body_blocks": [
             {
-              "en": "For startup, distinguish a port conflict, stale process, wrong profile, missing frozen import or missing PyInstaller asset. For mobile, separate pairing mismatch, WebSocket disconnect, ICE or STUN failure, expected relay fallback and a duplicate handshake. For Android, check app-signature mismatch and versionCode conflict. For tests, identify developer-profile dependence and any runtime file appearing unexpectedly in source. For providers, distinguish image rejection from authentication/quota; for schedules, verify syntax, due time and that the PC was running. Sanitize logs and preserve evidence before cleanup.",
-              "fr": "Au démarrage, distinguez conflit de port, processus obsolète, mauvais profil, import frozen manquant ou asset PyInstaller absent. Pour le mobile, séparez association incohérente, déconnexion WebSocket, échec ICE ou STUN, repli normal vers le relais et handshake dupliqué. Pour Android, vérifiez signature d’app et conflit versionCode. Pour les tests, repérez la dépendance au profil développeur et tout fichier d’exécution apparu dans les sources. Pour les fournisseurs, distinguez rejet d’image et auth/quota ; pour les tâches, vérifiez syntaxe, échéance et PC actif. Masquez les journaux et conservez les preuves."
+              "en": "For startup, distinguish a port conflict, stale process, wrong profile, missing frozen import or missing PyInstaller asset. For mobile, separate pairing mismatch, WebSocket disconnect, ICE or STUN failure, direct connection failure and a duplicate handshake. For Android, check app-signature mismatch and versionCode conflict. For tests, identify developer-profile dependence and any runtime file appearing unexpectedly in source. For providers, distinguish image rejection from authentication/quota; for schedules, verify syntax, due time and that the PC was running. Sanitize logs and preserve evidence before cleanup.",
+              "fr": "Au démarrage, distinguez conflit de port, processus obsolète, mauvais profil, import frozen manquant ou asset PyInstaller absent. Pour le mobile, séparez association incohérente, déconnexion WebSocket, échec ICE ou STUN, échec de connexion directe et handshake dupliqué. Pour Android, vérifiez signature d’app et conflit versionCode. Pour les tests, repérez la dépendance au profil développeur et tout fichier d’exécution apparu dans les sources. Pour les fournisseurs, distinguez rejet d’image et auth/quota ; pour les tâches, vérifiez syntaxe, échéance et PC actif. Masquez les journaux et conservez les preuves."
             }
           ],
           "callouts": [
