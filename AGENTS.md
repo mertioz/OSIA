@@ -114,10 +114,15 @@ tickets, tests, comments, and documentation when they conflict.
   security, product/display versions, source commit, hashes and artifact metadata.
   Publish only the authorized platform through the existing immutable R2 release
   infrastructure and verify the full public download and the site deployment.
-- Preserve published historical artifacts and their original URLs. Do not change
-  installed update channels or force automatic migration without proven schema
-  and migration compatibility. Clearly disclose beta, signing and acceptance
-  status and unverified commercial ChatGPT Account eligibility.
+- R2 keeps only the latest published installer for each platform (Windows EXE,
+  Linux installer and Android APK). Verify the replacement download, size,
+  SHA-256 and applicable signature before removing previous installer binaries,
+  including superseded builds and Previews. Withdraw any offer for a retired
+  installer and mark its download unavailable. Keep historical release metadata
+  and never reuse a versioned URL for different bytes. See Linear WOR-365.
+- Preserve installed update channels and require proven schema and migration
+  compatibility for automatic migration. Clearly disclose beta, signing and
+  acceptance status and unverified commercial ChatGPT Account eligibility.
 
 ## Primary checkout synchronization and Drive reporting
 
