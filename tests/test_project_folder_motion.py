@@ -169,6 +169,37 @@ def test_unacknowledged_toggle_keeps_canonical_project_state(panel):
     assert panel.visible_conversation_ids() == []
 
 
+def test_toggle_keeps_other_projects_and_reuses_opened_rows(panel):
+    other = panel._folder_widgets["next"]
+    _advance(_toggle(panel), 1)
+    first = panel._row_widgets["0"]
+    _advance(_toggle(panel), 1)
+    _advance(_toggle(panel), 1)
+    assert panel._folder_widgets["next"] is other
+    assert panel._row_widgets["0"] is first
+
+
+def test_large_project_paints_first_viewport_and_drops_obsolete_ack(panel):
+    snapshot = panel.conversation_snapshot()
+    snapshot["snapshot_revision"] += 1
+    snapshot["items"] = [{"id": str(i), "title": str(i), "folder_id": "stage"} for i in range(320)]
+    panel.refresh(snapshot=snapshot)
+    panel.preview_folder_toggle("stage", False, "first")
+    contents = panel._folder_contents["stage"]
+    assert 0 < len(panel._row_widgets) < 320
+    first = panel._row_widgets["0"]
+    panel.preview_folder_toggle("stage", True, "second")
+    panel.finish_folder_toggle("stage", "first", snapshot)
+    assert not panel._row_widgets
+    panel.finish_folder_toggle("stage", "second", snapshot)
+    panel.preview_folder_toggle("stage", False, "third")
+    while contents._append_row is not None:
+        contents._fill_batch()
+    assert len(panel._row_widgets) == 320 and panel._row_widgets["0"] is first
+    panel.finish_folder_toggle("stage", "third", snapshot)
+    assert panel._folder_widgets["stage"]._collapsed and not panel._row_widgets
+
+
 @pytest.mark.parametrize("decoration", ["folderTitle", "folderCount", "icon"])
 def test_project_title_icon_and_count_are_part_of_one_click_target(panel, decoration):
     header = panel._folder_widgets["stage"]

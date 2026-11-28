@@ -1921,6 +1921,7 @@ def wake_mode(startup=None, maintenance=None):
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
         toggle_popup = Signal()
         mobile_permission_needed = Signal()
+        folder_toggle_finished = Signal(str, str, object)
         # Sanitized durable execution state projected into its originating Chat.
 
     bridge = Bridge()
@@ -4517,6 +4518,23 @@ def wake_mode(startup=None, maintenance=None):
         print(f"âœï¸  Renamed conversation {conv_id}: {'ok' if ok else 'rejected'}")
         popup.refresh_conversations(active_conv["id"] if active_conv else None)
 
+    from concurrent.futures import ThreadPoolExecutor
+    folder_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="osia-project-state")
+    bridge.folder_toggle_finished.connect(popup.finish_folder_toggle)
+
+    def save_folder_toggle(folder_id, collapsed, operation_id):
+        snapshot = None
+        try:
+            result = conversations.set_folder_collapsed(folder_id, collapsed, operation_id=operation_id)
+            if result.get("success"):
+                _notify_mobile_conversation_changed("", revision=result.get("revision", 0),
+                                                    operation_id=operation_id, action="folders")
+            snapshot = conversations.conversation_snapshot()
+        except (OSError, ValueError) as exc:
+            print(f"[OSIA] Project visibility could not be synchronized: {type(exc).__name__}")
+        finally:
+            bridge.folder_toggle_finished.emit(folder_id, operation_id, snapshot)
+
     def handle_folder_mutation(request: dict):
         nonlocal active_conv
         action = str((request or {}).get("action") or "")
@@ -4532,11 +4550,11 @@ def wake_mode(startup=None, maintenance=None):
                 operation_id=operation_id,
             )
         elif action == "collapse":
-            result = conversations.set_folder_collapsed(
-                str(request.get("folder_id") or ""),
-                bool(request.get("collapsed", False)),
-                operation_id=operation_id,
-            )
+            folder_id = str(request.get("folder_id") or "")
+            collapsed = bool(request.get("collapsed", False))
+            popup.preview_folder_toggle(folder_id, collapsed, operation_id)
+            folder_writer.submit(save_folder_toggle, folder_id, collapsed, operation_id)
+            return
         elif action == "context":
             result = conversations.set_folder_context_policy(
                 str(request.get("folder_id") or ""),
@@ -5302,6 +5320,7 @@ def wake_mode(startup=None, maintenance=None):
     codex_update_stop = start_runtime_update_worker()
 
     def on_quit():
+        folder_writer.shutdown(wait=True)
         codex_update_stop.set()
         voice_ui_lifecycle.close()
         island_lifecycle.close()

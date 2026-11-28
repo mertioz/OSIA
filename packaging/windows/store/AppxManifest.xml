@@ -7,7 +7,7 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap10 desktop desktop2 rescap">
   <Identity Name="GreatInvention.OSIA" Publisher="CN=FA4E5D6A-6188-48A3-B369-2B6989768B29"
-            Version="1.9.280.0" ProcessorArchitecture="x64"/>
+            Version="1.9.281.0" ProcessorArchitecture="x64"/>
   <Properties>
     <DisplayName>OSIA</DisplayName>
     <PublisherDisplayName>Mertioz</PublisherDisplayName>

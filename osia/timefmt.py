@@ -19,9 +19,11 @@ def use_12h() -> bool:
     return str(get_setting("time_format", "24h")).strip().lower() == "12h"
 
 
-def format_hm(hour: int, minute: int) -> str:
+def format_hm(hour: int, minute: int, *, clock_12h: bool | None = None) -> str:
     """Format a 24-hour ``(hour, minute)`` pair as ``"14:30"`` or ``"2:30 PM"``."""
-    if use_12h():
+    if clock_12h is None:
+        clock_12h = use_12h()
+    if clock_12h:
         suffix = "AM" if hour < 12 else "PM"
         h12 = hour % 12 or 12
         return f"{h12}:{minute:02d} {suffix}"

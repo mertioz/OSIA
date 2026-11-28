@@ -36,7 +36,7 @@ import qrcode
 from PySide6.QtCore import (
     Qt, QEvent, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
-    QParallelAnimationGroup, QUrl, QProcess,
+    QParallelAnimationGroup, QUrl, QProcess, QThreadPool,
 )
 from PySide6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
@@ -210,12 +210,12 @@ def _paint_gear(painter: QPainter, cx: float, cy: float, size: float, color: QCo
     painter.drawPath(path.subtracted(hole))
 
 
-def _format_time(ts: str | None) -> str:
+def _format_time(ts: str | None, *, clock_12h: bool | None = None) -> str:
     if not ts:
         return ""
     try:
         dt = datetime.fromisoformat(ts)
-        return dt.strftime("%d %b ") + timefmt.format_time(dt)
+        return dt.strftime("%d %b ") + timefmt.format_hm(dt.hour, dt.minute, clock_12h=clock_12h)
     except (ValueError, TypeError):
         return ts
 
@@ -2658,6 +2658,7 @@ class _ConvRow(_PointerStyledButton):
         *,
         folders: list[dict] | None = None,
         indented: bool = False,
+        clock_12h: bool | None = None,
     ):
         super().__init__()
         self.setObjectName("convRow")
@@ -2686,7 +2687,7 @@ class _ConvRow(_PointerStyledButton):
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         title.setToolTip(f"<qt>{html.escape(self._full_title)}</qt>")
         count = i18n.t("conversations.msg_count", count=conv.get("message_count", 0))
-        updated_at = _format_time(conv.get("updated_at"))
+        updated_at = _format_time(conv.get("updated_at"), clock_12h=clock_12h)
         self._metadata = f"{count} · {updated_at}" if updated_at else count
         self._subtitle_label = QLabel(self._metadata)
         self._subtitle_label.setObjectName("convSub")
@@ -2996,6 +2997,47 @@ class _FolderContents(QWidget):
         self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._animation.finished.connect(self._finish_animation)
 
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setInterval(10)
+        self._fill_timer.timeout.connect(self._fill_batch)
+        self._remaining = ()
+        self._next_row = 0
+        self._append_row = None
+        self._placeholder = None
+
+    def populate(self, members, append_row):
+        # Paint the first viewport before constructing off-screen controls.
+        self._remaining, self._append_row = members, append_row
+        self._next_row = 0
+        self._fill_batch()
+
+    def _fill_batch(self):
+        if self._append_row is None:
+            return
+        if self._placeholder is not None:
+            self._rows_layout.removeItem(self._placeholder)
+        end = min(self._next_row + 16, len(self._remaining))
+        for idx in range(self._next_row, end):
+            self._append_row(self._remaining[idx])
+        self._next_row = end
+        left = len(self._remaining) - end
+        if left and self._rows_layout.count():
+            first = self._rows_layout.itemAt(0).widget()
+            spacing = self._rows_layout.spacing()
+            height = left * (first.sizeHint().height() + spacing) - spacing
+            self._rows_layout.addSpacing(max(0, height))
+            self._placeholder = self._rows_layout.itemAt(self._rows_layout.count() - 1)
+        else:
+            self._placeholder = None
+        if left and not self._collapsed:
+            self._fill_timer.start()
+        elif not left:
+            self.cancel_fill()
+
+    def cancel_fill(self):
+        self._fill_timer.stop()
+        self._remaining, self._append_row = (), None
+
     def reveal_from(self, height: int | None) -> None:
         if self._rows_layout.isEmpty():
             self.hide()
@@ -3033,9 +3075,15 @@ class _FolderContents(QWidget):
             self.setMaximumHeight(16777215)
 
     def hideEvent(self, event) -> None:
+        self._fill_timer.stop()
         self._animation.stop()
         self._finish_animation()
         super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._collapsed and self._append_row is not None:
+            self._fill_timer.start()
 
 
 class _ConversationsPanel(QWidget):
@@ -3046,6 +3094,7 @@ class _ConversationsPanel(QWidget):
     rename_conversation = Signal(str, str)
     delete_conversation = Signal(str)
     folder_mutation_requested = Signal(dict)
+    snapshot_ready = Signal(object)
     bulk_delete_ungrouped_requested = Signal(int)
 
     def __init__(self):
@@ -3058,6 +3107,10 @@ class _ConversationsPanel(QWidget):
         self._row_widgets: dict[str, _ConvRow] = {}
         self._folder_widgets: dict[str, _FolderRow] = {}
         self._folder_contents: dict[str, _FolderContents] = {}
+        self._folder_members: dict[str, list[dict]] = {}
+        self._pending_toggles: dict[str, tuple[str, bool]] = {}
+        self._poll_in_flight = False
+        self.snapshot_ready.connect(self._accept_polled_snapshot)
         self._empty_label: QLabel | None = None
         self._optimistic_hidden_ids: set[str] = set()
         self._optimistic_restore_items: dict[str, dict] = {}
@@ -3133,7 +3186,7 @@ class _ConversationsPanel(QWidget):
         self.destroyed.connect(lambda: i18n.remove_listener(self._retranslate))
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(750)
-        self._poll_timer.timeout.connect(self._poll_canonical_store)
+        self._poll_timer.timeout.connect(self.request_snapshot)
         self._poll_timer.start()
 
     def _retranslate(self) -> None:
@@ -3266,7 +3319,30 @@ class _ConversationsPanel(QWidget):
     def _poll_canonical_store(self) -> None:
         if not self.isVisible():
             return
-        snapshot = conversations.conversation_snapshot()
+        self._accept_polled_snapshot(conversations.conversation_snapshot())
+
+    def request_snapshot(self) -> None:
+        if not self.isVisible() or self._poll_in_flight:
+            return
+        self._poll_in_flight = True
+
+        def read():
+            snapshot = None
+            try:
+                snapshot = conversations.conversation_snapshot()
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    self.snapshot_ready.emit(snapshot)
+                except RuntimeError:
+                    pass  # Panel closed while the canonical store was being read.
+        QThreadPool.globalInstance().start(read)
+
+    def _accept_polled_snapshot(self, snapshot) -> None:
+        self._poll_in_flight = False
+        if snapshot is None or not self.isVisible():
+            return
         if int(snapshot.get("snapshot_revision") or 0) < int(
             (self._last_snapshot or {}).get("snapshot_revision") or 0
         ):
@@ -3340,7 +3416,75 @@ class _ConversationsPanel(QWidget):
             "folder_id": folder_id,
             "collapsed": collapsed,
         })
-        self._poll_canonical_store()
+        if folder_id not in self._pending_toggles:
+            self._poll_canonical_store()
+
+    def preview_folder_toggle(self, folder_id: str, collapsed: bool, operation_id: str) -> None:
+        self._pending_toggles[folder_id] = (operation_id, collapsed)
+        if folder_id in self._folder_widgets:
+            self._set_folder_visibility(folder_id, collapsed)
+
+    def finish_folder_toggle(self, folder_id: str, operation_id: str, snapshot) -> None:
+        pending = self._pending_toggles.get(folder_id)
+        if pending and pending[0] == operation_id:
+            self._pending_toggles.pop(folder_id)
+        if snapshot is not None or self._last_snapshot is not None:
+            self.refresh(snapshot=snapshot or self._last_snapshot)
+        if snapshot is None:
+            self.request_snapshot()
+
+    def _make_conversation(self, conv, folders, *, indented):
+        row = _ConvRow(conv, is_active=conv.get("id") == self._active_id, folders=folders,
+                       indented=indented, clock_12h=self._row_clock_12h)
+        row.open_clicked.connect(self.open_conversation.emit)
+        row.rename_clicked.connect(self.rename_conversation.emit)
+        row.delete_clicked.connect(self.delete_conversation.emit)
+        row.move_clicked.connect(self._emit_move)
+        return row
+
+    def _set_folder_visibility(self, folder_id, collapsed):
+        header = self._folder_widgets[folder_id]
+        if header._collapsed == collapsed:
+            return
+        contents = self._folder_contents[folder_id]
+        start = 0 if contents.isHidden() else contents.height()
+        header._collapsed = contents._collapsed = collapsed
+        header.setChecked(not collapsed)
+        members = self._folder_members.get(folder_id, ())
+        if not collapsed and contents._rows_layout.isEmpty():
+            def append_row(conv):
+                if conv["id"] not in self._optimistic_hidden_ids:
+                    row = self._make_conversation(conv, self._last_snapshot["folders"], indented=True)
+                    contents._rows_layout.addWidget(row)
+                    row.show()
+                    self._row_widgets[row._conv_id] = row
+            contents.populate(members, append_row)
+        if collapsed:
+            contents._fill_timer.stop()
+        elif contents._append_row is not None:
+            contents._fill_timer.start()
+        for index in range(contents._rows_layout.count()):
+            row = contents._rows_layout.itemAt(index).widget()
+            if row is None:
+                continue
+            if collapsed:
+                self._row_widgets.pop(row._conv_id, None)
+            elif row._conv_id not in self._optimistic_hidden_ids:
+                row.show()
+                self._row_widgets[row._conv_id] = row
+                active = row._conv_id == self._active_id
+                if row.property("active") != active:
+                    row.setProperty("active", active)
+                    row.style().unpolish(row)
+                    row.style().polish(row)
+            else:
+                row.hide()
+        contents.show()
+        contents._rows_layout.activate()
+        contents._rows_host.updateGeometry()
+        contents.layout().activate()
+        contents.parentWidget().layout().invalidate()
+        contents.reveal_from(start)
 
     def _emit_new_in_folder(self, folder_id: str) -> None:
         self.folder_mutation_requested.emit({
@@ -3451,17 +3595,26 @@ class _ConversationsPanel(QWidget):
             tuple(self._optimistic_restore_order.items()),
             i18n.get_language(), timefmt.use_12h(),
         )
-        if (
-            not force and projection == self._rendered_projection
-            and self._active_id == self._rendered_active_id
-        ):
-            # Retain fresh canonical metadata even when it has no visible
-            # effect. This cache only avoids widget work, not state projection.
+        self._row_clock_12h = projection[-1]
+        previous = self._rendered_projection
+        signature = projection[0]
+        # A project toggle changes no titles, membership, order, or actions.
+        # Keep the existing widgets and only reveal that project's own rows.
+        if (not force and previous is not None and previous[1:] == projection[1:]
+                and self._active_id == self._rendered_active_id
+                and previous[0][2] == signature[2]
+                and [(f[:3], f[4:]) for f in previous[0][1]] == [(f[:3], f[4:]) for f in signature[1]]):
             self._last_snapshot = {
                 "items": [dict(item) for item in snapshot.get("items") or []],
                 "folders": [dict(item) for item in snapshot.get("folders") or []],
                 "snapshot_revision": snapshot.get("snapshot_revision", 0),
             }
+            for folder in self._last_snapshot["folders"]:
+                fid = str(folder.get("id") or "")
+                pending = self._pending_toggles.get(fid)
+                self._set_folder_visibility(fid, pending[1] if pending else bool(folder.get("collapsed")))
+            self._last_signature = signature
+            self._rendered_projection = projection
             return
         animation_starts = {}
         for folder in snapshot.get("folders") or []:
@@ -3477,6 +3630,7 @@ class _ConversationsPanel(QWidget):
                 )
         for contents in self._folder_contents.values():
             contents._animation.stop()
+            contents.cancel_fill()
         self._capture_scroll(snapshot)
         active_changed = self._active_id != self._rendered_active_id
         while self._host_layout.count() > 1:
@@ -3494,7 +3648,7 @@ class _ConversationsPanel(QWidget):
             "folders": [dict(item) for item in snapshot.get("folders") or []],
             "snapshot_revision": snapshot.get("snapshot_revision", 0),
         }
-        self._last_signature = self._snapshot_signature(snapshot)
+        self._last_signature = signature
         canonical_items = list(snapshot.get("items") or [])
         items = []
         visible_ids = set()
@@ -3521,6 +3675,7 @@ class _ConversationsPanel(QWidget):
                 ungrouped.append(item)
             elif isinstance(folder_id, str):
                 members_by_folder.setdefault(folder_id, []).append(item)
+        self._folder_members = members_by_folder
         if not items and not folders:
             # An empty list is a valid state — never auto-create here. A new
             # conversation is created only when the user clicks "New chat"
@@ -3532,19 +3687,6 @@ class _ConversationsPanel(QWidget):
             self._rendered_projection = projection
             return
         insert_at = 0
-
-        def make_conversation(conv: dict, *, indented: bool) -> _ConvRow:
-            row = _ConvRow(
-                conv,
-                is_active=(conv.get("id") == self._active_id),
-                folders=folders,
-                indented=indented,
-            )
-            row.open_clicked.connect(self.open_conversation.emit)
-            row.rename_clicked.connect(self.rename_conversation.emit)
-            row.delete_clicked.connect(self.delete_conversation.emit)
-            row.move_clicked.connect(self._emit_move)
-            return row
 
         def register_conversation(row: _ConvRow) -> None:
             self._row_widgets[str(row._conv_id or "")] = row
@@ -3558,6 +3700,9 @@ class _ConversationsPanel(QWidget):
             insert_at += 1
         for index, folder in enumerate(folders):
             folder_id = str(folder.get("id") or "")
+            pending = self._pending_toggles.get(folder_id)
+            if pending:
+                folder = {**folder, "collapsed": pending[1]}
             members = members_by_folder.get(folder_id, [])
             folder_row = _FolderRow(folder, len(members), index, len(folders))
             folder_row.collapsed_changed.connect(self._emit_folder_state)
@@ -3585,7 +3730,7 @@ class _ConversationsPanel(QWidget):
             section.show()
             if not contents._collapsed or folder_id in animation_starts:
                 for conv in members:
-                    row = make_conversation(conv, indented=True)
+                    row = self._make_conversation(conv, folders, indented=True)
                     contents._rows_layout.addWidget(row)
                     row.show()
                     if not contents._collapsed:
@@ -3598,7 +3743,7 @@ class _ConversationsPanel(QWidget):
             self._host_layout.insertWidget(insert_at, label)
             insert_at += 1
         for conv in ungrouped:
-            row = make_conversation(conv, indented=False)
+            row = self._make_conversation(conv, folders, indented=False)
             self._host_layout.insertWidget(insert_at, row)
             row.show()
             register_conversation(row)
@@ -12388,6 +12533,13 @@ class MainPopup(QWidget):
     def reload_conversations(self) -> None:
         self._convs.refresh()
 
+    def preview_folder_toggle(self, folder_id, collapsed, operation_id) -> None:
+        self._convs.preview_folder_toggle(folder_id, collapsed, operation_id)
+
+    @Slot(str, str, object)
+    def finish_folder_toggle(self, folder_id, operation_id, snapshot) -> None:
+        self._convs.finish_folder_toggle(folder_id, operation_id, snapshot)
+
     def set_conversation_busy(self, conv_id: str, busy: bool) -> None:
         if not conv_id:
             return
@@ -12767,7 +12919,10 @@ class MainPopup(QWidget):
                 return
             self._switch_page(page_idx)
             if page_idx == self.PAGE_CONVS:
-                self._convs.refresh()
+                if self._convs._last_snapshot is None:
+                    self._convs.refresh()
+                else:
+                    self._convs.request_snapshot()
             elif page_idx == self.PAGE_OSIA:
                 self._osia.refresh()
 

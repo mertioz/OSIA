@@ -63,6 +63,13 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.281", released_on="2026-11-28", public=True,
+        changes_en=("Projects show their conversations immediately and keep their rows ready when reopened.",
+                    "Page and settings transitions are shorter. The history refreshes in the background."),
+        changes_fr=("Les projets affichent leurs discussions dès le clic et les gardent prêtes pour la prochaine ouverture.",
+                    "Les transitions entre pages et paramètres sont plus courtes. L’historique s’actualise en arrière-plan."),
+    ),
+    ReleaseEntry(
         version="0.9.280", released_on="2026-11-28", public=True,
         changes_en=(
             "The Microsoft Store edition remembers your mobile network choice across launches and updates. Mobile connectivity starts by default.",

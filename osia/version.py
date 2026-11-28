@@ -12,9 +12,9 @@ import sys
 from pathlib import Path
 
 
-PRODUCT_VERSION = "0.9.280"
+PRODUCT_VERSION = "0.9.281"
 VERSION = PRODUCT_VERSION
-RELEASE_SEQUENCE = 2026112801
+RELEASE_SEQUENCE = 2026112802
 FIRST_RELEASE_SEQUENCE = 2026102001
 
 # Display aliases only. Original identifiers remain the artifact/diagnostic keys.

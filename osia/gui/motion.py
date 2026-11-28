@@ -23,8 +23,8 @@ class MotionTokens:
     state_ms: int = 100
     appearance_ms: int = 120
     page_ms: int = 110
-    navigation_ms: int = 110
-    collapse_ms: int = 90
+    navigation_ms: int = 70
+    collapse_ms: int = 65
     theme_ms: int = 150
 
 
