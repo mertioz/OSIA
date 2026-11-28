@@ -1920,6 +1920,7 @@ def wake_mode(startup=None, maintenance=None):
         # Toggle the popup from the global Ctrl+Alt+O hotkey thread (WOR-22).
         # Marshalled onto the GUI thread so popup.toggle() is Qt-safe.
         toggle_popup = Signal()
+        mobile_permission_needed = Signal()
         # Sanitized durable execution state projected into its originating Chat.
 
     bridge = Bridge()
@@ -1935,7 +1936,9 @@ def wake_mode(startup=None, maintenance=None):
     # systemd unit owns it; on Windows main.py does, so it also starts on the
     # login-autostart path (which only runs main.py). Idempotent + off-thread so
     # it never blocks GUI startup. No-op on non-Windows platforms.
-    threading.Thread(target=_ensure_mobile_server_windows, daemon=True).start()
+    from osia import windows_store
+    if not windows_store.is_store_install():
+        threading.Thread(target=_ensure_mobile_server_windows, daemon=True).start()
 
     island = DynamicIsland()
     popup = MainPopup()
@@ -1948,12 +1951,34 @@ def wake_mode(startup=None, maintenance=None):
     perf_mark("wake_mode: GUI constructed (island + popup)")
 
     # The release-only gate follows the acceptance flags in the legal manifest.
+    def _ask_mobile_permission():
+        from osia.gui.network_permissions import request_mobile_permission
+        from osia.utils.systemd_manager import restart_service
+        if request_mobile_permission(popup):
+            # The login task may already be serving loopback before first consent.
+            threading.Thread(target=restart_service, args=("osia-server.service",),
+                             name="osia-mobile-first-grant", daemon=True).start()
+        else:
+            threading.Thread(target=_ensure_mobile_server_windows, daemon=True).start()
+
+    bridge.mobile_permission_needed.connect(_ask_mobile_permission)
+
+    def _store_mobile_startup():
+        from osia.utils.systemd_manager import is_service_enabled
+        if is_service_enabled("osia-server.service"):
+            if windows_store.permission_decision(windows_store.MOBILE_NETWORK_PERMISSION) is None:
+                bridge.mobile_permission_needed.emit()
+            else:
+                _ensure_mobile_server_windows()
+
     def _run_release_legal_gate() -> None:
         from osia.gui.legal_dialog import maybe_show_release_legal_gate
 
         if not maybe_show_release_legal_gate(popup):
             app.quit()
             return
+        if windows_store.is_store_install():
+            threading.Thread(target=_store_mobile_startup, name="osia-store-mobile-startup", daemon=True).start()
         try:
             from osia.onboarding import claim_automatic_onboarding
 

@@ -585,6 +585,10 @@ def main(args: list[str] | None = None) -> int:
     kind = (values[0] if values else "").strip().lower()
     if kind != "server":
         return 2
+    if windows_store.is_store_install():
+        from osia.config import CONFIG_DIR
+        if (Path(CONFIG_DIR) / "windows_server_disabled").exists():
+            return 0
 
     # Two separate logs in the OS temp dir: the supervisor's own timestamped
     # lines, and the child's stdout+stderr verbatim. Keeping them apart means a

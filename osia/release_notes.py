@@ -63,6 +63,17 @@ class ReleaseEntry:
 
 _RELEASES = (
     ReleaseEntry(
+        version="0.9.280", released_on="2026-11-28", public=True,
+        changes_en=(
+            "The Microsoft Store edition remembers your mobile network choice across launches and updates. Mobile connectivity starts by default.",
+            "Use the + in Settings → MCP / Connectors to add an HTTPS or stdio server. You can also ask OSIA to register a connector in chat.",
+        ),
+        changes_fr=(
+            "L’édition Microsoft Store mémorise votre choix d’accès réseau mobile entre les lancements et les mises à jour. La connectivité mobile démarre par défaut.",
+            "Le bouton + dans Paramètres → MCP / Connecteurs permet d’ajouter un serveur HTTPS ou stdio. Vous pouvez aussi demander à OSIA d’en enregistrer un dans le chat.",
+        ),
+    ),
+    ReleaseEntry(
         version="0.9.279", released_on="2026-11-27", public=True,
         changes_en=(
             "New desktop installations start OSIA at sign-in by default. You can turn this off in Settings.",

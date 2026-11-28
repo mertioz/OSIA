@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from osia.config import CONFIG_DIR
-from osia import windows_store
+from osia import portable_mobile, windows_store
 from osia.runtime import (
     SERVER_MODE,
     SERVICE_MODE,
@@ -1633,11 +1633,15 @@ def is_service_enabled(name: str) -> bool:
     Windows: the Scheduled Task being registered means it triggers at login
     (``disable_service`` unregisters it), so the GUI toggle reflects reality.
     """
+    if name == "osia-server.service" and portable_mobile.managed():
+        return portable_mobile.enabled()
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):
             return False
         if kind == "tunnel":
+            return False
+        if is_frozen() and kind == "server" and _SERVER_DISABLED_MARKER.exists():
             return False
         return _win_task_registered(_TASK_NAME[kind])
     try:
@@ -1649,6 +1653,8 @@ def is_service_enabled(name: str) -> bool:
 
 def get_service_status(name: str) -> str:
     """Return one of 'running', 'stopped', 'error'."""
+    if name == "osia-server.service" and portable_mobile.managed():
+        return "running" if portable_mobile.running() else "stopped"
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind == "tunnel":
@@ -1670,6 +1676,8 @@ def get_service_status(name: str) -> str:
 
 def enable_service(name: str) -> bool:
     """Enable and start the unit. Returns True on success."""
+    if name == "osia-server.service" and portable_mobile.managed():
+        return portable_mobile.set_enabled(True)
     if _IS_WINDOWS:
         return _win_enable(name)
     try:
@@ -1684,6 +1692,8 @@ def enable_service(name: str) -> bool:
 
 def disable_service(name: str) -> bool:
     """Disable and stop the unit. Returns True on success."""
+    if name == "osia-server.service" and portable_mobile.managed():
+        return portable_mobile.set_enabled(False)
     if _IS_WINDOWS:
         return _win_disable(name)
     try:
@@ -1699,6 +1709,8 @@ def disable_service(name: str) -> bool:
 def stop_service(name: str) -> bool:
     """Stop the current service session without changing launch-at-login."""
 
+    if name == "osia-server.service" and portable_mobile.managed():
+        return portable_mobile.stop()
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):
@@ -1725,6 +1737,9 @@ def stop_service(name: str) -> bool:
 def restart_service(name: str) -> bool:
     """Restart the unit (without changing its enabled state). Returns True on
     success."""
+    if name == "osia-server.service" and portable_mobile.managed():
+        portable_mobile.stop()
+        return portable_mobile.start()
     if _IS_WINDOWS:
         kind = _UNIT_KIND.get(name)
         if kind not in ("server", "tunnel"):

@@ -44,5 +44,5 @@ def test_store_manifest_matches_the_public_product():
     tasks = manifest.findall(".//d:StartupTask", ns)
     assert {t.get("TaskId"): t.get("Enabled") for t in tasks} == {
         windows_store.GUI_STARTUP: "true",
-        windows_store.SERVER_STARTUP: "false",
+        windows_store.SERVER_STARTUP: "true",
     }

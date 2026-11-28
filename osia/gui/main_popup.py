@@ -36,7 +36,7 @@ import qrcode
 from PySide6.QtCore import (
     Qt, QEvent, Signal, Slot, QTimer, QPropertyAnimation, QEasingCurve, QPoint,
     QRect, QRectF, QPointF, QSize, QFileSystemWatcher, QVariantAnimation,
-    QParallelAnimationGroup, QUrl,
+    QParallelAnimationGroup, QUrl, QProcess,
 )
 from PySide6.QtGui import (
     QColor, QPainter, QFont, QPainterPath, QGuiApplication, QPen, QPixmap, QIcon,
@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QStackedWidget, QListWidget, QAbstractItemView, QFrame,
     QSizePolicy, QFileDialog, QComboBox,
-    QButtonGroup, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
+    QButtonGroup, QTabBar, QGridLayout, QDialog, QTextEdit, QInputDialog, QLayout, QMenu,
     QToolTip, QMessageBox, QTextBrowser, QBoxLayout, QListView, QListWidgetItem,
     QStyle, QStyleOptionButton, QStylePainter, QStyledItemDelegate,
 )
@@ -69,7 +69,7 @@ from osia.config import (
     get_setting, get_mcp_token, set_mcp_token, delete_mcp_token,
     delete_mcp_oauth, get_mcp_oauth, set_mcp_oauth,
     get_oauth_client, set_oauth_client,
-    get_reasoning_settings, set_model_reasoning_option,
+    get_reasoning_settings, set_model_reasoning_option, settings_transaction,
 )
 from osia.reasoning import get_reasoning_options, model_reasoning_settings_key
 from osia.mobile_model_catalogue import (
@@ -5060,15 +5060,7 @@ class _CronConversationDialog(_PopoverDialog):
 
 
 class _McpCustomDialog(_PopoverDialog):
-    """Add a custom MCP server (WOR-44 Phase 3).
-
-    Captures a name, a transport (a stdio *command* — split on spaces into
-    command + args — OR an *https URL*), an optional token and (for stdio) the
-    env-var the token should be injected into. Validates locally and exposes the
-    NON-secret server config in ``self.result_cfg`` plus ``self.result_token``;
-    the caller persists the config to ``mcp_servers`` and the token to the
-    gitignored store. It never connects — that is an explicit, separate action.
-    """
+    """Register a connector without opening a connection in the settings dialog."""
 
     def __init__(self, parent, anchor=None):
         super().__init__(parent, anchor=anchor)
@@ -5078,31 +5070,47 @@ class _McpCustomDialog(_PopoverDialog):
         title = QLabel(i18n.t("mcp.custom_title"))
         title.setObjectName("dialogTitle")
         self._card_layout.addWidget(title)
-
         hint = QLabel(i18n.t("mcp.custom_hint"))
         hint.setObjectName("providerSub")
         hint.setWordWrap(True)
         self._card_layout.addWidget(hint)
+        self._tabs = QTabBar()
+        self._tabs.setObjectName("mcpTransport")
+        self._tabs.setDrawBase(False)
+        self._tabs.addTab("HTTPS")
+        self._tabs.addTab("stdio")
+        self._card_layout.addWidget(self._tabs)
 
-        def _field(label_key, placeholder_key="", password=False):
-            lab = QLabel(i18n.t(label_key))
-            lab.setObjectName("providerSub")
-            self._card_layout.addWidget(lab)
-            le = QLineEdit()
-            le.setObjectName("keyInput")
-            le.setMinimumWidth(320)
-            if placeholder_key:
-                le.setPlaceholderText(i18n.t(placeholder_key))
+        self._labels = {}
+
+        def field(label_key, placeholder_key, password=False):
+            label = QLabel(i18n.t(label_key))
+            label.setObjectName("providerSub")
+            self._card_layout.addWidget(label)
+            edit = QLineEdit()
+            edit.setObjectName("keyInput")
+            edit.setMinimumWidth(290)
+            edit.setPlaceholderText(i18n.t(placeholder_key))
+            edit.setAccessibleName(label.text())
+            label.setBuddy(edit)
             if password:
-                le.setEchoMode(QLineEdit.EchoMode.Password)
-            self._card_layout.addWidget(le)
-            return le
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self._labels[edit] = label
+            self._card_layout.addWidget(edit)
+            return edit
 
-        self._name = _field("mcp.field_name", "mcp.field_name_ph")
-        self._command = _field("mcp.field_command", "mcp.field_command_ph")
-        self._url = _field("mcp.field_url", "mcp.field_url_ph")
-        self._token = _field("mcp.field_token_optional", "mcp.field_token_ph", password=True)
-        self._token_env = _field("mcp.field_token_env_optional", "mcp.field_token_env_ph")
+        self._name = field("mcp.field_name", "mcp.field_name_ph")
+        self._url = field("mcp.field_url", "mcp.field_url_ph")
+        self._command = field("mcp.field_command", "mcp.field_command_ph")
+        self._auth = QComboBox()
+        self._auth.setObjectName("voiceCombo")
+        self._auth.setAccessibleName(i18n.t("mcp.authentication"))
+        self._auth.addItem(i18n.t("mcp.auth_none"), "none")
+        self._auth.addItem(i18n.t("mcp.field_token"), "token")
+        self._auth.addItem("OAuth", "oauth")
+        self._card_layout.addWidget(self._auth)
+        self._token = field("mcp.field_token", "mcp.field_token_ph", password=True)
+        self._token_env = field("mcp.token_env_label", "mcp.field_token_env_ph")
 
         self._error = QLabel("")
         self._error.setObjectName("providerSub")
@@ -5118,7 +5126,7 @@ class _McpCustomDialog(_PopoverDialog):
         cancel.setObjectName("ghostBtn")
         cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel.clicked.connect(self.reject)
-        ok = QPushButton(i18n.t("mcp.add_custom"))
+        ok = QPushButton(i18n.t("provider.save"))
         ok.setObjectName("primaryBtn")
         ok.setCursor(Qt.CursorShape.PointingHandCursor)
         ok.clicked.connect(self._on_ok)
@@ -5126,47 +5134,58 @@ class _McpCustomDialog(_PopoverDialog):
         row.addWidget(ok)
         self._card_layout.addLayout(row)
 
+        self._transport_auth = [(0, ""), (0, "")]
+        self._active_tab = 0
+        self._tabs.currentChanged.connect(self._change_transport)
+        self._auth.currentIndexChanged.connect(self._show_fields)
+        self._show_fields()
+
+    def _change_transport(self, tab):
+        self._transport_auth[self._active_tab] = (self._auth.currentIndex(), self._token.text())
+        self._active_tab = tab
+        auth, token = self._transport_auth[tab]
+        self._token.setText(token)
+        self._auth.setCurrentIndex(auth)
+        self._show_fields()
+
+    def _show_fields(self):
+        stdio = self._tabs.currentIndex() == 1
+        oauth = self._auth.model().item(2)
+        oauth.setEnabled(not stdio)
+        if stdio and self._auth.currentData() == "oauth":
+            self._auth.setCurrentIndex(0)
+        token = self._auth.currentData() == "token"
+        for edit, visible in ((self._url, not stdio), (self._command, stdio),
+                              (self._token, token), (self._token_env, stdio and token)):
+            self._labels[edit].setVisible(visible)
+            edit.setVisible(visible)
+        self._error.clear()
+        self._error.hide()
+        self.adjustSize()
+
     def _on_ok(self) -> None:
-        name = self._name.text().strip()
-        command = self._command.text().strip()
-        url = self._url.text().strip()
-        token = self._token.text().strip()
-        token_env = self._token_env.text().strip()
-
-        if not name:
-            self._error.setText(i18n.t("mcp.err_name"))
-            return
-        if bool(command) == bool(url):
-            # need exactly one of command / url
-            self._error.setText(i18n.t("mcp.err_transport"))
-            return
-        # Derive a stable id from the name (the namespace forbids "__").
-        sid = re.sub(r"[^A-Za-z0-9.-]+", "-", name).strip("-").lower() or "custom"
-
-        if url:
-            if not (url.startswith("https://") or url.startswith("http://")):
-                self._error.setText(i18n.t("mcp.err_url"))
-                return
-            # The manager only speaks stdio so far — a remote (HTTP) server
-            # could be saved but never connected, a silent dead-end. Refuse it
-            # (and don't store its token) until HTTP transport lands (Phase 5).
-            self._error.setText(i18n.t("mcp.err_http_soon"))
-            return
+        from osia.mcp_client.custom import InvalidServer, server_config
+        stdio = self._tabs.currentIndex() == 1
+        auth = self._auth.currentData()
         try:
-            parts = shlex.split(command)
-        except ValueError:
-            parts = command.split()
-        if not parts:
-            self._error.setText(i18n.t("mcp.err_transport"))
+            parts = []
+            if stdio:
+                command = self._command.text().strip()
+                try:
+                    parts = QProcess.splitCommand(command) if sys.platform == "win32" else shlex.split(command)
+                except ValueError as exc:
+                    raise InvalidServer("mcp.err_command") from exc
+            self.result_cfg = server_config(
+                self._name.text(), "stdio" if stdio else "https",
+                url="" if stdio else self._url.text(), command=parts[0] if parts else "", args=parts[1:],
+                auth_type=auth, token_env=self._token_env.text() if stdio and auth == "token" else "",
+            )
+        except InvalidServer as exc:
+            self._error.setText(i18n.t(str(exc)))
+            self._error.show()
+            self.adjustSize()
             return
-        cfg = {
-            "id": sid, "name": name, "transport": "stdio",
-            "command": parts[0], "args": parts[1:], "url": None, "env": {},
-            "auth_type": "token" if token else "none", "enabled": False,
-            "token_env": token_env or None, "custom": True,
-        }
-        self.result_cfg = cfg
-        self.result_token = token
+        self.result_token = self._token.text().strip() if auth == "token" else ""
         self.accept()
 
 
@@ -8062,7 +8081,17 @@ class _SettingsPanel(QWidget):
         self._mcp_desc = QLabel(i18n.t("settings.mcp_desc"))
         self._mcp_desc.setObjectName("sectionDesc")
         self._mcp_desc.setWordWrap(True)
-        l.addWidget(self._mcp_title)
+        header = QHBoxLayout()
+        header.addWidget(self._mcp_title, 1)
+        self._mcp_add_btn = QPushButton("+")
+        self._mcp_add_btn.setObjectName("mcpAddButton")
+        self._mcp_add_btn.setFixedSize(28, 28)
+        self._mcp_add_btn.setAccessibleName(i18n.t("mcp.add_custom"))
+        self._mcp_add_btn.setToolTip(i18n.t("mcp.add_custom"))
+        self._mcp_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mcp_add_btn.clicked.connect(self._on_mcp_add_custom)
+        header.addWidget(self._mcp_add_btn)
+        l.addLayout(header)
         l.addWidget(self._mcp_sub)
         l.addWidget(self._mcp_desc)
 
@@ -8114,11 +8143,6 @@ class _SettingsPanel(QWidget):
         self._mcp_entries: dict = {}
         self._mcp_selected_id = None
 
-        self._mcp_add_btn = QPushButton("＋ " + i18n.t("mcp.add_custom"))
-        self._mcp_add_btn.setObjectName("primaryBtn")
-        self._mcp_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mcp_add_btn.clicked.connect(self._on_mcp_add_custom)
-        l.addWidget(self._mcp_add_btn, 0, Qt.AlignmentFlag.AlignLeft)
         return wrap
 
     def _mcp_connectable(self, entry: dict) -> bool:
@@ -8261,23 +8285,26 @@ class _SettingsPanel(QWidget):
                 cfg.get("oauth_authorization_endpoint") or None
             )
             clean["oauth_token_endpoint"] = cfg.get("oauth_token_endpoint") or None
-        servers = [s for s in self._mcp_saved_servers() if s.get("id") != cfg["id"]]
-        servers.append(clean)
-        set_setting("mcp_servers", servers)
-
-    def _mcp_set_enabled(self, server_id: str, enabled: bool) -> None:
-        servers = self._mcp_saved_servers()
-        changed = False
-        for s in servers:
-            if s.get("id") == server_id:
-                s["enabled"] = enabled
-                changed = True
-        if changed:
+        with settings_transaction():
+            servers = [s for s in self._mcp_saved_servers() if s.get("id") != cfg["id"]]
+            servers.append(clean)
             set_setting("mcp_servers", servers)
 
+    def _mcp_set_enabled(self, server_id: str, enabled: bool) -> None:
+        with settings_transaction():
+            servers = self._mcp_saved_servers()
+            changed = False
+            for s in servers:
+                if s.get("id") == server_id:
+                    s["enabled"] = enabled
+                    changed = True
+            if changed:
+                set_setting("mcp_servers", servers)
+
     def _mcp_remove_saved(self, server_id: str) -> None:
-        servers = [s for s in self._mcp_saved_servers() if s.get("id") != server_id]
-        set_setting("mcp_servers", servers)
+        with settings_transaction():
+            servers = [s for s in self._mcp_saved_servers() if s.get("id") != server_id]
+            set_setting("mcp_servers", servers)
 
     def _mcp_all_entries(self) -> list:
         """Ordered connector entries for the dropdown: every catalog server,
@@ -8307,6 +8334,7 @@ class _SettingsPanel(QWidget):
         manager snapshot, but only the visible pill is painted."""
         entries = self._mcp_all_entries()
         self._mcp_entries = {e["id"]: e for e in entries}
+        self._mcp_custom_ids = {e["id"] for e in entries if e.get("custom")}
         combo = self._mcp_combo
         combo.blockSignals(True)
         combo.clear()
@@ -9417,25 +9445,20 @@ class _SettingsPanel(QWidget):
         dlg = _McpCustomDialog(self, anchor=self._mcp_add_btn)
         if not dlg.exec() or not dlg.result_cfg:
             return
-        cfg = dlg.result_cfg
-        # Ensure a unique id across catalog + saved servers.
-        taken = {e["id"] for e in self._MCP_CATALOG} | {
-            s["id"] for s in self._mcp_saved_servers()
-        }
-        base_id, sid, n = cfg["id"], cfg["id"], 2
-        while sid in taken:
-            sid = f"{base_id}-{n}"
-            n += 1
-        cfg["id"] = sid
-        self._mcp_upsert_server(cfg)            # NOT connected — explicit action
-        if dlg.result_token:
-            set_mcp_token(sid, dlg.result_token)
-        # Surface the new server straight away: select it so the dropdown lands
-        # on its panel after _render_mcp rebuilds the item list.
-        self._mcp_selected_id = sid
+        from osia.mcp_client.custom import save_custom_server
+        try:
+            self._mcp_selected_id = save_custom_server(dlg.result_cfg, dlg.result_token)
+        except (OSError, ValueError):
+            QMessageBox.warning(self, i18n.t("mcp.custom_title"), i18n.t("mcp.err_save"))
+            return
         self._render_mcp()
 
     def _refresh_mcp_status(self) -> None:
+        if self._mcp_combo.isVisible() and hasattr(self, "_mcp_custom_ids"):
+            custom_ids = {s["id"] for s in self._mcp_saved_servers() if s.get("custom")}
+            if custom_ids != self._mcp_custom_ids:
+                self._render_mcp()
+                return
         if not getattr(self, "_mcp_pills", None):
             return
         try:
@@ -10922,7 +10945,8 @@ class _SettingsPanel(QWidget):
         self._mcp_sub.setText(i18n.t("settings.mcp_sub"))
         self._mcp_desc.setText(i18n.t("settings.mcp_desc"))
         self._mcp_select_label.setText(i18n.t("mcp.select_label"))
-        self._mcp_add_btn.setText("＋ " + i18n.t("mcp.add_custom"))
+        self._mcp_add_btn.setAccessibleName(i18n.t("mcp.add_custom"))
+        self._mcp_add_btn.setToolTip(i18n.t("mcp.add_custom"))
         self._render_mcp()
 
     def _retranslate_nav(self) -> None:
@@ -10944,6 +10968,14 @@ class _SettingsPanel(QWidget):
         if self._startup_refresh_guard or unit in self._startup_changes:
             return
         checked = toggle.isChecked()
+        if checked and unit == "osia-server.service" and windows_store.is_store_install():
+            from osia.gui.network_permissions import request_mobile_permission
+            # Turning the feature back on is an explicit opportunity to reconsider.
+            if not request_mobile_permission(self, review=not windows_store.mobile_network_allowed()):
+                self._startup_refresh_guard = True
+                toggle.setChecked(False)
+                self._startup_refresh_guard = False
+                return
         op = enable_service if checked else disable_service
         self._startup_changes.add(unit)
         # An in-flight probe may have read the state before this change.
@@ -13686,6 +13718,19 @@ class MainPopup(QWidget):
                 background: rgba(196, 181, 245, 0.18);
                 border: 1px solid rgba(196, 181, 245, 0.45);
                 color: #e8e6f0;
+            }
+            QPushButton#mcpAddButton {
+                background: transparent; border: 1px solid transparent;
+                border-radius: 7px; padding: 0; color: #e8e6f0; font-size: 20px;
+            }
+            QPushButton#mcpAddButton:hover, QPushButton#mcpAddButton:focus,
+            QTabBar#mcpTransport::tab:selected {
+                background: rgba(196, 181, 245, 0.16);
+                border: 1px solid rgba(196, 181, 245, 0.38); border-radius: 7px;
+            }
+            QTabBar#mcpTransport::tab {
+                background: transparent; color: #e8e6f0; padding: 4px 12px; margin-right: 4px;
+                border: 1px solid transparent; border-radius: 7px;
             }
             QPushButton#hierarchyAction, QPushButton#hierarchyRemove {
                 background: rgba(196, 181, 245, 0.06);

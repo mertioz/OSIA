@@ -39,6 +39,15 @@ def _private_ipv4(value: str) -> str | None:
     return str(address)
 
 
+def local_ipv4_subnet(host: str):
+    """The subnet of the interface on which the secure gateway actually listens."""
+    for addresses in psutil.net_if_addrs().values():
+        for address in addresses:
+            if address.family == socket.AF_INET and address.address == host and address.netmask:
+                return ipaddress.IPv4Network((host, address.netmask), strict=False)
+    return None
+
+
 def select_private_ipv4() -> str:
     """Choose the routed private IPv4 without assuming an OS interface name."""
 

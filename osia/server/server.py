@@ -5494,6 +5494,7 @@ def _build_config_snapshot() -> dict:
     from osia import personality
     cfg = load_settings()
     cfg.pop("cron_jobs_conflict", None)
+    cfg.pop("desktop_permission_decisions", None)
     try:
         from osia import scheduled_tasks
 

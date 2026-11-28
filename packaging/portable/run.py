@@ -2,7 +2,6 @@
 import fcntl
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 
@@ -41,17 +40,12 @@ def run():
         ensure_config_files(create_token=True)
         # The server's own port guard exits before starting transports when a
         # pre-existing installation already serves this user.
-        child = subprocess.Popen([sys.executable, "-I", "-B", __file__, "--server"])
+        from osia import portable_mobile
+        portable_mobile.initialize([sys.executable, "-I", "-B", __file__, "--server"])
         try:
             return main()
         finally:
-            if child.poll() is None:
-                child.terminate()
-                try:
-                    child.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
+            portable_mobile.stop()
 
 
 if __name__ == "__main__":

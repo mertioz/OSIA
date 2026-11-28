@@ -894,13 +894,23 @@ async def _serve(
     stop_event: asyncio.Event,
 ) -> None:
     import websockets
-    from osia.lan_discovery import LanDiscoveryAdvertiser
+    from osia import windows_store
+    from osia.lan_discovery import LanDiscoveryAdvertiser, local_ipv4_subnet
+
+    store = windows_store.is_store_install()
+    subnet = local_ipv4_subnet(host) if store else None
 
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
     ssl_context.load_cert_chain(str(cert_file), str(key_file))
 
     async def handler(websocket) -> None:
+        if store:
+            peer = websocket.remote_address
+            if (not peer or subnet is None or ipaddress.ip_address(peer[0]) not in subnet
+                    or not windows_store.mobile_network_allowed()):
+                await websocket.close(code=1008, reason="local network access unavailable")
+                return
         request = getattr(websocket, "request", None)
         if request is None or request.path != LAN_PATH:
             await websocket.close(code=1008, reason="invalid LAN path")

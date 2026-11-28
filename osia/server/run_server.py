@@ -75,7 +75,10 @@ def _boot_mark(message: str) -> None:
 
 
 def _bind_host() -> str:
-    return "127.0.0.1" if os.environ.get("OSIA_SERVER_LOOPBACK_ONLY") == "1" else "0.0.0.0"
+    from osia import windows_store
+    if windows_store.is_store_install() or os.environ.get("OSIA_SERVER_LOOPBACK_ONLY") == "1":
+        return "127.0.0.1"
+    return "0.0.0.0"
 
 
 def _port_8765_available() -> bool:
@@ -169,6 +172,11 @@ def _launch_after_port_guard(
         print("port 8765 already in use; exiting cleanly")
         return False
     prepare()
+    from osia import windows_store
+    if not windows_store.mobile_network_allowed():
+        # The desktop still has its loopback API while mobile access is off.
+        run_server()
+        return True
     if _lan_coordination_enabled():
         # Provisioning must exist before the E2E relay standby announces it.
         start_lan()

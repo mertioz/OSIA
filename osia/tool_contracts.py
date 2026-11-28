@@ -758,6 +758,12 @@ def _build_static_specs() -> tuple[ToolSpec, ...]:
         _spec("declare_outcomes", "Optionally record high-level result notes ({id,result}); never required for tools or completion",
               _object({"outcomes": {"type": "array", "items": {"type": "object"}}}, required=("outcomes",)),
               R, I, NC, timeout=10.0, retry=RetryPolicy.NEVER_AFTER_DISPATCH),
+        _spec("add_mcp_server", "Save a user-requested MCP connector to Settings; enter secrets in Settings",
+              _object({"name": _string(maximum=120), "transport": _string(enum=("https", "stdio")),
+                       "url": URL, "command": PATH, "args": _array(_string(maximum=4096)),
+                       "auth_type": _string(enum=("none", "token", "oauth")),
+                       "token_env": _string(maximum=128)}, required=("name", "transport")), PL, N, NC,
+              progress=effect, real=local_real, verified=True, observability=ObservabilityPolicy.PRIVATE_METADATA_ONLY),
         _spec("create_chat_skill", "Save a new reusable OSIA skill requested through /skillcreator",
               _object({
                   "name": _string(maximum=64, pattern=r"^[a-z][a-z0-9-]*$"),

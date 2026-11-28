@@ -1271,8 +1271,8 @@ _ADVANCED_SPECS: tuple[CurriculumSpec, ...] = (
     ),
     (
         "advanced.mcp", "mcp", "MCP architecture", "Architecture MCP",
-        "MCP connects external tool servers through catalog or custom configurations.",
-        "MCP connecte des serveurs d’outils externes via le catalogue ou des configurations personnalisées.",
+        "To add a server, choose + in Settings → MCP / Connectors, or ask OSIA in chat. Choose HTTPS for a URL or stdio for a local command. Enter any token in Settings, then choose Connect.",
+        "Pour ajouter un serveur, cliquez sur + dans Paramètres → MCP / Connecteurs ou demandez-le à OSIA dans le chat. Choisissez HTTPS pour une adresse ou stdio pour une commande locale. Saisissez le jeton éventuel dans les paramètres, puis cliquez sur Connecter.",
         "Supported transports are stdio and streamable HTTP; legacy SSE is recognized but unsupported. Catalog entries define health and auth: OAuth may use Dynamic Client Registration or a static client, bearer tokens are validated, and custom connectors remain explicit. Connected tools are injected as namespaced agent tools. Lifecycle covers connect, cancel, disconnect, revoke and reconnect; mobile mirrors status and results.",
         "Les transports pris en charge sont stdio et HTTP streamable ; SSE ancien est reconnu mais non pris en charge. Le catalogue définit santé et auth : OAuth peut utiliser l’enregistrement dynamique ou un client statique, les jetons sont validés et les connecteurs personnalisés explicites. Les outils sont injectés avec namespace. Le cycle couvre connexion, annulation, déconnexion, révocation et reconnexion ; le mobile reflète l’état.",
         "Test a read tool, an annotated write, OAuth cancellation and restart reconnect with sanitized fixtures.",
